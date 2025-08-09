@@ -14,7 +14,7 @@
 
 BUILD_CONFIGURATION ?= debug
 
-SWIFT := "/usr/bin/swift"
+SWIFT := "swift"
 DESTDIR ?= /usr/local/
 ROOT_DIR := $(shell git rev-parse --show-toplevel)
 
