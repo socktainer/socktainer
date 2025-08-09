@@ -29,7 +29,6 @@ permissions:
 
 env:
   SWIFT_VERSION: 6.2-snapshot
-  XCODE_VERSION: 26.0-beta
 
 jobs:
 
@@ -49,6 +48,7 @@ jobs:
       - name: Use another XCode version
         run: |
          sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
+         sudo xcodebuild -license accept
 
       - name: install swiftly
         run: |
