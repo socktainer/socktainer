@@ -40,9 +40,14 @@ jobs:
 
       - uses: vapor/swiftly-action@v0.2
         with:
-          toolchain: 6.2-snapshot
+          toolchain: latest
+
+      - name: install latest swift
+        run: |
+          swiftly install 6.2-snapshot
       - name: Get swift version
         run: swift --version
+
 
       - name: Run Build
         timeout-minutes: 40
@@ -65,7 +70,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: vapor/swiftly-action@v0.2
         with:
-          toolchain: 6.2-snapshot
+          toolchain: latest
       - name: Get swift version
         run: swift --version
 
@@ -88,7 +93,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: vapor/swiftly-action@v0.2
         with:
-          toolchain: 6.2-snapshot
+          toolchain: latest
+
       - name: Get swift version
         run: swift --version
       - name: Execute test
