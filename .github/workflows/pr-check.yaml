@@ -60,20 +60,23 @@ jobs:
           echo "~/.swiftly/bin" >> $GITHUB_PATH
           echo "Swiftly installed successfully"
 
-      - name: Get swift version
+      - name: Display swift version
         run: swift --version
+
+      - name: Display Xcode version
+        run: xcodebuild -version
 
       - name: Run Build
         timeout-minutes: 40
         run: make release
 
       - name: List Build
-        run: ls -la ./dist/
+        run: ls -la ./.build/arm64-apple-macosx/release/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-x64-dmg
-          path: ./dist/podman-desktop-*x64.dmg
+          name: socktainer
+          path: ./.build/arm64-apple-macosx/release/socktainer
 
 
   tests-lint-format:
@@ -103,8 +106,12 @@ jobs:
           echo "~/.swiftly/bin" >> $GITHUB_PATH
           echo "Swiftly installed successfully"
 
-      - name: Get swift version
+      - name: Display swift version
         run: swift --version
+
+      - name: Display Xcode version
+        run: xcodebuild -version
+
 
       - name: Run formatter
         run: make fmt
