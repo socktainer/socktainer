@@ -40,14 +40,12 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
         with:
           xcode-version: 26.0-beta
 
       - name: Use another XCode version
         run: |
-         sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
          sudo xcodebuild -license accept
 
       - name: install swiftly
@@ -91,7 +89,6 @@ jobs:
 
       - name: Use another XCode version
         run: |
-         sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
          sudo xcodebuild -license accept
 
       - name: install swiftly
