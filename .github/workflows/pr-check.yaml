@@ -38,11 +38,13 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: vapor/swiftly-action@v0.2.0
-        with:
-          toolchain: 6.2-snapshot
-        env:
-          SWIFTLY_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: install swiftly
+        run: |
+          curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && \
+          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory && \
+          ~/.swiftly/bin/swiftly init --quiet-shell-followup && \
+          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh" && \
+          hash -r
 
       - name: Get swift version
         run: swift --version
