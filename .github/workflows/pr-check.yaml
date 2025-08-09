@@ -48,7 +48,7 @@ jobs:
 
       - name: Use another XCode version
         run: |
-         sudo xcode-select -s /Applications/Xcode-beta.app/    
+         sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
 
       - name: install swiftly
         run: |
