@@ -38,9 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: swift-actions/setup-swift@v2
+      - uses: vapor/swiftly-action@v0.2
         with:
-          swift-version: "6.2-snapshot"
+          toolchain: 6.2-snapshot
       - name: Get swift version
         run: swift --version
 
@@ -63,9 +63,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: swift-actions/setup-swift@v2
+      - uses: vapor/swiftly-action@v0.2
         with:
-          swift-version: "6.2-snapshot"
+          toolchain: 6.2-snapshot
       - name: Get swift version
         run: swift --version
 
@@ -86,9 +86,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: swift-actions/setup-swift@v2
+      - uses: vapor/swiftly-action@v0.2
         with:
-          swift-version: "6.2-snapshot"
+          toolchain: 6.2-snapshot
       - name: Get swift version
         run: swift --version
       - name: Execute test
