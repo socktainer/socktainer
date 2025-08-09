@@ -27,6 +27,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SWIFT_VERSION: 6.2-snapshot
+
 jobs:
 
   build:
@@ -45,10 +48,13 @@ jobs:
           ~/.swiftly/bin/swiftly init --quiet-shell-followup && \
           . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh" && \
           hash -r
+          swiftly install --use ${SWIFT_VERSION}
+          swiftly use ${SWIFT_VERSION}
+          echo "~/.swiftly/bin" >> $GITHUB_PATH
+          echo "Swiftly installed successfully"
 
       - name: Get swift version
         run: swift --version
-
 
       - name: Run Build
         timeout-minutes: 40
