@@ -30,7 +30,7 @@ permissions:
 jobs:
 
   build:
-    name: macOS
+    name: build
     runs-on: macos-15
     timeout-minutes: 40
     env:
@@ -38,9 +38,15 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2-snapshot"
+      - name: Get swift version
+        run: swift --version
+
       - name: Run Build
         timeout-minutes: 40
-        run: pnpm compile:pull-request
+        run: make release
 
       - name: List Build
         run: ls -la ./dist/
@@ -57,6 +63,12 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2-snapshot"
+      - name: Get swift version
+        run: swift --version
+
       - name: Run formatter
         run: make fmt
 
@@ -74,5 +86,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2-snapshot"
+      - name: Get swift version
+        run: swift --version
       - name: Execute test
         run: make test
