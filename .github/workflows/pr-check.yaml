@@ -60,7 +60,7 @@ jobs:
           echo "~/.swiftly/bin" >> $GITHUB_PATH
           echo "Swiftly installed successfully"
 
-      - name: Display swift version
+      - name: Display the swift version
         run: swift --version
 
       - name: Display Xcode version
