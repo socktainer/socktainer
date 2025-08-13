@@ -51,17 +51,9 @@ jobs:
               rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
-      - name: install swiftly
-        run: |
-          curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && \
-          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory && \
-          ~/.swiftly/bin/swiftly init --skip-install --quiet-shell-followup && \
-          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh" && \
-          hash -r
-          swiftly install --use ${SWIFT_VERSION}
-          swiftly use ${SWIFT_VERSION}
-          echo "~/.swiftly/bin" >> $GITHUB_PATH
-          echo "Swiftly installed successfully"
+      - name: swift
+        run: | 
+          xcode-select --install
 
       - name: Display the swift version
         run: swift --version
@@ -102,17 +94,9 @@ jobs:
               rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
-      - name: install swiftly
-        run: |
-          curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && \
-          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory && \
-          ~/.swiftly/bin/swiftly init --skip-install --quiet-shell-followup && \
-          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh" && \
-          hash -r
-          swiftly install --use ${SWIFT_VERSION}
-          swiftly use ${SWIFT_VERSION}
-          echo "~/.swiftly/bin" >> $GITHUB_PATH
-          echo "Swiftly installed successfully"
+      - name: swift
+        run: | 
+          xcode-select --install
 
       - name: Display swift version
         run: swift --version
