@@ -51,9 +51,11 @@ jobs:
               rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
-      - name: swift
-        run: | 
-          xcode-select --install
+      - name: Display swift version
+        run: |
+          which swift
+          swift --version
+
 
       - name: Display the swift version
         run: swift --version
@@ -94,12 +96,10 @@ jobs:
               rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
-      - name: swift
-        run: | 
-          xcode-select --install
-
       - name: Display swift version
-        run: swift --version
+        run: |
+          which swift
+          swift --version
 
       - name: Display Xcode version
         run: |
