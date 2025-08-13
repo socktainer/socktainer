@@ -29,7 +29,6 @@ permissions:
 
 env:
   SWIFT_VERSION: 6.2-snapshot
-  CURRENT_SDK: 1
 
 jobs:
 
@@ -45,20 +44,10 @@ jobs:
         with:
           xcode-version: 26.0-beta
 
-      - name: remove old XCode
-        run: |
-              rm -rf /Applications/Xcode_16*.app
-              rm -rf /Applications/Xcode.app
-              ls -la /Applications/    
-
       - name: Display swift version
         run: |
           which swift
           swift --version
-
-
-      - name: Display the swift version
-        run: swift --version
 
       - name: Display Xcode version
         run: |
@@ -89,12 +78,6 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
         with:
           xcode-version: 26.0-beta
-
-      - name: remove old XCode
-        run: |
-              rm -rf /Applications/Xcode_16*.app
-              rm -rf /Applications/Xcode.app
-              ls -la /Applications/    
 
       - name: Display swift version
         run: |
