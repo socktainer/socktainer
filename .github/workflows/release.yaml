@@ -87,6 +87,13 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.githubTag}}
 
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
       - name: Set macOS environment variables
         if: startsWith(matrix.os, 'macos')
         run: |

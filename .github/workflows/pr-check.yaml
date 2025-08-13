@@ -55,6 +55,13 @@ jobs:
           xcode-select -p
           xcrun --sdk macosx --show-sdk-path
 
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
       - name: Run Build
         timeout-minutes: 40
         run: make release
@@ -89,6 +96,14 @@ jobs:
           xcodebuild -version
           xcode-select -p
           xcrun --sdk macosx --show-sdk-path
+
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
 
       - name: Run formatter
         run: make fmt
