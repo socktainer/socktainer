@@ -44,6 +44,9 @@ jobs:
         with:
           xcode-version: 26.0-beta
 
+      - run: |
+              ls -la /Applications/    
+
       - name: Use another XCode version
         run: |
          sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
