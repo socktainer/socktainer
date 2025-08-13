@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "socktainer",
     platforms: [
-        .macOS(.v26)
+        .macOS(.v15)
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", from: "0.3.0"),

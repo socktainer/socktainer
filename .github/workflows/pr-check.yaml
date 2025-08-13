@@ -29,6 +29,7 @@ permissions:
 
 env:
   SWIFT_VERSION: 6.2-snapshot
+  CURRENT_SDK: 1
 
 jobs:
 
