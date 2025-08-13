@@ -47,6 +47,7 @@ jobs:
       - name: remove old XCode
         run: |
               rm -rf /Applications/Xcode_16*.app
+              rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
       - name: Use another XCode version
@@ -99,6 +100,7 @@ jobs:
       - name: remove old XCode
         run: |
               rm -rf /Applications/Xcode_16*.app
+              rm -rf /Applications/Xcode.app
               ls -la /Applications/    
 
       - name: Use another XCode version
