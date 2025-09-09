@@ -2,7 +2,7 @@ import ContainerClient
 
 protocol ClientContainerProtocol: Sendable {
     func list(showAll: Bool) async throws -> [ClientContainer]
-    func inspect(id: String) async throws -> ClientContainer?
+    func getContainer(id: String) async throws -> ClientContainer?
 
     func start(id: String) async throws
     func stop(id: String) async throws
@@ -22,15 +22,12 @@ struct ClientContainerService: ClientContainerProtocol {
         return try await ClientContainer.list()
     }
 
-    func inspect(id: String) async throws -> ClientContainer? {
-        try await ClientContainer.list().filter { $0.id == id }.first
+    func getContainer(id: String) async throws -> ClientContainer? {
+        try await ClientContainer.get(id: id)
     }
 
     func start(id: String) async throws {
-        let container = try await ClientContainer.list().filter { $0.id == id }.first
-        guard let container else {
-            throw ClientContainerError.notFound(id: id)
-        }
+        let container = try await ClientContainer.get(id: id)
         //try await container.createProcess(id: "start", command: ["start"]).start()
     }
 

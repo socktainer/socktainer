@@ -17,7 +17,7 @@ extension ContainerInspectRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            guard let container = try await client.inspect(id: id) else {
+            guard let container = try await client.getContainer(id: id) else {
                 throw Abort(.notFound, reason: "Container not found")
             }
 
