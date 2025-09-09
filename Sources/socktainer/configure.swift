@@ -14,6 +14,7 @@ func configure(_ app: Application) async throws {
     // /containers
     try app.register(collection: ContainerListRoute(client: containerClient))
     try app.register(collection: ContainerInspectRoute(client: containerClient))
+    try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
