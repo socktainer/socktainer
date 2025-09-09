@@ -8,7 +8,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", from: "0.4.1"),
-        .package(url: "https://github.com/vapor/vapor.git", from: "4.115.0"),
+        .package(url: "https://github.com/vapor/vapor.git", from: "4.116.0"),
     ],
     targets: [
         .executableTarget(
