@@ -11,7 +11,7 @@ struct ContainerInspectRoute: RouteCollection {
 }
 
 extension ContainerInspectRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerSummary {
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerInspect {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
@@ -21,12 +21,14 @@ extension ContainerInspectRoute {
                 throw Abort(.notFound, reason: "Container not found")
             }
 
-            return RESTContainerSummary(
+            return RESTContainerInspect(
                 Id: container.id,
                 Names: ["/" + container.id],
                 Image: container.configuration.image.reference,
                 ImageID: container.configuration.image.digest,
-                State: container.status.rawValue
+                    State: ContainerState(
+        Status: container.status.rawValue
+    )
             )
         }
     }
