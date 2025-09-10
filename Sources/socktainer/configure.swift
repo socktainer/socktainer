@@ -11,6 +11,9 @@ func configure(_ app: Application) async throws {
     // /events
     try app.register(collection: EventsRoute(client: healthCheckClient))
 
+    // exec
+    try app.register(collection: ExecRoute(client: containerClient))
+
     // /containers
     try app.register(collection: ContainerListRoute(client: containerClient))
     try app.register(collection: ContainerInspectRoute(client: containerClient))

@@ -3,6 +3,7 @@ import ContainerClient
 protocol ClientContainerProtocol: Sendable {
     func list(showAll: Bool) async throws -> [ClientContainer]
     func getContainer(id: String) async throws -> ClientContainer?
+    func enforceContainerRunning(container: ClientContainer) throws
 
     func start(id: String) async throws
     func stop(id: String) async throws
@@ -11,6 +12,7 @@ protocol ClientContainerProtocol: Sendable {
 
 enum ClientContainerError: Error {
     case notFound(id: String)
+    case notRunning(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -24,6 +26,12 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func getContainer(id: String) async throws -> ClientContainer? {
         try await ClientContainer.get(id: id)
+    }
+
+    func enforceContainerRunning(container: ClientContainer) throws {
+        guard container.status == .running else {
+            throw ClientContainerError.notRunning(id: container.id)
+        }
     }
 
     func start(id: String) async throws {
