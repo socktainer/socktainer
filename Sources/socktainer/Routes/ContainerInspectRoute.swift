@@ -26,9 +26,9 @@ extension ContainerInspectRoute {
                 Names: ["/" + container.id],
                 Image: container.configuration.image.reference,
                 ImageID: container.configuration.image.digest,
-                    State: ContainerState(
-        Status: container.status.rawValue
-    )
+                State: ContainerState(
+                    Status: container.status.rawValue
+                )
             )
         }
     }

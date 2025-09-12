@@ -46,7 +46,7 @@ actor ExecManager {
     }
 
     func remove(id: String) {
-       // storage.removeValue(forKey: id)
+        // storage.removeValue(forKey: id)
     }
 }
 
@@ -80,7 +80,7 @@ struct ExecRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
         routes.post(":version", "containers", ":id", "exec", use: ExecRoute.createExec(client: client))
         routes.post("containers", ":id", "exec", use: ExecRoute.createExec(client: client))
-        routes.get(":version", "exec", ":id", "json",use: ExecRoute.inspectExec(client: client))
+        routes.get(":version", "exec", ":id", "json", use: ExecRoute.inspectExec(client: client))
         routes.get("exec", ":id", "json", use: ExecRoute.inspectExec(client: client))
         routes.post(":version", "exec", ":id", "start", use: ExecRoute.startExec(client: client))
         routes.post("exec", ":id", "start", use: ExecRoute.startExec(client: client))
@@ -88,7 +88,7 @@ struct ExecRoute: RouteCollection {
         routes.post("exec", ":id", "resize", use: ExecRoute.resize(client: client))
     }
 
-     static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
             guard let execId = req.parameters.get("id") else {
@@ -111,7 +111,7 @@ struct ExecRoute: RouteCollection {
                 let ContainerID: String
                 let DetachKeys: String
                 let Pid: Int?
-                
+
                 struct ProcessConfigInfo: Content {
                     let privileged: Bool
                     let user: String
@@ -127,7 +127,7 @@ struct ExecRoute: RouteCollection {
             // In a real implementation, you'd track the actual process state
             let response = ExecInspectResponse(
                 ID: execId,
-                Running: false, // We'd need to track this properly
+                Running: false,  // We'd need to track this properly
                 ExitCode: nil,  // We'd need to track this from the actual process
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
@@ -191,36 +191,64 @@ struct ExecRoute: RouteCollection {
         }
     }
 
-static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
-    { req in
-        guard let execId = req.parameters.get("id") else {
-            throw Abort(.badRequest, reason: "Missing exec ID")
-        }
+    static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+        { req in
+            guard let execId = req.parameters.get("id") else {
+                throw Abort(.badRequest, reason: "Missing exec ID")
+            }
 
-        guard let config = await ExecManager.shared.get(id: execId) else {
-            throw Abort(.notFound, reason: "Exec process not found")
-        }
+            guard let config = await ExecManager.shared.get(id: execId) else {
+                throw Abort(.notFound, reason: "Exec process not found")
+            }
 
-        guard let container = try await client.getContainer(id: config.containerId) else {
-            throw Abort(.notFound, reason: "Container not found")
-        }
+            guard let container = try await client.getContainer(id: config.containerId) else {
+                throw Abort(.notFound, reason: "Container not found")
+            }
 
-        try client.enforceContainerRunning(container: container)
+            try client.enforceContainerRunning(container: container)
 
-        struct StartExecRequest: Content {
-            let Detach: Bool?
-            let Tty: Bool?
-            let ConsoleSize: [Int]?
-        }
+            struct StartExecRequest: Content {
+                let Detach: Bool?
+                let Tty: Bool?
+                let ConsoleSize: [Int]?
+            }
 
-        let startRequest = try req.content.decode(StartExecRequest.self)
+            let startRequest = try req.content.decode(StartExecRequest.self)
 
-        let detach = startRequest.Detach ?? false
-        let tty = startRequest.Tty ?? config.tty
-        let consoleSize = startRequest.ConsoleSize ?? [24, 80]
+            let detach = startRequest.Detach ?? false
+            let tty = startRequest.Tty ?? config.tty
+            let consoleSize = startRequest.ConsoleSize ?? [24, 80]
 
-        // Detached mode
-        if detach {
+            // Detached mode
+            if detach {
+                let executable = config.cmd.first!
+                let arguments = Array(config.cmd.dropFirst())
+                var processConfig = container.configuration.initProcess
+                processConfig.executable = executable
+                processConfig.arguments = arguments
+                processConfig.terminal = tty
+
+                let process = try await container.createProcess(
+                    id: UUID().uuidString.lowercased(),
+                    configuration: processConfig,
+                    stdio: [nil, nil, nil]
+                )
+                try await process.start()
+                await ExecManager.shared.remove(id: execId)
+                return Response(status: .ok)
+            }
+
+            // Attached mode
+            let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
+            let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
+            let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
+
+            let stdio = Stdio(
+                stdin: stdinPipe?.fileHandleForReading,
+                stdout: stdoutPipe?.fileHandleForWriting,
+                stderr: stderrPipe?.fileHandleForWriting
+            )
+
             let executable = config.cmd.first!
             let arguments = Array(config.cmd.dropFirst())
             var processConfig = container.configuration.initProcess
@@ -231,162 +259,125 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
             let process = try await container.createProcess(
                 id: UUID().uuidString.lowercased(),
                 configuration: processConfig,
-                stdio: [nil, nil, nil]
+                stdio: stdio.asArray
             )
+
             try await process.start()
-            await ExecManager.shared.remove(id: execId)
-            return Response(status: .ok)
-        }
 
-        // Attached mode
-        let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-        let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-        let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
-
-        let stdio = Stdio(
-            stdin: stdinPipe?.fileHandleForReading,
-            stdout: stdoutPipe?.fileHandleForWriting,
-            stderr: stderrPipe?.fileHandleForWriting
-        )
-
-        let executable = config.cmd.first!
-        let arguments = Array(config.cmd.dropFirst())
-        var processConfig = container.configuration.initProcess
-        processConfig.executable = executable
-        processConfig.arguments = arguments
-        processConfig.terminal = tty
-
-        let process = try await container.createProcess(
-            id: UUID().uuidString.lowercased(),
-            configuration: processConfig,
-            stdio: stdio.asArray
-        )
-
-        try await process.start()
-
-        let body = Response.Body(stream: { writer in
-            Task.detached {
-                @Sendable func writeFrame(streamType: UInt8, data: Data) {
-                    var buffer = ByteBufferAllocator().buffer(capacity: data.count + (tty ? 0 : 8))
-                    if tty {
-                        buffer.writeBytes(data)
-                    } else {
-                        let size = UInt32(data.count)
-                        var header = Data(capacity: 8)
-                        header.append(streamType)
-                        header.append(0)
-                        header.append(0)
-                        header.append(0)
-                        header.append(contentsOf: withUnsafeBytes(of: size.bigEndian) { Data($0) })
-                        buffer.writeBytes(header)
-                        buffer.writeBytes(data)
+            let body = Response.Body(stream: { writer in
+                Task.detached {
+                    @Sendable func writeFrame(streamType: UInt8, data: Data) {
+                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + (tty ? 0 : 8))
+                        if tty {
+                            buffer.writeBytes(data)
+                        } else {
+                            let size = UInt32(data.count)
+                            var header = Data(capacity: 8)
+                            header.append(streamType)
+                            header.append(0)
+                            header.append(0)
+                            header.append(0)
+                            header.append(contentsOf: withUnsafeBytes(of: size.bigEndian) { Data($0) })
+                            buffer.writeBytes(header)
+                            buffer.writeBytes(data)
+                        }
+                        _ = writer.write(.buffer(buffer))
                     }
-                    _ = writer.write(.buffer(buffer))
-                }
 
-                await withTaskGroup(of: Void.self) { group in
+                    await withTaskGroup(of: Void.self) { group in
 
-                    // stdout
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
-                        group.addTask {
-                            while true {
-                                do {
-                                    if let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty {
+                        // stdout
+                        if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                            group.addTask {
+                                while true {
+                                    do {
+                                        guard let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty else {
+                                            break
+                                        }
                                         writeFrame(streamType: 1, data: data)
-                                        /*if let text = String(data: data, encoding: .utf8) {
-                                             print("[Exec \(execId) stdout] \(text)", terminator: "")
-                                        }*/
-                                    } else {
+                                    } catch {
+                                        // print("[Exec \(execId) stdout] read error: \(error)")
                                         break
                                     }
-                                } catch {
-                                    // print("[Exec \(execId) stdout] read error: \(error)")
-                                    break
                                 }
+                                // print("[Exec \(execId) stdout] finished")
+                                try? stdoutHandle.close()
                             }
-                            // print("[Exec \(execId) stdout] finished")
-                            try? stdoutHandle.close()
                         }
-                    }
 
-                    // stderr
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
-                        group.addTask {
-                            while true {
-                                do {
-                                    if let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty {
+                        // stderr
+                        if let stderrHandle = stderrPipe?.fileHandleForReading {
+                            group.addTask {
+                                while true {
+                                    do {
+                                        guard let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty else {
+                                            break
+                                        }
                                         writeFrame(streamType: 2, data: data)
-                                        /*if let text = String(data: data, encoding: .utf8) {
-                                            print("[Exec \(execId) stderr] \(text)", terminator: "")
-                                        }*/
-                                    } else {
+                                    } catch {
+                                        // print("[Exec \(execId) stderr] read error: \(error)")
                                         break
                                     }
-                                } catch {
-                                    // print("[Exec \(execId) stderr] read error: \(error)")
-                                    break
                                 }
+                                // print("[Exec \(execId) stderr] finished")
+                                try? stderrHandle.close()
                             }
-                            // print("[Exec \(execId) stderr] finished")
-                            try? stderrHandle.close()
                         }
-                    }
 
-                    // stdin
-                    if let stdinWriter = stdinPipe?.fileHandleForWriting {
+                        // stdin
+                        if let stdinWriter = stdinPipe?.fileHandleForWriting {
+                            group.addTask {
+                                do {
+                                    for try await var buf in req.body {
+                                        if let data = buf.readData(length: buf.readableBytes) {
+                                            try stdinWriter.write(contentsOf: data)
+                                        }
+                                    }
+                                } catch {
+                                    // print("[Exec \(execId) stdin] Error: \(error)")
+                                }
+                                try? stdinWriter.close()
+                                // print("[Exec \(execId) stdin] finished")
+                            }
+                        }
+
+                        // Monitor process and close all write ends immediately
                         group.addTask {
                             do {
-                                for try await var buf in req.body {
-                                    if let data = buf.readData(length: buf.readableBytes) {
-                                        try stdinWriter.write(contentsOf: data)
-                                    }
-                                }
+                                let exitCode = try await process.wait()
+                                // print("Process \(execId) finished with exit code: \(exitCode)")
                             } catch {
-                                // print("[Exec \(execId) stdin] Error: \(error)")
+                                // print("Process \(execId) finished with error: \(error)")
                             }
-                            try? stdinWriter.close()
-                            // print("[Exec \(execId) stdin] finished")
-                        }
-                    }
 
-                    // Monitor process and close all write ends immediately
-                    group.addTask {
-                        do {
-                            let exitCode = try await process.wait()
-                            // print("Process \(execId) finished with exit code: \(exitCode)")
-                        } catch {
-                            // print("Process \(execId) finished with error: \(error)")
+                            // CLOSE ALL WRITE ENDS TO SIGNAL EOF
+                            try? stdoutPipe?.fileHandleForWriting.close()
+                            try? stderrPipe?.fileHandleForWriting.close()
+                            try? stdinPipe?.fileHandleForWriting.close()
+                            // print("[Exec \(execId)] all write ends closed")
                         }
 
-                        // CLOSE ALL WRITE ENDS TO SIGNAL EOF
-                        try? stdoutPipe?.fileHandleForWriting.close()
-                        try? stderrPipe?.fileHandleForWriting.close()
-                        try? stdinPipe?.fileHandleForWriting.close()
-                        // print("[Exec \(execId)] all write ends closed")
+                        for await _ in group {}
                     }
 
-                    for await _ in group {}
+                    await ExecManager.shared.remove(id: execId)
+                    _ = writer.write(.end)
                 }
+            })
 
-                await ExecManager.shared.remove(id: execId)
-                _ = writer.write(.end)
+            // Set headers
+            var headers: HTTPHeaders = [:]
+            headers.add(name: "Content-Type", value: tty ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream")
+
+            if req.headers.first(name: "Connection")?.lowercased().contains("upgrade") == true && req.headers.first(name: "Upgrade")?.lowercased() == "tcp" {
+                headers.add(name: "Connection", value: "Upgrade")
+                headers.add(name: "Upgrade", value: "tcp")
+                return Response(status: .switchingProtocols, headers: headers, body: body)
             }
-        })
 
-        // Set headers
-        var headers: HTTPHeaders = [:]
-        headers.add(name: "Content-Type", value: tty ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream")
-
-        if req.headers.first(name: "Connection")?.lowercased().contains("upgrade") == true &&
-           req.headers.first(name: "Upgrade")?.lowercased() == "tcp" {
-            headers.add(name: "Connection", value: "Upgrade")
-            headers.add(name: "Upgrade", value: "tcp")
-            return Response(status: .switchingProtocols, headers: headers, body: body)
+            return Response(status: .ok, headers: headers, body: body)
         }
-
-        return Response(status: .ok, headers: headers, body: body)
     }
-}
 
     static func resize(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
@@ -394,7 +385,6 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
             guard let execId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing exec ID")
             }
-
 
             guard let config = await ExecManager.shared.get(id: execId) else {
                 throw Abort(.notFound, reason: "Exec process not found")
@@ -409,7 +399,7 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
             let height = (try? req.query.get(Int.self, at: "h")) ?? 24
             let width = (try? req.query.get(Int.self, at: "w")) ?? 80
 
-           // Note: ContainerClient does not currently support resizing exec processes.
+            // Note: ContainerClient does not currently support resizing exec processes.
             // This is a placeholder for future implementation.
             // try await exec.resize(height: height, width: width)
 

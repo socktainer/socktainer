@@ -1,6 +1,5 @@
 import Vapor
 
-
 struct ContainerState: Content {
     let Status: String
 }
@@ -12,7 +11,6 @@ struct RESTContainerSummary: Content {
     let ImageID: String
     let State: String
 }
-
 
 struct RESTContainerInspect: Content {
     let Id: String
