@@ -1,14 +1,35 @@
 import Foundation
-import Vapor
+import NIO
 
-// Detect environment and set up logging
-var env = try Environment.detect()
-try LoggingSystem.bootstrap(from: &env)
+// Get HOME directory
+let homeDirectory = ProcessInfo.processInfo.environment["HOME"]
 
-// Create and configure the Vapor application
-let app = try await Application.make(env)
-try prepareUnixSocket(for: app, homeDirectory: ProcessInfo.processInfo.environment["HOME"])
-try await configure(app)
+do {
+    // Create router and register routes
+    let router = HTTPRouter()
+    let healthCheckClient = ClientService()
+    
+    // Register ping route
+    router.register(route: PingRoute())
+    router.register(route: ContainerInspectRoute())
+    router.register(route: ExecGetRoute())
+    router.register(route: ExecStartRoute())
+    router.register(route: ExecCreateRoute())
+    router.register(route: ExecResizeRoute())
 
-// Start the app
-try await app.execute()
+    // Start Unix socket server with HTTP support
+    let serverFuture = try startUnixSocketServer(
+        homeDirectory: homeDirectory,
+        router: router,
+        client: healthCheckClient
+    )
+    
+    // Wait for the server channel to be ready
+    let serverChannel = try serverFuture.wait()
+    
+    // Keep the server alive indefinitely
+    try serverChannel.closeFuture.wait()
+    
+} catch {
+    print("❌ Server failed: \(error)")
+}
