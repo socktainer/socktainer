@@ -90,7 +90,6 @@ struct ExecRoute: RouteCollection {
 
      static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            print("Inspect Exec Request: \(req)")
 
             guard let execId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing exec ID")
@@ -155,8 +154,6 @@ struct ExecRoute: RouteCollection {
     static func createExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
-            // create debug request
-            print("Create Exec Request: \(req)")
             guard let containerId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
@@ -189,7 +186,6 @@ struct ExecRoute: RouteCollection {
                 detach: false
             )
 
-            print("Creating exec with config: \(config)")
             let id = await ExecManager.shared.create(config: config)
             return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
         }
@@ -197,8 +193,6 @@ struct ExecRoute: RouteCollection {
 
 static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
     { req in
-        print("Start Exec Request: \(req)")
-
         guard let execId = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing exec ID")
         }
@@ -220,13 +214,10 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
         }
 
         let startRequest = try req.content.decode(StartExecRequest.self)
-        print("Start Exec Request Body: \(startRequest)")
 
         let detach = startRequest.Detach ?? false
         let tty = startRequest.Tty ?? config.tty
         let consoleSize = startRequest.ConsoleSize ?? [24, 80]
-
-        print("Parsed exec config - detach: \(detach), tty: \(tty), ConsoleSize: \(consoleSize)")
 
         // Detached mode
         if detach {
@@ -237,15 +228,12 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
             processConfig.arguments = arguments
             processConfig.terminal = tty
 
-            print("Starting detached exec process with config: \(processConfig)")
-
             let process = try await container.createProcess(
                 id: UUID().uuidString.lowercased(),
                 configuration: processConfig,
                 stdio: [nil, nil, nil]
             )
             try await process.start()
-            print("Detached process \(execId) started")
             await ExecManager.shared.remove(id: execId)
             return Response(status: .ok)
         }
@@ -268,8 +256,6 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
         processConfig.arguments = arguments
         processConfig.terminal = tty
 
-        print("Starting attached exec process with config: \(processConfig)")
-
         let process = try await container.createProcess(
             id: UUID().uuidString.lowercased(),
             configuration: processConfig,
@@ -277,7 +263,6 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
         )
 
         try await process.start()
-        print("Process \(execId) started")
 
         let body = Response.Body(stream: { writer in
             Task.detached {
@@ -308,18 +293,18 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
                                 do {
                                     if let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty {
                                         writeFrame(streamType: 1, data: data)
-                                        if let text = String(data: data, encoding: .utf8) {
-                                            print("[Exec \(execId) stdout] \(text)", terminator: "")
-                                        }
+                                        /*if let text = String(data: data, encoding: .utf8) {
+                                             print("[Exec \(execId) stdout] \(text)", terminator: "")
+                                        }*/
                                     } else {
                                         break
                                     }
                                 } catch {
-                                    print("[Exec \(execId) stdout] read error: \(error)")
+                                    // print("[Exec \(execId) stdout] read error: \(error)")
                                     break
                                 }
                             }
-                            print("[Exec \(execId) stdout] finished")
+                            // print("[Exec \(execId) stdout] finished")
                             try? stdoutHandle.close()
                         }
                     }
@@ -331,18 +316,18 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
                                 do {
                                     if let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty {
                                         writeFrame(streamType: 2, data: data)
-                                        if let text = String(data: data, encoding: .utf8) {
+                                        /*if let text = String(data: data, encoding: .utf8) {
                                             print("[Exec \(execId) stderr] \(text)", terminator: "")
-                                        }
+                                        }*/
                                     } else {
                                         break
                                     }
                                 } catch {
-                                    print("[Exec \(execId) stderr] read error: \(error)")
+                                    // print("[Exec \(execId) stderr] read error: \(error)")
                                     break
                                 }
                             }
-                            print("[Exec \(execId) stderr] finished")
+                            // print("[Exec \(execId) stderr] finished")
                             try? stderrHandle.close()
                         }
                     }
@@ -357,10 +342,10 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
                                     }
                                 }
                             } catch {
-                                print("[Exec \(execId) stdin] Error: \(error)")
+                                // print("[Exec \(execId) stdin] Error: \(error)")
                             }
                             try? stdinWriter.close()
-                            print("[Exec \(execId) stdin] finished")
+                            // print("[Exec \(execId) stdin] finished")
                         }
                     }
 
@@ -368,22 +353,21 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
                     group.addTask {
                         do {
                             let exitCode = try await process.wait()
-                            print("Process \(execId) finished with exit code: \(exitCode)")
+                            // print("Process \(execId) finished with exit code: \(exitCode)")
                         } catch {
-                            print("Process \(execId) finished with error: \(error)")
+                            // print("Process \(execId) finished with error: \(error)")
                         }
 
                         // CLOSE ALL WRITE ENDS TO SIGNAL EOF
                         try? stdoutPipe?.fileHandleForWriting.close()
                         try? stderrPipe?.fileHandleForWriting.close()
                         try? stdinPipe?.fileHandleForWriting.close()
-                        print("[Exec \(execId)] all write ends closed")
+                        // print("[Exec \(execId)] all write ends closed")
                     }
 
                     for await _ in group {}
                 }
 
-                print("[Exec \(execId)] All streams finished, closing HTTP response")
                 await ExecManager.shared.remove(id: execId)
                 _ = writer.write(.end)
             }
@@ -397,7 +381,6 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
            req.headers.first(name: "Upgrade")?.lowercased() == "tcp" {
             headers.add(name: "Connection", value: "Upgrade")
             headers.add(name: "Upgrade", value: "tcp")
-            print("Upgrading connection for exec \(execId)")
             return Response(status: .switchingProtocols, headers: headers, body: body)
         }
 
@@ -407,8 +390,6 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
 
     static func resize(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            // Debug request
-            print("Resize Exec Request: \(req)")
 
             guard let execId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing exec ID")
@@ -428,9 +409,7 @@ static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) as
             let height = (try? req.query.get(Int.self, at: "h")) ?? 24
             let width = (try? req.query.get(Int.self, at: "w")) ?? 80
 
-            print("Resizing exec process \(execId) to \(width)x\(height)")
-
-            // Note: ContainerClient does not currently support resizing exec processes.
+           // Note: ContainerClient does not currently support resizing exec processes.
             // This is a placeholder for future implementation.
             // try await exec.resize(height: height, width: width)
 

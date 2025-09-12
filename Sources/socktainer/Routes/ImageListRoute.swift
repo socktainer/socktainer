@@ -31,12 +31,7 @@ extension ImageListRoute {
                 //
                 let manifests = try await image.index().manifests
 
-                // print the number of manifests for debugging
-                print("Manifests for image \(image.digest): \(manifests.count)")
-
                 for descriptor in manifests {
-
-                    print("descriptor: \(descriptor)")
 
                     // skip these manifests
                     if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],

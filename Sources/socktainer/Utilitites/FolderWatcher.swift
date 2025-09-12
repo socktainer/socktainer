@@ -169,7 +169,7 @@ final class FolderWatcher: @unchecked Sendable {
             let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "container", status: "remove")
             Task {
                 await self.broadcaster.broadcast(event)
-                print("[FolderWatcher] Broadcasted container event")
+                // print("[FolderWatcher] Broadcasted container event")
             }
         }
         containerDebounceSource?.resume()
@@ -186,7 +186,7 @@ final class FolderWatcher: @unchecked Sendable {
             let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "image", status: "remove")
             Task {
                 await self.broadcaster.broadcast(event)
-                print("[FolderWatcher] Broadcasted image event")
+                // print("[FolderWatcher] Broadcasted image event")
             }
         }
         imageDebounceSource?.resume()
