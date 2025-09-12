@@ -61,7 +61,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ## Installation 🛠️
 
-Download from socktainer releases page the zip or binary. Ensure the binary has execute permissions (`+x`) before running it.
+Download from socktainer [releases](https://github.com/socktainer/socktainer/releases) page the zip or binary. Ensure the binary has execute permissions (`+x`) before running it.
 
 ---
 
