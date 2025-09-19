@@ -91,7 +91,7 @@ jobs:
 
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
         with:
-          xcode-version: 26.0-beta
+          xcode-version: 26.0.0
 
       - name: Display swift version
         run: |
