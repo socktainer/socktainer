@@ -9,6 +9,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/container.git", from: "0.4.1"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.116.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
     ],
     targets: [
         .executableTarget(
@@ -16,6 +17,7 @@ let package = Package(
             dependencies: [
                 .product(name: "ContainerClient", package: "container"),
                 .product(name: "Vapor", package: "vapor"),
+                .product(name: "Logging", package: "swift-log"),
             ]
         ),
         .testTarget(

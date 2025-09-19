@@ -47,7 +47,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 - Provides **Docker REST API compatibility** 🔄 (partial)
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock`
 - Supports container lifecycle operations: inspect, stop, remove 🛠️
-- Supports image listing, deletion, logs, health checks. Exec without interactive mode 📄
+- Supports image listing, pulling, deletion, logs, health checks. Exec without interactive mode 📄
 - Broadcasts container events for client liveness monitoring 📡
 
 ---
