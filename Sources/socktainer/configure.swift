@@ -8,6 +8,9 @@ func configure(_ app: Application) async throws {
     // /_ping
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
 
+    // /info
+    try app.register(collection: InfoRoute())
+
     // /events
     try app.register(collection: EventsRoute(client: healthCheckClient))
 
@@ -29,6 +32,15 @@ func configure(_ app: Application) async throws {
 
     // /volumes
     try app.register(collection: VolumeListRoute())
+
+    // /swarm
+    try app.register(collection: SwarmRoute())
+    try app.register(collection: SwarmInitRoute())
+    try app.register(collection: SwarmJoinRoute())
+    try app.register(collection: SwarmLeaveRoute())
+    try app.register(collection: SwarmUpdateRoute())
+    try app.register(collection: SwarmUnlockKeyRoute())
+    try app.register(collection: SwarmUnlockRoute())
 
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
