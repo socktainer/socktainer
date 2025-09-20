@@ -6,6 +6,6 @@ struct ContainerPauseRoute: RouteCollection {
     }
 
     static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/containers/{id}/pause", req.method.rawValue)
+        AppleContainerNotSupported.respond("Pausing container")
     }
 }

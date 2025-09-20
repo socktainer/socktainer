@@ -13,6 +13,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", from: "0.4.1"),
+        .package(url: "https://github.com/apple/containerization.git", from: "0.5.0"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.116.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
@@ -22,6 +23,7 @@ let package = Package(
             name: "socktainer",
             dependencies: [
                 .product(name: "ContainerClient", package: "container"),
+                .product(name: "Containerization", package: "containerization"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
