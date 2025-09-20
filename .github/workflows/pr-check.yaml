@@ -117,3 +117,95 @@ jobs:
 
       - name: Execute test
         run: make test
+
+  integration-test:
+    name: integration test
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # fetch the artifact from the build job
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: socktainer
+
+      - name: List downloaded artifact
+        run: |
+          ls -la
+          chmod 755 socktainer
+
+      - name: fetch apple container
+        run: |
+          APPLE_CONTAINER_VERSION=$(grep 'package(url: "https://github.com/apple/container.git"' Package.swift | sed -E 's/.*from: "([0-9.]+)".*/\1/')
+          wget https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-${APPLE_CONTAINER_VERSION}-installer-signed.pkg -O container-installer-signed.pkg
+
+      - name: install apple container
+        run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
+
+      - name: setup tmate
+        run: |
+          brew install tmate
+
+      - name: Start internal tmate session and start container system using this tmate session
+        run: |
+          # Start a detached tmate session
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          # skip welcome screen
+          tmate -F -S /tmp/tmate.sock send-keys "q" C-m
+
+          # Send Apple Container commands automatically
+          tmate -S /tmp/tmate.sock send-keys "echo 'Starting Apple Container...'" C-m
+          tmate -S /tmp/tmate.sock send-keys "sudo container system start --enable-kernel-install | tee /tmp/container.log" C-m
+          
+          # Loop until 'container system status' returns exit code 1 or timeout (60s)
+          START=$SECONDS
+          TIMEOUT=60
+
+          while [ $((SECONDS - START)) -lt $TIMEOUT ]; do
+            # Capture tmate session output
+            tmate -S /tmp/tmate.sock capture-pane -p > /tmp/container.log
+            cat /tmp/container.log
+
+            # Check container status locally
+            if sudo container system status >/dev/null 2>&1; then
+              # Exit code 0 → container is ready
+              echo "Container is ready. Exiting loop."
+              break
+            else
+              echo "Container not ready yet..."
+            fi
+          done
+
+          # stop tmate session
+          tmate -S /tmp/tmate.sock kill-session
+
+      - name: run socktainer
+        run: |
+          nohup sudo -i $PWD/socktainer > service.log 2>&1 &
+          echo $! > service.pid
+          sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
+          sleep 5
+          cat service.log
+
+      - name: check container root
+        run: |
+          sudo container image pull hello-world
+          sudo container images ls
+        
+      - name: install docker cli
+        run: |
+          brew install docker
+
+      - name: check docker image with socktainer
+        run: |
+          # expect that hello-world is present
+          sudo docker image ls | grep hello-world
+          # pull httpd image
+          sudo docker image pull httpd:latest
+          # list images
+          sudo docker image ls | grep httpd
