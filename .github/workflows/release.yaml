@@ -78,7 +78,7 @@ jobs:
     needs: tag
     permissions:
       contents: write
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
