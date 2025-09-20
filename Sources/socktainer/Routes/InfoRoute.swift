@@ -6,6 +6,6 @@ struct InfoRoute: RouteCollection {
     }
 
     static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/info", "GET")
+        NotImplemented.respond("/info", req.method.rawValue)
     }
 }
