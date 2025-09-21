@@ -3,8 +3,9 @@ import Vapor
 struct ContainerStartRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        // let group = routes.grouped("containers")
-        // group.get(":id", "json", use: ContainerStartRoute.handler(client: client))
+        routes.post(":version", "containers", ":id", "start", use: ContainerStartRoute.handler(client: client))
+        // also handle without version prefix
+        routes.post("containers", ":id", "start", use: ContainerStartRoute.handler(client: client))
     }
 }
 
@@ -14,7 +15,7 @@ extension ContainerStartRoute {
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
-            try await client.start(id: id)
+            try await client.start(id: id, detach: true)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
 
@@ -22,7 +23,8 @@ extension ContainerStartRoute {
 
             await broadcaster.broadcast(event)
 
-            return .ok
+            // should return 204 HTTP code
+            return .noContent
         }
     }
 }

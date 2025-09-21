@@ -1,11 +1,12 @@
 import ContainerClient
+import Foundation
 
 protocol ClientContainerProtocol: Sendable {
     func list(showAll: Bool) async throws -> [ClientContainer]
     func getContainer(id: String) async throws -> ClientContainer?
     func enforceContainerRunning(container: ClientContainer) throws
 
-    func start(id: String) async throws
+    func start(id: String, detach: Bool) async throws
     func stop(id: String) async throws
     func delete(id: String) async throws
 }
@@ -34,9 +35,17 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
-    func start(id: String) async throws {
+    func start(id: String, detach: Bool = true) async throws {
         let container = try await ClientContainer.get(id: id)
-        //try await container.createProcess(id: "start", command: ["start"]).start()
+        let stdin: FileHandle? = nil
+        let stdout: FileHandle? = nil
+        let stderr: FileHandle? = nil
+
+        let stdio = [stdin, stdout, stderr]
+
+        let process = try await container.bootstrap(stdio: stdio)
+        try await process.start()
+
     }
 
     func stop(id: String) async throws {
