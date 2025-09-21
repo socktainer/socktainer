@@ -6,6 +6,6 @@ struct PluginsNameUpgradeRoute: RouteCollection {
     }
 
     static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/plugins/{name}/upgrade", req.method.string)
+        NotImplemented.respond("/plugins/{name}/upgrade", req.method.rawValue)
     }
 }

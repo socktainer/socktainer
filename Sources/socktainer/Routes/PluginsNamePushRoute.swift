@@ -6,6 +6,6 @@ struct PluginsNamePushRoute: RouteCollection {
     }
 
     static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/plugins/{name}/push", req.method.string)
+        NotImplemented.respond("/plugins/{name}/push", req.method.rawValue)
     }
 }

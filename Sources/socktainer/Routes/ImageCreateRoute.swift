@@ -1,20 +1,34 @@
 import Foundation
 import Vapor
 
-struct ImagePullRoute: RouteCollection {
+struct ImageCreateRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "images", "create", use: ImagePullRoute.handler(client: client))
+        routes.post(":version", "images", "create", use: ImageCreateRoute.handler(client: client))
     }
 }
 
-extension ImagePullRoute {
+struct RESTImageCreateQuery: Content {
+    let fromImage: String?
+    let tag: String?
+    let platform: String?
+    // TODO: Revisit it later
+    // let fromSrc: String?
+    // let repo: String?
+    // let message: String?
+    // let inputImage: String?
+    // let xRegistryAuth: String?
+    // let changes: [String]?
+}
+
+extension ImageCreateRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            let image = req.query[String.self, at: "fromImage"] ?? ""
-            let tag = req.query[String.self, at: "tag"]
-            let platformString = req.query[String.self, at: "platform"]
+            let query = try req.query.decode(RESTImageCreateQuery.self)
+            let image = query.fromImage ?? ""
+            let tag = query.tag ?? ""
+            let platformString = query.platform
             let platform: Platform
             if let platformString, !platformString.isEmpty {
                 do {
