@@ -51,7 +51,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ImagePullRoute(client: imageClient))
     try app.register(collection: ImagePushRoute())
     try app.register(collection: ImageSearchRoute())
-    try app.register(collection: ImageSummaryRoute())
+    try app.register(collection: ImageInspectRoute(client: imageClient))
     try app.register(collection: ImageTagRoute())
     try app.register(collection: ImagesGetRoute())
     try app.register(collection: ImagesLoadRoute())

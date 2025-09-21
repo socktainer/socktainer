@@ -209,3 +209,9 @@ jobs:
           sudo docker image pull httpd:latest
           # list images
           sudo docker image ls | grep httpd
+          # check inspect
+          # Get the image ID
+          IMAGE_ID=$(sudo docker image inspect httpd | jq -r '.[0].Id')
+          echo "Image ID: $IMAGE_ID"
+          # Check and fail if it doesn't start with sha256:
+          [[ $IMAGE_ID == sha256:* ]] || { echo "Error: Image ID does not start with sha256:"; exit 1; }
