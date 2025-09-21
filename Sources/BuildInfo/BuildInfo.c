@@ -11,3 +11,11 @@ const char* get_build_git_commit(void) {
 const char* get_build_time(void) {
     return BUILD_TIME;
 }
+
+const char* get_docker_engine_api_min_version(void) {
+    return DOCKER_ENGINE_API_MIN_VERSION;
+}
+
+const char* get_docker_engine_api_max_version(void) {
+    return DOCKER_ENGINE_API_MAX_VERSION;
+}

@@ -31,16 +31,18 @@ struct SystemInfo: Content {
     var Labels: [String]?
     var ExperimentalBuild: Bool
     var ServerVersion: String
-    var Runtimes: [String: Runtime]
-    var DefaultRuntime: String
+    // NOTE: In Apple container, each container uses a dedicated runtime
+    // var Runtimes: [String: Runtime]
+    // var DefaultRuntime: String
     var ProductLicense: String
     var SystemTime: String
     var Warnings: [String]
 }
 
-struct Runtime: Content {
-    var path: String
-}
+// NOTE: In Apple container, each container uses a dedicated runtime
+// struct Runtime: Content {
+//     var path: String
+// }
 
 // NOTE: Doesn't attempt to mimic fully the schema
 // https://docs.docker.com/reference/api/engine/version/v1.51/#tag/System/operation/SystemVersion

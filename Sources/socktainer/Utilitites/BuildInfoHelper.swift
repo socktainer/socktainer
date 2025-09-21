@@ -13,3 +13,11 @@ public func getBuildGitCommit() -> String {
 public func getBuildTime() -> String {
     String(cString: get_build_time())
 }
+
+public func getDockerEngineApiMinVersion() -> String {
+    String(cString: get_docker_engine_api_min_version())
+}
+
+public func getDockerEngineApiMaxVersion() -> String {
+    String(cString: get_docker_engine_api_max_version())
+}

@@ -11,16 +11,17 @@ struct VersionRoute: RouteCollection {
         do {
             let version = VersionInfo(
                 Platform: ServerPlatform(Name: "socktainer"),
+                // NOTE: Empty for the time being, could be populated with additional information
                 Components: [],
-                Version: ProcessInfo.processInfo.environment["SOCKTAINER_VERSION"] ?? "unknown",
-                ApiVersion: "v1.51",
-                MinAPIVersion: "v1.51",
-                GitCommit: ProcessInfo.processInfo.environment["GIT_COMMIT"] ?? "unknown",
+                Version: getBuildVersion(),
+                ApiVersion: getDockerEngineApiMaxVersion(),
+                MinAPIVersion: getDockerEngineApiMinVersion(),
+                GitCommit: getBuildGitCommit(),
                 Os: "macOS",
                 Arch: "arm64",
                 KernelVersion: getKernel(),
-                Experimental: isDebug(),
-                BuildTime: ProcessInfo.processInfo.environment["SOCKTAINER_BUILD_TIME"] ?? "unknown",
+                Experimental: true,
+                BuildTime: getBuildTime(),
             )
             return try await version.encodeResponse(for: req)
         } catch {

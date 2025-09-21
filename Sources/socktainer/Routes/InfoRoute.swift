@@ -32,15 +32,12 @@ struct InfoRoute: RouteCollection {
                 Name: hostName(),
                 ExperimentalBuild: true,
                 ServerVersion: try await ClientHealthCheck.ping().apiServerVersion,
-                // TODO: Derive this dynamically somehow
-                Runtimes: [
-                    "container-runtime-linux": Runtime(
-                        path: "/usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux")
-                ],
-                DefaultRuntime: "container-runtime-linux",
                 ProductLicense: "socktainer [Apache License 2.0], Apple container [Apache License 2.0]",
                 SystemTime: currentTime(),
-                Warnings: ["WARNING: Apple container system info may differ"],
+                Warnings: [
+                    "WARNING: Apple container system info may differ",
+                    "NOTE: socktainer is still under active development and considered experimental!",
+                ],
             )
             return try await info.encodeResponse(for: req)
         } catch {
