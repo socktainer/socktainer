@@ -20,6 +20,11 @@ ROOT_DIR := $(shell git rev-parse --show-toplevel)
 
 MACOS_VERSION := $(shell sw_vers -productVersion)
 MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
+# Build information - only shows real version if exactly on a tagged commit
+export BUILD_VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null || echo "0.0.0-dev")
+export BUILD_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+export BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 SUDO ?= sudo
 .DEFAULT_GOAL := all
 
@@ -38,6 +43,11 @@ socktainer: build
 release: BUILD_CONFIGURATION = release
 release: all
 
+.PHONY: version
+version:
+	@echo "Version: $(BUILD_VERSION)"
+	@echo "Commit: $(BUILD_GIT_COMMIT)"
+	@echo "Build Time: $(BUILD_TIME)"
 
 .PHONY: test
 test:
