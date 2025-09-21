@@ -17,6 +17,13 @@ extension ContainerDeleteRoute {
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
+
+            // if running, stop it first
+            if let container = try await client.getContainer(id: id),
+                container.status == .running
+            {
+                try await client.stop(id: id)
+            }
             try await client.delete(id: id)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
