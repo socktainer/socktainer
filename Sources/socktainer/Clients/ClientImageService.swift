@@ -16,9 +16,14 @@ enum ClientImageError: Error {
 struct ClientImageService: ClientImageProtocol {
 
     func list() async throws -> [ClientImage] {
+        let allImages = try await ClientImage.list()
         // filter out infra images
-        let filteredImages = try await ClientImage.list().filter { img in
-            !Utility.isInfraImage(name: img.reference)
+        // also filter images based on digests
+        let filteredImages = allImages.filter { img in
+            let ref = img.reference.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isDigest = ref.contains("@sha256:")
+            let isInfra = Utility.isInfraImage(name: ref)
+            return isDigest || !isInfra
         }
         return filteredImages
     }
@@ -36,7 +41,11 @@ struct ClientImageService: ClientImageProtocol {
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
         let reference: String
         if let tag = tag, !tag.isEmpty {
-            reference = "\(image):\(tag)"
+            if tag.starts(with: "sha256:") {
+                reference = "\(image)@\(tag)"
+            } else {
+                reference = "\(image):\(tag)"
+            }
         } else {
             reference = image
         }
@@ -55,7 +64,7 @@ struct ClientImageService: ClientImageProtocol {
                                 logger.debug("\(message)")
                                 continuation.yield(message)
                             default:
-                                logger.debug("[ImagePullEvent]: \(event)")
+                                logger.debug("Image pull event: \(event)")
                             }
                         }
                     }

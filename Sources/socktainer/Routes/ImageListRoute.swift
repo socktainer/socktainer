@@ -82,10 +82,12 @@ extension ImageListRoute {
 
                     let name = details.name
 
+                    let repoTags = name.isEmpty ? [] : [name]
+                    let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
                     let summary = RESTImageSummary(
                         Id: image.digest,
-                        RepoTags: [name],
-                        RepoDigests: [],
+                        RepoTags: repoTags,
+                        RepoDigests: repoDigests,
                         Created: created,
                         Size: size,
                         Labels: [:],

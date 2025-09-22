@@ -28,6 +28,7 @@ extension ImageCreateRoute {
             let query = try req.query.decode(RESTImageCreateQuery.self)
             let image = query.fromImage ?? ""
             let tag = query.tag ?? ""
+            let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform
             let platform: Platform
             if let platformString, !platformString.isEmpty {
@@ -44,7 +45,7 @@ extension ImageCreateRoute {
             }
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
-            let progressStream = try await client.pull(image: image, tag: tag, platform: platform, logger: req.logger)
+            let progressStream = try await client.pull(image: image, tag: decodedTag, platform: platform, logger: req.logger)
 
             response.body = .init(stream: { writer in
                 Task {

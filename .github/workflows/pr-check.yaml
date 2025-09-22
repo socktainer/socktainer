@@ -215,6 +215,12 @@ jobs:
           echo "Image ID: $IMAGE_ID"
           # Check and fail if it doesn't start with sha256:
           [[ $IMAGE_ID == sha256:* ]] || { echo "Error: Image ID does not start with sha256:"; exit 1; }
+          # pull image using digest
+          sudo docker pull quay.io/podman/hello@sha256:41316c18917a27a359ee3191fd8f43559d30592f82a144bbc59d9d44790f6e7a
+          # NOTE: we are not inspecting the image with digest due to
+          # https://github.com/socktainer/socktainer/issues/47
+          # check image is present
+          sudo docker image ls | grep 'quay.io/podman/hello'
 
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails
