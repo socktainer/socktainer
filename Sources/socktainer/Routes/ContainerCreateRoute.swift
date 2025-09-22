@@ -48,7 +48,7 @@ struct CreateContainerRequest: Content {
     let HostConfig: HostConfig?
     let Labels: [String: String]?
     let Shell: [String]?
-    let NetworkingConfig: NetworkingConfig?
+    let NetworkingConfig: ContainerNetworkSettings?
 }
 
 extension ContainerCreateRoute {

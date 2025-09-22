@@ -33,11 +33,34 @@ extension ContainerInspectRoute {
                 ExposedPorts: exposedPorts,
             )
             // add network settings
-            let networkSettings: NetworkSettings = NetworkSettings(
+            let networkSettings = ContainerNetworkSettings(
+                Bridge: nil,
+                SandboxID: nil,
                 Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.hostPort)/\($0.proto.rawValue)" })
                     .mapValues { bindings in
                         bindings.map { PortBinding(HostIp: "\($0.hostAddress)", HostPort: "\($0.hostPort)") }
+                    },
+                SandboxKey: nil,
+                Networks: Dictionary(
+                    uniqueKeysWithValues: container.networks.map { attachment in
+                        let endpoint = ContainerEndpointSettings(
+                            IPAMConfig: nil,
+                            Links: nil,
+                            Aliases: nil,
+                            NetworkID: attachment.network,
+                            EndpointID: nil,
+                            Gateway: attachment.gateway,
+                            IPAddress: attachment.address,
+                            IPPrefixLen: nil,
+                            IPv6Gateway: nil,
+                            GlobalIPv6Address: nil,
+                            GlobalIPv6PrefixLen: nil,
+                            MacAddress: nil,
+                            DriverOpts: nil
+                        )
+                        return (attachment.network, endpoint)
                     }
+                )
             )
 
             let hostConfig: HostConfig = HostConfig()

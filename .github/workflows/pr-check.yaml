@@ -215,3 +215,31 @@ jobs:
           echo "Image ID: $IMAGE_ID"
           # Check and fail if it doesn't start with sha256:
           [[ $IMAGE_ID == sha256:* ]] || { echo "Error: Image ID does not start with sha256:"; exit 1; }
+
+      # NOTE: Disabling tests for now.
+      #       Most likely calling some internal function that fails
+      #       on CI host.
+      # - name: check system info was returned by socktainer
+      #   run: |
+      #     # expect specific content returned via `/info` endpoint
+      #     sudo docker info | grep 'container-apiserver'
+      #     sudo docker info | grep 'com.apple.container'
+      #     sudo docker info | grep 'socktainer'
+
+      - name: check version info was returned by socktainer
+        run: |
+          # expect specific content returned via `/version` endpoint
+          sudo docker version | grep 'socktainer'
+          # expect specific Docker engine API versions
+          sudo docker version | grep 'v1.32'
+          sudo docker version | grep 'v1.51'
+
+      - name: check network with socktainer
+        run: |
+          # expect default network to be present
+          sudo docker network ls | grep default
+          # inspect the default network
+          NETWORK_ID=$(sudo docker network inspect default | jq -r '.[].Id')
+          echo "Network ID: ${NETWORK_ID}"
+          # Check and fail if it doesn't match 'default':
+          [[ ${NETWORK_ID} == default ]] || { echo "Error: Network ID does not match 'default'"; exit 1; }

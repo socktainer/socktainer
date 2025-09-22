@@ -232,12 +232,22 @@ struct TmpfsOptions: Content {
     let Mode: Int?
 }
 
-struct NetworkingConfig: Content {
-    let EndpointsConfig: [String: EndpointSettings]?
+struct ContainerNetworkSettings: Content {
+    let Bridge: String?
+    let SandboxID: String?
+    let Ports: [String: [PortBinding]]?
+    let SandboxKey: String?
+    let Networks: [String: ContainerEndpointSettings]?
 }
 
-struct EndpointSettings: Content {
-    let IPAMConfig: IPAMConfig?
+/// Address type for SecondaryIPAddresses and SecondaryIPv6Addresses
+struct Address: Content {
+    let Addr: String?
+    let PrefixLen: Int?
+}
+
+struct ContainerEndpointSettings: Content {
+    let IPAMConfig: ContainerIPAMConfig?
     let Links: [String]?
     let Aliases: [String]?
     let NetworkID: String?
@@ -252,7 +262,7 @@ struct EndpointSettings: Content {
     let DriverOpts: [String: String]?
 }
 
-struct IPAMConfig: Content {
+struct ContainerIPAMConfig: Content {
     let IPv4Address: String?
     let IPv6Address: String?
     let LinkLocalIPs: [String]?
@@ -264,6 +274,31 @@ struct ContainerConfig: Content {
 
 }
 
-struct NetworkSettings: Content {
-    let Ports: [String: [PortBinding]]?
+// `/networks` related
+public struct NetworkConfigReference: Codable, Sendable {
+    public let Network: String
+}
+
+public struct NetworkContainer: Codable, Sendable {
+    public let Name: String
+    public let EndpointID: String?
+    public let MacAddress: String?
+    public let IPv4Address: String
+    public let IPv6Address: String?
+}
+
+public struct NetworkLabel: Codable {
+    public let Name: String
+}
+
+public struct NetworkIPAMConfig: Codable, Sendable {
+    public let Subnet: String?
+    public let IPRange: String?
+    public let Gateway: String?
+    public let AuxiliaryAddresses: [String: String]?
+}
+
+public struct NetworkIPAM: Codable, Sendable {
+    public let Driver: String
+    public let Config: [NetworkIPAMConfig]
 }

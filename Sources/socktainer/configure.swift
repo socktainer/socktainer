@@ -4,6 +4,7 @@ func configure(_ app: Application) async throws {
     let containerClient = ClientContainerService()
     let imageClient = ClientImageService()
     let healthCheckClient = ClientHealthCheckService()
+    let networkClient = ClientNetworkService()
 
     // /_ping
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
@@ -75,7 +76,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: NetworkConnectRoute())
     try app.register(collection: NetworkCreateRoute())
     try app.register(collection: NetworkDisconnectRoute())
-    try app.register(collection: NetworkInspectRoute())
+    try app.register(collection: NetworkInspectRoute(client: networkClient))
     try app.register(collection: NetworkListRoute())
     try app.register(collection: NetworkPruneRoute())
 

@@ -30,7 +30,8 @@ struct RESTContainerInspect: Content {
     let State: ContainerState
     let Config: ContainerConfig
     let HostConfig: HostConfig
-    let NetworkSettings: NetworkSettings
+    // NOTE: Details information about ports it not exposed by Apple container
+    let NetworkSettings: ContainerNetworkSettings
 }
 
 struct RESTContainerListQuery: Content {

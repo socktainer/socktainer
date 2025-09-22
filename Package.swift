@@ -25,6 +25,7 @@ let package = Package(
             name: "socktainer",
             dependencies: [
                 .product(name: "ContainerClient", package: "container"),
+                .product(name: "ContainerNetworkService", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "Logging", package: "swift-log"),
