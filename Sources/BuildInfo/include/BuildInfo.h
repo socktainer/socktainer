@@ -10,14 +10,6 @@
 #define BUILD_TIME "unspecified"
 #endif
 
-#ifndef DOCKER_ENGINE_API_MIN_VERSION
-#define DOCKER_ENGINE_API_MIN_VERSION "1.51"
-#endif
-
-#ifndef DOCKER_ENGINE_API_MAX_VERSION
-#define DOCKER_ENGINE_API_MAX_VERSION "1.51"
-#endif
-
 const char* get_build_version();
 
 const char* get_build_git_commit();

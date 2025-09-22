@@ -24,6 +24,9 @@ MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
 export BUILD_VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null || echo "0.0.0-dev")
 export BUILD_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 export BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Build information - docker engine API versions
+export DOCKER_ENGINE_API_MIN_VERSION := v1.32
+export DOCKER_ENGINE_API_MAX_VERSION := v1.51
 
 SUDO ?= sudo
 .DEFAULT_GOAL := all
@@ -48,6 +51,8 @@ version:
 	@echo "Version: $(BUILD_VERSION)"
 	@echo "Commit: $(BUILD_GIT_COMMIT)"
 	@echo "Build Time: $(BUILD_TIME)"
+	@echo "Docker Engine API Min version: $(DOCKER_ENGINE_API_MIN_VERSION)"
+	@echo "Docker Engine API Max version: $(DOCKER_ENGINE_API_MAX_VERSION)"
 
 .PHONY: test
 test:
