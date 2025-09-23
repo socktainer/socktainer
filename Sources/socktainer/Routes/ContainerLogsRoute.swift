@@ -1,3 +1,5 @@
+import Foundation
+import NIOCore
 import Vapor
 
 struct ContainerLogsRoute: RouteCollection {
@@ -32,15 +34,20 @@ extension ContainerLogsRoute {
             let fd = fileHandle.fileDescriptor
 
             let body = Response.Body { writer in
-                // Immediately read what’s already there
                 Task.detached {
+                    var buffer = Data()
+
                     do {
+                        // Read initial logs
                         while true {
                             let data = try fileHandle.read(upToCount: 4096)
                             guard let data, !data.isEmpty else { break }
-                            var buffer = ByteBufferAllocator().buffer(capacity: data.count)
-                            buffer.writeBytes(data)
-                            _ = writer.write(.buffer(buffer))
+                            buffer.append(data)
+
+                            // Process complete frames from buffer
+                            buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
+                                _ = writer.write(.buffer(outputBuffer))
+                            }
                         }
 
                         if !follow {
@@ -66,9 +73,12 @@ extension ContainerLogsRoute {
                             while true {
                                 let data = try fileHandle.read(upToCount: 4096)
                                 guard let data, !data.isEmpty else { break }
-                                var buffer = ByteBufferAllocator().buffer(capacity: data.count)
-                                buffer.writeBytes(data)
-                                _ = writer.write(.buffer(buffer))
+                                buffer.append(data)
+
+                                // Process complete frames from buffer
+                                buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
+                                    _ = writer.write(.buffer(outputBuffer))
+                                }
                             }
                         } catch {
                             source.cancel()
@@ -90,5 +100,32 @@ extension ContainerLogsRoute {
                 body: body
             )
         }
+    }
+
+    private static func processDockerLogFrames(from buffer: Data, writeOutput: (ByteBuffer) -> Void) throws -> Data {
+        // Since the buffer contains raw log data, we need to format it as Docker log frames
+        // with stdout stream type (0x01)
+        guard !buffer.isEmpty else {
+            return buffer
+        }
+
+        // Create a Docker log frame with stdout stream type
+        let streamType: UInt8 = 0x01  // stdout
+        let frameSize = UInt32(buffer.count)
+
+        // Create the 8-byte header: [stream_type, 0, 0, 0, size_bytes...]
+        var frame = Data(capacity: 8 + buffer.count)
+        frame.append(streamType)
+        frame.append(contentsOf: [0, 0, 0])  // padding
+        frame.append(contentsOf: withUnsafeBytes(of: frameSize.bigEndian) { Data($0) })
+        frame.append(buffer)
+
+        // Write the complete frame
+        var outputBuffer = ByteBufferAllocator().buffer(capacity: frame.count)
+        outputBuffer.writeBytes(frame)
+        writeOutput(outputBuffer)
+
+        // Return empty data since we've processed all the buffer
+        return Data()
     }
 }
