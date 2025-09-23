@@ -31,7 +31,6 @@ env:
   SWIFT_VERSION: 6.2-snapshot
 
 jobs:
-
   build:
     name: build
     runs-on: macos-26
@@ -73,7 +72,6 @@ jobs:
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
-
 
   tests-lint-format:
     name: formatters & tests
@@ -161,7 +159,7 @@ jobs:
           # Send Apple Container commands automatically
           tmate -S /tmp/tmate.sock send-keys "echo 'Starting Apple Container...'" C-m
           tmate -S /tmp/tmate.sock send-keys "sudo container system start --enable-kernel-install | tee /tmp/container.log" C-m
-          
+
           # Loop until 'container system status' returns exit code 1 or timeout (60s)
           START=$SECONDS
           TIMEOUT=60
@@ -196,7 +194,7 @@ jobs:
         run: |
           sudo container image pull hello-world
           sudo container images ls
-        
+
       - name: install docker cli
         run: |
           brew install docker
@@ -249,3 +247,15 @@ jobs:
           echo "Network ID: ${NETWORK_ID}"
           # Check and fail if it doesn't match 'default':
           [[ ${NETWORK_ID} == default ]] || { echo "Error: Network ID does not match 'default'"; exit 1; }
+          # create networks
+          sudo docker network create test1
+          sudo docker network create test2
+          sudo docker network create test3
+          sudo docker network create test4
+          sudo docker network create foo
+          # delete network
+          sudo docker network rm foo
+          # prune networks using filter
+          sudo docker network prune --filter 'name=test' --force
+          # ensure only default is left
+          sudo docker network ls | grep 'default'

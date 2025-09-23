@@ -1,41 +1,7 @@
 import Vapor
 
 struct RESTNetworksListQuery: Content {
-    let dangling: String?
-    let driver: String?
-    let id: String?
-    let label: String?
-    let name: String?
-    let scope: String?
-    let type: String?
-}
-
-public struct NetworkListFilters {
-    public let dangling: Bool?
-    public let driver: String?
-    public let id: String?
-    public let label: [String]?
-    public let name: String?
-    public let scope: String?
-    public let type: String?
-
-    public init(
-        dangling: Bool? = nil,
-        driver: String? = nil,
-        id: String? = nil,
-        label: [String]? = nil,
-        name: String? = nil,
-        scope: String? = nil,
-        type: String? = nil
-    ) {
-        self.dangling = dangling
-        self.driver = driver
-        self.id = id
-        self.label = label
-        self.name = name
-        self.scope = scope
-        self.type = type
-    }
+    let filters: String?
 }
 
 struct NetworkListRoute: RouteCollection {
@@ -45,30 +11,10 @@ struct NetworkListRoute: RouteCollection {
 
     static func handler(_ req: Request) async throws -> Response {
         let networkClient = ClientNetworkService()
-        let filtersParam = try? req.query.get(String.self, at: "filters")
+        let query = try req.query.decode(RESTNetworksListQuery.self)
+        let filtersParam = query.filters
 
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                req.logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                req.logger.warning("Failed to decode filters")
-            }
-        }
+        let parsedFilters = DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: false, logger: req.logger)
 
         let filtersJSON = try JSONEncoder().encode(parsedFilters)
         let filtersJSONString = String(data: filtersJSON, encoding: .utf8)

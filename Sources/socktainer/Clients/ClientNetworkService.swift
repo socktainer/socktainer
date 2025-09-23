@@ -6,6 +6,8 @@ import Logging
 protocol ClientNetworkProtocol: Sendable {
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary]
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary?
+    func delete(id: String, logger: Logger) async throws
+    func create(name: String, logger: Logger) async throws -> RESTNetworkCreate
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
@@ -59,6 +61,13 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
         guard let filters = filters, let data = filters.data(using: .utf8) else { return allNetworks }
         guard let filtersDict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return allNetworks }
+        // If filtersDict contains only unknown keys, return []
+        let knownKeys: Set<String> = ["dangling", "driver", "id", "label", "name", "scope", "type"]
+        let filterKeys = Set(filtersDict.keys)
+        if !filterKeys.isEmpty && filterKeys.isDisjoint(with: knownKeys) {
+            logger.info("All filter keys are unknown: \(filterKeys). Returning empty result.")
+            return []
+        }
         return allNetworks.filter { network in
             var excludedReason: String? = nil
             if let danglingArr = filtersDict["dangling"], let danglingStr = danglingArr.first {
@@ -68,7 +77,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 }
             }
             if let driverArr = filtersDict["driver"], let driver = driverArr.first {
-                if network.Driver.caseInsensitiveCompare(driver) != .orderedSame { excludedReason = "driver mismatch" }
+                if network.Driver.caseInsensitiveCompare(driver) != ComparisonResult.orderedSame { excludedReason = "driver mismatch" }
             }
             if let idArr = filtersDict["id"], let id = idArr.first {
                 if !network.Id.localizedCaseInsensitiveContains(id) { excludedReason = "id mismatch" }
@@ -107,6 +116,19 @@ struct ClientNetworkService: ClientNetworkProtocol {
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
         let networks = try await list(logger: logger)
         return networks.first { $0.Id == id || $0.Name == id }
+    }
+
+    func delete(id: String, logger: Logger) async throws {
+        try await ClientNetwork.delete(id: id)
+        logger.debug("Deleted network with id: \(id)")
+    }
+
+    func create(name: String, logger: Logger) async throws -> RESTNetworkCreate {
+        // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
+        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat)
+        let state = try await ClientNetwork.create(configuration: configuration)
+        logger.debug("Created network with id: \(configuration.id)")
+        return RESTNetworkCreate(Id: configuration.id, Warning: "")
     }
 }
 
