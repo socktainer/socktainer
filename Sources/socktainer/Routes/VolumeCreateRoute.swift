@@ -1,11 +1,25 @@
 import Vapor
 
 struct VolumeCreateRoute: RouteCollection {
-    func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "volumes", "create", use: VolumeCreateRoute.handler)
+    let client: ClientVolumeService
+    init(client: ClientVolumeService) {
+        self.client = client
     }
 
-    static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/volumes/create", req.method.rawValue)
+    func boot(routes: RoutesBuilder) throws {
+        routes.post(":version", "volumes", "create", use: self.handler)
+    }
+
+    func handler(_ req: Request) async throws -> Volume {
+        let createRequest = try req.content.decode(VolumeRequest.self)
+        let resolvedName = (createRequest.Name?.isEmpty == false) ? createRequest.Name! : "volume-\(UUID().uuidString)"
+        let restRequest = RESTVolumeCreate(
+            Name: resolvedName,
+            Driver: createRequest.Driver ?? "local",
+            Options: createRequest.DriverOpts ?? [:],
+            Labels: createRequest.Labels ?? [:]
+        )
+        let volume = try await client.create(request: restRequest)
+        return volume
     }
 }

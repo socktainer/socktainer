@@ -5,6 +5,7 @@ func configure(_ app: Application) async throws {
     let imageClient = ClientImageService()
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
+    let volumeClinet = ClientVolumeService()
 
     // /_ping
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
@@ -58,10 +59,11 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ImagesLoadRoute())
 
     // /volumes
-    try app.register(collection: VolumeCreateRoute())
-    try app.register(collection: VolumeListRoute())
-    try app.register(collection: VolumeNameRoute())
-    try app.register(collection: VolumePruneRoute())
+    try app.register(collection: VolumeCreateRoute(client: volumeClinet))
+    try app.register(collection: VolumeDeleteRoute(client: volumeClinet))
+    try app.register(collection: VolumeInspectRoute(client: volumeClinet))
+    try app.register(collection: VolumeListRoute(client: volumeClinet))
+    try app.register(collection: VolumePruneRoute(client: volumeClinet))
 
     // /swarm
     try app.register(collection: SwarmInitRoute())

@@ -12,7 +12,7 @@ struct NetworkPruneRoute: RouteCollection {
         let filtersParam = query.filters
 
         // Use utility to parse filters (default to dangling)
-        let parsedFilters = DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: true, logger: req.logger)
+        let parsedFilters = try DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: true, logger: req.logger)
 
         let filtersJSON = try JSONEncoder().encode(parsedFilters)
         let filtersJSONString = String(data: filtersJSON, encoding: .utf8)

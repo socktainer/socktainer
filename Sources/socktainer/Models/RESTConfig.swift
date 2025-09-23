@@ -302,3 +302,47 @@ public struct NetworkIPAM: Codable, Sendable {
     public let Driver: String
     public let Config: [NetworkIPAMConfig]
 }
+
+// `/volumes` related
+
+struct VolumeRequest: Content {
+    let Name: String?
+    let Driver: String?
+    let DriverOpts: [String: String]?
+    let Labels: [String: String]?
+    let ClusterVolumeSpec: EmptyObject?
+}
+
+struct VolumeUsageData: Content {
+    let Size: Int64
+    let RefCount: Int64
+    init() {
+        self.Size = -1  // will return -1, we have no option to calculate the actual usage of volume
+        self.RefCount = -1  // will return -1, we don't map attached containers to volumes
+    }
+}
+
+struct Volume: Content {
+    let Name: String
+    let Driver: String
+    let Mountpoint: String
+    let CreatedAt: String?
+    let Status: [String: String]?
+    let Labels: [String: String]?
+    let Scope: String
+    let ClusterVolume: EmptyObject?  // unused, only part of swarm
+    let Options: [String: String]
+    let UsageData: VolumeUsageData?
+}
+
+struct VolumeInfo: Content {
+    let CreatedAt: String
+    let Driver: String
+    let Labels: [String: String]?
+    let Mountpoint: String
+    let Name: String
+    let Options: [String: String]
+    let Scope: String
+    let Status: [String: String]?  // we do not report any status from the underlying driver at the moment
+    let UsageData: VolumeUsageData?
+}

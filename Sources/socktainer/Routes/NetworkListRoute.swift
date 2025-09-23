@@ -14,7 +14,7 @@ struct NetworkListRoute: RouteCollection {
         let query = try req.query.decode(RESTNetworksListQuery.self)
         let filtersParam = query.filters
 
-        let parsedFilters = DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: false, logger: req.logger)
+        let parsedFilters = try DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: false, logger: req.logger)
 
         let filtersJSON = try JSONEncoder().encode(parsedFilters)
         let filtersJSONString = String(data: filtersJSON, encoding: .utf8)
