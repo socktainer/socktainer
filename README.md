@@ -145,6 +145,14 @@ We welcome contributions!
 
 ---
 
+## Community 💬
+
+Join the Socktainer community to ask questions, share ideas, or get help:
+
+- **Discord**: [discord.gg/Td5chFNK](https://discord.gg/Td5chFNK) – chat in real time with contributors and users  
+- **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features  
+- **GitHub Issues**: [socktainer/issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
+
 ## License 📄
 
 See the `LICENSE` file in the repository root.
