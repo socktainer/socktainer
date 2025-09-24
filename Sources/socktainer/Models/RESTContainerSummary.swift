@@ -19,18 +19,47 @@ struct RESTContainerSummary: Content {
     let Names: [String]
     let Image: String
     let ImageID: String
+    let ImageManifestDescriptor: ImageOCIDescriptor?
+    let Command: String
+    let Created: Int64
+    let Ports: [ContainerPort]
+    let SizeRw: Int64?
+    let SizeRootFs: Int64?
+    let Labels: [String: String]
     let State: String
+    let Status: String
+    let HostConfig: ContainerHostConfig
+    let NetworkSettings: ContainerNetworkSummary
+    let Mounts: [ContainerMountPoint]
+    let Platform: String
 }
 
 struct RESTContainerInspect: Content {
     let Id: String
-    let Names: [String]
-    let Image: String
-    let ImageID: String
+    let Created: String?
+    let Path: String
+    let Args: [String]
     let State: ContainerState
-    let Config: ContainerConfig
+    let Image: String
+    let ResolvConfPath: String
+    let HostnamePath: String
+    let HostsPath: String
+    let LogPath: String?
+    let Name: String
+    let RestartCount: Int
+    let Driver: String
+    let Platform: String
+    let ImageManifestDescriptor: ImageOCIDescriptor?
+    let MountLabel: String
+    let ProcessLabel: String
+    let AppArmorProfile: String
+    let ExecIDs: [String]?
     let HostConfig: HostConfig
-    // NOTE: Details information about ports it not exposed by Apple container
+    let GraphDriver: ContainerDriverData
+    let SizeRw: Int64?
+    let SizeRootFs: Int64?
+    let Mounts: [ContainerMountPoint]
+    let Config: ContainerConfig
     let NetworkSettings: ContainerNetworkSettings
 }
 

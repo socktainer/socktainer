@@ -9,14 +9,14 @@ struct InfoRoute: RouteCollection {
     static func handler(_ req: Request) async throws -> Response {
         do {
             let containerClient = ClientContainerService()
-            let allContainers = try await containerClient.list(showAll: true)
+            let allContainers = try await containerClient.list(showAll: true, filters: [:])
 
             let info = SystemInfo(
                 Containers: allContainers.count,
-                ContainersRunning: allContainers.filter { $0.status == .running }.count,
+                ContainersRunning: allContainers.filter { $0.status == RuntimeStatus.running }.count,
                 // Apple container doesn't support pausing containers
                 ContainersPaused: 0,
-                ContainersStopped: allContainers.filter { $0.status == .stopped }.count,
+                ContainersStopped: allContainers.filter { $0.status == RuntimeStatus.stopped }.count,
                 Images: try await ClientImageService().list().count,
                 DockerRootDir: try await ClientHealthCheck.ping().appRoot.path,
                 Debug: isDebug(),

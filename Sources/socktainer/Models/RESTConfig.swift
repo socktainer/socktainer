@@ -1,5 +1,7 @@
 import Vapor
 
+// TODO: Sort out this file into logical sections
+
 struct EmptyObject: Content {
     // Empty struct to represent {} in JSON
 }
@@ -238,6 +240,7 @@ struct ContainerNetworkSettings: Content {
     let Ports: [String: [PortBinding]]?
     let SandboxKey: String?
     let Networks: [String: ContainerEndpointSettings]?
+    let EndpointsConfig: [String: ContainerEndpointSettings]?
 }
 
 /// Address type for SecondaryIPAddresses and SecondaryIPv6Addresses
@@ -269,9 +272,31 @@ struct ContainerIPAMConfig: Content {
 }
 
 struct ContainerConfig: Content {
-    let Image: String
+    let Hostname: String?
+    let Domainname: String?
+    let User: String?
+    let AttachStdin: Bool?
+    let AttachStdout: Bool?
+    let AttachStderr: Bool?
     let ExposedPorts: [String: EmptyObject]?
-
+    let Tty: Bool?
+    let OpenStdin: Bool?
+    let StdinOnce: Bool?
+    let Env: [String]?
+    let Cmd: [String]?
+    let Healthcheck: HealthcheckConfig?
+    let ArgsEscaped: Bool?
+    let Image: String
+    let Volumes: [String: EmptyObject]?
+    let WorkingDir: String?
+    let Entrypoint: [String]?
+    let NetworkDisabled: Bool?
+    let MacAddress: String?
+    let OnBuild: [String]?
+    let Labels: [String: String]?
+    let StopSignal: String?
+    let StopTimeout: Int?
+    let Shell: [String]?
 }
 
 // `/networks` related
@@ -345,4 +370,75 @@ struct VolumeInfo: Content {
     let Scope: String
     let Status: [String: String]?  // we do not report any status from the underlying driver at the moment
     let UsageData: VolumeUsageData?
+}
+
+// image related
+
+struct ImageOCIDescriptor: Content {
+    let mediaType: String
+    let digest: String
+    let size: Int64
+    let urls: [String]?
+    let annotations: [String: String]?
+    let platform: ImageOCIPlatform?
+}
+
+struct ImageOCIPlatform: Content {
+    let architecture: String
+    let os: String
+    let osVersion: String?
+    let osFeatures: [String]?
+    let variant: String?
+}
+
+// container related
+
+struct ContainerDriverData: Content {
+    let Name: String
+    let Data: [String: String]
+}
+
+struct ContainerMountPoint: Content {
+    let type: String
+    let name: String?
+    let source: String
+    let destination: String
+    let driver: String?
+    let mode: String
+    let rw: Bool
+    let propagation: String
+
+    enum CodingKeys: String, CodingKey {
+        case type = "Type"
+        case name = "Name"
+        case source = "Source"
+        case destination = "Destination"
+        case driver = "Driver"
+        case mode = "Mode"
+        case rw = "RW"
+        case propagation = "Propagation"
+    }
+}
+
+struct ContainerPort: Content {
+    let IP: String?
+    let PrivatePort: Int
+    let PublicPort: Int?
+    let type: String
+
+    enum CodingKeys: String, CodingKey {
+        case IP
+        case PrivatePort
+        case PublicPort
+        case type = "Type"
+    }
+}
+
+struct ContainerHostConfig: Content {
+    let NetworkMode: String
+    let Annotations: [String: String]?
+}
+
+struct ContainerNetworkSummary: Content {
+    let Networks: [String: ContainerEndpointSettings]?
 }

@@ -44,6 +44,62 @@ struct DockerNetworkFilterUtility {
     }
 }
 
+// utility for parsing container filters from query string
+struct DockerContainerFilterUtility {
+    static func parseContainerFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
+        let allowedKeys: Set<String> = [
+            "status",
+            "exited",
+            "label",
+            "name",
+            "id",
+            "ancestor",
+            "before",
+            "since",
+            "health",
+            "volume",
+            "expose",
+            "health",
+            "isolation",
+            "is-task",
+            "network",
+            "publish",
+            "since",
+        ]
+        var filters: [String: Any] = [:]
+        var parsedFilters: [String: [String]] = [:]
+        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
+            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
+                filters = decoded
+                // Validate keys
+                let filterKeys = Set(filters.keys)
+                if !filterKeys.isSubset(of: allowedKeys) {
+                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+                }
+                for (key, value) in filters {
+                    if key == "label", let dict = value as? [String: Any] {
+                        let keys = dict.compactMap { (k, v) in
+                            (v as? Bool == true) ? k : nil
+                        }
+                        if !keys.isEmpty {
+                            parsedFilters[key] = keys
+                        }
+                    } else if let arr = value as? [String] {
+                        parsedFilters[key] = arr
+                    } else if let str = value as? String {
+                        parsedFilters[key] = [str]
+                    }
+                }
+                logger.debug("Decoded filters: \(parsedFilters)")
+            } else {
+                logger.warning("Failed to decode filters")
+            }
+        }
+        return parsedFilters
+    }
+}
+
 // utility for parsing volume filters from query string
 struct DockerVolumeFilterUtility {
     static func parsePruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {

@@ -15,7 +15,13 @@ extension ContainerStartRoute {
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
-            try await client.start(id: id, detach: true)
+
+            do {
+                try await client.start(id: id, detach: true)
+            } catch {
+                req.logger.error("Failed to start container \(id): \(error)")
+                throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
+            }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
 

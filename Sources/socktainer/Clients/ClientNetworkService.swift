@@ -15,7 +15,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
         let networksList = try await ClientNetwork.list()
         var allNetworks = networksList.map { RESTNetworkSummary(networkState: $0) }
         let containerClient = ClientContainerService()
-        let allContainers = try await containerClient.list(showAll: true)
+        let allContainers = try await containerClient.list(showAll: true, filters: [:])
 
         // Map containers to networks
         for i in 0..<allNetworks.count {
