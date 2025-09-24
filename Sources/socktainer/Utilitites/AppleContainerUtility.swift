@@ -8,3 +8,8 @@ public func getLinuxDefaultKernelName() async throws -> String {
     let components = pathString.split(separator: "/")
     return components.last.map(String.init) ?? pathString
 }
+
+public func stripSubnetFromIP(_ ipAddress: String?) -> String? {
+    guard let ipAddress = ipAddress else { return nil }
+    return ipAddress.components(separatedBy: "/").first
+}

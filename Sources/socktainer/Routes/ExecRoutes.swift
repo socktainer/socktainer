@@ -1,5 +1,6 @@
 import ContainerClient
 import Foundation
+import NIOCore
 import Vapor
 
 // Minimal Terminal wrapper for TTY support
@@ -217,7 +218,7 @@ struct ExecRoute: RouteCollection {
 
             let detach = startRequest.Detach ?? false
             let tty = startRequest.Tty ?? config.tty
-            let consoleSize = startRequest.ConsoleSize ?? [24, 80]
+            let _ = startRequest.ConsoleSize
 
             // Detached mode
             if detach {
@@ -238,55 +239,46 @@ struct ExecRoute: RouteCollection {
                 return Response(status: .ok)
             }
 
-            // Attached mode
-            let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-            let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-            let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
+            // Check if client requested connection upgrade and attachStdin is true
+            let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
+            let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
+            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
 
-            let stdio = Stdio(
-                stdin: stdinPipe?.fileHandleForReading,
-                stdout: stdoutPipe?.fileHandleForWriting,
-                stderr: stderrPipe?.fileHandleForWriting
-            )
+            guard shouldUpgrade else {
+                // Fallback to HTTP streaming mode
+                return ConnectionHijackingMiddleware.createDockerStreamingResponse(
+                    request: req,
+                    ttyEnabled: tty
+                ) { streamContinuation in
 
-            let executable = config.cmd.first!
-            let arguments = Array(config.cmd.dropFirst())
-            var processConfig = container.configuration.initProcess
-            processConfig.executable = executable
-            processConfig.arguments = arguments
-            processConfig.terminal = tty
+                    // Setup pipes
+                    let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
+                    let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
+                    let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
 
-            let process = try await container.createProcess(
-                id: UUID().uuidString.lowercased(),
-                configuration: processConfig,
-                stdio: stdio.asArray
-            )
+                    let stdio = Stdio(
+                        stdin: stdinPipe?.fileHandleForReading,
+                        stdout: stdoutPipe?.fileHandleForWriting,
+                        stderr: stderrPipe?.fileHandleForWriting
+                    )
 
-            try await process.start()
+                    let executable = config.cmd.first!
+                    let arguments = Array(config.cmd.dropFirst())
+                    var processConfig = container.configuration.initProcess
+                    processConfig.executable = executable
+                    processConfig.arguments = arguments
+                    processConfig.terminal = tty
 
-            let body = Response.Body(stream: { writer in
-                Task.detached {
-                    @Sendable func writeFrame(streamType: UInt8, data: Data) {
-                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + (tty ? 0 : 8))
-                        if tty {
-                            buffer.writeBytes(data)
-                        } else {
-                            let size = UInt32(data.count)
-                            var header = Data(capacity: 8)
-                            header.append(streamType)
-                            header.append(0)
-                            header.append(0)
-                            header.append(0)
-                            header.append(contentsOf: withUnsafeBytes(of: size.bigEndian) { Data($0) })
-                            buffer.writeBytes(header)
-                            buffer.writeBytes(data)
-                        }
-                        _ = writer.write(.buffer(buffer))
-                    }
+                    let process = try await container.createProcess(
+                        id: UUID().uuidString.lowercased(),
+                        configuration: processConfig,
+                        stdio: stdio.asArray
+                    )
+
+                    try await process.start()
 
                     await withTaskGroup(of: Void.self) { group in
-
-                        // stdout
+                        // stdout handler
                         if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                             group.addTask {
                                 while true {
@@ -294,18 +286,19 @@ struct ExecRoute: RouteCollection {
                                         guard let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty else {
                                             break
                                         }
-                                        writeFrame(streamType: 1, data: data)
+
+                                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + (tty ? 0 : 8))
+                                        buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: tty)
+                                        streamContinuation.yield(buffer)
                                     } catch {
-                                        // print("[Exec \(execId) stdout] read error: \(error)")
                                         break
                                     }
                                 }
-                                // print("[Exec \(execId) stdout] finished")
                                 try? stdoutHandle.close()
                             }
                         }
 
-                        // stderr
+                        // stderr handler
                         if let stderrHandle = stderrPipe?.fileHandleForReading {
                             group.addTask {
                                 while true {
@@ -313,18 +306,19 @@ struct ExecRoute: RouteCollection {
                                         guard let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty else {
                                             break
                                         }
-                                        writeFrame(streamType: 2, data: data)
+
+                                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + 8)
+                                        buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: tty)
+                                        streamContinuation.yield(buffer)
                                     } catch {
-                                        // print("[Exec \(execId) stderr] read error: \(error)")
                                         break
                                     }
                                 }
-                                // print("[Exec \(execId) stderr] finished")
                                 try? stderrHandle.close()
                             }
                         }
 
-                        // stdin
+                        // stdin handler for HTTP mode
                         if let stdinWriter = stdinPipe?.fileHandleForWriting {
                             group.addTask {
                                 do {
@@ -334,48 +328,227 @@ struct ExecRoute: RouteCollection {
                                         }
                                     }
                                 } catch {
-                                    // print("[Exec \(execId) stdin] Error: \(error)")
                                 }
                                 try? stdinWriter.close()
-                                // print("[Exec \(execId) stdin] finished")
                             }
                         }
 
-                        // Monitor process and close all write ends immediately
+                        // Process monitor
                         group.addTask {
                             do {
-                                let exitCode = try await process.wait()
-                                // print("Process \(execId) finished with exit code: \(exitCode)")
+                                let _ = try await process.wait()
                             } catch {
-                                // print("Process \(execId) finished with error: \(error)")
                             }
 
-                            // CLOSE ALL WRITE ENDS TO SIGNAL EOF
+                            // Close all write ends to signal EOF
                             try? stdoutPipe?.fileHandleForWriting.close()
                             try? stderrPipe?.fileHandleForWriting.close()
                             try? stdinPipe?.fileHandleForWriting.close()
-                            // print("[Exec \(execId)] all write ends closed")
                         }
 
                         for await _ in group {}
                     }
 
                     await ExecManager.shared.remove(id: execId)
-                    _ = writer.write(.end)
+                    streamContinuation.finish()
                 }
-            })
-
-            // Set headers
-            var headers: HTTPHeaders = [:]
-            headers.add(name: "Content-Type", value: tty ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream")
-
-            if req.headers.first(name: "Connection")?.lowercased().contains("upgrade") == true && req.headers.first(name: "Upgrade")?.lowercased() == "tcp" {
-                headers.add(name: "Connection", value: "Upgrade")
-                headers.add(name: "Upgrade", value: "tcp")
-                return Response(status: .switchingProtocols, headers: headers, body: body)
             }
+            // Use Docker TCP upgrader for true connection hijacking
 
-            return Response(status: .ok, headers: headers, body: body)
+            return Response.dockerTCPUpgrade(
+                execId: execId,
+                ttyEnabled: tty
+            ) { channel, tcpHandler in
+
+                // Setup pipes with detailed logging
+                let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
+                let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
+                let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
+
+                let stdio = Stdio(
+                    stdin: stdinPipe?.fileHandleForReading,
+                    stdout: stdoutPipe?.fileHandleForWriting,
+                    stderr: stderrPipe?.fileHandleForWriting
+                )
+
+                // Connect TCP handler to stdin writer for bidirectional communication
+                if let stdinWriter = stdinPipe?.fileHandleForWriting {
+                    tcpHandler.setStdinWriter(stdinWriter)
+                }
+
+                let executable = config.cmd.first!
+                let arguments = Array(config.cmd.dropFirst())
+
+                var processConfig = container.configuration.initProcess
+                processConfig.executable = executable
+                processConfig.arguments = arguments
+                processConfig.terminal = tty
+
+                let process = try await container.createProcess(
+                    id: UUID().uuidString.lowercased(),
+                    configuration: processConfig,
+                    stdio: stdio.asArray
+                )
+
+                try await process.start()
+
+                // Setup bidirectional communication for interactive sessions
+                await withTaskGroup(of: Void.self) { group in
+                    // stdout/stderr -> channel (container output to client)
+                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                        group.addTask {
+                            let dispatchIO = DispatchIO(
+                                type: .stream,
+                                fileDescriptor: stdoutHandle.fileDescriptor,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { error in
+                                // Handle cleanup error if needed
+                            }
+
+                            // Set up for streaming - read in small chunks with low water mark
+                            dispatchIO.setLimit(lowWater: 1)
+                            dispatchIO.setLimit(highWater: 4096)
+
+                            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                                var isFinished = false
+                                var hasResumed = false
+
+                                func readNextChunk() {
+                                    guard !isFinished else { return }
+
+                                    dispatchIO.read(
+                                        offset: off_t.max,  // Use off_t.max for streaming (current position)
+                                        length: 4096,
+                                        queue: DispatchQueue.global(qos: .userInteractive)
+                                    ) { done, data, error in
+
+                                        if let data = data, !data.isEmpty {
+                                            // Send data to channel immediately
+                                            channel.eventLoop.execute {
+                                                var outputBuffer = channel.allocator.buffer(capacity: data.count + (tty ? 0 : 8))
+                                                if tty {
+                                                    outputBuffer.writeBytes(data)
+                                                } else {
+                                                    outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
+                                                }
+                                                _ = channel.writeAndFlush(outputBuffer)
+                                            }
+                                        }
+
+                                        if done || error != 0 {
+                                            if !isFinished && !hasResumed {
+                                                isFinished = true
+                                                hasResumed = true
+                                                dispatchIO.close()
+                                                continuation.resume()
+                                            }
+                                        } else if !isFinished {
+                                            // Continue reading immediately for streaming
+                                            readNextChunk()
+                                        }
+                                    }
+                                }
+
+                                // Start reading
+                                readNextChunk()
+                            }
+
+                            try? stdoutHandle.close()
+                        }
+                    }
+
+                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                        group.addTask {
+                            let dispatchIO = DispatchIO(
+                                type: .stream,
+                                fileDescriptor: stderrHandle.fileDescriptor,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { error in
+                                // Handle cleanup error if needed
+                            }
+
+                            // Set up for streaming
+                            dispatchIO.setLimit(lowWater: 1)
+                            dispatchIO.setLimit(highWater: 1024)
+
+                            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                                var isFinished = false
+                                var hasResumed = false
+
+                                func readNextChunk() {
+                                    guard !isFinished else { return }
+
+                                    dispatchIO.read(
+                                        offset: off_t.max,  // Streaming mode
+                                        length: 1024,
+                                        queue: DispatchQueue.global(qos: .userInteractive)
+                                    ) { done, data, error in
+
+                                        if let data = data, !data.isEmpty {
+                                            channel.eventLoop.execute {
+                                                var outputBuffer = channel.allocator.buffer(capacity: data.count + 8)
+                                                outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: tty)
+                                                _ = channel.writeAndFlush(outputBuffer)
+                                            }
+                                        }
+
+                                        if done || error != 0 {
+                                            if !isFinished && !hasResumed {
+                                                isFinished = true
+                                                hasResumed = true
+                                                dispatchIO.close()
+                                                continuation.resume()
+                                            }
+                                        } else if !isFinished {
+                                            readNextChunk()
+                                        }
+                                    }
+                                }
+
+                                readNextChunk()
+                            }
+
+                            try? stderrHandle.close()
+                        }
+                    }
+
+                    // Connection monitor to handle client disconnection
+                    group.addTask {
+                        // Monitor channel for closure - simplified approach
+                        while channel.isActive {
+                            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                        }
+
+                        // Connection was closed - the process monitor will handle cleanup
+                    }
+
+                    // Process monitor with proper cleanup
+                    group.addTask {
+                        do {
+                            let _ = try await process.wait()
+                        } catch {
+                            // Process wait error - handle gracefully
+                        }
+
+                        // Give a small delay for any final output to be processed
+                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+
+                        // Close all pipes to signal EOF to readers
+                        try? stdoutPipe?.fileHandleForWriting.close()
+                        try? stderrPipe?.fileHandleForWriting.close()
+                        try? stdinPipe?.fileHandleForWriting.close()
+
+                        // Close the channel gracefully
+                        _ = channel.eventLoop.submit {
+                            channel.close(promise: nil)
+                        }
+                    }
+
+                    for await _ in group {}
+                }
+
+                await ExecManager.shared.remove(id: execId)
+            }
         }
     }
 
@@ -396,8 +569,8 @@ struct ExecRoute: RouteCollection {
 
             try client.enforceContainerRunning(container: container)
 
-            let height = (try? req.query.get(Int.self, at: "h")) ?? 24
-            let width = (try? req.query.get(Int.self, at: "w")) ?? 80
+            let _ = (try? req.query.get(Int.self, at: "h")) ?? 24
+            let _ = (try? req.query.get(Int.self, at: "w")) ?? 80
 
             // Note: ContainerClient does not currently support resizing exec processes.
             // This is a placeholder for future implementation.
