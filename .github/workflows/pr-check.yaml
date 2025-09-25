@@ -263,20 +263,20 @@ jobs:
       # NOTE: Inspecting a volume is not possible in CI
       - name: check volume with socktainer
         run: |
-          # create container with randomly generated name
+          # create volume with randomly generated name
           sudo docker volume create
-          # create container
+          # create volume
           sudo docker volume create test
-          # create containers with labels
+          # create volumes with labels
           sudo docker volume create foo --label 'test=false'
           sudo docker volume create bar --label 'test=true'
-          # filter containers by `test` expect 2 containers to return (extra line for header)
+          # filter volumes by `test` expect 2 volumes to return (extra line for header)
           [[ "3" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # filter containers by `test=true` expect a single container to return (extra line for header)
+          # filter volumes by `test=true` expect a single volume to return (extra line for header)
           [[ "2" == $(sudo docker volume ls --filter 'label=test=true' | wc -l | xargs) ]]
-          # inspect container
+          # inspect volume
           # sudo docker inspect test
-          # delete single container
+          # delete single volume
           sudo docker volume rm test
           # prune containers by labels and ensure it is not present
           sudo docker volume prune --force --filter 'label=test=true'
@@ -284,3 +284,27 @@ jobs:
           # prune all images end ensure no volumes are left
           sudo docker volume prune --all --force
           [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+
+      # NOTE: Launching containers is not possible in GitHub provided CI nodes
+      - name: check conainers with socktainer
+        run: |
+          echo "Pre creation 1"
+          # create containers with randomly generated names
+          for i in $(seq 1 5); do sudo docker create --label "iter=${i}" --rm quay.io/podman/hello:latest; done
+          echo "Post creation 1"
+          # prune container according to label
+          echo "Pre prune 1"
+          sudo docker container prune --filter 'label=iter=2' --force
+          echo "Post prune 1"
+          # expect to see 4 containers and a header
+          [[ "5" == $(sudo docker container ls | wc -l | xargs) ]]
+          # negative pruning of all containers besides 'iter=1'
+          echo "Pre prune 2"
+          sudo docker container prune --filter 'label=!iter=1' --force
+          echo "Post prune 2"
+          # expect to see a single container and a header
+          [[ "2" == $(sudo docker container ls | wc -l | xargs) ]]
+          # prune all stopped containers
+          echo "Pre prune 3"
+          sudo docker container prune --force
+          echo "Post prune 3"
