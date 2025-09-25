@@ -22,7 +22,7 @@ extension ContainerDeleteRoute {
             if let container = try await client.getContainer(id: id),
                 container.status == .running
             {
-                try await client.stop(id: id)
+                try await client.stop(id: id, signal: nil, timeout: nil)
             }
             try await client.delete(id: id)
 

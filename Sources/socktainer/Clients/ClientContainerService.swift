@@ -6,9 +6,12 @@ protocol ClientContainerProtocol: Sendable {
     func getContainer(id: String) async throws -> ClientContainer?
     func enforceContainerRunning(container: ClientContainer) throws
 
-    func start(id: String, detach: Bool) async throws
-    func stop(id: String) async throws
+    func start(id: String, detachKeys: String?) async throws
+    func stop(id: String, signal: String?, timeout: Int?) async throws
+    func restart(id: String, signal: String?, timeout: Int?) async throws
+    func kill(id: String, signal: String?) async throws
     func delete(id: String) async throws
+    func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
 
@@ -126,24 +129,71 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
-    func start(id: String, detach: Bool = true) async throws {
-        let container = try await ClientContainer.get(id: id)
+    func start(id: String, detachKeys: String?) async throws {
+        guard let container = try await getContainer(id: id) else {
+            throw ClientContainerError.notFound(id: id)
+        }
+
         let stdin: FileHandle? = nil
         let stdout: FileHandle? = nil
         let stderr: FileHandle? = nil
 
         let stdio = [stdin, stdout, stderr]
 
-        let process = try await container.bootstrap(stdio: stdio)
-        try await process.start()
+        do {
+            let process = try await container.bootstrap(stdio: stdio)
+            try await process.start()
+        } catch {
+            // Check if the error indicates the container is already booted/bootstrapped
+            let errorMessage = error.localizedDescription
+            let isAlreadyBootstrapedError = errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") || errorMessage.contains("invalidState")
+
+            if isAlreadyBootstrapedError {
+                return
+            }
+
+            throw error
+        }
     }
 
-    func stop(id: String) async throws {
+    func stop(id: String, signal: String?, timeout: Int?) async throws {
         let container = try await ClientContainer.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
-        try await container.stop()
+
+        let signal = try parseSignal(signal ?? "SIGTERM")
+
+        let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
+        try await container.stop(opts: options)
+    }
+
+    func kill(id: String, signal: String?) async throws {
+        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        guard let container else {
+            throw ClientContainerError.notFound(id: id)
+        }
+
+        guard container.status == .running else {
+            throw ClientContainerError.notRunning(id: id)
+        }
+
+        let signal = try parseSignal(signal ?? "SIGKILL")
+
+        try await container.kill(signal)
+    }
+
+    func restart(id: String, signal: String?, timeout: Int?) async throws {
+        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        guard let container else {
+            throw ClientContainerError.notFound(id: id)
+        }
+
+        if container.status == .running {
+            try await stop(id: id, signal: signal, timeout: timeout)
+        }
+
+        try await start(id: id, detachKeys: nil)
     }
 
     func delete(id: String) async throws {
@@ -152,6 +202,49 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
         try await container.delete()
+    }
+
+    // NOTE: For Apple Container, we'll implement a simple polling mechanism
+    //       since there's no direct wait API
+    func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
+        var container = try await ClientContainer.list().filter { $0.id == id }.first
+        guard let initialContainer = container else {
+            throw ClientContainerError.notFound(id: id)
+        }
+
+        // For now, default to 0
+        var exitCode: Int64 = 0
+
+        switch condition {
+        case .notRunning:
+            while container?.status == .running {
+                try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
+                container = try await ClientContainer.list().first(where: { $0.id == id })
+                guard let container = container else {
+                    break
+                }
+            }
+
+        case .nextExit:
+            // Wait for next exit (only if currently running)
+            if initialContainer.status == .running {
+                while true {
+                    try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
+                    container = try await ClientContainer.list().first(where: { $0.id == id })
+                    if container?.status != .running {
+                        exitCode = 0
+                        break
+                    }
+                }
+            }
+
+        case .removed:
+            while try await ClientContainer.list().contains(where: { $0.id == id }) {
+                try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
+            }
+        }
+
+        return RESTContainerWait(statusCode: exitCode)
     }
 
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {

@@ -9,15 +9,25 @@ struct ContainerStartRoute: RouteCollection {
     }
 }
 
+struct ContainerStartQuery: Content {
+    /// Override the key sequence for detaching a container
+    let detachKeys: String?
+}
+
 extension ContainerStartRoute {
+    // TODO: Update logic to parse stdin from request.
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
+
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
+            let query = try req.query.decode(ContainerStartQuery.self)
+            let detachKeys = query.detachKeys
+
             do {
-                try await client.start(id: id, detach: true)
+                try await client.start(id: id, detachKeys: detachKeys)
             } catch {
                 req.logger.error("Failed to start container \(id): \(error)")
                 throw Abort(.internalServerError, reason: "Failed to start container: \(error)")

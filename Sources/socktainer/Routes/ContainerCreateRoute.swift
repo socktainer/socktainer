@@ -62,6 +62,7 @@ extension ContainerCreateRoute {
 
             // body contains the Image
             let body = try req.content.decode(CreateContainerRequest.self)
+
             req.logger.info("Creating container for image: \(body.Image)")
 
             let id = Utility.createContainerID(name: containerName)
@@ -146,6 +147,10 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "No executable specified for container. Image must specify ENTRYPOINT or CMD, or request must provide Entrypoint or Cmd.")
             }
 
+            // For Apple Container compatibility, we ignore attach flags during creation
+            // Containers are always created in detached mode and can be attached to later
+            // TODO: Store attach flags (AttachStdin, AttachStdout, AttachStderr) in container metadata
+            // for use when container is started via /start endpoint
             let processConfig = ProcessConfiguration(
                 executable: executable,
                 arguments: commandLine.dropFirst().map { String($0) },
@@ -194,7 +199,7 @@ extension ContainerCreateRoute {
             containerConfiguration.publishedPorts = publishedPorts
             containerConfiguration.labels = body.Labels ?? [:]
 
-            let options = ContainerCreateOptions(autoRemove: false)
+            let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ClientContainer
             do {
                 container = try await ClientContainer.create(configuration: containerConfiguration, options: options, kernel: kernel)

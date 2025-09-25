@@ -1,6 +1,7 @@
 import Vapor
 
 func configure(_ app: Application) async throws {
+
     let containerClient = ClientContainerService()
     let imageClient = ClientImageService()
     let healthCheckClient = ClientHealthCheckService()
@@ -28,21 +29,21 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute())
     try app.register(collection: ContainerInspectRoute(client: containerClient))
-    try app.register(collection: ContainerKillRoute())
+    try app.register(collection: ContainerKillRoute(client: containerClient))
     try app.register(collection: ContainerListRoute(client: containerClient))
     try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerPauseRoute())
     try app.register(collection: ContainerPruneRoute(client: containerClient))
     try app.register(collection: ContainerRenameRoute())
     try app.register(collection: ContainerResizeRoute())
-    try app.register(collection: ContainerRestartRoute())
+    try app.register(collection: ContainerRestartRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
     try app.register(collection: ContainerStatsRoute())
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerTopRoute())
     try app.register(collection: ContainerUnpauseRoute())
     try app.register(collection: ContainerUpdateRoute())
-    try app.register(collection: ContainerWaitRoute())
+    try app.register(collection: ContainerWaitRoute(client: containerClient))
 
     // /images
     try app.register(collection: ImageDeleteRoute(client: imageClient))

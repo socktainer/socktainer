@@ -442,3 +442,7 @@ struct ContainerHostConfig: Content {
 struct ContainerNetworkSummary: Content {
     let Networks: [String: ContainerEndpointSettings]?
 }
+
+public struct ContainerWaitExitError: Codable, Sendable {
+    public let Message: String?
+}
