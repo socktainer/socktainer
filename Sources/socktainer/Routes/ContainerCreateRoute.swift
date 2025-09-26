@@ -116,19 +116,38 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to allocate ports: \(error)")
             }
 
-            // Handle Entrypoint and Cmd from request, falling back to image config
+            // Handle Entrypoint and Cmd from request, following Docker semantics
             var commandLine: [String] = []
-            if let requestEntrypoint = body.Entrypoint, !requestEntrypoint.isEmpty {
-                commandLine.append(contentsOf: requestEntrypoint)
+
+            // Determine the entrypoint to use
+            let entrypoint: [String]
+            if let requestEntrypoint = body.Entrypoint {
+                // If entrypoint is explicitly provided (even if empty), use it
+                entrypoint = requestEntrypoint
             } else if let imageEntrypoint = imageConfig?.entrypoint {
-                commandLine.append(contentsOf: imageEntrypoint)
+                // Otherwise use image's entrypoint
+                entrypoint = imageEntrypoint
+            } else {
+                // No entrypoint specified
+                entrypoint = []
             }
 
-            if let requestCmd = body.Cmd, !requestCmd.isEmpty {
-                commandLine.append(contentsOf: requestCmd)
-            } else if let imageCmd = imageConfig?.cmd {
-                commandLine.append(contentsOf: imageCmd)
+            // Determine the command to use
+            let command: [String]
+            if let requestCmd = body.Cmd {
+                // If cmd is explicitly provided but empty, use image's cmd
+                command = requestCmd.isEmpty ? (imageConfig?.cmd ?? []) : requestCmd
+            } else if body.Entrypoint != nil {
+                // If entrypoint was explicitly overridden, don't use image's cmd
+                command = []
+            } else {
+                // Use image's cmd
+                command = imageConfig?.cmd ?? []
             }
+
+            // Build final command line
+            commandLine.append(contentsOf: entrypoint)
+            commandLine.append(contentsOf: command)
 
             // Use working directory from request if provided, otherwise from image config
             let finalWorkingDirectory = body.WorkingDir ?? workingDirectory

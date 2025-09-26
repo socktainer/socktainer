@@ -134,6 +134,10 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
+        if container.status == .running {
+            return
+        }
+
         let stdin: FileHandle? = nil
         let stdout: FileHandle? = nil
         let stderr: FileHandle? = nil
@@ -144,14 +148,14 @@ struct ClientContainerService: ClientContainerProtocol {
             let process = try await container.bootstrap(stdio: stdio)
             try await process.start()
         } catch {
-            // Check if the error indicates the container is already booted/bootstrapped
+            // NOTE: If bootstrap fails because container is already booted,
+            //       the attach handler may have already bootstrapped it
             let errorMessage = error.localizedDescription
-            let isAlreadyBootstrapedError = errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") || errorMessage.contains("invalidState")
-
-            if isAlreadyBootstrapedError {
+            if errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") {
                 return
             }
 
+            // Re-throw any other errors
             throw error
         }
     }
@@ -239,9 +243,10 @@ struct ClientContainerService: ClientContainerProtocol {
             }
 
         case .removed:
-            while try await ClientContainer.list().contains(where: { $0.id == id }) {
-                try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
-            }
+            // TODO: This condition needs to be re-implemented to properly handle container lifecycle
+            //       Currently stubbed to support `docker run --rm` workflows,
+            //       immediately return to prevent blocking `docker run --rm`
+            break
         }
 
         return RESTContainerWait(statusCode: exitCode)

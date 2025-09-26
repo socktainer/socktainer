@@ -205,11 +205,9 @@ public struct ConnectionHijackingMiddleware: AsyncMiddleware {
     private func shouldHijackConnection(for request: Request) -> Bool {
         let path = request.url.path
 
-        // NOTE: Not implemented
-        // Check for attach endpoints
-        // if path.contains("/attach") && !path.contains("/attach/ws") {
-        //     return true
-        // }
+        if path.contains("/attach") && !path.contains("/attach/ws") {
+            return true
+        }
 
         // Check for exec start endpoints
         if path.contains("/exec/") && path.hasSuffix("/start") {

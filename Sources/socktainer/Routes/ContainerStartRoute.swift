@@ -15,7 +15,6 @@ struct ContainerStartQuery: Content {
 }
 
 extension ContainerStartRoute {
-    // TODO: Update logic to parse stdin from request.
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
 
@@ -27,10 +26,31 @@ extension ContainerStartRoute {
             let detachKeys = query.detachKeys
 
             do {
-                try await client.start(id: id, detachKeys: detachKeys)
+                guard let container = try await client.getContainer(id: id) else {
+                    throw Abort(.notFound, reason: "No such container: \(id)")
+                }
+
+                // If container is already running, return success (Docker CLI behavior)
+                if container.status == .running {
+                    req.logger.debug("Container \(id) is already running")
+                } else {
+                    // Try to start the container
+                    try await client.start(id: id, detachKeys: detachKeys)
+                    req.logger.debug("Started container \(id)")
+                }
+
             } catch {
-                req.logger.error("Failed to start container \(id): \(error)")
-                throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
+                // Check if error indicates container is already running/bootstrapped
+                let errorMessage = error.localizedDescription
+                let isAlreadyRunning =
+                    errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") || errorMessage.contains("invalidState")
+                    || errorMessage.contains("already running")
+
+                guard isAlreadyRunning else {
+                    req.logger.error("Failed to start container \(id): \(error)")
+                    throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
+                }
+                req.logger.debug("Container \(id) was already running or bootstrapped")
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!

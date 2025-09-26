@@ -3,23 +3,6 @@ import Foundation
 import NIOCore
 import Vapor
 
-// Minimal Terminal wrapper for TTY support
-struct Terminal {
-    let handle: FileHandle
-
-    static var current: Terminal {
-        Terminal(handle: FileHandle.standardOutput)
-    }
-
-    func setRaw() throws {
-        // Configure terminal to raw mode if needed
-    }
-
-    func reset() throws {
-        // Reset terminal to normal mode
-    }
-}
-
 // Singleton ExecManager to track exec configs
 actor ExecManager {
     static let shared = ExecManager()
@@ -85,8 +68,6 @@ struct ExecRoute: RouteCollection {
         routes.get("exec", ":id", "json", use: ExecRoute.inspectExec(client: client))
         routes.post(":version", "exec", ":id", "start", use: ExecRoute.startExec(client: client))
         routes.post("exec", ":id", "start", use: ExecRoute.startExec(client: client))
-        routes.post(":version", "exec", ":id", "resize", use: ExecRoute.resize(client: client))
-        routes.post("exec", ":id", "resize", use: ExecRoute.resize(client: client))
     }
 
     static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
@@ -551,33 +532,4 @@ struct ExecRoute: RouteCollection {
             }
         }
     }
-
-    static func resize(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
-        { req in
-
-            guard let execId = req.parameters.get("id") else {
-                throw Abort(.badRequest, reason: "Missing exec ID")
-            }
-
-            guard let config = await ExecManager.shared.get(id: execId) else {
-                throw Abort(.notFound, reason: "Exec process not found")
-            }
-
-            guard let container = try await client.getContainer(id: config.containerId) else {
-                throw Abort(.notFound, reason: "Container not found")
-            }
-
-            try client.enforceContainerRunning(container: container)
-
-            let _ = (try? req.query.get(Int.self, at: "h")) ?? 24
-            let _ = (try? req.query.get(Int.self, at: "w")) ?? 80
-
-            // Note: ContainerClient does not currently support resizing exec processes.
-            // This is a placeholder for future implementation.
-            // try await exec.resize(height: height, width: width)
-
-            return Response(status: .ok)
-        }
-    }
-
 }
