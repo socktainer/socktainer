@@ -7,6 +7,11 @@ func configure(_ app: Application) async throws {
     let networkClient = ClientNetworkService()
     let volumeClinet = ClientVolumeService()
 
+    // Create and install regex routing middleware with logging
+    let regexRouter = app.regexRouter(with: app.logger)
+    app.setRegexRouter(regexRouter)
+    regexRouter.installMiddleware(on: app)
+
     // /_ping
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
 
