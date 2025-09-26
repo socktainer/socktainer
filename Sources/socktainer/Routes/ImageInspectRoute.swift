@@ -13,16 +13,28 @@ struct ImageInspectRoute: RouteCollection {
 }
 
 extension ImageInspectRoute {
-    /// Checks if an image name matches the requested name, considering Docker Hub prefixes
-    private static func imageMatches(imageName: String, requestedName: String) -> Bool {
+    /// Checks if an image name matches the requested name, considering Docker Hub prefixes and digest hashes
+    private static func imageMatches(imageName: String, imageDigest: String, refOrId: String) -> Bool {
+        // Check if refOrId is a digest hash (sha256:, sha512:, etc.)
+        if refOrId.contains(":") && refOrId.split(separator: ":").count == 2 {
+            let parts = refOrId.split(separator: ":")
+            let algorithm = String(parts[0])
+            let hash = String(parts[1])
+
+            // Check if it looks like a hash algorithm (common ones: sha256, sha512, sha1, md5, etc.)
+            if algorithm.lowercased().matches(of: /^(sha|md)\d*$/).count > 0 && hash.allSatisfy({ $0.isHexDigit }) {
+                return imageDigest == refOrId
+            }
+        }
+
         // Exact match
-        if imageName == requestedName {
+        if imageName == refOrId {
             return true
         }
 
         // Extract the base name without tag from both names
         let imageBaseName = imageName.components(separatedBy: ":").first ?? imageName
-        let requestedBaseName = requestedName.components(separatedBy: ":").first ?? requestedName
+        let requestedBaseName = refOrId.components(separatedBy: ":").first ?? refOrId
 
         // If requested name contains no registry/namespace, check if image has docker.io/library prefix
         if !requestedBaseName.contains("/") {
@@ -42,7 +54,7 @@ extension ImageInspectRoute {
 
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> RESTImageInspect {
         { req in
-            guard let imageName = req.parameters.get("name") else {
+            guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
@@ -53,7 +65,7 @@ extension ImageInspectRoute {
                 let details: ImageDetail = try await image.details()
 
                 // Check if this is the image we're looking for using improved matching
-                if imageMatches(imageName: details.name, requestedName: imageName) {
+                if imageMatches(imageName: details.name, imageDigest: image.digest, refOrId: refOrId) {
                     let manifests = try await image.index().manifests
 
                     for descriptor in manifests {
@@ -113,7 +125,7 @@ extension ImageInspectRoute {
             }
 
             // If we get here, the image was not found
-            throw Abort(.notFound, reason: "Image '\(imageName)' not found")
+            throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
         }
     }
 }
