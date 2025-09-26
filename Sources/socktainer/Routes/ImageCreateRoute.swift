@@ -5,7 +5,7 @@ struct ImageCreateRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "images", "create", use: ImageCreateRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/images/create", use: ImageCreateRoute.handler(client: client))
     }
 }
 

@@ -6,9 +6,7 @@ struct ImageInspectRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "images", ":name", "json", use: ImageInspectRoute.handler(client: client))
-        // also handle without version prefix
-        routes.get("images", ":name", "json", use: ImageInspectRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json", use: ImageInspectRoute.handler(client: client))
     }
 }
 

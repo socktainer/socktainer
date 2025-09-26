@@ -3,13 +3,7 @@ import Vapor
 struct ImageDeleteRoute: RouteCollection {
     let client: ClientImageProtocol
     func boot(routes: RoutesBuilder) throws {
-
-        // DELETE /:version/images/<catchall>
-        routes.delete(":version", "images", "**", use: ImageDeleteRoute.handler(client: client))
-
-        // DELETE /images/<catchall>
-        routes.delete("images", "**", use: ImageDeleteRoute.handler(client: client))
-
+        try routes.registerVersionedRoute(.DELETE, pattern: "/images/{name:.*}", use: ImageDeleteRoute.handler(client: client))
     }
 
 }
@@ -17,14 +11,11 @@ struct ImageDeleteRoute: RouteCollection {
 extension ImageDeleteRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
-            // Catchall segments after /images/
-            let parts = req.parameters.getCatchall()
-
-            guard !parts.isEmpty else {
-                throw Abort(.badRequest, reason: "Missing image reference")
+            // Get image name from regex pattern parameter
+            guard let imageRef = req.parameters.get("name") else {
+                throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
-            let imageRef = parts.joined(separator: "/")
             try await client.delete(id: imageRef)
 
             // Optional: broadcast event
