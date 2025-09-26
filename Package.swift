@@ -35,7 +35,10 @@ let package = Package(
         ),
         .testTarget(
             name: "socktainerTests",
-            dependencies: ["socktainer"]
+            dependencies: [
+                .target(name: "socktainer"),
+                .product(name: "VaporTesting", package: "vapor"),
+            ],
         ),
         .target(
             name: "BuildInfo",
