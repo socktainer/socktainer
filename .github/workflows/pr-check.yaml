@@ -263,20 +263,20 @@ jobs:
       # NOTE: Inspecting a volume is not possible in CI
       - name: check volume with socktainer
         run: |
-          # create container with randomly generated name
+          # create volume with randomly generated name
           sudo docker volume create
-          # create container
+          # create volume
           sudo docker volume create test
-          # create containers with labels
+          # create volumes with labels
           sudo docker volume create foo --label 'test=false'
           sudo docker volume create bar --label 'test=true'
-          # filter containers by `test` expect 2 containers to return (extra line for header)
+          # filter volumes by `test` expect 2 volumes to return (extra line for header)
           [[ "3" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # filter containers by `test=true` expect a single container to return (extra line for header)
+          # filter volumes by `test=true` expect a single volume to return (extra line for header)
           [[ "2" == $(sudo docker volume ls --filter 'label=test=true' | wc -l | xargs) ]]
-          # inspect container
+          # inspect volume
           # sudo docker inspect test
-          # delete single container
+          # delete single volume
           sudo docker volume rm test
           # prune containers by labels and ensure it is not present
           sudo docker volume prune --force --filter 'label=test=true'
