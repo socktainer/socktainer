@@ -1,5 +1,6 @@
 import ContainerClient
 import ContainerNetworkService
+import Containerization
 import ContainerizationError
 import ContainerizationExtras
 import Foundation
@@ -217,6 +218,87 @@ extension ContainerCreateRoute {
 
             containerConfiguration.publishedPorts = publishedPorts
             containerConfiguration.labels = body.Labels ?? [:]
+
+            var resolvedMounts: [Filesystem] = []
+
+            // Process bind mounts from HostConfig.Binds
+            var volumesOrFs: [VolumeOrFilesystem] = []
+            if let binds = body.HostConfig?.Binds, !binds.isEmpty {
+                volumesOrFs = try Parser.volumes(binds)
+            }
+
+            // Process mounts from HostConfig.Mounts
+            var mountsOrFs: [VolumeOrFilesystem] = []
+            if let mounts = body.HostConfig?.Mounts, !mounts.isEmpty {
+                // Separate volume mounts from other mount types
+                let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
+                let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" }
+
+                // Handle volume mounts using the volume format (source:destination)
+                if !volumeMounts.isEmpty {
+                    let volumeStrings = volumeMounts.map { mount in
+                        var volumeString = "\(mount.Source):\(mount.Target)"
+                        if mount.ReadOnly == true {
+                            volumeString += ":ro"
+                        }
+                        return volumeString
+                    }
+                    let volumeMountsOrFs = try Parser.volumes(volumeStrings)
+                    mountsOrFs.append(contentsOf: volumeMountsOrFs)
+                }
+
+                // Handle other mount types (bind, tmpfs, etc.)
+                if !otherMounts.isEmpty {
+                    let mountStrings = otherMounts.map { mount in
+                        var components: [String] = []
+
+                        // Convert Docker mount type to Parser-supported type
+                        let mountType = mount.MountType.lowercased() == "bind" ? "bind" : mount.MountType
+                        components.append("type=\(mountType)")
+
+                        // Add source if specified
+                        if !mount.Source.isEmpty {
+                            components.append("source=\(mount.Source)")
+                        }
+
+                        // Add destination/target
+                        components.append("destination=\(mount.Target)")
+
+                        // Add readonly flag if specified
+                        if mount.ReadOnly == true {
+                            components.append("ro")
+                        }
+
+                        return components.joined(separator: ",")
+                    }
+                    let otherMountsOrFs = try Parser.mounts(mountStrings)
+                    mountsOrFs.append(contentsOf: otherMountsOrFs)
+                }
+            }
+
+            // Resolve volumes from both volumes and mounts
+            for item in (volumesOrFs + mountsOrFs) {
+                switch item {
+                case .filesystem(let fs):
+                    resolvedMounts.append(fs)
+                case .volume(let parsed):
+                    do {
+                        let volume = try await ClientVolume.inspect(parsed.name)
+                        let volumeMount = Filesystem.volume(
+                            name: parsed.name,
+                            format: volume.format,
+                            source: volume.source,
+                            destination: parsed.destination,
+                            options: parsed.options
+                        )
+                        resolvedMounts.append(volumeMount)
+                    } catch {
+                        throw ContainerizationError(.invalidArgument, message: "volume '\(parsed.name)' not found")
+                    }
+                }
+            }
+
+            containerConfiguration.mounts = resolvedMounts
 
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ClientContainer

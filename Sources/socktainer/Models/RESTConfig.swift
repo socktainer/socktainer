@@ -212,6 +212,17 @@ struct Mount: Content {
     let BindOptions: BindOptions?
     let VolumeOptions: VolumeOptions?
     let TmpfsOptions: TmpfsOptions?
+
+    enum CodingKeys: String, CodingKey {
+        case Target
+        case Source
+        case MountType = "Type"
+        case ReadOnly
+        case Consistency
+        case BindOptions
+        case VolumeOptions
+        case TmpfsOptions
+    }
 }
 
 struct BindOptions: Content {
