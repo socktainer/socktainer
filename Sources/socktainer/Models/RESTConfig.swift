@@ -457,3 +457,12 @@ struct ContainerNetworkSummary: Content {
 public struct ContainerWaitExitError: Codable, Sendable {
     public let Message: String?
 }
+
+// auth related
+
+struct AuthConfig: Content {
+    let username: String?
+    let password: String?
+    let email: String?
+    let serveraddress: String?
+}

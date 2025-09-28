@@ -18,7 +18,6 @@ struct RESTImageCreateQuery: Content {
     // let repo: String?
     // let message: String?
     // let inputImage: String?
-    // let xRegistryAuth: String?
     // let changes: [String]?
 }
 
@@ -26,7 +25,7 @@ extension ImageCreateRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             let query = try req.query.decode(RESTImageCreateQuery.self)
-            let image = query.fromImage ?? ""
+            let image = RegistryUtility.normalizeImageReference(query.fromImage ?? "")
             let tag = query.tag ?? ""
             let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform
@@ -43,21 +42,32 @@ extension ImageCreateRoute {
             } else {
                 platform = currentPlatform()
             }
+
+            // Extract and decode X-Registry-Auth header
+            var registryAuth: AuthConfig?
+            if let xAuthConfigHeader = req.headers.first(name: "X-Registry-Auth") {
+                if let decodedData = Data(base64Encoded: xAuthConfigHeader),
+                    let auth = try? JSONDecoder().decode(AuthConfig.self, from: decodedData)
+                {
+                    registryAuth = auth
+                }
+            }
+
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
-            let progressStream = try await client.pull(image: image, tag: decodedTag, platform: platform, logger: req.logger)
+            let progressStream = try await client.pull(image: image, tag: decodedTag, platform: platform, registryAuth: registryAuth, logger: req.logger)
 
             response.body = .init(stream: { writer in
                 Task {
                     do {
                         for try await progress in progressStream {
                             let json = "{\"status\": \"\(progress.replacingOccurrences(of: "\"", with: "\\\""))\"}"  // Docker style
-                            _ = try? await writer.write(.buffer(ByteBuffer(string: json + "\n")))
+                            _ = writer.write(.buffer(ByteBuffer(string: json + "\n")))
                         }
-                        await writer.write(.end)
+                        _ = writer.write(.end)
                     } catch {
-                        _ = try? await writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
-                        await writer.write(.error(error))
+                        _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
+                        _ = writer.write(.error(error))
                     }
                 }
             })

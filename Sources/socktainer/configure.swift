@@ -7,6 +7,7 @@ func configure(_ app: Application) async throws {
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClinet = ClientVolumeService()
+    let registryClient = ClientRegistryService()
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -140,7 +141,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: SessionRoute())
 
     // --- miscellaneous ---
-    try app.register(collection: AuthRoute())
+    try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: CommitRoute())
     try app.register(collection: SystemDFRoute())
     try app.register(collection: VersionRoute())
