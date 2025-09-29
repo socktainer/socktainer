@@ -1,4 +1,5 @@
 import ContainerClient
+import ContainerizationError
 import Foundation
 
 protocol ClientContainerProtocol: Sendable {
@@ -120,7 +121,11 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ClientContainer? {
-        try await ClientContainer.get(id: id)
+        do {
+            return try await ClientContainer.get(id: id)
+        } catch let error as ContainerizationError where error.code == .notFound {
+            return nil
+        }
     }
 
     func enforceContainerRunning(container: ClientContainer) throws {
