@@ -282,19 +282,33 @@ extension ContainerCreateRoute {
                 case .filesystem(let fs):
                     resolvedMounts.append(fs)
                 case .volume(let parsed):
-                    do {
-                        let volume = try await ClientVolume.inspect(parsed.name)
-                        let volumeMount = Filesystem.volume(
+                    // Check if volume exists by listing all volumes and finding a match
+                    let existingVolumes = try await ClientVolume.list()
+                    let existingVolume = existingVolumes.first { $0.name == parsed.name }
+
+                    let volume: ContainerClient.Volume
+                    if let existing = existingVolume {
+                        // Volume exists, use it
+                        volume = existing
+                    } else {
+                        // Volume doesn't exist, create it automatically (Docker behavior)
+                        req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
+                        volume = try await ClientVolume.create(
                             name: parsed.name,
-                            format: volume.format,
-                            source: volume.source,
-                            destination: parsed.destination,
-                            options: parsed.options
+                            driver: "local",
+                            driverOpts: [:],
+                            labels: [:]
                         )
-                        resolvedMounts.append(volumeMount)
-                    } catch {
-                        throw ContainerizationError(.invalidArgument, message: "volume '\(parsed.name)' not found")
                     }
+
+                    let volumeMount = Filesystem.volume(
+                        name: parsed.name,
+                        format: volume.format,
+                        source: volume.source,
+                        destination: parsed.destination,
+                        options: parsed.options
+                    )
+                    resolvedMounts.append(volumeMount)
                 }
             }
 
