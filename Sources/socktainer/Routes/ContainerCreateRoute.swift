@@ -150,8 +150,8 @@ extension ContainerCreateRoute {
             commandLine.append(contentsOf: entrypoint)
             commandLine.append(contentsOf: command)
 
-            // Use working directory from request if provided, otherwise from image config
-            let finalWorkingDirectory = body.WorkingDir ?? workingDirectory
+            // Use working directory from request if provided and not empty, otherwise from image config
+            let finalWorkingDirectory = (body.WorkingDir?.isEmpty == false) ? body.WorkingDir! : workingDirectory
 
             // Handle user from request if provided
             let finalUser: ProcessConfiguration.User = {
