@@ -292,6 +292,7 @@ extension ContainerCreateRoute {
                         volume = existing
                     } else {
                         // Volume doesn't exist, create it automatically (Docker behavior)
+                        // might be revisited if https://github.com/apple/container/issues/690 is closed
                         req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
                         volume = try await ClientVolume.create(
                             name: parsed.name,
