@@ -24,6 +24,7 @@ let package = Package(
         .executableTarget(
             name: "socktainer",
             dependencies: [
+                .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerClient", package: "container"),
                 .product(name: "ContainerNetworkService", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
