@@ -214,14 +214,23 @@ extension BuildRoute {
                     } catch {
                         req.logger.error("Build failed: \(error)")
 
+                        // Extract error message - prioritize ContainerizationError message
+                        let errorMessage: String
+                        if error is ContainerizationError {
+                            // Use string interpolation to get ContainerizationError's description
+                            errorMessage = "\(error)"
+                        } else {
+                            errorMessage = error.localizedDescription
+                        }
+
                         // Docker API compliant error response
                         let errorDetail: [String: Any] = [
-                            "message": error.localizedDescription
+                            "message": errorMessage
                         ]
 
                         let errorResponse: [String: Any] = [
                             "errorDetail": errorDetail,
-                            "error": error.localizedDescription,
+                            "error": errorMessage,
                         ]
 
                         if let jsonData = try? JSONSerialization.data(withJSONObject: errorResponse),
