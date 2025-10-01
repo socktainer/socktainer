@@ -30,7 +30,7 @@ actor ExecManager {
     }
 
     func remove(id: String) {
-        // storage.removeValue(forKey: id)
+        storage.removeValue(forKey: id)
     }
 }
 
@@ -262,46 +262,64 @@ struct ExecRoute: RouteCollection {
                         // stdout handler
                         if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                             group.addTask {
-                                while true {
+                                defer {
+                                    try? stdoutHandle.close()
+                                }
+
+                                let state = DockerConnectionState()
+
+                                while !state.shouldStop() {
                                     do {
-                                        guard let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty else {
-                                            break
+                                        guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
+                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                                            continue
                                         }
 
-                                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + (tty ? 0 : 8))
+                                        let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
+                                        var buffer = sharedAllocator.buffer(capacity: bufferSize)
                                         buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: tty)
                                         streamContinuation.yield(buffer)
                                     } catch {
                                         break
                                     }
                                 }
-                                try? stdoutHandle.close()
                             }
                         }
 
                         // stderr handler
                         if let stderrHandle = stderrPipe?.fileHandleForReading {
                             group.addTask {
-                                while true {
+                                defer {
+                                    try? stderrHandle.close()
+                                }
+
+                                let state = DockerConnectionState()
+
+                                while !state.shouldStop() {
                                     do {
-                                        guard let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty else {
-                                            break
+                                        guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
+                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                                            continue
                                         }
 
-                                        var buffer = ByteBufferAllocator().buffer(capacity: data.count + 8)
+                                        let bufferSize = min(data.count + 8, 65536)
+                                        var buffer = sharedAllocator.buffer(capacity: bufferSize)
                                         buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: tty)
                                         streamContinuation.yield(buffer)
                                     } catch {
                                         break
                                     }
                                 }
-                                try? stderrHandle.close()
                             }
                         }
 
                         // stdin handler for HTTP mode
                         if let stdinWriter = stdinPipe?.fileHandleForWriting {
                             group.addTask {
+                                defer {
+                                    try? stdinWriter.close()
+                                }
+
                                 do {
                                     for try await var buf in req.body {
                                         if let data = buf.readData(length: buf.readableBytes) {
@@ -310,21 +328,22 @@ struct ExecRoute: RouteCollection {
                                     }
                                 } catch {
                                 }
-                                try? stdinWriter.close()
                             }
                         }
 
                         // Process monitor
                         group.addTask {
+                            defer {
+                                // Close all write ends to signal EOF
+                                try? stdoutPipe?.fileHandleForWriting.close()
+                                try? stderrPipe?.fileHandleForWriting.close()
+                                try? stdinPipe?.fileHandleForWriting.close()
+                            }
+
                             do {
                                 let _ = try await process.wait()
                             } catch {
                             }
-
-                            // Close all write ends to signal EOF
-                            try? stdoutPipe?.fileHandleForWriting.close()
-                            try? stderrPipe?.fileHandleForWriting.close()
-                            try? stdinPipe?.fileHandleForWriting.close()
                         }
 
                         for await _ in group {}
@@ -378,118 +397,133 @@ struct ExecRoute: RouteCollection {
                     // stdout/stderr -> channel (container output to client)
                     if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                         group.addTask {
+                            defer {
+                                try? stdoutHandle.close()
+                            }
+
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                                // Handle cleanup error if needed
                             }
 
-                            // Set up for streaming - read in small chunks with low water mark
+                            defer {
+                                dispatchIO.close()
+                            }
+
+                            // Set up for streaming
                             dispatchIO.setLimit(lowWater: 1)
                             dispatchIO.setLimit(highWater: 4096)
 
+                            let state = DockerConnectionState()
+
+                            // Use a single read operation that processes all available data
                             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                                var isFinished = false
-                                var hasResumed = false
+                                var hasCompleted = false
+                                let completionLock = NSLock()
 
-                                func readNextChunk() {
-                                    guard !isFinished else { return }
-
-                                    dispatchIO.read(
-                                        offset: off_t.max,  // Use off_t.max for streaming (current position)
-                                        length: 4096,
-                                        queue: DispatchQueue.global(qos: .userInteractive)
-                                    ) { done, data, error in
-
-                                        if let data = data, !data.isEmpty {
-                                            // Send data to channel immediately
-                                            channel.eventLoop.execute {
-                                                var outputBuffer = channel.allocator.buffer(capacity: data.count + (tty ? 0 : 8))
-                                                if tty {
-                                                    outputBuffer.writeBytes(data)
-                                                } else {
-                                                    outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
-                                                }
-                                                _ = channel.writeAndFlush(outputBuffer)
-                                            }
-                                        }
-
-                                        if done || error != 0 {
-                                            if !isFinished && !hasResumed {
-                                                isFinished = true
-                                                hasResumed = true
-                                                dispatchIO.close()
-                                                continuation.resume()
-                                            }
-                                        } else if !isFinished {
-                                            // Continue reading immediately for streaming
-                                            readNextChunk()
-                                        }
-                                    }
+                                func safeComplete() {
+                                    completionLock.lock()
+                                    defer { completionLock.unlock() }
+                                    guard !hasCompleted else { return }
+                                    hasCompleted = true
+                                    continuation.resume()
                                 }
 
-                                // Start reading
-                                readNextChunk()
-                            }
+                                // Start a continuous read operation
+                                dispatchIO.read(
+                                    offset: 0,
+                                    length: Int.max,  // Read all available data
+                                    queue: DispatchQueue.global(qos: .userInteractive)
+                                ) { done, data, error in
 
-                            try? stdoutHandle.close()
+                                    completionLock.lock()
+                                    let shouldProcess = !hasCompleted && channel.isActive
+                                    completionLock.unlock()
+
+                                    if shouldProcess, let data = data, !data.isEmpty {
+                                        channel.eventLoop.execute {
+                                            let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
+                                            var outputBuffer = channel.allocator.buffer(capacity: bufferSize)
+                                            if tty {
+                                                outputBuffer.writeBytes(data)
+                                            } else {
+                                                outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
+                                            }
+                                            _ = channel.writeAndFlush(outputBuffer)
+                                        }
+                                    }
+
+                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
+                                        safeComplete()
+                                    }
+                                }
+                            }
                         }
                     }
 
                     if let stderrHandle = stderrPipe?.fileHandleForReading {
                         group.addTask {
+                            defer {
+                                try? stderrHandle.close()
+                            }
+
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
-                                // Handle cleanup error if needed
+                                // Cleanup handled automatically
+                            }
+
+                            defer {
+                                dispatchIO.close()
                             }
 
                             // Set up for streaming
                             dispatchIO.setLimit(lowWater: 1)
                             dispatchIO.setLimit(highWater: 1024)
 
+                            let state = DockerConnectionState()
+
                             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                                var isFinished = false
-                                var hasResumed = false
+                                var hasCompleted = false
+                                let completionLock = NSLock()
 
-                                func readNextChunk() {
-                                    guard !isFinished else { return }
-
-                                    dispatchIO.read(
-                                        offset: off_t.max,  // Streaming mode
-                                        length: 1024,
-                                        queue: DispatchQueue.global(qos: .userInteractive)
-                                    ) { done, data, error in
-
-                                        if let data = data, !data.isEmpty {
-                                            channel.eventLoop.execute {
-                                                var outputBuffer = channel.allocator.buffer(capacity: data.count + 8)
-                                                outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: tty)
-                                                _ = channel.writeAndFlush(outputBuffer)
-                                            }
-                                        }
-
-                                        if done || error != 0 {
-                                            if !isFinished && !hasResumed {
-                                                isFinished = true
-                                                hasResumed = true
-                                                dispatchIO.close()
-                                                continuation.resume()
-                                            }
-                                        } else if !isFinished {
-                                            readNextChunk()
-                                        }
-                                    }
+                                func safeComplete() {
+                                    completionLock.lock()
+                                    defer { completionLock.unlock() }
+                                    guard !hasCompleted else { return }
+                                    hasCompleted = true
+                                    continuation.resume()
                                 }
 
-                                readNextChunk()
-                            }
+                                // Start a continuous read operation
+                                dispatchIO.read(
+                                    offset: 0,
+                                    length: Int.max,  // Read all available data
+                                    queue: DispatchQueue.global(qos: .userInteractive)
+                                ) { done, data, error in
 
-                            try? stderrHandle.close()
+                                    completionLock.lock()
+                                    let shouldProcess = !hasCompleted && channel.isActive
+                                    completionLock.unlock()
+
+                                    if shouldProcess, let data = data, !data.isEmpty {
+                                        channel.eventLoop.execute {
+                                            let bufferSize = min(data.count + 8, 65536)
+                                            var outputBuffer = channel.allocator.buffer(capacity: bufferSize)
+                                            outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: tty)
+                                            _ = channel.writeAndFlush(outputBuffer)
+                                        }
+                                    }
+
+                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
+                                        safeComplete()
+                                    }
+                                }
+                            }
                         }
                     }
 

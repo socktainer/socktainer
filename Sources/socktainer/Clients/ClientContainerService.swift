@@ -225,14 +225,18 @@ struct ClientContainerService: ClientContainerProtocol {
         var exitCode: Int64 = 0
 
         switch condition {
+        // TODO: This condition needs to be re-implemented to properly handle container lifecycle
+        //       Currently stubbed to support `docker attach` workflows,
+        //       immediately return to prevent blocking `docker attach`
         case .notRunning:
-            while container?.status == .running {
-                try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
-                container = try await ClientContainer.list().first(where: { $0.id == id })
-                guard let container = container else {
-                    break
-                }
-            }
+            // while container?.status == .running {
+            //     try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
+            //     container = try await ClientContainer.list().first(where: { $0.id == id })
+            //     guard let container = container else {
+            //         break
+            //     }
+            // }
+            break
 
         case .nextExit:
             // Wait for next exit (only if currently running)

@@ -3,6 +3,34 @@ import NIOCore
 import NIOHTTP1
 import Vapor
 
+/// Thread-safe state management for Docker I/O operations to prevent race conditions
+public final class DockerConnectionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isFinished = false
+    private var _hasResumed = false
+
+    public init() {}
+
+    public func shouldStop() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isFinished
+    }
+
+    public func finish(completion: () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        if !_hasResumed {
+            _isFinished = true
+            _hasResumed = true
+            completion()
+        }
+    }
+}
+
+/// Shared allocator for memory efficiency across Docker operations
+public let sharedAllocator = ByteBufferAllocator()
+
 /// This provides TCP connection hijacking for Docker exec endpoints
 public struct DockerTCPUpgrader: Upgrader, Sendable {
     let execId: String
@@ -287,29 +315,6 @@ public struct DockerStreamFrame {
         self.streamType = streamType
         self.data = data
     }
-
-    /// Creates the 8-byte header for multiplexed streams
-    public func createHeader() -> Data {
-        var header = Data(capacity: 8)
-        header.append(streamType.rawValue)  // Stream type
-        header.append(0)  // Padding
-        header.append(0)  // Padding
-        header.append(0)  // Padding
-
-        // Append size as big-endian uint32
-        let size = UInt32(data.count)
-        let sizeBytes = withUnsafeBytes(of: size.bigEndian) { Data($0) }
-        header.append(sizeBytes)
-
-        return header
-    }
-
-    /// Creates the complete frame (header + data) for multiplexed streams
-    public func createFrame() -> Data {
-        var frame = createHeader()
-        frame.append(data)
-        return frame
-    }
 }
 
 /// Extension to ByteBuffer for Docker stream handling
@@ -321,8 +326,13 @@ extension ByteBuffer {
             writeBytes(data)
         } else {
             // In non-TTY mode, use multiplexed format with 8-byte headers
-            let frame = DockerStreamFrame(streamType: streamType, data: data)
-            writeBytes(frame.createFrame())
+            // Create 8-byte header: [stream_type, 0, 0, 0, size_big_endian]
+            writeInteger(streamType.rawValue, as: UInt8.self)  // Stream type
+            writeInteger(UInt8(0), as: UInt8.self)  // Padding
+            writeInteger(UInt8(0), as: UInt8.self)  // Padding
+            writeInteger(UInt8(0), as: UInt8.self)  // Padding
+            writeInteger(UInt32(data.count), endianness: .big, as: UInt32.self)
+            writeBytes(data)
         }
     }
 }

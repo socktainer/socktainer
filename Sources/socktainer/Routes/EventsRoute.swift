@@ -28,8 +28,8 @@ extension EventsRoute {
                             buffer.writeBytes(json)
                             buffer.writeString("\n")
                             writer.write(.buffer(buffer)).whenFailure { error in
-                                // Optional: handle error
-                                print("Write error: \(error)")
+                                // NOTE: Consider improving logging
+                                req.logger.warning("\(event) raised '\(error)'")
                             }
                         }
                     }

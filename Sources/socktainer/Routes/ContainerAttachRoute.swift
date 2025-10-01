@@ -118,6 +118,10 @@ extension ContainerAttachRoute {
                 let pollInterval: UInt64 = 200_000_000  // 200ms
                 var containerWasRunning = false
 
+                defer {
+                    _ = writer.write(.end)
+                }
+
                 // Continuously poll for log handles and send data
                 while true {
                     // Check if container still exists
@@ -134,36 +138,35 @@ extension ContainerAttachRoute {
                     do {
                         logHandles = try await container.logs()
                         hasValidHandles = !logHandles.isEmpty
-
                     } catch {
                         hasValidHandles = false
                     }
 
+                    defer {
+                        for handle in logHandles {
+                            try? handle.close()
+                        }
+                    }
+
                     if hasValidHandles {
                         let shouldAttachStdout = stdout || (!stdout && !stderr)
-
                         var consecutiveEmptyReads = 0
-                        let maxEmptyReads = 100  // Switch to polling after 100 empty reads
-
+                        let maxEmptyReads = 50  // Switch to polling after 100 empty reads
                         while true {
                             // Check if container still exists before reading data
-                            // Check if container is still running (only exit if it was running and now stopped)
                             do {
                                 let currentContainer = try await client.getContainer(id: id)
                                 guard let container = currentContainer else {
-                                    _ = writer.write(.end)
                                     return
                                 }
                                 if container.status == .running {
                                     containerWasRunning = true
                                 } else if containerWasRunning {
                                     // Container was running but now stopped - exit
-                                    _ = writer.write(.end)
                                     return
                                 }
                             } catch {
-                                // Container not available, break out of both loops
-                                _ = writer.write(.end)
+                                // Container not available, exit
                                 return
                             }
 
@@ -173,7 +176,8 @@ extension ContainerAttachRoute {
                                 let stdoutData = logHandles[0].availableData
                                 if !stdoutData.isEmpty {
                                     hasData = true
-                                    var buffer = ByteBufferAllocator().buffer(capacity: stdoutData.count + (isTTY ? 0 : 8))
+                                    let capacity = min(stdoutData.count + (isTTY ? 0 : 8), 65536)
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
                                     buffer.writeDockerFrame(streamType: .stdout, data: stdoutData, ttyMode: isTTY)
                                     _ = writer.write(.buffer(buffer))
                                 }
@@ -182,32 +186,22 @@ extension ContainerAttachRoute {
                             if !hasData {
                                 consecutiveEmptyReads += 1
 
-                                // After many empty reads, send empty data to keep connection alive
+                                // After many empty reads, send keep-alive less frequently
                                 if consecutiveEmptyReads >= maxEmptyReads {
-                                    let keepAliveData = Data()
-                                    var buffer = ByteBufferAllocator().buffer(capacity: (isTTY ? 0 : 8))
-                                    buffer.writeDockerFrame(streamType: .stdout, data: keepAliveData, ttyMode: isTTY)
-                                    _ = writer.write(.buffer(buffer))
                                     consecutiveEmptyReads = 0  // Reset counter
-
-                                    try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                                    try await Task.sleep(nanoseconds: 500_000_000)  // 500ms
                                 } else {
-                                    try await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+                                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
                                 }
                             } else {
-                                // Reset empty read counter when we get data
                                 consecutiveEmptyReads = 0
+                                try await Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
                             }
                         }
 
                     } else {
-                        // No valid handles, send empty data to keep connection alive
-                        let keepAliveData = Data()
-
-                        var buffer = ByteBufferAllocator().buffer(capacity: (isTTY ? 0 : 8))
-                        buffer.writeDockerFrame(streamType: .stdout, data: keepAliveData, ttyMode: isTTY)
-
-                        _ = writer.write(.buffer(buffer))
+                        // No valid handles, just wait
+                        try await Task.sleep(nanoseconds: pollInterval)
                     }
 
                     do {
@@ -216,8 +210,6 @@ extension ContainerAttachRoute {
                         break
                     }
                 }
-
-                _ = writer.write(.end)
             }
         }
 
@@ -250,6 +242,7 @@ extension ContainerAttachRoute {
 
         // NOTE: For true docker run -it behavior, we need to control the main process stdio,
         //       this means we need to bootstrap the container with our own pipes
+        // WARN: docker compose reaches this logic
         guard currentContainer.status == .stopped else {
             throw Abort(.conflict, reason: "Container is in \(currentContainer.status) state and cannot be attached to")
         }
@@ -306,65 +299,80 @@ extension ContainerAttachRoute {
                 request: req,
                 ttyEnabled: isTTY
             ) { streamContinuation in
+
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor - when process exits, close pipes and finish stream
                     group.addTask {
+                        defer {
+                            // Close pipes to break the reader loops
+                            try? stdoutPipe?.fileHandleForWriting.close()
+                            try? stderrPipe?.fileHandleForWriting.close()
+                            try? stdinPipe.fileHandleForWriting.close()
+
+                            // Close stream
+                            streamContinuation.finish()
+                        }
+
                         do {
                             let _ = try await process.wait()
                         } catch {
                         }
-
-                        // Close pipes to break the reader loops
-                        try? stdoutPipe?.fileHandleForWriting.close()
-                        try? stderrPipe?.fileHandleForWriting.close()
-                        try? stdinPipe.fileHandleForWriting.close()
-
-                        // Close stream
-                        streamContinuation.finish()
                     }
 
                     if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                         group.addTask {
+                            defer {
+                                try? stdoutHandle.close()
+                            }
+
                             while true {
                                 do {
-                                    guard let data = try stdoutHandle.read(upToCount: 4096), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+                                    guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
+                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
                                         continue
                                     }
 
-                                    var buffer = ByteBufferAllocator().buffer(capacity: data.count + (isTTY ? 0 : 8))
+                                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)  // Cap buffer size
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
                                     buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
                                     streamContinuation.yield(buffer)
                                 } catch {
                                     break
                                 }
                             }
-                            try? stdoutHandle.close()
                         }
                     }
 
                     if let stderrHandle = stderrPipe?.fileHandleForReading {
                         group.addTask {
+                            defer {
+                                try? stderrHandle.close()
+                            }
+
                             while true {
                                 do {
-                                    guard let data = try stderrHandle.read(upToCount: 4096), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 10_000_000)  // 10ms
+                                    guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
+                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
                                         continue
                                     }
 
-                                    var buffer = ByteBufferAllocator().buffer(capacity: data.count + 8)
+                                    let capacity = min(data.count + 8, 65536)  // Cap buffer size
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
                                     buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: isTTY)
                                     streamContinuation.yield(buffer)
                                 } catch {
                                     break
                                 }
                             }
-                            try? stderrHandle.close()
                         }
                     }
 
                     let stdinWriter = stdinPipe.fileHandleForWriting
                     group.addTask {
+                        defer {
+                            try? stdinWriter.close()
+                        }
+
                         do {
                             for try await var buf in req.body {
                                 if let data = buf.readData(length: buf.readableBytes) {
@@ -374,7 +382,6 @@ extension ContainerAttachRoute {
                             }
                         } catch {
                         }
-                        try? stdinWriter.close()
                     }
 
                     for await _ in group {}
@@ -400,23 +407,29 @@ extension ContainerAttachRoute {
                         }
 
                         dispatchIO.setLimit(lowWater: 1)
-                        dispatchIO.setLimit(highWater: 4096)
+                        dispatchIO.setLimit(highWater: 8192)
 
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                            var isFinished = false
-                            var hasResumed = false
+                            let state = DockerConnectionState()
 
-                            func readNextChunk() {
-                                guard !isFinished else { return }
+                            @Sendable func readNextChunk() {
+                                if state.shouldStop() {
+                                    state.finish {
+                                        dispatchIO.close()
+                                        continuation.resume()
+                                    }
+                                    return
+                                }
 
                                 dispatchIO.read(
                                     offset: off_t.max,
-                                    length: 4096,
+                                    length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
                                     if let data = data, !data.isEmpty {
                                         channel.eventLoop.execute {
-                                            var outputBuffer = channel.allocator.buffer(capacity: data.count + (isTTY ? 0 : 8))
+                                            let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                                            var outputBuffer = channel.allocator.buffer(capacity: capacity)
                                             if isTTY {
                                                 outputBuffer.writeBytes(data)
                                             } else {
@@ -427,14 +440,14 @@ extension ContainerAttachRoute {
                                     }
 
                                     if done || error != 0 {
-                                        if !isFinished && !hasResumed {
-                                            isFinished = true
-                                            hasResumed = true
+                                        state.finish {
                                             dispatchIO.close()
                                             continuation.resume()
                                         }
-                                    } else if !isFinished {
-                                        readNextChunk()
+                                    } else if !state.shouldStop() {
+                                        DispatchQueue.global(qos: .userInteractive).async {
+                                            readNextChunk()
+                                        }
                                     }
                                 }
                             }
@@ -456,37 +469,47 @@ extension ContainerAttachRoute {
                         }
 
                         dispatchIO.setLimit(lowWater: 1)
-                        dispatchIO.setLimit(highWater: 1024)
+                        dispatchIO.setLimit(highWater: 8192)
 
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                            var isFinished = false
-                            var hasResumed = false
+                            let state = DockerConnectionState()
 
-                            func readNextChunk() {
-                                guard !isFinished else { return }
+                            @Sendable func readNextChunk() {
+                                if state.shouldStop() {
+                                    state.finish {
+                                        dispatchIO.close()
+                                        continuation.resume()
+                                    }
+                                    return
+                                }
 
                                 dispatchIO.read(
                                     offset: off_t.max,
-                                    length: 1024,
+                                    length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
                                     if let data = data, !data.isEmpty {
                                         channel.eventLoop.execute {
-                                            var outputBuffer = channel.allocator.buffer(capacity: data.count + 8)
-                                            outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: isTTY)
+                                            let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                                            var outputBuffer = channel.allocator.buffer(capacity: capacity)
+                                            if isTTY {
+                                                outputBuffer.writeBytes(data)
+                                            } else {
+                                                outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: false)
+                                            }
                                             _ = channel.writeAndFlush(outputBuffer)
                                         }
                                     }
 
                                     if done || error != 0 {
-                                        if !isFinished && !hasResumed {
-                                            isFinished = true
-                                            hasResumed = true
+                                        state.finish {
                                             dispatchIO.close()
                                             continuation.resume()
                                         }
-                                    } else if !isFinished {
-                                        readNextChunk()
+                                    } else if !state.shouldStop() {
+                                        DispatchQueue.global(qos: .userInteractive).async {
+                                            readNextChunk()
+                                        }
                                     }
                                 }
                             }
@@ -499,7 +522,9 @@ extension ContainerAttachRoute {
                 }
 
                 group.addTask {
-                    while channel.isActive {
+                    let maxWaits = 6000  // 10 minutes max (6000 * 100ms)
+                    for _ in 0..<maxWaits {
+                        guard channel.isActive else { break }
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                     }
                 }
@@ -511,7 +536,7 @@ extension ContainerAttachRoute {
                     }
 
                     // Give a small delay for any final output to be processed
-                    try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                    try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
 
                     // Close all pipes to signal EOF to readers
                     try? stdoutPipe?.fileHandleForWriting.close()
