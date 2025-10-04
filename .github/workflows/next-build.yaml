@@ -182,3 +182,40 @@ jobs:
           id: ${{ needs.tag.outputs.releaseId}}
           repo: prereleases
           owner: socktainer
+
+brew-tap-update:
+  needs: [tag, release]
+    name: Homebrew Tap
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: socktainer/homebrew-tap
+          token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Trigger and wait for Homebrew formula update
+        run: |
+          VERSION=${{ needs.tag.outputs.socktainerVersion}}
+          echo "Triggering homebrew-tap workflow with version: $VERSION"
+
+          # Trigger workflow run in homebrew-tap
+          gh workflow run update-formula-next.yml \
+            --repo socktainer/homebrew-tap \
+            --ref main \
+            -f version="$VERSION"
+
+          # Get the latest run ID for that workflow
+          run_id=$(gh run list \
+            --workflow update-formula-next.yml \
+            --repo socktainer/homebrew-tap \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+
+          echo "Waiting for workflow run ID: $run_id"
+
+          # Watch until completion (streams logs & exits with same status)
+          gh run watch "$run_id" --repo socktainer/homebrew-tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
