@@ -27,8 +27,9 @@ struct NetworkCreateRoute: RouteCollection {
     func handler(_ req: Request) async throws -> Response {
         let logger = req.logger
         let query = try req.content.decode(NetworksCreateQuery.self)
-        // only pass network name
-        let response = try await client.create(name: query.Name, logger: logger)
+        // only pass network name and labels for now
+        let labels = query.Labels ?? [:]
+        let response = try await client.create(name: query.Name, labels: labels, logger: logger)
         return try await response.encodeResponse(for: req)
     }
 }
