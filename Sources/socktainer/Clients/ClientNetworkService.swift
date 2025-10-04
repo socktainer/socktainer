@@ -7,7 +7,7 @@ protocol ClientNetworkProtocol: Sendable {
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary]
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary?
     func delete(id: String, logger: Logger) async throws
-    func create(name: String, logger: Logger) async throws -> RESTNetworkCreate
+    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
@@ -123,9 +123,9 @@ struct ClientNetworkService: ClientNetworkProtocol {
         logger.debug("Deleted network with id: \(id)")
     }
 
-    func create(name: String, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
-        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat)
+        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat, labels: labels)
         let state = try await ClientNetwork.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")
@@ -137,7 +137,7 @@ extension RESTNetworkSummary {
         let id: String
         let driver: String
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels: [String: String] = [:]  // Not provided by Apple container
+        let labels: [String: String]
         var subnet: String? = nil
         var gateway: String? = nil
 
@@ -146,11 +146,13 @@ extension RESTNetworkSummary {
             id = config.id
             driver = String(describing: config.mode)
             subnet = config.subnet
+            labels = config.labels
         case .running(let config, let status):
             id = config.id
             driver = String(describing: config.mode)
             subnet = config.subnet ?? status.address
             gateway = status.gateway
+            labels = config.labels
         }
 
         self.init(
