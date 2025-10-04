@@ -265,6 +265,10 @@ jobs:
           sudo docker network prune --filter 'name=test' --force
           # ensure only default is left
           sudo docker network ls | grep 'default'
+          # Create a network with a label
+          sudo docker network create bar --label 'test=true'
+          # expect to get the label back when inspecting the network
+          [[ $(sudo docker network inspect bar | jq -r ".[0].Labels.test // empty") == "true" ]] || { echo "Error: Label 'test=true' not found"; exit 1;}
 
       # NOTE: Inspecting a volume is not possible in CI
       - name: check volume with socktainer
