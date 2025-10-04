@@ -190,7 +190,7 @@ jobs:
       - name: check container root
         run: |
           sudo container image pull hello-world
-          sudo container images ls
+          sudo container image ls
 
       - name: install docker cli
         run: |
