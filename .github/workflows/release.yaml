@@ -160,11 +160,22 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
 
+      - name: Create & sign the installer
+        run: |
+          make notarize
+        env:
+          BUILD_VERSION: ${{ needs.tag.outputs.socktainerVersion}}
+          APPLE_APPLICATION_ID: ${{ secrets.APPLE_APPLICATION_ID}}
+          APPLE_PRODUCT_ID: ${{ secrets.APPLE_PRODUCT_ID}}  
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
       - name: Upload socktainer binary
         run: |
          gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
          gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
-
+         gh release upload ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
 
   release:
     needs: [tag, build]

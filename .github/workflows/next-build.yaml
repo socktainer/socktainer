@@ -115,7 +115,6 @@ jobs:
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
 
-
       - name: Decode .p12 certificate
         run: |
           echo "$CERTIFICATE_P12_BASE64" | base64 --decode > signing_cert.p12
@@ -159,10 +158,22 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
 
+      - name: Create & sign the installer
+        run: |
+          make notarize
+        env:
+          BUILD_VERSION: ${{ needs.tag.outputs.socktainerVersion}}
+          APPLE_APPLICATION_ID: ${{ secrets.APPLE_APPLICATION_ID}}
+          APPLE_PRODUCT_ID: ${{ secrets.APPLE_PRODUCT_ID}}  
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
       - name: Upload socktainer binary
         run: |
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
 

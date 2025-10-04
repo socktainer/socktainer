@@ -1,0 +1,34 @@
+#!/bin/bash
+
+set -e
+
+echo "Socktainer __VERSION__ installation completed successfully!"
+
+# Verify the installation
+if [ -f "__INSTALL_PREFIX__/bin/socktainer" ]; then
+    echo "✅ socktainer binary installed to __INSTALL_PREFIX__/bin/socktainer"
+    
+    # Make sure it's executable
+    chmod +x "__INSTALL_PREFIX__/bin/socktainer"
+    
+    # Add to system PATH by creating paths.d entry
+    if [ ! -d "/etc/paths.d" ]; then
+        mkdir -p /etc/paths.d
+    fi
+    echo "__INSTALL_PREFIX__/bin" > /etc/paths.d/socktainer
+    echo "✅ Added __INSTALL_PREFIX__/bin to system PATH"
+    
+    echo ""
+    echo "🚀 Quick start:"
+    echo "   Open a new terminal, then run:"
+    echo "   socktainer --help      # Show available commands"
+    echo "   socktainer --version   # Display version information"
+    echo ""
+    echo "   Or use the full path:"
+    echo "   __INSTALL_PREFIX__/bin/socktainer --help"
+    echo ""
+    echo "Happy containerizing! 🍏📦🐳"
+else
+    echo "⚠️  Warning: socktainer binary not found at expected location"
+    exit 1
+fi

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Installation Complete</title>
+</head>
+<body>
+<div style="font-family: Helvetica; padding: 20px;">
+    <h2>Thanks for installing Socktainer!</h2>
+    
+    <p style="color: #020202; font-size: 14px;">
+        <strong>Socktainer __VERSION__ has been successfully installed.</strong>
+    </p>
+    
+    <h3>Getting Started</h3>
+    <p style="color: #020202; font-size: 12px;">
+        You can now use the <code>socktainer</code> command from your terminal.
+    </p>
+    
+    <p style="color: #020202; font-size: 12px;">
+        <strong>Quick start commands:</strong>
+    </p>
+    <ul style="font-size: 12px; color: #020202;">
+        <li><code>socktainer --help</code> - Show help and available commands</li>
+        <li><code>socktainer --version</code> - Display version information</li>
+    </ul>
+    
+    <h3>Installation Location</h3>
+    <p style="color: #555555; font-size: 11px;">
+        Binary installed to: <code>__INSTALL_PREFIX__/bin/socktainer</code>
+    </p>
+    
+    <p style="color: #020202; font-size: 12px;">
+        <strong>Happy containerizing! 🐳</strong>
+    </p>
+</div>
+</body>
+</html>

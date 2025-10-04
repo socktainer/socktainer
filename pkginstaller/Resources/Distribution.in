@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Socktainer __VERSION__</title>
+    <welcome file="welcome.html"/>
+    <conclusion file="conclusion.html"/>
+    <pkg-ref id="com.socktainer.socktainer"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="io.github.socktainer.socktainer"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="io.github.socktainer.socktainer" visible="false">
+        <pkg-ref id="io.github.socktainer.socktainer"/>
+    </choice>
+    <pkg-ref id="io.github.socktainer.socktainer" version="__VERSION__" onConclusion="none">socktainer.pkg</pkg-ref>
+</installer-gui-script>

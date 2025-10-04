@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -e
+
+echo "Preparing to install socktainer..."
+
+# Remove any existing socktainer installation to ensure clean installation
+if [ -d "__INSTALL_PREFIX__" ]; then
+    echo "Removing existing socktainer installation..."
+    rm -rf "__INSTALL_PREFIX__"
+fi
+
+# Remove any existing PATH entries
+if [ -f "/etc/paths.d/socktainer" ]; then
+    echo "Removing existing PATH configuration..."
+    rm -f "/etc/paths.d/socktainer"
+fi
+
+# Ensure the target directory exists
+mkdir -p "__INSTALL_PREFIX__/bin"
+
+echo "Pre-installation checks completed successfully."

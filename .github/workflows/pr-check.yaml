@@ -65,10 +65,19 @@ jobs:
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
 
+      - name: build installer package
+        run: |
+          make installer
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: socktainer-installer
+          path: ./pkginstaller/out/socktainer-installer.pkg
 
   tests-lint-format:
     name: formatters & tests

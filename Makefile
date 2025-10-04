@@ -54,6 +54,22 @@ version:
 	@echo "Docker Engine API Min version: $(DOCKER_ENGINE_API_MIN_VERSION)"
 	@echo "Docker Engine API Max version: $(DOCKER_ENGINE_API_MAX_VERSION)"
 
+.PHONY: help
+help:
+	@echo "Available targets:"
+	@echo "  all              - Build socktainer (default)"
+	@echo "  build            - Build in debug mode"
+	@echo "  release          - Build in release mode"
+	@echo "  test             - Run tests"
+	@echo "  fmt              - Format source code"
+	@echo "  clean            - Clean build artifacts"
+	@echo "  version          - Show version information"
+	@echo "  installer        - Build unsigned macOS .pkg installer"
+	@echo "  installer-signed - Build signed macOS .pkg installer"
+	@echo "  installer-notarized - Build signed and notarized .pkg installer"
+	@echo "  installer-help   - Show detailed installer help"
+	@echo "  help             - Show this help message"
+
 .PHONY: test
 test:
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION)
@@ -67,8 +83,29 @@ swift-fmt:
 	@echo Applying the standard code formatting...
 	@$(SWIFT) format --recursive --configuration .swift-format -i $(SWIFT_SRC)
 
+# Installer targets - delegated to pkginstaller subdirectory
+.PHONY: installer
+installer: release
+	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" pkginstaller
+
+.PHONY: installer-signed
+installer-signed: release
+	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-signed
+
+.PHONY: installer-notarized
+installer-notarized: release
+	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-notarized
+
+.PHONY: installer-help
+installer-help:
+	@$(MAKE) -C pkginstaller help
+
+.PHONY: installer-clean
+installer-clean:
+	@$(MAKE) -C pkginstaller clean
+
 .PHONY: clean
-clean:
+clean: installer-clean
 	@echo Cleaning the build files...
 	@rm -rf bin/ libexec/
 	@$(SWIFT) package clean

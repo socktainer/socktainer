@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Welcome to Socktainer __VERSION__</title>
+</head>
+<body>
+<div style="font-family: Helvetica; padding: 20px;">
+    <h2>Welcome to Socktainer __VERSION__</h2>
+    <p>This installer will install socktainer, a Docker Engine API compatible server for containers.</p>
+    
+    <h3>What is Socktainer?</h3>
+    <p>Socktainer is a lightweight, Docker-compatible container runtime that provides Docker Engine API compatibility</p>
+    
+    <h3>Installation Details</h3>
+    <p>The socktainer binary will be installed to <code>__INSTALL_PREFIX__/bin/socktainer</code></p>
+    <p>The installation directory will be automatically added to your system PATH.</p>
+    <p>After installation, open a new terminal and use socktainer from anywhere.</p>
+    
+    <p><strong>Click Continue to proceed with the installation.</strong></p>
+</div>
+</body>
+</html>
