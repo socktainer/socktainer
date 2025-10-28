@@ -413,7 +413,7 @@ extension BuildRoute {
             noCache: noCache,
             platforms: [Platform](platforms),
             terminal: nil,  // No terminal for API
-            tag: imageName,
+            tags: [imageName],
             target: target,
             quiet: quiet,
             exports: exports,
