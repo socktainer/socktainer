@@ -225,6 +225,9 @@ jobs:
           # https://github.com/socktainer/socktainer/issues/47
           # check image is present
           sudo docker image ls | grep 'quay.io/podman/hello'
+          # Tag images
+          sudo docker image tag httpd test
+          sudo docker image inspect test
 
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails
