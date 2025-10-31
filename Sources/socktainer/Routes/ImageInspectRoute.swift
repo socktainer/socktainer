@@ -110,12 +110,52 @@ extension ImageInspectRoute {
                         }
                         let size = descriptor.size + manifest.config.size + manifest.layers.reduce(0, { (l, r) in l + r.size })
 
+                        let imageConfig: ImageConfig? = config.config.map { ociConfig in
+                            ImageConfig(
+                                User: ociConfig.user,
+                                ExposedPorts: nil,  // Not available in OCI config
+                                Env: ociConfig.env,
+                                Cmd: ociConfig.cmd,
+                                Healthcheck: nil,  // Not available in OCI config
+                                ArgsEscaped: nil,
+                                Volumes: nil,  // Not available in OCI config
+                                WorkingDir: ociConfig.workingDir,
+                                Entrypoint: ociConfig.entrypoint,
+                                OnBuild: nil,  // Not available in OCI config
+                                Labels: ociConfig.labels,
+                                StopSignal: ociConfig.stopSignal,
+                                Shell: nil  // Not available in OCI config
+                            )
+                        }
+
+                        // Build RootFS from manifest layers
+                        let rootFS = RootFS(
+                            rootfsType: config.rootfs.type,
+                            Layers: config.rootfs.diffIDs
+                        )
+
                         let summary = RESTImageInspect(
                             Id: image.digest,
+                            Descriptor: nil,  // Not readily available
+                            Manifests: nil,  // Not readily available
                             RepoTags: [details.name],
-                            RepoDigests: [],
-                            Created: iso8601Formatter.string(from: date),
-                            Size: size, )
+                            RepoDigests: [],  // Would need registry information
+                            Parent: nil,  // Not available from OCI format
+                            Comment: nil,  // Not available from OCI format
+                            Created: config.created,
+                            DockerVersion: nil,  // Not available from OCI format
+                            Author: config.author,
+                            Config: imageConfig,
+                            Architecture: config.architecture,
+                            Variant: config.variant,
+                            Os: config.os,
+                            OsVersion: config.osVersion,
+                            Size: size,
+                            VirtualSize: size,  // Same as Size for compatibility
+                            GraphDriver: nil,  // Storage driver info not available
+                            RootFS: rootFS,
+                            Metadata: nil  // Local metadata not available
+                        )
 
                         return summary
                     }
