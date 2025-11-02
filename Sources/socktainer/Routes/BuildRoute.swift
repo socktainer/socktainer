@@ -90,7 +90,7 @@ extension BuildRoute {
             let contextDir: String
             let buildUUID = UUID().uuidString
             let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
-            let appSupportDir = homeDirectory.appendingPathComponent(".socktainer").appendingPathComponent(".build")
+            let appSupportDir = homeDirectory.appendingPathComponent(".socktainer").appendingPathComponent("builder")
             let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
 
             do {
@@ -413,7 +413,7 @@ extension BuildRoute {
             noCache: noCache,
             platforms: [Platform](platforms),
             terminal: nil,  // No terminal for API
-            tag: imageName,
+            tags: [imageName],
             target: target,
             quiet: quiet,
             exports: exports,
