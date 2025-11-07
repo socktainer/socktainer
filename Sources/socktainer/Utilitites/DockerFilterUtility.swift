@@ -203,3 +203,49 @@ struct DockerVolumeFilterUtility {
         return parsedFilters
     }
 }
+
+struct DockerImageFilterUtility {
+    static func parseImagePruneFilters(filterParam: String?, logger: Logger) -> [String: [String]] {
+        var parsedFilters: [String: [String]] = [:]
+
+        if let filterParam = filterParam {
+            if let data = filterParam.data(using: .utf8) {
+                do {
+                    // First try to parse as generic JSON to see what we got
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        for (key, value) in json {
+                            switch key {
+                            case "dangling", "label", "until":
+                                // Handle dictionary format: {"dangling": {"true": true}}
+                                if let dict = value as? [String: Any] {
+                                    let keys = dict.compactMap { (k, v) in
+                                        (v as? Bool == true) ? k : nil
+                                    }
+                                    if !keys.isEmpty {
+                                        parsedFilters[key] = keys
+                                    }
+                                }
+                                // Handle array format: {"dangling": ["true"]}
+                                else if let arr = value as? [String] {
+                                    parsedFilters[key] = arr
+                                }
+                                // Handle single string: {"dangling": "true"}
+                                else if let str = value as? String {
+                                    parsedFilters[key] = [str]
+                                }
+                            default:
+                                logger.warning("Unknown filter key '\(key)'")
+                            }
+                        }
+                    }
+                } catch {
+                    logger.warning("Failed to decode filters: \(error)")
+                }
+            } else {
+                logger.warning("Failed to convert filter param to data")
+            }
+        }
+
+        return parsedFilters
+    }
+}

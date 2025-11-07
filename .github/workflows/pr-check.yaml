@@ -228,6 +228,9 @@ jobs:
           # Tag images
           sudo docker image tag httpd test
           sudo docker image inspect test
+          # Prune images
+          sudo docker image prune --all --force
+          [[ "1" == $(sudo docker image ls | wc -l | xargs) ]]
 
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails

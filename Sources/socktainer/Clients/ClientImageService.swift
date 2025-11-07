@@ -10,6 +10,7 @@ protocol ClientImageProtocol: Sendable {
     func delete(id: String) async throws
     func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error>
     func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error>
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
 }
 
 enum ClientImageError: Error {
@@ -218,5 +219,173 @@ struct ClientImageService: ClientImageProtocol {
                 }
             }
         }
+    }
+
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64) {
+        let allImages = try await list()
+        var imagesToDelete: [ClientImage] = []
+
+        let allContainers = try await ClientContainer.list()
+        let imagesInUse = Set(allContainers.map { $0.configuration.image.reference })
+
+        for image in allImages {
+            var shouldDelete = false
+            let reference = image.reference
+
+            do {
+                _ = try await image.details()
+
+                if imagesInUse.contains(reference) {
+                    continue
+                }
+
+                let isDangling = reference.contains("<none>") || reference.contains("@sha256:")
+
+                if let danglingFilters = filters["dangling"] {
+                    if let danglingValue = danglingFilters.first {
+                        let shouldBeDangling = (danglingValue == "true" || danglingValue == "1")
+                        if shouldBeDangling {
+                            shouldDelete = isDangling
+                        } else {
+                            shouldDelete = true
+                        }
+                    }
+                } else {
+                    shouldDelete = isDangling
+                }
+
+                var imageConfig: ContainerizationOCI.Image?
+                if shouldDelete && (filters["label"] != nil || filters["until"] != nil) {
+                    // Get the config for the first available platform
+                    let manifests = try await image.index().manifests
+
+                    for descriptor in manifests {
+                        guard let platform = descriptor.platform else { continue }
+
+                        do {
+                            imageConfig = try await image.config(for: platform)
+                            break
+                        } catch {
+                            continue
+                        }
+                    }
+                }
+
+                if shouldDelete, let labelFilters = filters["label"], let config = imageConfig {
+                    var allLabelsMatch = true
+                    for labelFilter in labelFilters {
+                        if let eqIdx = labelFilter.firstIndex(of: "=") {
+                            let key = String(labelFilter[..<eqIdx])
+                            let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
+                            if config.config?.labels?[key] != value {
+                                allLabelsMatch = false
+                                break
+                            }
+                        } else {
+                            if config.config?.labels?[labelFilter] == nil {
+                                allLabelsMatch = false
+                                break
+                            }
+                        }
+                    }
+
+                    shouldDelete = shouldDelete && allLabelsMatch
+                }
+
+                if shouldDelete, let untilFilters = filters["until"], let config = imageConfig {
+                    let createdIso8601 = config.created ?? "1970-01-01T00:00:00Z"
+
+                    let iso8601Formatter = ISO8601DateFormatter()
+                    iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    var imageCreationDate = iso8601Formatter.date(from: createdIso8601)
+
+                    if imageCreationDate == nil {
+                        iso8601Formatter.formatOptions = [.withInternetDateTime]
+                        imageCreationDate = iso8601Formatter.date(from: createdIso8601)
+                    }
+
+                    if let imageCreationDate = imageCreationDate {
+                        var matchesUntil = false
+
+                        for untilValue in untilFilters {
+                            iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                            var untilDate = iso8601Formatter.date(from: untilValue)
+
+                            if untilDate == nil {
+                                iso8601Formatter.formatOptions = [.withInternetDateTime]
+                                untilDate = iso8601Formatter.date(from: untilValue)
+                            }
+
+                            if untilDate == nil {
+                                if let unixTimestamp = TimeInterval(untilValue) {
+                                    untilDate = Date(timeIntervalSince1970: unixTimestamp)
+                                }
+                            }
+
+                            if let untilDate = untilDate {
+                                if imageCreationDate < untilDate {
+                                    matchesUntil = true
+                                    break
+                                }
+                            } else {
+                                logger.warning("Failed to parse until timestamp: \(untilValue)")
+                            }
+                        }
+
+                        shouldDelete = shouldDelete && matchesUntil
+                    } else {
+                        logger.warning("Failed to parse image creation date: \(createdIso8601)")
+                        shouldDelete = false
+                    }
+                }
+
+            } catch {
+                logger.warning("Failed to get details for image \(image.reference): \(error)")
+                continue
+            }
+
+            if shouldDelete {
+                imagesToDelete.append(image)
+            }
+        }
+
+        var deletedImages: [String] = []
+        var spaceReclaimed: Int64 = 0
+
+        for image in imagesToDelete {
+            do {
+                let reference = image.reference
+
+                let manifests = try await image.index().manifests
+
+                for descriptor in manifests {
+                    if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
+                        referenceType == "attestation-manifest"
+                    {
+                        continue
+                    }
+
+                    guard let platform = descriptor.platform else {
+                        continue
+                    }
+
+                    do {
+                        let manifest = try await image.manifest(for: platform)
+                        // Calculate size: descriptor + config + all layers
+                        let imageSize = descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
+                        spaceReclaimed += imageSize
+                    } catch {
+                        continue
+                    }
+                }
+
+                try await delete(id: reference)
+                deletedImages.append(reference)
+            } catch {
+                logger.warning("Failed to delete image \(image.reference): \(error)")
+            }
+        }
+
+        return (deletedImages, spaceReclaimed)
     }
 }
