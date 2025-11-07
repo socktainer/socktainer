@@ -217,7 +217,12 @@ extension ContainerCreateRoute {
             }
 
             containerConfiguration.publishedPorts = publishedPorts
-            containerConfiguration.labels = body.Labels ?? [:]
+
+            var labels = body.Labels ?? [:]
+            // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
+            //       https://github.com/apple/container/issues/302
+            labels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
+            containerConfiguration.labels = labels
 
             var resolvedMounts: [Filesystem] = []
 

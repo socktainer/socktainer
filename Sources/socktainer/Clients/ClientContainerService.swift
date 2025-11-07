@@ -59,6 +59,13 @@ struct ClientContainerService: ClientContainerProtocol {
                 containers = containers.filter { container in
                     for beforeId in values {
                         if let beforeContainer = allContainers.first(where: { $0.id == beforeId || $0.id.hasPrefix(beforeId) }) {
+                            if let beforeTimestampStr = beforeContainer.configuration.labels["io.github.socktainer.creation-timestamp"],
+                                let beforeTimestamp = TimeInterval(beforeTimestampStr),
+                                let containerTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
+                                let containerTimestamp = TimeInterval(containerTimestampStr)
+                            {
+                                return containerTimestamp < beforeTimestamp
+                            }
                             return container.id < beforeContainer.id
                         }
                     }
@@ -68,6 +75,13 @@ struct ClientContainerService: ClientContainerProtocol {
                 containers = containers.filter { container in
                     for sinceId in values {
                         if let sinceContainer = allContainers.first(where: { $0.id == sinceId || $0.id.hasPrefix(sinceId) }) {
+                            if let sinceTimestampStr = sinceContainer.configuration.labels["io.github.socktainer.creation-timestamp"],
+                                let sinceTimestamp = TimeInterval(sinceTimestampStr),
+                                let containerTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
+                                let containerTimestamp = TimeInterval(containerTimestampStr)
+                            {
+                                return containerTimestamp > sinceTimestamp
+                            }
                             return container.id > sinceContainer.id
                         }
                     }
@@ -268,20 +282,34 @@ struct ClientContainerService: ClientContainerProtocol {
 
         for (key, values) in filters {
             switch key {
-            // NOTE: Currently this filter is useless, since Apple container doesn't
-            //       store creation date for containers.
             case "until":
                 containersToDelete = containersToDelete.filter { container in
+                    guard let creationTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
+                        let creationTimestamp = TimeInterval(creationTimestampStr)
+                    else {
+                        // If label is not present or invalid, don't prune
+                        return false
+                    }
+                    let creationDate = Date(timeIntervalSince1970: creationTimestamp)
+
                     for timestamp in values {
+                        let untilDate: Date?
                         let dateFormatter = ISO8601DateFormatter()
-                        if dateFormatter.date(from: timestamp) != nil {
-                            return true
+                        if let date = dateFormatter.date(from: timestamp) {
+                            untilDate = date
                         } else if let unixTimestamp = TimeInterval(timestamp) {
-                            let date = Date(timeIntervalSince1970: unixTimestamp)
-                            return Date() < date
+                            untilDate = Date(timeIntervalSince1970: unixTimestamp)
+                        } else {
+                            untilDate = nil
+                        }
+
+                        if let untilDate = untilDate {
+                            if creationDate < untilDate {
+                                return true  // Prune if created before the 'until' timestamp
+                            }
                         }
                     }
-                    return values.isEmpty
+                    return false
                 }
             case "label":
                 containersToDelete = containersToDelete.filter { container in

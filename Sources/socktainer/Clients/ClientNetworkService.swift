@@ -125,7 +125,11 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
-        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat, labels: labels)
+        // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
+        //       https://github.com/apple/container/issues/665
+        var mutableLabels = labels
+        mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
+        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat, labels: mutableLabels)
         let state = try await ClientNetwork.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")
@@ -155,12 +159,22 @@ extension RESTNetworkSummary {
             labels = config.labels
         }
 
+        let createdTimestamp: String
+        if let timestampStr = labels["io.github.socktainer.creation-timestamp"],
+            let timestamp = Double(timestampStr)
+        {
+            let date = Date(timeIntervalSince1970: timestamp)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            createdTimestamp = formatter.string(from: date)
+        } else {
+            createdTimestamp = "1970-01-01T00:00:00Z"
+        }
+
         self.init(
             Name: id,
             Id: id,
-            // NOTE: Apple container doesn't return creation timestamp
-            //       https://github.com/apple/container/issues/665
-            Created: "1970-01-01T00:00:00Z",  // Default to epoch time
+            Created: createdTimestamp,
             Scope: "local",  // We will always use "local", other modes are not available
             Driver: driver,
             EnableIPv4: true,

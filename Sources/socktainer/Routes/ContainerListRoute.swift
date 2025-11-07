@@ -96,6 +96,15 @@ extension ContainerListRoute {
                     )
                 }
 
+                let createdTimestamp: Int64
+                if let timestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
+                    let timestamp = Double(timestampStr)
+                {
+                    createdTimestamp = Int64(timestamp)
+                } else {
+                    createdTimestamp = 0
+                }
+
                 return RESTContainerSummary(
                     Id: container.id,
                     Names: ["/" + container.id],
@@ -103,7 +112,7 @@ extension ContainerListRoute {
                     ImageID: container.configuration.image.digest,
                     ImageManifestDescriptor: nil,
                     Command: ([container.configuration.initProcess.executable] + container.configuration.initProcess.arguments).joined(separator: " "),
-                    Created: 0,  // Default to epoch time for Apple containers
+                    Created: createdTimestamp,
                     Ports: ports,
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container
                     SizeRootFs: nil,  // there is no mechanism to retrieve this value from apple container
