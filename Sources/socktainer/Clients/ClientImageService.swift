@@ -8,9 +8,15 @@ import TerminalProgress
 protocol ClientImageProtocol: Sendable {
     func list() async throws -> [ClientImage]
     func delete(id: String) async throws
-    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error>
-    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error>
+    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    >
+    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    >
     func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
+    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
+    func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
 }
 
 enum ClientImageError: Error {
@@ -42,8 +48,10 @@ struct ClientImageService: ClientImageProtocol {
         try await ClientImage.delete(reference: id, garbageCollect: false)
     }
 
-    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
-        let normalizedImage = RegistryUtility.normalizeImageReference(image)
+    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    > {
+        let normalizedImage = ContainerImageUtility.normalizeImageReference(image)
         let reference: String
         if let tag = tag, !tag.isEmpty {
             if tag.starts(with: "sha256:") {
@@ -78,12 +86,8 @@ struct ClientImageService: ClientImageProtocol {
             continuation.yield("Trying to pull \(reference)")
             Task {
                 do {
-                    // Use the same ImageStore path as the daemon to ensure images are registered properly
-                    let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-                    let daemonRoot = appSupportDir.appendingPathComponent("com.apple.container")
-                    let imageStore = try ImageStore(path: daemonRoot)
+                    let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
 
-                    // Use ImageStore.pull directly with authentication
                     let image = try await imageStore.pull(
                         reference: reference,
                         platform: platform,
@@ -125,8 +129,10 @@ struct ClientImageService: ClientImageProtocol {
         }
     }
 
-    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
-        let normalizedReference = RegistryUtility.normalizeImageReference(reference)
+    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    > {
+        let normalizedReference = ContainerImageUtility.normalizeImageReference(reference)
 
         logger.info("Pushing image reference: \(normalizedReference)")
 
@@ -165,9 +171,7 @@ struct ClientImageService: ClientImageProtocol {
             continuation.yield("Trying to push \(normalizedReference)")
             Task {
                 do {
-                    let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-                    let daemonRoot = appSupportDir.appendingPathComponent("com.apple.container")
-                    let imageStore = try ImageStore(path: daemonRoot)
+                    let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
 
                     try await imageStore.push(
                         reference: normalizedReference,
@@ -387,5 +391,138 @@ struct ClientImageService: ClientImageProtocol {
         }
 
         return (deletedImages, spaceReclaimed)
+    }
+
+    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
+        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let dockerFormatPath = tempDir.appendingPathComponent("docker-format")
+        try FileManager.default.createDirectory(at: dockerFormatPath, withIntermediateDirectories: true)
+
+        try TarUtility.extract(tarPath: tarballPath, to: dockerFormatPath)
+
+        let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
+        try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
+
+        let loadedImages = try await ContainerImageUtility.convertDockerTarToOCI(
+            dockerFormatPath: dockerFormatPath,
+            ociLayoutPath: ociLayoutPath,
+            logger: logger
+        )
+
+        let images = try await imageStore.load(
+            from: ociLayoutPath,
+            progress: { progressEvents in
+                for event in progressEvents {
+                    logger.debug("Load progress event: \(event.event) = \(event.value)")
+                }
+            })
+
+        for image in loadedImages {
+            logger.info("Loaded image: \(image)")
+        }
+
+        logger.info("Successfully loaded \(images.count) image(s) from tarball")
+
+        return loadedImages
+    }
+
+    func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let exportPath = tempDir.appendingPathComponent("oci-layout")
+        try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
+
+        var resolvedRefs: [String] = []
+
+        for reference in references {
+            let candidatesToTry: [String] = {
+                var candidates: [String] = []
+
+                candidates.append(reference)
+
+                if !reference.contains(":") && !reference.contains("@sha256:") {
+                    candidates.append("\(reference):latest")
+                }
+
+                let normalized = ContainerImageUtility.normalizeImageReference(reference)
+                if normalized != reference {
+                    candidates.append(normalized)
+                    if !normalized.contains(":") && !normalized.contains("@sha256:") {
+                        candidates.append("\(normalized):latest")
+                    }
+                }
+
+                return candidates
+            }()
+
+            var resolved = false
+            for candidate in candidatesToTry {
+                do {
+                    _ = try await ClientImage.get(reference: candidate)
+                    logger.debug("Image exists: \(candidate)")
+                    resolvedRefs.append(candidate)
+                    resolved = true
+                    break
+                } catch {
+                    continue
+                }
+            }
+
+            if !resolved {
+                logger.error("Image not found: \(reference)")
+                throw ClientImageError.notFound(id: reference)
+            }
+        }
+
+        do {
+            try await imageStore.save(
+                references: resolvedRefs,
+                out: exportPath,
+                platform: platform
+            )
+        } catch {
+            let errorDescription = String(describing: error)
+            logger.error("Failed to export images: \(errorDescription)")
+
+            if errorDescription.contains("notFound") && errorDescription.localizedCaseInsensitiveContains("content with digest") {
+                let detailedMessage =
+                    "Export failed: ContentStore missing blob data. This is a limitation of Apple's Containerization framework. The image metadata exists but the underlying content blobs are not available."
+                logger.error("\(detailedMessage)")
+                throw ClientImageError.notFound(id: detailedMessage)
+            }
+            throw error
+        }
+
+        let dockerFormatPath = tempDir.appendingPathComponent("docker-format")
+        try FileManager.default.createDirectory(at: dockerFormatPath, withIntermediateDirectories: true)
+
+        let dockerManifests = try await ContainerImageUtility.convertOCIToDockerTar(
+            ociLayoutPath: exportPath,
+            dockerFormatPath: dockerFormatPath,
+            resolvedRefs: resolvedRefs,
+            logger: logger
+        )
+
+        let dockerManifestData = try JSONSerialization.data(withJSONObject: dockerManifests, options: [.prettyPrinted])
+        try dockerManifestData.write(to: dockerFormatPath.appendingPathComponent("manifest.json"))
+
+        let tarballPath = tempDir.appendingPathComponent("images.tar")
+
+        try TarUtility.create(tarPath: tarballPath, from: dockerFormatPath)
+
+        logger.info("Successfully exported \(references.count) image(s) to tarball in Docker format")
+
+        return tarballPath
     }
 }

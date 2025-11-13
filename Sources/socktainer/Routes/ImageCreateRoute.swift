@@ -25,7 +25,7 @@ extension ImageCreateRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             let query = try req.query.decode(RESTImageCreateQuery.self)
-            let image = RegistryUtility.normalizeImageReference(query.fromImage ?? "")
+            let image = ContainerImageUtility.normalizeImageReference(query.fromImage ?? "")
             let tag = query.tag ?? ""
             let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform
@@ -53,9 +53,14 @@ extension ImageCreateRoute {
                 }
             }
 
+            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
+                throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
+            }
+
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
-            let progressStream = try await client.pull(image: image, tag: decodedTag, platform: platform, registryAuth: registryAuth, logger: req.logger)
+            let progressStream = try await client.pull(
+                image: image, tag: decodedTag, platform: platform, registryAuth: registryAuth, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
 
             response.body = .init(stream: { writer in
                 Task {

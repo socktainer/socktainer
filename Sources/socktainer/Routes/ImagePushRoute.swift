@@ -60,6 +60,10 @@ extension ImagePushRoute {
                 platform = nil
             }
 
+            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
+                throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
+            }
+
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
 
@@ -67,6 +71,7 @@ extension ImagePushRoute {
                 reference: reference,
                 platform: platform,
                 registryAuth: registryAuth,
+                appleContainerAppSupportUrl: appleContainerAppSupportUrl,
                 logger: req.logger
             )
 

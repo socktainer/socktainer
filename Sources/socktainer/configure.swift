@@ -1,5 +1,9 @@
 import Vapor
 
+struct AppleContainerAppSupportUrlKey: StorageKey {
+    typealias Value = URL
+}
+
 func configure(_ app: Application) async throws {
 
     let containerClient = ClientContainerService()
@@ -53,7 +57,6 @@ func configure(_ app: Application) async throws {
 
     // /images
     try app.register(collection: ImageDeleteRoute(client: imageClient))
-    try app.register(collection: ImageGetRoute())
     try app.register(collection: ImageHistoryRoute())
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
@@ -62,8 +65,8 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ImageSearchRoute())
     try app.register(collection: ImageInspectRoute(client: imageClient))
     try app.register(collection: ImageTagRoute())
-    try app.register(collection: ImagesGetRoute())
-    try app.register(collection: ImagesLoadRoute())
+    try app.register(collection: ImagesGetRoute(client: imageClient))
+    try app.register(collection: ImagesLoadRoute(client: imageClient))
 
     // /volumes
     try app.register(collection: VolumeCreateRoute(client: volumeClinet))
@@ -151,9 +154,11 @@ func configure(_ app: Application) async throws {
     app.storage[EventBroadcasterKey.self] = broadcaster
 
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
-    let parentFolderURL = URL(fileURLWithPath: folderPath)
+    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
 
-    let watcher = FolderWatcher(parentFolderURL: parentFolderURL, broadcaster: broadcaster)
+    app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
+
+    let watcher = FolderWatcher(parentFolderURL: appleContainerAppSupportUrl, broadcaster: broadcaster)
     app.storage[FolderWatcherKey.self] = watcher
 
     // Await starting watching
