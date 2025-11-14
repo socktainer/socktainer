@@ -5,10 +5,7 @@ import Vapor
 struct ContainerInspectRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "containers", ":id", "json", use: ContainerInspectRoute.handler(client: client))
-        // also handle without version prefix
-        routes.get("containers", ":id", "json", use: ContainerInspectRoute.handler(client: client))
-
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/json", use: ContainerInspectRoute.handler(client: client))
     }
 }
 

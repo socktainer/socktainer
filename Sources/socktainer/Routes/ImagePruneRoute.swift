@@ -18,7 +18,7 @@ struct ImagePruneRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "images", "prune", use: handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/images/prune", use: handler)
     }
 }
 

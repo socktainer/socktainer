@@ -2,7 +2,7 @@ import Vapor
 
 struct CommitRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "commit", use: CommitRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/commit", use: CommitRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

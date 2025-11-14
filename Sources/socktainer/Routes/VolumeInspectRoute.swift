@@ -4,7 +4,7 @@ struct VolumeInspectRoute: RouteCollection {
     let client: ClientVolumeService
 
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "volumes", ":name", use: self.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/volumes/{name}", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> Response {

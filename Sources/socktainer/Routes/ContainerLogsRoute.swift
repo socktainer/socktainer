@@ -5,10 +5,7 @@ import Vapor
 struct ContainerLogsRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "containers", ":id", "logs", use: ContainerLogsRoute.handler(client: client))
-        // also handle without version prefix
-        routes.get("containers", ":id", "logs", use: ContainerLogsRoute.handler(client: client))
-
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/logs", use: ContainerLogsRoute.handler(client: client))
     }
 }
 

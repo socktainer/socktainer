@@ -8,7 +8,7 @@ struct ContainerKillQuery: Content {
 struct ContainerKillRoute: RouteCollection {
     let client: ClientContainerService
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "kill", use: ContainerKillRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/kill", use: ContainerKillRoute.handler(client: client))
     }
 }
 

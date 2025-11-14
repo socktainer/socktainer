@@ -3,7 +3,7 @@ import Vapor
 struct HealthCheckPingRoute: RouteCollection {
     let client: ClientHealthCheckProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.get("_ping", use: HealthCheckPingRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/_ping", use: HealthCheckPingRoute.handler(client: client))
     }
 }
 

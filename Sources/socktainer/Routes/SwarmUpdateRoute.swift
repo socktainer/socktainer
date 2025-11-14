@@ -2,7 +2,7 @@ import Vapor
 
 struct SwarmUpdateRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "swarm", "update", use: SwarmUpdateRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/swarm/update", use: SwarmUpdateRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

@@ -2,7 +2,7 @@ import Vapor
 
 struct PluginsPrivilegesRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "plugins", "privileges", use: PluginsPrivilegesRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/plugins/privileges", use: PluginsPrivilegesRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

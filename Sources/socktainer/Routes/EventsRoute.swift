@@ -4,8 +4,7 @@ import Vapor
 struct EventsRoute: RouteCollection {
     let client: ClientHealthCheckProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "events", use: EventsRoute.handler(client: client))
-        routes.get("events", use: EventsRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/events", use: EventsRoute.handler(client: client))
     }
 
 }

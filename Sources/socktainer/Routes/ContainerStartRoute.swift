@@ -3,9 +3,7 @@ import Vapor
 struct ContainerStartRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "start", use: ContainerStartRoute.handler(client: client))
-        // also handle without version prefix
-        routes.post("containers", ":id", "start", use: ContainerStartRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/start", use: ContainerStartRoute.handler(client: client))
     }
 }
 

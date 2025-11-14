@@ -2,7 +2,7 @@ import Vapor
 
 struct ContainerPauseRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "pause", use: ContainerPauseRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/pause", use: ContainerPauseRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

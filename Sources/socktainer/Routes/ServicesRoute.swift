@@ -2,7 +2,7 @@ import Vapor
 
 struct ServicesRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "services", use: ServicesRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/services", use: ServicesRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

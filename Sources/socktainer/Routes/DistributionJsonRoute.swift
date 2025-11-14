@@ -2,7 +2,7 @@ import Vapor
 
 struct DistributionJsonRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "distribution", ":name", "json", use: DistributionJsonRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/distribution/{name}/json", use: DistributionJsonRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

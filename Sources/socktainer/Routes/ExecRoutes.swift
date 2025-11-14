@@ -62,12 +62,9 @@ struct ExecRoute: RouteCollection {
     let client: ClientContainerProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "exec", use: ExecRoute.createExec(client: client))
-        routes.post("containers", ":id", "exec", use: ExecRoute.createExec(client: client))
-        routes.get(":version", "exec", ":id", "json", use: ExecRoute.inspectExec(client: client))
-        routes.get("exec", ":id", "json", use: ExecRoute.inspectExec(client: client))
-        routes.post(":version", "exec", ":id", "start", use: ExecRoute.startExec(client: client))
-        routes.post("exec", ":id", "start", use: ExecRoute.startExec(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/exec", use: ExecRoute.createExec(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/exec/{id}/json", use: ExecRoute.inspectExec(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/start", use: ExecRoute.startExec(client: client))
     }
 
     static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {

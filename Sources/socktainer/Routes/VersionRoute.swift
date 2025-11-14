@@ -2,9 +2,7 @@ import Vapor
 
 struct VersionRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "version", use: VersionRoute.handler)
-        // also handle without version prefix
-        routes.get("version", use: VersionRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/version", use: VersionRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

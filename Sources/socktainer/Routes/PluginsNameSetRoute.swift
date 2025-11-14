@@ -2,7 +2,7 @@ import Vapor
 
 struct PluginsNameSetRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "plugins", ":name", "set", use: PluginsNameSetRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/plugins/{name}/set", use: PluginsNameSetRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

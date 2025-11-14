@@ -2,7 +2,7 @@ import Vapor
 
 struct ContainerChangesRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "containers", ":id", "changes", use: ContainerChangesRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/changes", use: ContainerChangesRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

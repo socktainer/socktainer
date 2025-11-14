@@ -21,7 +21,7 @@ struct NetworksCreateQuery: Content {
 struct NetworkCreateRoute: RouteCollection {
     let client: ClientNetworkProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "networks", "create", use: self.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/networks/create", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> Response {

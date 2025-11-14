@@ -3,7 +3,7 @@ import Vapor
 
 struct InfoRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "info", use: InfoRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/info", use: InfoRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

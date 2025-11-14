@@ -7,7 +7,7 @@ struct VolumeCreateRoute: RouteCollection {
     }
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "volumes", "create", use: self.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/volumes/create", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> Volume {

@@ -3,10 +3,7 @@ import Vapor
 struct ContainerStopRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "stop", use: ContainerStopRoute.handler(client: client))
-        // also handle without version prefix
-        routes.post("containers", ":id", "stop", use: ContainerStopRoute.handler(client: client))
-
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/stop", use: ContainerStopRoute.handler(client: client))
     }
 }
 

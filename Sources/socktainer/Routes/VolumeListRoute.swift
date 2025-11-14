@@ -16,8 +16,7 @@ struct VolumeListRoute: RouteCollection {
     }
 
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "volumes", use: self.handler)
-        routes.get("volumes", use: self.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/volumes", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> VolumeListResponse {

@@ -11,7 +11,7 @@ struct VolumePruneRoute: RouteCollection {
     }
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "volumes", "prune", use: self.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/volumes/prune", use: self.handler)
     }
 
     struct PruneResponse: Content {

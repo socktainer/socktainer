@@ -9,9 +9,7 @@ struct ContainerListRoute: RouteCollection {
     let client: ClientContainerProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "containers", "json", use: ContainerListRoute.handler(client: client))
-        // also handle without version prefix
-        routes.get("containers", "json", use: ContainerListRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/json", use: ContainerListRoute.handler(client: client))
     }
 }
 

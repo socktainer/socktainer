@@ -4,7 +4,7 @@ struct NetworkDeletetRoute: RouteCollection {
     let client: ClientNetworkProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.delete(":version", "networks", ":id", use: self.handler)
+        try routes.registerVersionedRoute(.DELETE, pattern: "/networks/{id}", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> Response {

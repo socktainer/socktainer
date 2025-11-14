@@ -12,8 +12,7 @@ struct ContainerWaitRoute: RouteCollection {
     let client: ClientContainerProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", ":id", "wait", use: ContainerWaitRoute.handler(client: client))
-        routes.post("containers", ":id", "wait", use: ContainerWaitRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/wait", use: ContainerWaitRoute.handler(client: client))
     }
 
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerWait {

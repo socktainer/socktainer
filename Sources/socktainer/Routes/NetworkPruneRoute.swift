@@ -3,7 +3,7 @@ import Vapor
 struct NetworkPruneRoute: RouteCollection {
     let client: ClientNetworkProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "networks", "prune", use: NetworkPruneRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/networks/prune", use: NetworkPruneRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

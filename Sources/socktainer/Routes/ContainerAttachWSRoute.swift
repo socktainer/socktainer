@@ -2,7 +2,7 @@ import Vapor
 
 struct ContainerAttachWSRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "containers", ":id", "attach", "ws", use: ContainerAttachWSRoute.handler)
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/attach/ws", use: ContainerAttachWSRoute.handler)
     }
 
     static func handler(_ req: Request) async throws -> Response {

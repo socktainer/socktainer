@@ -3,10 +3,7 @@ import Vapor
 struct ContainerDeleteRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        routes.delete(":version", "containers", ":id", use: ContainerDeleteRoute.handler(client: client))
-        // also handle without version prefix
-        routes.delete("containers", ":id", use: ContainerDeleteRoute.handler(client: client))
-
+        try routes.registerVersionedRoute(.DELETE, pattern: "/containers/{id}", use: ContainerDeleteRoute.handler(client: client))
     }
 
 }

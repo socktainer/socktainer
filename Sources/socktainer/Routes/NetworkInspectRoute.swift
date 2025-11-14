@@ -9,9 +9,7 @@ struct NetworkInspectRoute: RouteCollection {
     let client: ClientNetworkProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.get(":version", "networks", ":id", use: NetworkInspectRoute.handler(client: client))
-        // Optionally, add route without version prefix
-        routes.get("networks", ":id", use: NetworkInspectRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/networks/{id}", use: NetworkInspectRoute.handler(client: client))
     }
 
     static func handler(client: ClientNetworkProtocol) -> @Sendable (Request) async throws -> RESTNetworkSummary {

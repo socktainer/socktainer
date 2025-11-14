@@ -13,7 +13,7 @@ struct ContainerPruneRoute: RouteCollection {
     let client: ClientContainerProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        routes.post(":version", "containers", "prune", use: handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/prune", use: handler)
     }
 }
 
