@@ -7,6 +7,9 @@ import Vapor
 struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, help: "Show version")
     var version: Bool = false
+
+    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility and exit")
+    var checkCompatibility: Bool = true
 }
 
 // Parse CLI before starting the app
@@ -16,8 +19,17 @@ if options.version {
     print("socktainer: \(getBuildVersion()) (git commit: \(getBuildGitCommit()))")
     exit(0)
 }
+
+if options.checkCompatibility {
+    await AppleContainerVersionCheck.performCompatibilityCheck()
+}
+
+// Ignore real CLI args for Vapor: always behave like `socktainer serve`
+let executable = CommandLine.arguments.first ?? "socktainer"
+let vaporArgs = [executable, "serve"]
+
 // Detect environment and set up logging
-var env = try Environment.detect()
+var env = try Environment.detect(arguments: vaporArgs)
 try LoggingSystem.bootstrap(from: &env)
 
 // Create and configure the Vapor application
