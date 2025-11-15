@@ -19,3 +19,5 @@ const char* get_build_time();
 const char* get_docker_engine_api_min_version();
 
 const char* get_docker_engine_api_max_version();
+
+const char* get_apple_container_version();
