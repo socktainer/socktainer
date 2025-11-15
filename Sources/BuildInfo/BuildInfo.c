@@ -19,3 +19,7 @@ const char* get_docker_engine_api_min_version(void) {
 const char* get_docker_engine_api_max_version(void) {
     return DOCKER_ENGINE_API_MAX_VERSION;
 }
+
+const char* get_apple_container_version(void) {
+    return APPLE_CONTAINER_VERSION;
+}
