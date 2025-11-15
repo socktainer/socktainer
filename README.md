@@ -1,5 +1,40 @@
 # Socktainer 🚢
 
+> [!IMPORTANT]
+> Both `socktainer` and [Apple container](https://github.com/apple/container) are still under heavy development!
+
+> [!NOTE]
+> `socktainer` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
+>
+> Progress is tracked in [#14](https://github.com/socktainer/socktainer/issues/14) and [#90](https://github.com/socktainer/socktainer/issues/90).
+
+<!--toc:start-->
+
+- [Socktainer 🚢](#socktainer-🚢)
+  - [Quick Start ⚡](#quick-start)
+    - [Launch socktainer 🏁](#launch-socktainer-🏁)
+    - [Using Docker CLI 🐳](#using-docker-cli-🐳)
+  - [Key Features ✨](#key-features)
+  - [Requirements 📋](#requirements-📋)
+  - [Installation 🛠️](#installation-🛠️)
+    - [Homebrew](#homebrew)
+      - [Stable Release](#stable-release)
+      - [Pre Release](#pre-release)
+    - [GitHub Releases](#github-releases)
+  - [Usage 🚀](#usage-🚀)
+  - [Building from Source 🏗️](#building-from-source-🏗️)
+    - [Prerequisites](#prerequisites)
+    - [Build & Run](#build-run)
+    - [Testing ✅](#testing)
+  - [Contributing 🤝](#contributing-🤝)
+    - [Workflow](#workflow)
+    - [Developer Notes 🧑‍💻](#developer-notes-🧑‍💻)
+  - [Security & Limitations ⚠️](#security-limitations-️)
+  - [Community 💬](#community-💬)
+  - [License 📄](#license-📄)
+  - [Acknowledgements 🙏](#acknowledgements-🙏)
+  <!--toc:end-->
+
 Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries 🍏📦.
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
@@ -54,12 +89,38 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ## Requirements 📋
 
-- **macOS on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻  
-  [Apple container requirements](https://github.com/apple/container/blob/main/README.md#requirements) 
+- **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
+- **Apple Container 0.6.0**
 
 ---
 
 ## Installation 🛠️
+
+### Homebrew
+
+`socktainer` is shipped via a homebrew tap:
+
+```shell
+brew tap socktainer/tap
+```
+
+#### Stable Release
+
+Install the official release:
+
+```shell
+brew install socktainer
+```
+
+#### Pre Release
+
+Install development release:
+
+```shell
+brew install socktainer-next
+```
+
+### GitHub Releases
 
 Download from socktainer [releases](https://github.com/socktainer/socktainer/releases) page the zip or binary. Ensure the binary has execute permissions (`+x`) before running it.
 
@@ -75,7 +136,7 @@ Refer to **Quick Start** above for immediate usage examples.
 
 ### Prerequisites
 
-- **Swift 6.2** (requirements from Apple container)  
+- **Swift 6.2** (requirements from Apple container)
 - **Xcode 26** (select the correct toolchain if installed in a custom location)
 
 ```bash
@@ -118,13 +179,13 @@ make test
 
 ## Contributing 🤝
 
-We welcome contributions!  
+We welcome contributions!
 
 ### Workflow
 
-1. Fork the repository and create a feature branch 🌿  
-2. Open a PR against `main` with a clear description 📝  
-3. Add or update tests for new behavior (see `Tests/socktainerTests`) ✔️  
+1. Fork the repository and create a feature branch 🌿
+2. Open a PR against `main` with a clear description 📝
+3. Add or update tests for new behavior (see `Tests/socktainerTests`) ✔️
 4. Keep changes small and focused. Document API or behavioral changes in the PR description 📚
 
 ### Developer Notes 🧑‍💻
@@ -149,8 +210,8 @@ We welcome contributions!
 
 Join the Socktainer community to ask questions, share ideas, or get help:
 
-- **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users  
-- **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features  
+- **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users
+- **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
 - **GitHub Issues**: [socktainer/issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
 
 ## License 📄
@@ -161,5 +222,5 @@ See the `LICENSE` file in the repository root.
 
 ## Acknowledgements 🙏
 
-- Built using **Apple containerization libraries** 🍏  
+- Built using **Apple containerization libraries** 🍏
 - Enables Docker CLI and other Docker clients to interact with local macOS containers 🐳💻
