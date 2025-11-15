@@ -14,11 +14,11 @@ extension AuthRoute {
             let collectedBuffer = try await req.body.collect().get()
 
             if let buffer = collectedBuffer {
-                let bodyData = buffer.getString(at: 0, length: buffer.readableBytes)
+                _ = buffer.getString(at: 0, length: buffer.readableBytes)
 
                 if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
                     do {
-                        let authConfig = try JSONDecoder().decode(AuthConfig.self, from: data)
+                        _ = try JSONDecoder().decode(AuthConfig.self, from: data)
                     } catch {
                         req.logger.error("Failed to decode content from buffer: \(error)")
                     }

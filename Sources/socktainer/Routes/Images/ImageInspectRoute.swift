@@ -105,7 +105,7 @@ extension ImageInspectRoute {
                         }
 
                         // Use guard to ensure we now have a valid date
-                        guard let date = formattedDate else {
+                        guard formattedDate != nil else {
                             continue  // or return, depending on context
                         }
                         let size = descriptor.size + manifest.config.size + manifest.layers.reduce(0, { (l, r) in l + r.size })

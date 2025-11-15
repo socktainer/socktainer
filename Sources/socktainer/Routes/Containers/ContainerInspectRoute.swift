@@ -67,25 +67,20 @@ extension ContainerInspectRoute {
             let mounts = container.configuration.mounts.map { mount in
                 let mountType: String
                 let mountName: String?
-                let driver: String?
 
                 switch mount.type {
                 case .block(_, _, _):
                     mountType = "bind"
                     mountName = nil
-                    driver = nil
                 case .volume(let name, _, _, _):
                     mountType = "volume"
                     mountName = name
-                    driver = "local"
                 case .virtiofs:
                     mountType = "bind"
                     mountName = nil
-                    driver = nil
                 case .tmpfs:
                     mountType = "tmpfs"
                     mountName = nil
-                    driver = nil
                 }
 
                 let isReadonly = mount.options.readonly
