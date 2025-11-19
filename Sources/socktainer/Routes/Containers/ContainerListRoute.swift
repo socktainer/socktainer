@@ -115,8 +115,8 @@ extension ContainerListRoute {
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container
                     SizeRootFs: nil,  // there is no mechanism to retrieve this value from apple container
                     Labels: container.configuration.labels,
-                    State: container.status.rawValue,
-                    Status: container.status.rawValue,
+                    State: container.status.mobyState,
+                    Status: container.status.mobyState,
                     HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),
                     NetworkSettings: ContainerNetworkSummary(Networks: networkSettings.isEmpty ? nil : networkSettings),
                     Mounts: mounts,

@@ -31,7 +31,7 @@ struct ClientContainerService: ClientContainerProtocol {
         for (key, values) in filters {
             switch key {
             case "status":
-                containers = containers.filter { values.contains($0.status.rawValue) }
+                containers = containers.filter { values.contains($0.status.mobyState) }
             case "exited":
                 containers = containers.filter { container in
                     guard container.status == .stopped else { return false }

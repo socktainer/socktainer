@@ -155,7 +155,7 @@ extension ContainerInspectRoute {
             // Enhanced container state with better timestamp handling
 
             let containerState: ContainerState = ContainerState(
-                Status: container.status.rawValue,
+                Status: container.status.mobyState,
                 Running: container.status == .running,
                 Paused: false,  // Apple containers don't have a paused state like Docker
                 Restarting: false,
