@@ -89,8 +89,8 @@ extension BuildRoute {
             // Extract tar archive from request body and unpack to temporary directory
             let contextDir: String
             let buildUUID = UUID().uuidString
-            let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
-            let appSupportDir = homeDirectory.appendingPathComponent(".socktainer").appendingPathComponent("builder")
+            let appSupportDir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+                .appendingPathComponent("com.apple.container/builder")
             let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
 
             do {
@@ -371,11 +371,11 @@ extension BuildRoute {
 
         sendStreamMessage(" ---> Setting up build environment")
 
-        // Setup temp directory - use BuildCommand approach
-        let systemHealth = try await ClientHealthCheck.ping(timeout: .seconds(10))
-        let exportPath = systemHealth.appRoot.appendingPathComponent(".build")
+        // Setup temp directory - must use the builder export path that's mounted in buildkit container
+        let builderExportPath = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            .appendingPathComponent("com.apple.container/builder")
         let buildID = UUID().uuidString
-        let tempURL = exportPath.appendingPathComponent(buildID)
+        let tempURL = builderExportPath.appendingPathComponent(buildID)
         try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
 
         // Validate and normalize image name
