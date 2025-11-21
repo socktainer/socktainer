@@ -59,8 +59,8 @@ extension ContainerCreateRoute {
             // use platform "" if not provided
             let containerPlatform = query.platform ?? "linux/\(Arch.hostArchitecture().rawValue)"
 
-            // body contains the Image
-            let body = try req.content.decode(CreateContainerRequest.self)
+            let bodyData = try await req.body.collect().get()!
+            let body = try JSONDecoder().decode(CreateContainerRequest.self, from: bodyData.getData(at: 0, length: bodyData.readableBytes)!)
 
             req.logger.info("Creating container for image: \(body.Image)")
 
