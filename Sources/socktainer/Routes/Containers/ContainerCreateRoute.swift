@@ -57,7 +57,7 @@ extension ContainerCreateRoute {
             let containerName = query.name
 
             // use platform "" if not provided
-            let containerPlatform = query.platform ?? "linux/\(Arch.hostArchitecture().rawValue)"
+            let containerPlatform = (query.platform?.isEmpty == false) ? query.platform! : "linux/\(Arch.hostArchitecture().rawValue)"
 
             let bodyData = try await req.body.collect().get()!
             let body = try JSONDecoder().decode(CreateContainerRequest.self, from: bodyData.getData(at: 0, length: bodyData.readableBytes)!)
