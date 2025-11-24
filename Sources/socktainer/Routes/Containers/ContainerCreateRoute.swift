@@ -181,6 +181,11 @@ extension ContainerCreateRoute {
             var containerConfiguration = ContainerConfiguration(id: id, image: img.description, process: processConfig)
             containerConfiguration.platform = requestedPlatform
 
+            // Enable Rosetta when running amd64 images if on arm64 host
+            if Platform.current.architecture == "arm64" && requestedPlatform.architecture == "amd64" {
+                containerConfiguration.rosetta = true
+            }
+
             // Handle hostname from request - ensure uniqueness to avoid collision
             let hostname = (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())"
 
