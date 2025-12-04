@@ -145,7 +145,7 @@ jobs:
       - name: fetch apple container
         run: |
           APPLE_CONTAINER_VERSION=$(grep 'let appleContainerVersion' Package.swift | sed -E 's/.*"([0-9.]+)".*/\1/')
-          wget https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-${APPLE_CONTAINER_VERSION}-installer-signed.pkg -O container-installer-signed.pkg
+          wget https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-installer-signed.pkg -O container-installer-signed.pkg
 
       - name: install apple container
         run: sudo installer -pkg container-installer-signed.pkg -target / -verbose

@@ -130,7 +130,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
         var mutableLabels = labels
         mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
         let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat, labels: mutableLabels)
-        let state = try await ClientNetwork.create(configuration: configuration)
+        _ = try await ClientNetwork.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")
     }

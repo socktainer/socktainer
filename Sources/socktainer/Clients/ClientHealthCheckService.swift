@@ -7,7 +7,7 @@ protocol ClientHealthCheckProtocol: Sendable {
 
 struct ClientHealthCheckService: ClientHealthCheckProtocol {
     func ping() async throws {
-        try await ClientHealthCheck.ping(timeout: .seconds(1))
+        _ = try await ClientHealthCheck.ping(timeout: .seconds(1))
     }
 
 }

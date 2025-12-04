@@ -371,7 +371,7 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
         // Parse the port specification (e.g., "5432/tcp")
         let components = portSpec.split(separator: "/")
         guard components.count == 2,
-            let containerPort = Int(components[0])
+            let containerPort = UInt16(components[0])
         else {
             continue  // Skip invalid port specifications
         }
@@ -387,18 +387,23 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
             let hostAddress = binding.HostIp?.isEmpty == false ? binding.HostIp! : "0.0.0.0"
 
             // If HostPort is empty/nil, find an available port
-            let hostPort: Int
+            let hostPort: UInt16
             if let hostPortString = binding.HostPort, !hostPortString.isEmpty {
-                hostPort = try Int(hostPortString) ?? findAvailablePort()
+                if let parsedPort = UInt16(hostPortString) {
+                    hostPort = parsedPort
+                } else {
+                    hostPort = UInt16(try findAvailablePort())
+                }
             } else {
-                hostPort = try findAvailablePort()
+                hostPort = UInt16(try findAvailablePort())
             }
 
             let publishPort = PublishPort(
                 hostAddress: hostAddress,
                 hostPort: hostPort,
                 containerPort: containerPort,
-                proto: proto
+                proto: proto,
+                count: 1
             )
 
             publishedPorts.append(publishPort)
