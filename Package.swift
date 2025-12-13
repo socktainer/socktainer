@@ -33,6 +33,7 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 "BuildInfo",
+                "Libarchive",
             ],
         ),
         .testTarget(
@@ -54,6 +55,9 @@ let package = Package(
                 .define("DOCKER_ENGINE_API_MAX_VERSION", to: "\"\(dockerEngineApiMaxVersion)\""),
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(appleContainerVersion)\""),
             ]
+        ),
+        .systemLibrary(
+            name: "Libarchive"
         ),
 
     ]
