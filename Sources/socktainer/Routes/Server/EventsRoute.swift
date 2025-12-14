@@ -1,4 +1,5 @@
 import ContainerClient
+import NIOCore
 import Vapor
 
 struct EventsRoute: RouteCollection {
@@ -28,6 +29,12 @@ extension EventsRoute {
                             buffer.writeString("\n")
                             do {
                                 try await writer.write(.buffer(buffer))
+                            } catch is IOError {
+                                req.logger.debug("Client disconnected (broken pipe)")
+                                break
+                            } catch let error as ChannelError where error == .ioOnClosedChannel {
+                                req.logger.debug("Client disconnected (closed channel)")
+                                break
                             } catch {
                                 // NOTE: Consider improving logging
                                 req.logger.warning("\(event) raised '\(error)'")
