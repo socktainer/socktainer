@@ -19,14 +19,16 @@ extension EventsRoute {
             let response = Response(status: .ok)
             response.headers.add(name: .contentType, value: "application/json")
 
-            response.body = .init(stream: { writer in
+            response.body = .init(asyncStream: { writer in
                 Task {
                     for await event in stream {
                         if let json = try? JSONEncoder().encode(event) {
                             var buffer = req.application.allocator.buffer(capacity: json.count + 1)
                             buffer.writeBytes(json)
                             buffer.writeString("\n")
-                            writer.write(.buffer(buffer)).whenFailure { error in
+                            do {
+                                try await writer.write(.buffer(buffer))
+                            } catch {
                                 // NOTE: Consider improving logging
                                 req.logger.warning("\(event) raised '\(error)'")
                             }
