@@ -432,8 +432,14 @@ extension ContainerAttachRoute {
                                         }
                                         return
                                     }
+                                    guard let data = data else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
 
-                                    if let data = data, !data.isEmpty {
+                                    if !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                                             var outputBuffer = channel.allocator.buffer(capacity: capacity)
@@ -500,8 +506,14 @@ extension ContainerAttachRoute {
                                         }
                                         return
                                     }
+                                    guard let data = data else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
 
-                                    if let data = data, !data.isEmpty {
+                                    if !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                                             var outputBuffer = channel.allocator.buffer(capacity: capacity)
