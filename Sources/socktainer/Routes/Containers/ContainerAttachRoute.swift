@@ -438,6 +438,12 @@ extension ContainerAttachRoute {
                                         }
                                         return
                                     }
+                                    guard !data.isEmpty || !done else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
 
                                     if !data.isEmpty {
                                         channel.eventLoop.execute {
@@ -452,11 +458,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if data.isEmpty && done {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                    } else if !state.shouldStop() {
+                                    if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
@@ -512,6 +514,12 @@ extension ContainerAttachRoute {
                                         }
                                         return
                                     }
+                                    guard !data.isEmpty || !done else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
 
                                     if !data.isEmpty {
                                         channel.eventLoop.execute {
@@ -526,11 +534,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if data.isEmpty && done {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                    } else if !state.shouldStop() {
+                                    if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
