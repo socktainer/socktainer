@@ -414,13 +414,6 @@ extension ContainerAttachRoute {
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
-                                if state.shouldStop() {
-                                    state.finish {
-                                        dispatchIO.close()
-                                    }
-                                    return
-                                }
-
                                 dispatchIO.read(
                                     offset: off_t.max,
                                     length: 8192,
@@ -490,13 +483,6 @@ extension ContainerAttachRoute {
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
-                                if state.shouldStop() {
-                                    state.finish {
-                                        dispatchIO.close()
-                                    }
-                                    return
-                                }
-
                                 dispatchIO.read(
                                     offset: off_t.max,
                                     length: 8192,
