@@ -458,7 +458,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if !state.shouldStop() {
+                                    if done && !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
@@ -534,7 +534,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if !state.shouldStop() {
+                                    if done && !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
