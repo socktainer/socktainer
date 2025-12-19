@@ -426,7 +426,7 @@ extension ContainerAttachRoute {
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
-                                    guard error == 0 else {
+                                    guard !done || error == 0 else {
                                         state.finish {
                                             dispatchIO.close()
                                         }
@@ -494,7 +494,7 @@ extension ContainerAttachRoute {
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
-                                    guard error == 0 else {
+                                    guard !done || error == 0 else {
                                         state.finish {
                                             dispatchIO.close()
                                         }
