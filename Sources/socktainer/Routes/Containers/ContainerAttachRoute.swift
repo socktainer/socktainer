@@ -426,6 +426,13 @@ extension ContainerAttachRoute {
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
+                                    guard error == 0 else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+
                                     if let data = data, !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
@@ -439,7 +446,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done || error != 0 {
+                                    if done {
                                         state.finish {
                                             dispatchIO.close()
                                         }
@@ -487,6 +494,13 @@ extension ContainerAttachRoute {
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
+                                    guard error == 0 else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+
                                     if let data = data, !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
@@ -500,7 +514,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done || error != 0 {
+                                    if done {
                                         state.finish {
                                             dispatchIO.close()
                                         }
