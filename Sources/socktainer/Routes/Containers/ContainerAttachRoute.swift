@@ -405,6 +405,7 @@ extension ContainerAttachRoute {
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
+                                continuation.resume()
                             }
 
                             dispatchIO.setLimit(lowWater: 1)
@@ -416,7 +417,6 @@ extension ContainerAttachRoute {
                                 if state.shouldStop() {
                                     state.finish {
                                         dispatchIO.close()
-                                        continuation.resume()
                                     }
                                     return
                                 }
@@ -442,7 +442,6 @@ extension ContainerAttachRoute {
                                     if done || error != 0 {
                                         state.finish {
                                             dispatchIO.close()
-                                            continuation.resume()
                                         }
                                     } else if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
@@ -467,6 +466,7 @@ extension ContainerAttachRoute {
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
                             ) { error in
+                                continuation.resume()
                             }
 
                             dispatchIO.setLimit(lowWater: 1)
@@ -478,7 +478,6 @@ extension ContainerAttachRoute {
                                 if state.shouldStop() {
                                     state.finish {
                                         dispatchIO.close()
-                                        continuation.resume()
                                     }
                                     return
                                 }
@@ -504,7 +503,6 @@ extension ContainerAttachRoute {
                                     if done || error != 0 {
                                         state.finish {
                                             dispatchIO.close()
-                                            continuation.resume()
                                         }
                                     } else if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
