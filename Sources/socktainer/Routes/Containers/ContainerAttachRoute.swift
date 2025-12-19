@@ -399,24 +399,24 @@ extension ContainerAttachRoute {
             await withTaskGroup(of: Void.self) { group in
                 if let stdoutHandle = stdoutPipe?.fileHandleForReading {
                     group.addTask {
-                        let dispatchIO = DispatchIO(
-                            type: .stream,
-                            fileDescriptor: stdoutHandle.fileDescriptor,
-                            queue: DispatchQueue.global(qos: .userInteractive)
-                        ) { error in
-                        }
-
-                        dispatchIO.setLimit(lowWater: 1)
-                        dispatchIO.setLimit(highWater: 8192)
-
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            let dispatchIO = DispatchIO(
+                                type: .stream,
+                                fileDescriptor: stdoutHandle.fileDescriptor,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { error in
+                                continuation.resume()
+                            }
+
+                            dispatchIO.setLimit(lowWater: 1)
+                            dispatchIO.setLimit(highWater: 8192)
+
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
                                 if state.shouldStop() {
                                     state.finish {
                                         dispatchIO.close()
-                                        continuation.resume()
                                     }
                                     return
                                 }
@@ -442,7 +442,6 @@ extension ContainerAttachRoute {
                                     if done || error != 0 {
                                         state.finish {
                                             dispatchIO.close()
-                                            continuation.resume()
                                         }
                                     } else if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
@@ -461,24 +460,24 @@ extension ContainerAttachRoute {
 
                 if let stderrHandle = stderrPipe?.fileHandleForReading {
                     group.addTask {
-                        let dispatchIO = DispatchIO(
-                            type: .stream,
-                            fileDescriptor: stderrHandle.fileDescriptor,
-                            queue: DispatchQueue.global(qos: .userInteractive)
-                        ) { error in
-                        }
-
-                        dispatchIO.setLimit(lowWater: 1)
-                        dispatchIO.setLimit(highWater: 8192)
-
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            let dispatchIO = DispatchIO(
+                                type: .stream,
+                                fileDescriptor: stderrHandle.fileDescriptor,
+                                queue: DispatchQueue.global(qos: .userInteractive)
+                            ) { error in
+                                continuation.resume()
+                            }
+
+                            dispatchIO.setLimit(lowWater: 1)
+                            dispatchIO.setLimit(highWater: 8192)
+
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
                                 if state.shouldStop() {
                                     state.finish {
                                         dispatchIO.close()
-                                        continuation.resume()
                                     }
                                     return
                                 }
@@ -504,7 +503,6 @@ extension ContainerAttachRoute {
                                     if done || error != 0 {
                                         state.finish {
                                             dispatchIO.close()
-                                            continuation.resume()
                                         }
                                     } else if !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
