@@ -452,7 +452,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done {
+                                    if data.isEmpty && done {
                                         state.finish {
                                             dispatchIO.close()
                                         }
@@ -526,7 +526,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done {
+                                    if data.isEmpty && done {
                                         state.finish {
                                             dispatchIO.close()
                                         }
