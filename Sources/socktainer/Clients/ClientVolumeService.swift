@@ -1,4 +1,5 @@
-import ContainerClient
+import ContainerAPIClient
+import ContainerResource
 import Foundation
 import Vapor
 
@@ -99,7 +100,7 @@ struct ClientVolumeService: ClientVolumeProtocol {
         return Self.convert(result)
     }
 
-    private static func convert(_ v: ContainerClient.Volume) -> Volume {
+    private static func convert(_ v: ContainerResource.Volume) -> Volume {
         Volume(
             Name: v.name,
             Driver: v.driver,

@@ -1,5 +1,5 @@
 import ContainerBuild
-import ContainerClient
+import ContainerAPIClient
 import ContainerImagesServiceClient
 import Containerization
 import ContainerizationError
@@ -448,7 +448,7 @@ extension BuildRoute {
 
         let loaded = try await ClientImage.load(from: destPath.absolutePath())
 
-        for image in loaded {
+        for image in loaded.images {
             sendStreamMessage(" ---> Unpacking image layers")
             try await image.unpack(platform: nil, progressUpdate: { _ in })
         }
