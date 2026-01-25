@@ -25,7 +25,7 @@ extension ContainerListRoute {
             return containers.map { container in
                 let ports = container.configuration.publishedPorts.map { port in
                     ContainerPort(
-                        IP: port.hostAddress,
+                        IP: port.hostAddress.description,
                         PrivatePort: Int(port.containerPort),
                         PublicPort: Int(port.hostPort),
                         type: port.proto.rawValue
@@ -42,8 +42,8 @@ extension ContainerListRoute {
                             Aliases: nil,
                             NetworkID: attachment.network,
                             EndpointID: nil,
-                            Gateway: stripSubnetFromIP(attachment.gateway),
-                            IPAddress: stripSubnetFromIP(attachment.address),
+                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
+                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
                             IPPrefixLen: nil,
                             IPv6Gateway: nil,
                             GlobalIPv6Address: nil,

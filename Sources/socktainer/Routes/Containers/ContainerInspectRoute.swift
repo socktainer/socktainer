@@ -1,4 +1,5 @@
-import ContainerClient
+import ContainerAPIClient
+import ContainerResource
 import Containerization
 import Vapor
 
@@ -107,7 +108,7 @@ extension ContainerInspectRoute {
                 SandboxID: nil,
                 Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
                     .mapValues { bindings in
-                        bindings.map { PortBinding(HostIp: $0.hostAddress, HostPort: "\($0.hostPort)") }
+                        bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
                     },
                 SandboxKey: nil,
                 Networks: Dictionary(
@@ -118,8 +119,8 @@ extension ContainerInspectRoute {
                             Aliases: nil,
                             NetworkID: attachment.network,
                             EndpointID: nil,
-                            Gateway: stripSubnetFromIP(attachment.gateway),
-                            IPAddress: stripSubnetFromIP(attachment.address),
+                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
+                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
                             IPPrefixLen: nil,
                             IPv6Gateway: nil,
                             GlobalIPv6Address: nil,
@@ -138,8 +139,8 @@ extension ContainerInspectRoute {
                             Aliases: nil,
                             NetworkID: attachment.network,
                             EndpointID: nil,
-                            Gateway: stripSubnetFromIP(attachment.gateway),
-                            IPAddress: stripSubnetFromIP(attachment.address),
+                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
+                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
                             IPPrefixLen: nil,
                             IPv6Gateway: nil,
                             GlobalIPv6Address: nil,

@@ -1,6 +1,8 @@
-import ContainerClient
+import ContainerAPIClient
 import ContainerNetworkService
+import ContainerResource
 import Containerization
+import ContainerizationExtras
 import ContainerizationError
 import ContainerizationExtras
 import Foundation
@@ -294,7 +296,7 @@ extension ContainerCreateRoute {
                     let existingVolumes = try await ClientVolume.list()
                     let existingVolume = existingVolumes.first { $0.name == parsed.name }
 
-                    let volume: ContainerClient.Volume
+                    let volume: ContainerResource.Volume
                     if let existing = existingVolume {
                         // Volume exists, use it
                         volume = existing
@@ -399,7 +401,7 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
             }
 
             let publishPort = PublishPort(
-                hostAddress: hostAddress,
+                hostAddress: try IPAddress(hostAddress),
                 hostPort: hostPort,
                 containerPort: containerPort,
                 proto: proto,

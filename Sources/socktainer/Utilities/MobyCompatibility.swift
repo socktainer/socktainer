@@ -1,4 +1,5 @@
-import ContainerClient
+import ContainerAPIClient
+import ContainerResource
 import Foundation
 
 public enum MobyContainerStatus {

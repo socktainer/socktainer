@@ -1,4 +1,4 @@
-import ContainerClient
+import ContainerAPIClient
 
 protocol ClientHealthCheckProtocol: Sendable {
 

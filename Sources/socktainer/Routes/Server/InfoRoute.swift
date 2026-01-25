@@ -1,4 +1,5 @@
-import ContainerClient
+import ContainerAPIClient
+import ContainerResource
 import Vapor
 
 struct InfoRoute: RouteCollection {
