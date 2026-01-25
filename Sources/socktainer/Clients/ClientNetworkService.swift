@@ -1,5 +1,6 @@
-import ContainerClient
+import ContainerAPIClient
 import ContainerNetworkService
+import ContainerResource
 import Foundation
 import Logging
 
@@ -28,7 +29,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
                             Name: container.id,
                             EndpointID: nil,  // Apple container doesn't have a matching field
                             MacAddress: nil,  // Apple container doesn't have a matching field
-                            IPv4Address: attachment.address,
+                            IPv4Address: String(describing: attachment.ipv4Address),
                             IPv6Address: nil
                         )
                         containersForNetwork[container.id] = nc
@@ -129,7 +130,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
         //       https://github.com/apple/container/issues/665
         var mutableLabels = labels
         mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
-        let configuration = try ContainerNetworkService.NetworkConfiguration(id: name, mode: .nat, labels: mutableLabels)
+        let configuration = try NetworkConfiguration(id: name, mode: NetworkMode.nat, labels: mutableLabels)
         _ = try await ClientNetwork.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")
@@ -149,13 +150,13 @@ extension RESTNetworkSummary {
         case .created(let config):
             id = config.id
             driver = String(describing: config.mode)
-            subnet = config.subnet
+            subnet = config.ipv4Subnet.map { String(describing: $0) }
             labels = config.labels
         case .running(let config, let status):
             id = config.id
             driver = String(describing: config.mode)
-            subnet = config.subnet ?? status.address
-            gateway = status.gateway
+            subnet = config.ipv4Subnet.map { String(describing: $0) } ?? String(describing: status.ipv4Subnet)
+            gateway = String(describing: status.ipv4Gateway)
             labels = config.labels
         }
 

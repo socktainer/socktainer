@@ -1,4 +1,4 @@
-import ContainerClient
+import ContainerAPIClient
 import Vapor
 
 struct ContainerKillQuery: Content {
