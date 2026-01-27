@@ -5,6 +5,106 @@ import Foundation
 import SystemPackage
 import Vapor
 
+
+/// Extension to access internal EXT4.Inode properties via unsafe memory access.
+/// This is needed because Apple's ContainerizationEXT4 marks these properties as internal.
+/// TODO: Remove this once Apple makes Inode properties public.
+/// See: https://github.com/apple/containerization - consider submitting a PR
+extension EXT4.Inode {
+    /// File mode (permissions + file type)
+    /// Offset 0, UInt16
+    var extractedMode: UInt16 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 0, as: UInt16.self) }
+    }
+
+    /// User ID (low 16 bits)
+    /// Offset 2, UInt16
+    var extractedUid: UInt16 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 2, as: UInt16.self) }
+    }
+
+    /// File size (low 32 bits)
+    /// Offset 4, UInt32
+    var extractedSizeLow: UInt32 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 4, as: UInt32.self) }
+    }
+
+    /// Modification time (Unix timestamp)
+    /// Offset 16, UInt32
+    var extractedMtime: UInt32 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 16, as: UInt32.self) }
+    }
+
+    /// Group ID (low 16 bits)
+    /// Offset 24, UInt16
+    var extractedGid: UInt16 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 24, as: UInt16.self) }
+    }
+
+    /// File size (high 32 bits)
+    /// Offset 108, UInt32
+    var extractedSizeHigh: UInt32 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 108, as: UInt32.self) }
+    }
+
+    /// User ID (high 16 bits)
+    /// Offset 120, UInt16
+    var extractedUidHigh: UInt16 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 120, as: UInt16.self) }
+    }
+
+    /// Group ID (high 16 bits)
+    /// Offset 122, UInt16
+    var extractedGidHigh: UInt16 {
+        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 122, as: UInt16.self) }
+    }
+
+    /// Block data (for inline symlinks)
+    /// Offset 40, 60 bytes
+    var extractedBlockData: Data {
+        withUnsafeBytes(of: self) { buffer in
+            Data(bytes: buffer.baseAddress!.advanced(by: 40), count: 60)
+        }
+    }
+
+
+    /// Full 64-bit file size
+    var extractedSize: Int64 {
+        Int64(extractedSizeLow) | (Int64(extractedSizeHigh) << 32)
+    }
+
+    /// Full 32-bit user ID
+    var extractedFullUid: UInt32 {
+        UInt32(extractedUid) | (UInt32(extractedUidHigh) << 16)
+    }
+
+    /// Full 32-bit group ID
+    var extractedFullGid: UInt32 {
+        UInt32(extractedGid) | (UInt32(extractedGidHigh) << 16)
+    }
+
+    /// Check if this is a directory
+    var isDirectory: Bool {
+        (extractedMode & 0xF000) == 0x4000
+    }
+
+    /// Check if this is a regular file
+    var isRegularFile: Bool {
+        (extractedMode & 0xF000) == 0x8000
+    }
+
+    /// Check if this is a symbolic link
+    var isSymlink: Bool {
+        (extractedMode & 0xF000) == 0xA000
+    }
+
+    /// Permission bits only (without file type)
+    var extractedPermissions: UInt16 {
+        extractedMode & 0x0FFF
+    }
+}
+
+
 /// Errors specific to archive operations
 enum ClientArchiveError: Error, LocalizedError {
     case containerNotFound(id: String)
@@ -29,6 +129,7 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
+
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
@@ -46,6 +147,7 @@ struct PathStat: Codable {
     }
 }
 
+
 /// Protocol for archive operations on containers
 protocol ClientArchiveProtocol: Sendable {
     /// Get the path to a container's rootfs
@@ -57,6 +159,7 @@ protocol ClientArchiveProtocol: Sendable {
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws
 }
+
 
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
@@ -75,6 +178,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Read a file or directory from a container's filesystem and return as tar data
+    /// This implementation reads only the requested path directly, avoiding full filesystem export.
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
         let rootfsPath = getRootfsPath(containerId: containerId)
 
@@ -88,36 +192,45 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
 
-        // Check if path exists
+        // Check if path exists and get stat
         guard reader.exists(FilePath(normalizedPath)) else {
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
 
-        // Create temporary files
-        let tempDir = FileManager.default.temporaryDirectory
-        let sessionId = UUID().uuidString
-        let fullExportPath = tempDir.appendingPathComponent("\(sessionId)-full.tar")
-        let filteredTarPath = tempDir.appendingPathComponent("\(sessionId)-filtered.tar")
+        let (_, inode) = try reader.stat(FilePath(normalizedPath))
 
-        defer {
-            try? FileManager.default.removeItem(at: fullExportPath)
-            try? FileManager.default.removeItem(at: filteredTarPath)
-        }
-
-        // Export the entire filesystem to a tar archive
-        try reader.export(archive: FilePath(fullExportPath.path))
-
-        // Filter the tar to only include the requested path
-        let stat = try filterTarToPath(
-            sourceTar: fullExportPath,
-            destTar: filteredTarPath,
-            requestedPath: normalizedPath
+        // Create PathStat for the response header
+        let pathStat = PathStat(
+            name: (normalizedPath as NSString).lastPathComponent,
+            size: inode.extractedSize,
+            mode: UInt32(inode.extractedMode),
+            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.extractedMtime))),
+            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, inode: inode) : nil
         )
 
-        // Read the filtered tar data
-        let tarData = try Data(contentsOf: filteredTarPath)
+        // Create temporary directory for tar creation
+        let tempDir = FileManager.default.temporaryDirectory
+        let sessionId = UUID().uuidString
+        let stagingDir = tempDir.appendingPathComponent("\(sessionId)-staging")
+        let tarPath = tempDir.appendingPathComponent("\(sessionId).tar")
 
-        return (tarData: tarData, stat: stat)
+        defer {
+            try? FileManager.default.removeItem(at: stagingDir)
+            try? FileManager.default.removeItem(at: tarPath)
+        }
+
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+
+        // Extract the requested path to the staging directory
+        try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+
+        // Create tar archive from the staging directory
+        try TarUtility.create(tarPath: tarPath, from: stagingDir)
+
+        // Read the tar data
+        let tarData = try Data(contentsOf: tarPath)
+
+        return (tarData: tarData, stat: pathStat)
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
@@ -198,131 +311,66 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
 
-    /// Filter a tar archive to only include entries matching the requested path
-    private func filterTarToPath(sourceTar: URL, destTar: URL, requestedPath: String) throws -> PathStat {
-        let sourceReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: sourceTar
-        )
-
-        let config = ArchiveWriterConfiguration(
-            format: .paxRestricted,
-            filter: .none,
-            options: []
-        )
-        let writer = try ArchiveWriter(configuration: config)
-        try writer.open(file: destTar)
-
-        // Normalize the requested path for matching
-        var matchPath = requestedPath
-        if matchPath.hasPrefix("/") {
-            matchPath = String(matchPath.dropFirst())
+    /// Read symlink target from inode
+    private func readSymlinkTarget(reader: EXT4.EXT4Reader, inode: EXT4.Inode) -> String? {
+        let size = inode.extractedSize
+        if size < 60 {
+            // Fast symlink - target stored in inode block field
+            let blockData = inode.extractedBlockData
+            return String(data: blockData.prefix(Int(size)), encoding: .utf8)
         }
+        // For larger symlinks, we'd need to read from the data blocks
+        // For now, return nil (rare case)
+        return nil
+    }
 
-        var foundStat: PathStat?
-        var foundAnyEntry = false
+    /// Extract a path from the ext4 filesystem to a local directory
+    private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
+        let (_, inode) = try reader.stat(FilePath(sourcePath))
+        let baseName = (sourcePath as NSString).lastPathComponent
 
-        for (entry, streamReader) in sourceReader.makeStreamingIterator() {
-            guard var entryPath = entry.path else {
-                continue
-            }
+        if inode.isDirectory {
+            // Create the directory
+            let dirDest = destDir.appendingPathComponent(baseName)
+            try FileManager.default.createDirectory(at: dirDest, withIntermediateDirectories: true)
 
-            // Normalize entry path
-            if entryPath.hasPrefix("./") {
-                entryPath = String(entryPath.dropFirst(2))
-            }
-            if entryPath.hasPrefix("/") {
-                entryPath = String(entryPath.dropFirst())
-            }
-
-            // Check if this entry matches or is under the requested path
-            let matches = entryPath == matchPath ||
-                entryPath.hasPrefix(matchPath + "/") ||
-                matchPath.isEmpty
-
-            if matches {
-                foundAnyEntry = true
-
-                // Create stat for the exact match
-                if entryPath == matchPath && foundStat == nil {
-                    foundStat = PathStat(
-                        name: (requestedPath as NSString).lastPathComponent,
-                        size: entry.size ?? 0,
-                        mode: UInt32(entry.permissions),
-                        mtime: ISO8601DateFormatter().string(from: entry.modificationDate ?? Date()),
-                        linkTarget: entry.symlinkTarget
-                    )
-                }
-
-                // Calculate relative path from the requested path
-                let relativePath: String
-                if entryPath == matchPath {
-                    relativePath = (requestedPath as NSString).lastPathComponent
-                } else if matchPath.isEmpty {
-                    relativePath = entryPath
-                } else {
-                    relativePath = String(entryPath.dropFirst(matchPath.count + 1))
-                }
-
-                // Write the entry with the relative path
-                let newEntry = WriteEntry()
-                newEntry.path = relativePath
-                newEntry.permissions = entry.permissions
-                newEntry.owner = entry.owner
-                newEntry.group = entry.group
-                newEntry.modificationDate = entry.modificationDate
-                newEntry.contentAccessDate = entry.contentAccessDate
-                newEntry.creationDate = entry.creationDate
-                newEntry.xattrs = entry.xattrs
-                newEntry.fileType = entry.fileType
-
-                if entry.fileType == .symbolicLink {
-                    newEntry.symlinkTarget = entry.symlinkTarget
-                    try writer.writeEntry(entry: newEntry, data: nil)
-                } else if entry.fileType == .directory {
-                    try writer.writeEntry(entry: newEntry, data: nil)
-                } else if entry.fileType == .regular {
-                    newEntry.size = entry.size ?? 0
-                    // Read the file data
-                    var data = Data()
-                    let bufferSize = 64 * 1024
-                    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-                    defer { buffer.deallocate() }
-
-                    while true {
-                        let bytesRead = streamReader.read(buffer, maxLength: bufferSize)
-                        if bytesRead <= 0 {
-                            break
-                        }
-                        data.append(buffer, count: bytesRead)
-                    }
-                    try writer.writeEntry(entry: newEntry, data: data)
-                } else if let hardlink = entry.hardlink {
-                    newEntry.hardlink = hardlink
-                    try writer.writeEntry(entry: newEntry, data: nil)
-                }
-            }
-        }
-
-        try writer.finishEncoding()
-
-        if !foundAnyEntry {
-            throw ClientArchiveError.pathNotFound(path: requestedPath)
-        }
-
-        // If we didn't find an exact match stat, create one for the directory
-        if foundStat == nil {
-            foundStat = PathStat(
-                name: (requestedPath as NSString).lastPathComponent,
-                size: 0,
-                mode: 0o755 | 0x4000,  // Directory mode
-                mtime: ISO8601DateFormatter().string(from: Date()),
-                linkTarget: nil
+            // Set permissions
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: inode.extractedPermissions)],
+                ofItemAtPath: dirDest.path
             )
-        }
 
-        return foundStat!
+            // Recursively extract contents
+            let entries = try reader.listDirectory(FilePath(sourcePath))
+            for entry in entries {
+                let childPath = sourcePath == "/" ? "/\(entry)" : "\(sourcePath)/\(entry)"
+                try extractPathToDirectory(reader: reader, sourcePath: childPath, destDir: dirDest)
+            }
+        } else if inode.isRegularFile {
+            // Read file contents
+            let fileData = try reader.readFile(at: FilePath(sourcePath))
+            let fileDest = destDir.appendingPathComponent(baseName)
+
+            // Write file
+            try fileData.write(to: fileDest)
+
+            // Set permissions and modification time
+            let mtime = Date(timeIntervalSince1970: TimeInterval(inode.extractedMtime))
+            try FileManager.default.setAttributes(
+                [
+                    .posixPermissions: NSNumber(value: inode.extractedPermissions),
+                    .modificationDate: mtime,
+                ],
+                ofItemAtPath: fileDest.path
+            )
+        } else if inode.isSymlink {
+            // Read symlink target
+            if let target = readSymlinkTarget(reader: reader, inode: inode) {
+                let linkDest = destDir.appendingPathComponent(baseName)
+                try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
+            }
+        }
+        // Skip other file types (devices, fifos, sockets)
     }
 
     private func unpackTarToPath(formatter: EXT4.Formatter, tarPath: URL, destinationPath: String) throws {
