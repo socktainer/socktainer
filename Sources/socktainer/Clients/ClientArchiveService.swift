@@ -244,6 +244,142 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
+        // Try optimized in-place modification first
+        // This is O(tar size) instead of O(filesystem size)
+        if let success = try? await putArchiveOptimized(
+            rootfsPath: rootfsPath,
+            destinationPath: normalizedPath,
+            tarData: tarData
+        ), success {
+            return
+        }
+
+        // Fall back to full read-modify-write approach
+        try await putArchiveFallback(
+            rootfsPath: rootfsPath,
+            destinationPath: normalizedPath,
+            tarData: tarData
+        )
+    }
+
+    /// Optimized PUT using EXT4Editor for in-place modification
+    /// Returns true if successful, false if fallback is needed
+    private func putArchiveOptimized(
+        rootfsPath: URL,
+        destinationPath: String,
+        tarData: Data
+    ) async throws -> Bool {
+        // Extract tar to temp directory first to examine contents
+        let tempDir = FileManager.default.temporaryDirectory
+        let sessionId = UUID().uuidString
+        let extractDir = tempDir.appendingPathComponent("\(sessionId)-extract")
+
+        defer {
+            try? FileManager.default.removeItem(at: extractDir)
+        }
+
+        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+        // Write tar and extract it
+        let tarPath = tempDir.appendingPathComponent("\(sessionId).tar")
+        defer { try? FileManager.default.removeItem(at: tarPath) }
+        try tarData.write(to: tarPath)
+
+        // Extract tar to temp directory
+        try TarUtility.extract(tarPath: tarPath, to: extractDir)
+
+        // Open EXT4Editor
+        let editor = try EXT4Editor(devicePath: FilePath(rootfsPath.path))
+
+        // Process extracted files
+        let success = try processExtractedFiles(
+            editor: editor,
+            extractDir: extractDir,
+            basePath: extractDir.path,
+            destinationPath: destinationPath
+        )
+
+        if success {
+            try editor.sync()
+        }
+
+        return success
+    }
+
+    /// Recursively process extracted files and add them to the filesystem
+    private func processExtractedFiles(
+        editor: EXT4Editor,
+        extractDir: URL,
+        basePath: String,
+        destinationPath: String
+    ) throws -> Bool {
+        let fileManager = FileManager.default
+        let contents = try fileManager.contentsOfDirectory(
+            at: extractDir,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        )
+
+        for itemURL in contents {
+            let relativePath = String(itemURL.path.dropFirst(basePath.count))
+            let fullDestPath = destinationPath == "/"
+                ? relativePath
+                : destinationPath + relativePath
+
+            let resourceValues = try itemURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            let isDirectory = resourceValues.isDirectory ?? false
+            let isSymlink = resourceValues.isSymbolicLink ?? false
+
+            if isSymlink {
+                // Handle symlink
+                let target = try fileManager.destinationOfSymbolicLink(atPath: itemURL.path)
+                if editor.exists(path: fullDestPath) {
+                    // Can't overwrite with EXT4Editor, fall back
+                    return false
+                }
+                try editor.addSymlink(path: fullDestPath, target: target)
+            } else if isDirectory {
+                // Handle directory
+                if !editor.exists(path: fullDestPath) {
+                    try editor.createDirectory(path: fullDestPath)
+                }
+                // Recursively process contents
+                let success = try processExtractedFiles(
+                    editor: editor,
+                    extractDir: itemURL,
+                    basePath: basePath,
+                    destinationPath: destinationPath
+                )
+                if !success {
+                    return false
+                }
+            } else {
+                // Handle regular file
+                if editor.exists(path: fullDestPath) {
+                    // Can't overwrite with EXT4Editor, fall back
+                    return false
+                }
+
+                let fileData = try Data(contentsOf: itemURL)
+                let attributes = try fileManager.attributesOfItem(atPath: itemURL.path)
+                let posixPermissions = (attributes[.posixPermissions] as? UInt16) ?? 0o644
+
+                try editor.addFile(
+                    path: fullDestPath,
+                    data: fileData,
+                    mode: posixPermissions
+                )
+            }
+        }
+
+        return true
+    }
+
+    /// Fallback PUT using full read-modify-write approach
+    private func putArchiveFallback(
+        rootfsPath: URL,
+        destinationPath: String,
+        tarData: Data
+    ) async throws {
         // Create temporary files for the operation
         let tempDir = FileManager.default.temporaryDirectory
         let sessionId = UUID().uuidString
@@ -286,7 +422,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         try formatter.unpack(reader: existingReader)
 
         // Step 5: Unpack the new tar at the specified destination path
-        try unpackTarToPath(formatter: formatter, tarPath: inputTarPath, destinationPath: normalizedPath)
+        try unpackTarToPath(formatter: formatter, tarPath: inputTarPath, destinationPath: destinationPath)
 
         // Step 6: Finalize the new filesystem
         try formatter.close()

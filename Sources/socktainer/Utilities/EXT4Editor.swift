@@ -1,13 +1,3 @@
-//===----------------------------------------------------------------------===//
-// EXT4Editor - In-place modification of ext4 filesystems
-//
-// This provides efficient file addition to existing ext4 filesystems without
-// requiring a full read-modify-write cycle. It leverages the same data
-// structures as Apple's ContainerizationEXT4 package.
-//
-// TODO: Submit PR to Apple to add this functionality to ContainerizationEXT4
-//===----------------------------------------------------------------------===//
-
 import ContainerizationEXT4
 import Foundation
 import SystemPackage
