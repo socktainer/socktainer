@@ -414,19 +414,31 @@ extension ContainerAttachRoute {
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
-                                if state.shouldStop() {
-                                    state.finish {
-                                        dispatchIO.close()
-                                    }
-                                    return
-                                }
-
                                 dispatchIO.read(
                                     offset: off_t.max,
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
-                                    if let data = data, !data.isEmpty {
+                                    guard !done || error == 0 else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+                                    guard let data = data else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+                                    guard !data.isEmpty || !done else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+
+                                    if !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                                             var outputBuffer = channel.allocator.buffer(capacity: capacity)
@@ -439,11 +451,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done || error != 0 {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                    } else if !state.shouldStop() {
+                                    if done && !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
@@ -475,19 +483,31 @@ extension ContainerAttachRoute {
                             let state = DockerConnectionState()
 
                             @Sendable func readNextChunk() {
-                                if state.shouldStop() {
-                                    state.finish {
-                                        dispatchIO.close()
-                                    }
-                                    return
-                                }
-
                                 dispatchIO.read(
                                     offset: off_t.max,
                                     length: 8192,
                                     queue: DispatchQueue.global(qos: .userInteractive)
                                 ) { done, data, error in
-                                    if let data = data, !data.isEmpty {
+                                    guard !done || error == 0 else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+                                    guard let data = data else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+                                    guard !data.isEmpty || !done else {
+                                        state.finish {
+                                            dispatchIO.close()
+                                        }
+                                        return
+                                    }
+
+                                    if !data.isEmpty {
                                         channel.eventLoop.execute {
                                             let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                                             var outputBuffer = channel.allocator.buffer(capacity: capacity)
@@ -500,11 +520,7 @@ extension ContainerAttachRoute {
                                         }
                                     }
 
-                                    if done || error != 0 {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                    } else if !state.shouldStop() {
+                                    if done && !state.shouldStop() {
                                         DispatchQueue.global(qos: .userInteractive).async {
                                             readNextChunk()
                                         }
