@@ -2,7 +2,6 @@ import ContainerizationEXT4
 import Foundation
 import SystemPackage
 
-
 /// EXT4 filesystem constants
 private enum EXT4Constants {
     static let superBlockOffset: UInt64 = 1024
@@ -12,7 +11,6 @@ private enum EXT4Constants {
     static let firstInode: UInt32 = 11
     static let inodeSize: UInt32 = 256
 }
-
 
 /// Errors specific to EXT4Editor operations
 public enum EXT4EditorError: Error, LocalizedError {
@@ -48,7 +46,6 @@ public enum EXT4EditorError: Error, LocalizedError {
         }
     }
 }
-
 
 /// On-disk superblock structure (matches Apple's EXT4.SuperBlock layout)
 struct EXT4SuperBlock {
@@ -116,21 +113,22 @@ struct EXT4Inode {
     var blocksLow: UInt32 = 0
     var flags: UInt32 = 0
     var version: UInt32 = 0
-    var block: (
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
-    ) = (
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    )
+    var block:
+        (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        )
     var generation: UInt32 = 0
     var xattrBlockLow: UInt32 = 0
     var sizeHigh: UInt32 = 0
@@ -177,7 +175,6 @@ struct EXT4ExtentLeaf {
     var startLow: UInt32 = 0
 }
 
-
 private enum EXT4FileType: UInt8 {
     case unknown = 0
     case regular = 1
@@ -200,7 +197,6 @@ private enum EXT4ModeFlag: UInt16 {
     case TypeMask = 0xF000
 }
 
-
 /// Editor for in-place modification of ext4 filesystems
 public final class EXT4Editor {
     private let handle: FileHandle
@@ -220,7 +216,6 @@ public final class EXT4Editor {
     private var groupDescriptorSize: Int {
         MemoryLayout<EXT4GroupDescriptor>.size
     }
-
 
     /// Open an existing ext4 filesystem for editing
     public init(devicePath: FilePath) throws {
@@ -258,7 +253,6 @@ public final class EXT4Editor {
     deinit {
         try? handle.close()
     }
-
 
     /// Add a file to the filesystem
     /// - Parameters:
@@ -474,7 +468,6 @@ public final class EXT4Editor {
     public func sync() throws {
         try handle.synchronize()
     }
-
 
     private func loadGroupDescriptors() throws {
         let gdOffset = UInt64(blockSize)  // Group descriptors start after first block
@@ -790,8 +783,8 @@ public final class EXT4Editor {
         inode.uidHigh = UInt16((uid >> 16) & 0xFFFF)
         inode.gid = UInt16(gid & 0xFFFF)
         inode.gidHigh = UInt16((gid >> 16) & 0xFFFF)
-        inode.sizeLow = UInt32(size & 0xFFFFFFFF)
-        inode.sizeHigh = UInt32((size >> 32) & 0xFFFFFFFF)
+        inode.sizeLow = UInt32(size & 0xFFFF_FFFF)
+        inode.sizeHigh = UInt32((size >> 32) & 0xFFFF_FFFF)
         inode.linksCount = 1
         inode.flags = 0x80000  // EXT4_EXTENTS_FL
 
@@ -1003,28 +996,26 @@ public final class EXT4Editor {
 
         if sentinelOffset >= 0 {
             // There's a sentinel entry - check if we can fit in its space
-            if Int(sentinelRecordLen) >= newEntryAlignedSize {
-                newEntryOffset = sentinelOffset
-                newRecordLen = sentinelRecordLen
-            } else {
+            guard Int(sentinelRecordLen) >= newEntryAlignedSize else {
                 throw EXT4EditorError.directoryFull("No space in directory block for new entry")
             }
+            newEntryOffset = sentinelOffset
+            newRecordLen = sentinelRecordLen
         } else if lastRealEntryOffset >= 0 {
             // No sentinel - check if we can split the last real entry's record
             let lastEntryActualSize = (MemoryLayout<EXT4DirectoryEntry>.size + Int(lastRealEntryNameLen) + 3) & ~3
             let availableSpace = Int(lastRealEntryRecordLen) - lastEntryActualSize
 
-            if availableSpace >= newEntryAlignedSize {
-                // Shrink last entry's record length to its actual size
-                let updatedRecordLen = UInt16(lastEntryActualSize)
-                blockData[lastRealEntryOffset + 4] = UInt8(updatedRecordLen & 0xFF)
-                blockData[lastRealEntryOffset + 5] = UInt8((updatedRecordLen >> 8) & 0xFF)
-
-                newEntryOffset = lastRealEntryOffset + lastEntryActualSize
-                newRecordLen = UInt16(Int(blockSize) - newEntryOffset)
-            } else {
+            guard availableSpace >= newEntryAlignedSize else {
                 throw EXT4EditorError.directoryFull("No space in directory block for new entry")
             }
+            // Shrink last entry's record length to its actual size
+            let updatedRecordLen = UInt16(lastEntryActualSize)
+            blockData[lastRealEntryOffset + 4] = UInt8(updatedRecordLen & 0xFF)
+            blockData[lastRealEntryOffset + 5] = UInt8((updatedRecordLen >> 8) & 0xFF)
+
+            newEntryOffset = lastRealEntryOffset + lastEntryActualSize
+            newRecordLen = UInt16(Int(blockSize) - newEntryOffset)
         } else {
             // Empty directory block (shouldn't happen for valid directories)
             newEntryOffset = 0

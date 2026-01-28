@@ -80,7 +80,6 @@ struct EXT4EditorTests {
         return try reader.listDirectory(FilePath(path))
     }
 
-
     @Test("Open existing filesystem")
     func testOpenFilesystem() throws {
         let fsPath = try createTestFilesystem()

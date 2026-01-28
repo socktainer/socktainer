@@ -5,7 +5,6 @@ import Foundation
 import SystemPackage
 import Vapor
 
-
 /// Extension to access internal EXT4.Inode properties via unsafe memory access.
 /// This is needed because Apple's ContainerizationEXT4 marks these properties as internal.
 /// TODO: Remove this once Apple makes Inode properties public.
@@ -67,7 +66,6 @@ extension EXT4.Inode {
         }
     }
 
-
     /// Full 64-bit file size
     var extractedSize: Int64 {
         Int64(extractedSizeLow) | (Int64(extractedSizeHigh) << 32)
@@ -104,7 +102,6 @@ extension EXT4.Inode {
     }
 }
 
-
 /// Errors specific to archive operations
 enum ClientArchiveError: Error, LocalizedError {
     case containerNotFound(id: String)
@@ -129,7 +126,6 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
-
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
@@ -147,7 +143,6 @@ struct PathStat: Codable {
     }
 }
 
-
 /// Protocol for archive operations on containers
 protocol ClientArchiveProtocol: Sendable {
     /// Get the path to a container's rootfs
@@ -159,7 +154,6 @@ protocol ClientArchiveProtocol: Sendable {
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws
 }
-
 
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
@@ -321,7 +315,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         for itemURL in contents {
             let relativePath = String(itemURL.path.dropFirst(basePath.count))
-            let fullDestPath = destinationPath == "/"
+            let fullDestPath =
+                destinationPath == "/"
                 ? relativePath
                 : destinationPath + relativePath
 
@@ -445,7 +440,6 @@ struct ClientArchiveService: ClientArchiveProtocol {
             throw ClientArchiveError.operationFailed(message: "Failed to replace rootfs: \(error.localizedDescription)")
         }
     }
-
 
     /// Read symlink target from inode
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, inode: EXT4.Inode) -> String? {
