@@ -7,8 +7,7 @@ import Vapor
 
 /// Extension to access internal EXT4.Inode properties via unsafe memory access.
 /// This is needed because Apple's ContainerizationEXT4 marks these properties as internal.
-/// TODO: Remove this once Apple makes Inode properties public.
-/// See: https://github.com/apple/containerization - consider submitting a PR
+/// To be removed with the next containerization release (see https://github.com/apple/containerization/pull/500)
 extension EXT4.Inode {
     /// File mode (permissions + file type)
     /// Offset 0, UInt16
