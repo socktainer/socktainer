@@ -6,12 +6,17 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
 
 func configure(_ app: Application) async throws {
 
+    // Define app support path early since it's needed by multiple services
+    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
+    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
+
     let containerClient = ClientContainerService()
     let imageClient = ClientImageService()
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClinet = ClientVolumeService()
     let registryClient = ClientRegistryService()
+    let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -31,7 +36,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ExecRoute(client: containerClient))
 
     // /containers
-    try app.register(collection: ContainerArchiveRoute())
+    try app.register(collection: ContainerArchiveRoute(containerClient: containerClient, archiveClient: archiveClient))
     try app.register(collection: ContainerAttachRoute(client: containerClient))
     try app.register(collection: ContainerAttachWSRoute())
     try app.register(collection: ContainerChangesRoute())
@@ -152,10 +157,6 @@ func configure(_ app: Application) async throws {
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
     app.storage[EventBroadcasterKey.self] = broadcaster
-
-    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
-    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
-
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
     let watcher = FolderWatcher(parentFolderURL: appleContainerAppSupportUrl, broadcaster: broadcaster)
