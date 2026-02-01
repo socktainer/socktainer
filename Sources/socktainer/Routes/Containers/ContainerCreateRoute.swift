@@ -71,6 +71,13 @@ extension ContainerCreateRoute {
             // Validate the requested platform only if provided
             let requestedPlatform = try Platform(from: containerPlatform)
 
+            // Check if image exists locally
+            do {
+                _ = try await ClientImage.get(reference: body.Image)
+            } catch {
+                throw Abort(.notFound, reason: "No such image: \(body.Image)")
+            }
+
             let img = try await ClientImage.fetch(
                 reference: body.Image,
                 platform: requestedPlatform,
