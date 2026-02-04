@@ -5,99 +5,41 @@ import Foundation
 import SystemPackage
 import Vapor
 
-/// Extension to access internal EXT4.Inode properties via unsafe memory access.
-/// This is needed because Apple's ContainerizationEXT4 marks these properties as internal.
-/// To be removed with the next containerization release (see https://github.com/apple/containerization/pull/500)
+/// Extension to add convenience computed properties for EXT4.Inode
 extension EXT4.Inode {
-    /// File mode (permissions + file type)
-    /// Offset 0, UInt16
-    var extractedMode: UInt16 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 0, as: UInt16.self) }
-    }
-
-    /// User ID (low 16 bits)
-    /// Offset 2, UInt16
-    var extractedUid: UInt16 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 2, as: UInt16.self) }
-    }
-
-    /// File size (low 32 bits)
-    /// Offset 4, UInt32
-    var extractedSizeLow: UInt32 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 4, as: UInt32.self) }
-    }
-
-    /// Modification time (Unix timestamp)
-    /// Offset 16, UInt32
-    var extractedMtime: UInt32 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 16, as: UInt32.self) }
-    }
-
-    /// Group ID (low 16 bits)
-    /// Offset 24, UInt16
-    var extractedGid: UInt16 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 24, as: UInt16.self) }
-    }
-
-    /// File size (high 32 bits)
-    /// Offset 108, UInt32
-    var extractedSizeHigh: UInt32 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 108, as: UInt32.self) }
-    }
-
-    /// User ID (high 16 bits)
-    /// Offset 120, UInt16
-    var extractedUidHigh: UInt16 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 120, as: UInt16.self) }
-    }
-
-    /// Group ID (high 16 bits)
-    /// Offset 122, UInt16
-    var extractedGidHigh: UInt16 {
-        withUnsafeBytes(of: self) { $0.load(fromByteOffset: 122, as: UInt16.self) }
-    }
-
-    /// Block data (for inline symlinks)
-    /// Offset 40, 60 bytes
-    var extractedBlockData: Data {
-        withUnsafeBytes(of: self) { buffer in
-            Data(bytes: buffer.baseAddress!.advanced(by: 40), count: 60)
-        }
-    }
-
     /// Full 64-bit file size
-    var extractedSize: Int64 {
-        Int64(extractedSizeLow) | (Int64(extractedSizeHigh) << 32)
+    var size: Int64 {
+        Int64(sizeLow) | (Int64(sizeHigh) << 32)
     }
 
     /// Full 32-bit user ID
-    var extractedFullUid: UInt32 {
-        UInt32(extractedUid) | (UInt32(extractedUidHigh) << 16)
+    var fullUid: UInt32 {
+        UInt32(uid) | (UInt32(uidHigh) << 16)
     }
 
     /// Full 32-bit group ID
-    var extractedFullGid: UInt32 {
-        UInt32(extractedGid) | (UInt32(extractedGidHigh) << 16)
+    var fullGid: UInt32 {
+        UInt32(gid) | (UInt32(gidHigh) << 16)
     }
 
     /// Check if this is a directory
     var isDirectory: Bool {
-        (extractedMode & 0xF000) == 0x4000
+        (mode & 0xF000) == 0x4000
     }
 
     /// Check if this is a regular file
     var isRegularFile: Bool {
-        (extractedMode & 0xF000) == 0x8000
+        (mode & 0xF000) == 0x8000
     }
 
     /// Check if this is a symbolic link
     var isSymlink: Bool {
-        (extractedMode & 0xF000) == 0xA000
+        (mode & 0xF000) == 0xA000
     }
 
     /// Permission bits only (without file type)
-    var extractedPermissions: UInt16 {
-        extractedMode & 0x0FFF
+    var permissions: UInt16 {
+        mode & 0x0FFF
     }
 }
 
@@ -195,10 +137,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Create PathStat for the response header
         let pathStat = PathStat(
             name: (normalizedPath as NSString).lastPathComponent,
-            size: inode.extractedSize,
-            mode: UInt32(inode.extractedMode),
-            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.extractedMtime))),
-            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, inode: inode) : nil
+            size: inode.size,
+            mode: UInt32(inode.mode),
+            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
         )
 
         // Create temporary directory for tar creation
@@ -440,17 +382,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Read symlink target from inode
-    private func readSymlinkTarget(reader: EXT4.EXT4Reader, inode: EXT4.Inode) -> String? {
-        let size = inode.extractedSize
-        if size < 60 {
-            // Fast symlink - target stored in inode block field
-            let blockData = inode.extractedBlockData
-            return String(data: blockData.prefix(Int(size)), encoding: .utf8)
+    /// Read symlink target using the reader's public API
+    private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
+        guard let data = try? reader.readFile(at: FilePath(path), followSymlinks: false) else {
+            return nil
         }
-        // For larger symlinks, we'd need to read from the data blocks
-        // For now, return nil (rare case)
-        return nil
+        return String(data: data, encoding: .utf8)
     }
 
     /// Extract a path from the ext4 filesystem to a local directory
@@ -465,7 +402,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
             // Set permissions
             try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: inode.extractedPermissions)],
+                [.posixPermissions: NSNumber(value: inode.permissions)],
                 ofItemAtPath: dirDest.path
             )
 
@@ -484,17 +421,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try fileData.write(to: fileDest)
 
             // Set permissions and modification time
-            let mtime = Date(timeIntervalSince1970: TimeInterval(inode.extractedMtime))
+            let mtimeDate = Date(timeIntervalSince1970: TimeInterval(inode.mtime))
             try FileManager.default.setAttributes(
                 [
-                    .posixPermissions: NSNumber(value: inode.extractedPermissions),
-                    .modificationDate: mtime,
+                    .posixPermissions: NSNumber(value: inode.permissions),
+                    .modificationDate: mtimeDate,
                 ],
                 ofItemAtPath: fileDest.path
             )
         } else if inode.isSymlink {
             // Read symlink target
-            if let target = readSymlinkTarget(reader: reader, inode: inode) {
+            if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
                 let linkDest = destDir.appendingPathComponent(baseName)
                 try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
             }
