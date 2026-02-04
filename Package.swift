@@ -7,7 +7,8 @@ let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unsp
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "unspecified"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "unspecified"
-let appleContainerVersion = "0.8.0"
+let appleContainerVersion = "0.9.0"
+let appleContainerizationVersion = "0.24.5"
 
 let package = Package(
     name: "socktainer",
@@ -16,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", exact: Version(stringLiteral: appleContainerVersion)),
-        .package(url: "https://github.com/apple/containerization.git", from: "0.21.1"),
+        .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: appleContainerizationVersion)),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.119.2"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.1"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.2"),
