@@ -5,6 +5,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationExtras
 import Foundation
+import SystemPackage
 import Vapor
 
 struct ContainerCreateRoute: RouteCollection {
@@ -228,6 +229,15 @@ extension ContainerCreateRoute {
             }
 
             containerConfiguration.publishedPorts = publishedPorts
+
+            // Configure DNS for the container
+            containerConfiguration.dns = try await DNSUtility.createDNSConfiguration(
+                dnsServers: body.HostConfig?.Dns,
+                dnsSearch: body.HostConfig?.DnsSearch,
+                dnsOptions: body.HostConfig?.DnsOptions,
+                domainname: body.Domainname,
+                networks: containerConfiguration.networks,
+            )
 
             var labels = body.Labels ?? [:]
             // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
