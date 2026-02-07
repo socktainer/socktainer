@@ -406,7 +406,7 @@ struct ClientImageService: ClientImageProtocol {
         let dockerFormatPath = tempDir.appendingPathComponent("docker-format")
         try FileManager.default.createDirectory(at: dockerFormatPath, withIntermediateDirectories: true)
 
-        try TarUtility.extract(tarPath: tarballPath, to: dockerFormatPath)
+        try LibArchiveUtility.extract(tarPath: tarballPath, to: dockerFormatPath)
 
         let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
@@ -519,7 +519,7 @@ struct ClientImageService: ClientImageProtocol {
 
         let tarballPath = tempDir.appendingPathComponent("images.tar")
 
-        try TarUtility.create(tarPath: tarballPath, from: dockerFormatPath)
+        try LibArchiveUtility.create(tarPath: tarballPath, from: dockerFormatPath)
 
         logger.info("Successfully exported \(references.count) image(s) to tarball in Docker format")
 

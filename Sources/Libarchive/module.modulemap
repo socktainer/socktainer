@@ -1,0 +1,6 @@
+module Libarchive {
+    header "include/archive.h"
+    header "include/archive_entry.h"
+    link "archive"
+    export *
+}

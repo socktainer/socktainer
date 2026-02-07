@@ -119,14 +119,18 @@ extension BuildRoute {
                             try fileHandle?.write(contentsOf: data)
                             totalBytesWritten = data.count
                         } else {
-                            // Use ByteBuffer streaming to avoid loading all data into memory
-                            for try await chunk in req.body {
-                                let data = Data(buffer: chunk)
+                            var chunkCount = 0
+                            for try await var chunk in req.body {
+                                guard let data = chunk.readData(length: chunk.readableBytes) else {
+                                    continue
+                                }
+                                chunkCount += 1
                                 try fileHandle?.write(contentsOf: data)
                                 totalBytesWritten += data.count
                             }
                         }
 
+                        try fileHandle?.synchronize()
                         try fileHandle?.close()
                         fileHandle = nil
                     } catch {
@@ -138,27 +142,27 @@ extension BuildRoute {
                     }
 
                     if totalBytesWritten > 0 {
+                        guard FileManager.default.fileExists(atPath: tarPath.path),
+                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
+                            let fileSize = fileAttributes[.size] as? Int64,
+                            fileSize > 0
+                        else {
+                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
+                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+                        }
+
                         // Extract the tar archive
                         let extractDir = tempContextDir.appendingPathComponent("context")
                         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
 
-                        // Use tar command to extract the archive
-                        let process = Process()
-                        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-                        process.arguments = ["-xf", tarPath.path, "-C", extractDir.path]
+                        do {
+                            try LibArchiveUtility.extract(tarPath: tarPath, to: extractDir)
+                        } catch {
+                            req.logger.error("Tar extraction failed: \(error)")
 
-                        // Capture stderr for debugging
-                        let pipe = Pipe()
-                        process.standardError = pipe
+                            let timestamp = Int(Date().timeIntervalSince1970)
 
-                        try process.run()
-                        process.waitUntilExit()
-
-                        guard process.terminationStatus == 0 else {
-                            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
-                            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-                            req.logger.error("Tar extraction failed with status \(process.terminationStatus): \(errorMessage)")
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(errorMessage)")
+                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
                         }
                         contextDir = extractDir.path
                     } else {
