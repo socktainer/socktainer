@@ -233,7 +233,7 @@ extension ContainerCreateRoute {
             let nameservers = body.HostConfig?.Dns ?? []
             let searchDomains = body.HostConfig?.DnsSearch ?? []
             let dnsOptions = body.HostConfig?.DnsOptions ?? []
-            let domain = body.Domainname
+            let domain = (body.Domainname?.isEmpty == false) ? body.Domainname : nil
 
             // Always set DNS configuration to ensure /etc/resolv.conf is created
             // Even if empty, this ensures the file exists in the container
