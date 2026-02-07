@@ -229,6 +229,20 @@ extension ContainerCreateRoute {
 
             containerConfiguration.publishedPorts = publishedPorts
 
+            // Handle DNS configuration from request
+            let nameservers = body.HostConfig?.Dns ?? []
+            let searchDomains = body.HostConfig?.DnsSearch ?? []
+            let dnsOptions = body.HostConfig?.DnsOptions ?? []
+            let domain = body.Domainname
+
+            // Always set DNS configuration to ensure /etc/resolv.conf is created
+            // Even if empty, this ensures the file exists in the container
+            containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                nameservers: nameservers,
+                domain: domain,
+                searchDomains: searchDomains,
+                options: dnsOptions
+            )
             var labels = body.Labels ?? [:]
             // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
             //       https://github.com/apple/container/issues/302
