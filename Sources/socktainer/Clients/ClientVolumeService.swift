@@ -13,12 +13,21 @@ protocol ClientVolumeProtocol: Sendable {
 
 struct ClientVolumeService: ClientVolumeProtocol {
     func create(request: RESTVolumeCreate) async throws -> Volume {
-        let result = try await ClientVolume.create(
-            name: request.Name,
-            driver: request.Driver,
-            driverOpts: request.Options,
-            labels: request.Labels ?? [:]
-        )
+        let existingVolumes = try await ClientVolume.list()
+        let existingVolume = existingVolumes.first { $0.name == request.Name }
+
+        let result: ContainerClient.Volume
+        if let existing = existingVolume {
+            // Volume exists, use it
+            result = existing
+        } else {
+            result = try await ClientVolume.create(
+                name: request.Name,
+                driver: request.Driver,
+                driverOpts: request.Options,
+                labels: request.Labels ?? [:]
+            )
+        }
         return Self.convert(result)
     }
 
