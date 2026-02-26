@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import NIOCore
 import NIOHTTP1
@@ -136,7 +137,7 @@ extension ContainerAttachRoute {
 
                     // Try to get log handles
                     do {
-                        logHandles = try await container.logs()
+                        logHandles = try await ContainerClient().logs(id: container.id)
                         hasValidHandles = !logHandles.isEmpty
                     } catch {
                         hasValidHandles = false
@@ -225,7 +226,7 @@ extension ContainerAttachRoute {
     private static func handleAttachWithStdin(
         req: Request,
         client: ClientContainerProtocol,
-        container: ClientContainer,
+        container: ContainerSnapshot,
         query: ContainerAttachQuery,
         isUpgrade: Bool,
         hasConnectionUpgrade: Bool,
@@ -260,7 +261,7 @@ extension ContainerAttachRoute {
     private static func createContainerForAttachment(
         req: Request,
         client: ClientContainerProtocol,
-        container: ClientContainer,
+        container: ContainerSnapshot,
         query: ContainerAttachQuery,
         shouldUpgrade: Bool,
         isTTY: Bool
@@ -282,7 +283,7 @@ extension ContainerAttachRoute {
 
         let process: ClientProcess
         do {
-            process = try await container.bootstrap(stdio: stdio)
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
         } catch {
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }

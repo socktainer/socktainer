@@ -346,9 +346,11 @@ extension ContainerCreateRoute {
             containerConfiguration.mounts = resolvedMounts
 
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
-            let container: ClientContainer
+            let container: ContainerSnapshot
             do {
-                container = try await ClientContainer.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                let containerClient = ContainerClient()
+                try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                container = try await containerClient.get(id: containerConfiguration.id)
                 req.logger.debug("Container created successfully with ID: \(container.id)")
             } catch {
                 req.logger.error("Failed to create container: \(error)")

@@ -4,9 +4,9 @@ import ContainerizationError
 import Foundation
 
 protocol ClientContainerProtocol: Sendable {
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ClientContainer]
-    func getContainer(id: String) async throws -> ClientContainer?
-    func enforceContainerRunning(container: ClientContainer) throws
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot]
+    func getContainer(id: String) async throws -> ContainerSnapshot?
+    func enforceContainerRunning(container: ContainerSnapshot) throws
 
     func start(id: String, detachKeys: String?) async throws
     func stop(id: String, signal: String?, timeout: Int?) async throws
@@ -23,8 +23,10 @@ enum ClientContainerError: Error {
 }
 
 struct ClientContainerService: ClientContainerProtocol {
-    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ClientContainer] {
-        let allContainers = try await ClientContainer.list()
+    private let containerClient = ContainerClient()
+
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
+        let allContainers = try await containerClient.list()
         var containers = allContainers
         if !showAll {
             containers = containers.filter { $0.status == .running }
@@ -135,15 +137,15 @@ struct ClientContainerService: ClientContainerProtocol {
         return containers
     }
 
-    func getContainer(id: String) async throws -> ClientContainer? {
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
         do {
-            return try await ClientContainer.get(id: id)
+            return try await containerClient.get(id: id)
         } catch let error as ContainerizationError where error.code == .notFound {
             return nil
         }
     }
 
-    func enforceContainerRunning(container: ClientContainer) throws {
+    func enforceContainerRunning(container: ContainerSnapshot) throws {
         guard container.status == .running else {
             throw ClientContainerError.notRunning(id: container.id)
         }
@@ -165,7 +167,7 @@ struct ClientContainerService: ClientContainerProtocol {
         let stdio = [stdin, stdout, stderr]
 
         do {
-            let process = try await container.bootstrap(stdio: stdio)
+            let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
             try await process.start()
         } catch {
             // NOTE: If bootstrap fails because container is already booted,
@@ -181,7 +183,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
-        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -189,11 +191,11 @@ struct ClientContainerService: ClientContainerProtocol {
         let signal = try parseSignal(signal ?? "SIGTERM")
 
         let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
-        try await container.stop(opts: options)
+        try await containerClient.stop(id: container.id, opts: options)
     }
 
     func kill(id: String, signal: String?) async throws {
-        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -204,11 +206,11 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let signal = try parseSignal(signal ?? "SIGKILL")
 
-        try await container.kill(signal)
+        try await containerClient.kill(id: container.id, signal: signal)
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
-        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -221,17 +223,17 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func delete(id: String) async throws {
-        let container = try await ClientContainer.list().filter { $0.id == id }.first
+        let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
-        try await container.delete()
+        try await containerClient.delete(id: container.id)
     }
 
     // NOTE: For Apple Container, we'll implement a simple polling mechanism
     //       since there's no direct wait API
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
-        var container = try await ClientContainer.list().filter { $0.id == id }.first
+        var container = try await containerClient.list().filter { $0.id == id }.first
         guard let initialContainer = container else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -246,7 +248,7 @@ struct ClientContainerService: ClientContainerProtocol {
         case .notRunning:
             // while container?.status == .running {
             //     try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
-            //     container = try await ClientContainer.list().first(where: { $0.id == id })
+            //     container = try await containerClient.list().first(where: { $0.id == id })
             //     guard let container = container else {
             //         break
             //     }
@@ -258,7 +260,7 @@ struct ClientContainerService: ClientContainerProtocol {
             if initialContainer.status == .running {
                 while true {
                     try await Task.sleep(nanoseconds: 500_000_000)  // 0.5 seconds
-                    container = try await ClientContainer.list().first(where: { $0.id == id })
+                    container = try await containerClient.list().first(where: { $0.id == id })
                     if container?.status != .running {
                         exitCode = 0
                         break
@@ -277,9 +279,9 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = try await ClientContainer.list()
+        let allContainers = try await containerClient.list()
 
-        var containersToDelete: [ClientContainer] = allContainers.filter { $0.status == .stopped }
+        var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
 
         for (key, values) in filters {
             switch key {
@@ -352,7 +354,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
         for container in containersToDelete {
             do {
-                try await container.delete()
+                try await containerClient.delete(id: container.id)
                 deletedIds.append(container.id)
             } catch {
                 continue

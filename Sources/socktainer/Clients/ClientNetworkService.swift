@@ -130,7 +130,12 @@ struct ClientNetworkService: ClientNetworkProtocol {
         //       https://github.com/apple/container/issues/665
         var mutableLabels = labels
         mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
-        let configuration = try NetworkConfiguration(id: name, mode: NetworkMode.nat, labels: mutableLabels)
+        let configuration = try NetworkConfiguration(
+            id: name,
+            mode: NetworkMode.nat,
+            labels: mutableLabels,
+            pluginInfo: NetworkPluginInfo(plugin: "container-network-vmnet")
+        )
         _ = try await ClientNetwork.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")

@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Foundation
 import NIOCore
 import Vapor
@@ -22,7 +23,7 @@ extension ContainerLogsRoute {
 
             // always use the container's log, not the boot of the container
             let boot = false
-            let fhs = try await container.logs()
+            let fhs = try await ContainerClient().logs(id: container.id)
             let fileHandle = boot ? fhs[1] : fhs[0]
             // Create a streaming body
             // `follow=1` means tail like

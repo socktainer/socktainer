@@ -229,7 +229,7 @@ struct ClientImageService: ClientImageProtocol {
         let allImages = try await list()
         var imagesToDelete: [ClientImage] = []
 
-        let allContainers = try await ClientContainer.list()
+        let allContainers = try await ContainerClient().list()
         let imagesInUse = Set(allContainers.map { $0.configuration.image.reference })
 
         for image in allImages {

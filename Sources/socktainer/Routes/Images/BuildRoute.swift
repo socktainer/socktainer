@@ -82,6 +82,7 @@ extension BuildRoute {
             let targetImageName = query.t ?? UUID().uuidString.lowercased()
             let quiet = query.q!
             let noCache = query.nocache!
+            let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
             let platform = query.platform!
             let memory = query.memory ?? 2_048_000_000  // 2GB default
@@ -199,6 +200,7 @@ extension BuildRoute {
                             buildArgs: buildArgs,
                             labels: labels,
                             noCache: noCache,
+                            pull: pull,
                             target: target,
                             platform: platform,
                             memory: memory,
@@ -272,6 +274,7 @@ extension BuildRoute {
         buildArgs: [String],
         labels: [String],
         noCache: Bool,
+        pull: Bool,
         target: String,
         platform: String,
         memory: Int,
@@ -331,8 +334,8 @@ extension BuildRoute {
             group.addTask {
                 while true {
                     do {
-                        let container = try await ClientContainer.get(id: "buildkit")
-                        let fh = try await container.dial(8088)  // Default vsock port
+                        let container = try await ContainerClient().get(id: "buildkit")
+                        let fh = try await ContainerClient().dial(id: container.id, port: 8088)  // Default vsock port
 
                         let threadGroup: MultiThreadedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
                         let b = try Builder(socket: fh, group: threadGroup)
@@ -418,7 +421,8 @@ extension BuildRoute {
             quiet: quiet,
             exports: exports,
             cacheIn: [],
-            cacheOut: []
+            cacheOut: [],
+            pull: pull
         )
 
         sendStreamMessage(" ---> Starting build process")

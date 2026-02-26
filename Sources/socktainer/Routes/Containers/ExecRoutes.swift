@@ -207,8 +207,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
-                let process = try await container.createProcess(
-                    id: UUID().uuidString.lowercased(),
+                let process = try await ContainerClient().createProcess(
+                    containerId: container.id,
+                    processId: UUID().uuidString.lowercased(),
                     configuration: processConfig,
                     stdio: [nil, nil, nil]
                 )
@@ -247,8 +248,9 @@ struct ExecRoute: RouteCollection {
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
 
-                    let process = try await container.createProcess(
-                        id: UUID().uuidString.lowercased(),
+                    let process = try await ContainerClient().createProcess(
+                        containerId: container.id,
+                        processId: UUID().uuidString.lowercased(),
                         configuration: processConfig,
                         stdio: stdio.asArray
                     )
@@ -381,8 +383,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
-                let process = try await container.createProcess(
-                    id: UUID().uuidString.lowercased(),
+                let process = try await ContainerClient().createProcess(
+                    containerId: container.id,
+                    processId: UUID().uuidString.lowercased(),
                     configuration: processConfig,
                     stdio: stdio.asArray
                 )

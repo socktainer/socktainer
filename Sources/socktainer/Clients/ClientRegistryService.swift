@@ -73,10 +73,10 @@ struct ClientRegistryService: ClientRegistryProtocol {
 
     func storeCredentials(serverAddress: String, username: String, password: String, logger: Logger) async throws {
         let normalizedServer = normalizeServerAddress(serverAddress)
-        let keychainHelper = KeychainHelper(id: keychainEntryId)
+        let keychainHelper = KeychainHelper(securityDomain: keychainEntryId)
 
         do {
-            try keychainHelper.save(domain: normalizedServer, username: username, password: password)
+            try keychainHelper.save(hostname: normalizedServer, username: username, password: password)
             logger.debug("Credentials stored successfully in keychain for \(normalizedServer)")
         } catch {
             logger.error("Failed to store credentials in keychain: \(error)")
@@ -88,10 +88,10 @@ struct ClientRegistryService: ClientRegistryProtocol {
         let normalizedServer = normalizeServerAddress(serverAddress)
         logger.debug("Retrieving credentials for registry: \(normalizedServer)")
 
-        let keychainHelper = KeychainHelper(id: keychainEntryId)
+        let keychainHelper = KeychainHelper(securityDomain: keychainEntryId)
 
         do {
-            let auth = try keychainHelper.lookup(domain: normalizedServer)
+            let auth = try keychainHelper.lookup(hostname: normalizedServer)
             logger.debug("Credentials found for \(normalizedServer)")
             return auth
         } catch KeychainHelper.Error.keyNotFound {
