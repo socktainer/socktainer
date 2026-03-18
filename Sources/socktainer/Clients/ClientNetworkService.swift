@@ -126,14 +126,10 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
-        // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
-        //       https://github.com/apple/container/issues/665
-        var mutableLabels = labels
-        mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
         let configuration = try NetworkConfiguration(
             id: name,
             mode: NetworkMode.nat,
-            labels: mutableLabels,
+            labels: labels,
             pluginInfo: NetworkPluginInfo(plugin: "container-network-vmnet")
         )
         _ = try await ClientNetwork.create(configuration: configuration)
@@ -165,17 +161,9 @@ extension RESTNetworkSummary {
             labels = config.labels
         }
 
-        let createdTimestamp: String
-        if let timestampStr = labels["io.github.socktainer.creation-timestamp"],
-            let timestamp = Double(timestampStr)
-        {
-            let date = Date(timeIntervalSince1970: timestamp)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            createdTimestamp = formatter.string(from: date)
-        } else {
-            createdTimestamp = "1970-01-01T00:00:00Z"
-        }
+        let createdTimestamp = AppleContainerTimestampResolver.iso8601Timestamp(
+            AppleContainerTimestampResolver.networkCreationDate(networkState)
+        )
 
         self.init(
             Name: id,

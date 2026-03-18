@@ -94,14 +94,9 @@ extension ContainerListRoute {
                     )
                 }
 
-                let createdTimestamp: Int64
-                if let timestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
-                    let timestamp = Double(timestampStr)
-                {
-                    createdTimestamp = Int64(timestamp)
-                } else {
-                    createdTimestamp = 0
-                }
+                let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(
+                    AppleContainerTimestampResolver.containerCreationDate(container)
+                )
 
                 return RESTContainerSummary(
                     Id: container.id,

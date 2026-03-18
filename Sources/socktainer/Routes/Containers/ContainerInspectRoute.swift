@@ -153,7 +153,7 @@ extension ContainerInspectRoute {
                 )
             )
 
-            // Enhanced container state with better timestamp handling
+            let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
 
             let containerState: ContainerState = ContainerState(
                 Status: container.status.mobyState,
@@ -165,13 +165,13 @@ extension ContainerInspectRoute {
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
-                StartedAt: container.status == .running ? "1970-01-01T00:00:00.000000000Z" : "",
+                StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
                 FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""
             )
 
             return RESTContainerInspect(
                 Id: container.id,
-                Created: "1970-01-01T00:00:00.000000000Z",  // Default to epoch time for Apple containers
+                Created: AppleContainerTimestampResolver.iso8601Timestamp(createdAt),
                 Path: container.configuration.initProcess.executable,
                 Args: container.configuration.initProcess.arguments,
                 State: containerState,

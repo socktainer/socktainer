@@ -62,10 +62,8 @@ struct ClientContainerService: ClientContainerProtocol {
                 containers = containers.filter { container in
                     for beforeId in values {
                         if let beforeContainer = allContainers.first(where: { $0.id == beforeId || $0.id.hasPrefix(beforeId) }) {
-                            if let beforeTimestampStr = beforeContainer.configuration.labels["io.github.socktainer.creation-timestamp"],
-                                let beforeTimestamp = TimeInterval(beforeTimestampStr),
-                                let containerTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
-                                let containerTimestamp = TimeInterval(containerTimestampStr)
+                            if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
+                                let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
                                 return containerTimestamp < beforeTimestamp
                             }
@@ -78,10 +76,8 @@ struct ClientContainerService: ClientContainerProtocol {
                 containers = containers.filter { container in
                     for sinceId in values {
                         if let sinceContainer = allContainers.first(where: { $0.id == sinceId || $0.id.hasPrefix(sinceId) }) {
-                            if let sinceTimestampStr = sinceContainer.configuration.labels["io.github.socktainer.creation-timestamp"],
-                                let sinceTimestamp = TimeInterval(sinceTimestampStr),
-                                let containerTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
-                                let containerTimestamp = TimeInterval(containerTimestampStr)
+                            if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
+                                let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
                                 return containerTimestamp > sinceTimestamp
                             }
@@ -287,13 +283,10 @@ struct ClientContainerService: ClientContainerProtocol {
             switch key {
             case "until":
                 containersToDelete = containersToDelete.filter { container in
-                    guard let creationTimestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
-                        let creationTimestamp = TimeInterval(creationTimestampStr)
-                    else {
+                    guard let creationDate = AppleContainerTimestampResolver.containerCreationDate(container) else {
                         // If label is not present or invalid, don't prune
                         return false
                     }
-                    let creationDate = Date(timeIntervalSince1970: creationTimestamp)
 
                     for timestamp in values {
                         let untilDate: Date?
