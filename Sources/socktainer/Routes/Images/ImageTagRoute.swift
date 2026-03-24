@@ -24,12 +24,12 @@ extension ImageTagRoute {
             throw Abort(.badRequest, reason: "repo parameter is required")
         }
 
-        let targetReference: String
-        if let tag = query.tag, !tag.isEmpty {
-            targetReference = "\(repo):\(tag)"
-        } else {
-            targetReference = "\(repo):latest"
-        }
+        let targetReference = try {
+            if let tag = query.tag, !tag.isEmpty {
+                return try ClientImage.normalizeReference("\(repo):\(tag)")
+            }
+            return try ClientImage.normalizeReference(repo)
+        }()
 
         let sourceImage: ClientImage
         do {
