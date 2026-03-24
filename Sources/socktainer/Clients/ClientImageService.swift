@@ -8,10 +8,10 @@ import TerminalProgress
 protocol ClientImageProtocol: Sendable {
     func list() async throws -> [ClientImage]
     func delete(id: String) async throws
-    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
-    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+    func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
     func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
@@ -24,6 +24,41 @@ enum ClientImageError: Error {
 }
 
 struct ClientImageService: ClientImageProtocol {
+    // Workaround for narrowing an unspecified push from all platforms to a single platform available.
+    // This avoids container push failures caused by missing blobs for non local platforms.
+    private func resolvedPushPlatform(for image: ClientImage, requestedPlatform: Platform?, logger: Logger) async throws -> Platform? {
+        guard requestedPlatform == nil else {
+            return requestedPlatform
+        }
+
+        let manifests = try await image.index().manifests
+        var availablePlatforms: [Platform] = []
+
+        for descriptor in manifests {
+            if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
+                referenceType == "attestation-manifest"
+            {
+                continue
+            }
+
+            guard let platform = descriptor.platform else {
+                continue
+            }
+
+            do {
+                _ = try await image.manifest(for: platform)
+                availablePlatforms.append(platform)
+            } catch {
+                logger.debug("Skipping unavailable platform \(platform.description) for push of \(image.reference): \(error)")
+            }
+        }
+
+        if availablePlatforms.count == 1 {
+            return availablePlatforms[0]
+        }
+
+        return nil
+    }
 
     func list() async throws -> [ClientImage] {
         let allImages = try await ClientImage.list()
@@ -48,75 +83,61 @@ struct ClientImageService: ClientImageProtocol {
         try await ClientImage.delete(reference: id, garbageCollect: false)
     }
 
-    func pull(image: String, tag: String?, platform: Platform, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let normalizedImage = ContainerImageUtility.normalizeImageReference(image)
-        let reference: String
-        if let tag = tag, !tag.isEmpty {
-            if tag.starts(with: "sha256:") {
-                reference = "\(normalizedImage)@\(tag)"
-            } else {
-                reference = "\(normalizedImage):\(tag)"
+        let reference = try {
+            guard let tag, !tag.isEmpty else {
+                return try ClientImage.normalizeReference(image)
             }
-        } else {
-            reference = normalizedImage
-        }
+
+            let parsedReference = try Reference.parse(image)
+            let updatedReference: Reference
+            if tag.starts(with: "sha256:") {
+                updatedReference = try parsedReference.withDigest(tag)
+            } else {
+                updatedReference = try parsedReference.withTag(tag)
+            }
+            return try ClientImage.normalizeReference(updatedReference.description)
+        }()
 
         logger.info("Pulling image reference: \(reference)")
-
-        // Create authentication from X-Registry-Auth header if provided
-        let authentication: Authentication? = {
-            guard let auth = registryAuth else {
-                logger.debug("No registry authentication provided")
-                return nil
-            }
-
-            guard let username = auth.username, let password = auth.password else {
-                logger.debug("Registry auth missing username or password")
-                return nil
-            }
-
-            logger.debug("Creating BasicAuthentication for user: \(username)")
-            return BasicAuthentication(username: username, password: password)
-        }()
 
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield("Trying to pull \(reference)")
             Task {
                 do {
-                    let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
-
-                    let image = try await imageStore.pull(
+                    let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
-                        insecure: false,  //Should be revisited later
-                        auth: authentication,
-                        progress: { progressEvents in
+                        progressUpdate: { progressEvents in
                             for event in progressEvents {
-                                switch event.event {
-                                case "add-total-size":
-                                    if let size = event.value as? UInt64 {
-                                        let humanReadableSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-                                        let message = "Downloaded \(humanReadableSize)"
-                                        continuation.yield(message)
-                                    } else if let size = event.value as? Int64 {
-                                        let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-                                        let message = "Downloaded \(humanReadableSize)"
-                                        continuation.yield(message)
-                                    }
-                                case "add-total-items":
-                                    if let items = event.value as? Int {
-                                        let message = "Processing \(items) layer\(items == 1 ? "" : "s")"
-                                        continuation.yield(message)
-                                    }
+                                switch event {
+                                case .setDescription(let description),
+                                    .setSubDescription(let description),
+                                    .setItemsName(let description),
+                                    .custom(let description):
+                                    continuation.yield(description)
+                                case .addTotalSize(let size),
+                                    .setTotalSize(let size),
+                                    .addSize(let size),
+                                    .setSize(let size):
+                                    let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+                                    continuation.yield("Downloaded \(humanReadableSize)")
+                                case .addTotalItems(let items),
+                                    .setTotalItems(let items),
+                                    .addItems(let items),
+                                    .setItems(let items):
+                                    continuation.yield("Processing \(items) layer\(items == 1 ? "" : "s")")
                                 default:
-                                    logger.debug("Progress event: \(event.event) = \(event.value)")
+                                    break
                                 }
                             }
                         }
                     )
+                    continuation.yield("Unpacking image")
+                    try await image.unpack(platform: platform, progressUpdate: nil)
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
                     continuation.yield("Image digest: \(image.digest)")
                     continuation.finish()
@@ -129,10 +150,10 @@ struct ClientImageService: ClientImageProtocol {
         }
     }
 
-    func push(reference: String, platform: Platform?, registryAuth: AuthConfig?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> AsyncThrowingStream<
+    func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let normalizedReference = ContainerImageUtility.normalizeImageReference(reference)
+        let normalizedReference = try ClientImage.normalizeReference(reference)
 
         logger.info("Pushing image reference: \(normalizedReference)")
 
@@ -146,58 +167,39 @@ struct ClientImageService: ClientImageProtocol {
 
         logger.debug("Image reference from ClientImage: \(image.reference)")
 
-        // WARN: Tagged images may fail to push if layers are not properly linked
-        //       in Apple's ImageStore. This is a limitation of the Containerization framework.
-
-        let authentication: Authentication? = {
-            guard let auth = registryAuth else {
-                logger.debug("No registry authentication provided")
-                return nil
-            }
-
-            guard let username = auth.username, let password = auth.password else {
-                logger.debug("Registry auth missing username or password")
-                return nil
-            }
-
-            logger.debug("Creating BasicAuthentication for user: \(username)")
-            return BasicAuthentication(username: username, password: password)
-        }()
+        let effectivePlatform = try await resolvedPushPlatform(for: image, requestedPlatform: platform, logger: logger)
 
         return AsyncThrowingStream { continuation in
-            let platformDesc = platform?.description ?? "default"
+            let platformDesc = effectivePlatform?.description ?? "default"
             logger.info("Starting to push image \(normalizedReference) for platform \(platformDesc)")
             logger.info("Retrieved image object with reference: \(image.reference)")
             continuation.yield("Trying to push \(normalizedReference)")
             Task {
                 do {
-                    let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
-
-                    try await imageStore.push(
-                        reference: normalizedReference,
-                        platform: platform,
-                        insecure: false,  //Should be revisited later
-                        auth: authentication,
-                        progress: { progressEvents in
+                    try await image.push(
+                        platform: effectivePlatform,
+                        scheme: .auto,
+                        progressUpdate: { progressEvents in
                             for event in progressEvents {
-                                switch event.event {
-                                case "add-total-size":
-                                    if let size = event.value as? UInt64 {
-                                        let humanReadableSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-                                        let message = "Uploaded \(humanReadableSize)"
-                                        continuation.yield(message)
-                                    } else if let size = event.value as? Int64 {
-                                        let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-                                        let message = "Uploaded \(humanReadableSize)"
-                                        continuation.yield(message)
-                                    }
-                                case "add-total-items":
-                                    if let items = event.value as? Int {
-                                        let message = "Pushing \(items) layer\(items == 1 ? "" : "s")"
-                                        continuation.yield(message)
-                                    }
+                                switch event {
+                                case .setDescription(let description),
+                                    .setSubDescription(let description),
+                                    .setItemsName(let description),
+                                    .custom(let description):
+                                    continuation.yield(description)
+                                case .addTotalSize(let size),
+                                    .setTotalSize(let size),
+                                    .addSize(let size),
+                                    .setSize(let size):
+                                    let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+                                    continuation.yield("Uploaded \(humanReadableSize)")
+                                case .addTotalItems(let items),
+                                    .setTotalItems(let items),
+                                    .addItems(let items),
+                                    .setItems(let items):
+                                    continuation.yield("Pushing \(items) layer\(items == 1 ? "" : "s")")
                                 default:
-                                    logger.debug("Progress event: \(event.event) = \(event.value)")
+                                    break
                                 }
                             }
                         }
@@ -446,40 +448,11 @@ struct ClientImageService: ClientImageProtocol {
         var resolvedRefs: [String] = []
 
         for reference in references {
-            let candidatesToTry: [String] = {
-                var candidates: [String] = []
-
-                candidates.append(reference)
-
-                if !reference.contains(":") && !reference.contains("@sha256:") {
-                    candidates.append("\(reference):latest")
-                }
-
-                let normalized = ContainerImageUtility.normalizeImageReference(reference)
-                if normalized != reference {
-                    candidates.append(normalized)
-                    if !normalized.contains(":") && !normalized.contains("@sha256:") {
-                        candidates.append("\(normalized):latest")
-                    }
-                }
-
-                return candidates
-            }()
-
-            var resolved = false
-            for candidate in candidatesToTry {
-                do {
-                    _ = try await ClientImage.get(reference: candidate)
-                    logger.debug("Image exists: \(candidate)")
-                    resolvedRefs.append(candidate)
-                    resolved = true
-                    break
-                } catch {
-                    continue
-                }
-            }
-
-            if !resolved {
+            do {
+                let image = try await ClientImage.get(reference: reference)
+                logger.debug("Image exists: \(image.reference)")
+                resolvedRefs.append(image.reference)
+            } catch {
                 logger.error("Image not found: \(reference)")
                 throw ClientImageError.notFound(id: reference)
             }
