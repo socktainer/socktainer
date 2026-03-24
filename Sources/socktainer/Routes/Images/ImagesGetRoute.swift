@@ -19,9 +19,7 @@ struct ImagesGetRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Image name is required")
             }
 
-            let normalizedName = ContainerImageUtility.normalizeImageReference(name)
-
-            return try await saveImages(references: [normalizedName], req: req, client: client)
+            return try await saveImages(references: [name], req: req, client: client)
         }
     }
 
@@ -33,9 +31,7 @@ struct ImagesGetRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "At least one image name is required in 'names' query parameter")
             }
 
-            let normalizedNames = names.map { ContainerImageUtility.normalizeImageReference($0) }
-
-            return try await saveImages(references: normalizedNames, req: req, client: client)
+            return try await saveImages(references: names, req: req, client: client)
         }
     }
 
