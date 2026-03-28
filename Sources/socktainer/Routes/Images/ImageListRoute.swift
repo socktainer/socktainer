@@ -3,6 +3,11 @@ import ContainerResource
 import ContainerizationOCI
 import Vapor
 
+struct RESTImageListQuery: Vapor.Content {
+    let manifests: Bool?
+    let digests: Bool?
+}
+
 struct ImageListRoute: RouteCollection {
     let client: ClientImageProtocol
 
@@ -16,23 +21,67 @@ struct CustomImageDetail: Decodable {
 }
 
 extension ImageListRoute {
+    private static func makeOCIDescriptor(
+        from descriptor: Descriptor,
+        appSupportURL: URL? = nil,
+        parentDigest: String? = nil
+    ) -> OCIDescriptor {
+        let platform = descriptor.platform.map {
+            OCIDescriptor.OCIPlatform(
+                architecture: $0.architecture,
+                os: $0.os,
+                osVersion: $0.osVersion,
+                osFeatures: $0.osFeatures,
+                variant: $0.variant
+            )
+        }
+
+        let extras: AppleContainerImageStoreResolver.DescriptorExtras? =
+            if let appSupportURL, let parentDigest {
+                AppleContainerImageStoreResolver.descriptorExtras(
+                    appSupportURL: appSupportURL,
+                    parentDigest: parentDigest,
+                    childDigest: descriptor.digest
+                )
+            } else {
+                nil
+            }
+
+        return OCIDescriptor(
+            mediaType: descriptor.mediaType,
+            digest: descriptor.digest,
+            size: descriptor.size,
+            urls: descriptor.urls,
+            annotations: descriptor.annotations,
+            data: extras?.data,
+            platform: platform,
+            artifactType: extras?.artifactType
+        )
+    }
+
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageSummary] {
         { req in
-
+            let query = try req.query.decode(RESTImageListQuery.self)
+            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
+                throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
+            }
             let images = try await client.list()
-
+            let containers = try await ContainerClient().list()
+            let includeManifests = query.manifests ?? false
+            let includeDigests = query.digests ?? false
             var imagesSummaries: [RESTImageSummary] = []
 
-            // for each images, grab the details and print
             for image in images {
                 let details: ImageDetail = try await image.details()
-
-                //
-                let manifests = try await image.index().manifests
+                let imageIndex = try await image.index()
+                let manifests = imageIndex.manifests
+                var manifestSummaries: [ImageManifestSummary] = []
+                var created = 0
+                var size: Int64 = 0
+                var labels: [String: String] = [:]
+                var foundUsableManifest = false
 
                 for descriptor in manifests {
-
-                    // skip these manifests
                     if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
                         referenceType == "attestation-manifest"
                     {
@@ -43,59 +92,89 @@ extension ImageListRoute {
                         continue
                     }
 
-                    var config: ContainerizationOCI.Image
-                    var manifest: ContainerizationOCI.Manifest
-
-                    // try to get the config and manifest for the platform
+                    let available: Bool
+                    let manifest: ContainerizationOCI.Manifest?
+                    let config: ContainerizationOCI.Image?
                     do {
-
-                        config = try await image.config(for: platform)
-                        manifest = try await image.manifest(for: platform)
-
+                        let resolvedConfig = try await image.config(for: platform)
+                        let resolvedManifest = try await image.manifest(for: platform)
+                        config = resolvedConfig
+                        manifest = resolvedManifest
+                        available = true
                     } catch {
-                        // ignore failure
-                        continue
+                        config = nil
+                        manifest = nil
+                        available = false
                     }
 
-                    // created is a String value like Optional("2025-05-14T11:03:12.497281595Z"
-                    // need to convert it to a Unix timestamp (number of seconds since EPOCH).
-                    let createdIso8601 = config.created ?? "1970-01-01T00:00:00Z"  // Default to epoch if not available
+                    let contentSize = (manifest?.config.size ?? 0) + (manifest?.layers.reduce(0) { $0 + $1.size } ?? 0)
+                    let totalSize = descriptor.size + contentSize
 
-                    let iso8601Formatter = ISO8601DateFormatter()
-                    iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    var formattedDate = iso8601Formatter.date(from: createdIso8601)
+                    if includeManifests {
+                        let unpackedSize = AppleContainerSnapshotResolver.unpackedSize(
+                            appSupportURL: appleContainerAppSupportUrl,
+                            descriptor: descriptor
+                        )
+                        let platformSummary = descriptor.platform.map {
+                            OCIDescriptor.OCIPlatform(
+                                architecture: $0.architecture,
+                                os: $0.os,
+                                osVersion: $0.osVersion,
+                                osFeatures: $0.osFeatures,
+                                variant: $0.variant
+                            )
+                        }
 
-                    if formattedDate == nil {
-                        // Try without fractional seconds
-                        iso8601Formatter.formatOptions = [.withInternetDateTime]
-                        formattedDate = iso8601Formatter.date(from: createdIso8601)
+                        manifestSummaries.append(
+                            ImageManifestSummary(
+                                ID: descriptor.digest,
+                                Descriptor: makeOCIDescriptor(
+                                    from: descriptor,
+                                    appSupportURL: appleContainerAppSupportUrl,
+                                    parentDigest: details.index.digest
+                                ),
+                                Available: available,
+                                Kind: "image",
+                                Size: .init(Total: totalSize + unpackedSize, Content: contentSize),
+                                ImageData: .init(
+                                    Platform: platformSummary,
+                                    Containers: [],
+                                    Size: .init(Unpacked: unpackedSize)
+                                ),
+                                AttestationData: nil
+                            )
+                        )
                     }
 
-                    // Use guard to ensure we now have a valid date
-                    guard let date = formattedDate else {
-                        continue  // or return, depending on context
+                    if !foundUsableManifest, let config, available {
+                        created = Int(AppleContainerTimestampResolver.unixTimestampSeconds(config.created))
+                        size = totalSize
+                        labels = config.config?.labels ?? [:]
+                        foundUsableManifest = true
                     }
-                    let unixTimestamp = date.timeIntervalSince1970
-                    let created = Int(unixTimestamp)
-                    let size = descriptor.size + manifest.config.size + manifest.layers.reduce(0, { (l, r) in l + r.size })
-
-                    let name = details.name
-
-                    let repoTags = name.isEmpty ? [] : [name]
-                    let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
-                    let summary = RESTImageSummary(
-                        Id: image.digest,
-                        RepoTags: repoTags,
-                        RepoDigests: repoDigests,
-                        Created: created,
-                        Size: size,
-                        Labels: [:],
-                    )
-
-                    imagesSummaries.append(summary)
-
                 }
 
+                let repoTags = details.name.isEmpty ? [] : [details.name]
+                let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
+                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference || $0.configuration.image.reference == details.name }
+                let summary = RESTImageSummary(
+                    Id: image.digest,
+                    ParentId: "",
+                    RepoTags: repoTags,
+                    RepoDigests: repoDigests,
+                    Created: created,
+                    Size: size,
+                    SharedSize: -1,
+                    Labels: labels,
+                    Containers: containersUsingImage.count,
+                    Manifests: includeManifests ? manifestSummaries : nil,
+                    Descriptor: makeOCIDescriptor(
+                        from: details.index,
+                        appSupportURL: appleContainerAppSupportUrl
+                    )
+                )
+
+                imagesSummaries.append(summary)
             }
 
             return imagesSummaries

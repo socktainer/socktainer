@@ -37,20 +37,7 @@ struct ImagesGetRoute: RouteCollection {
 
     private static func saveImages(references: [String], req: Request, client: ClientImageProtocol) async throws -> Response {
         let platformString = try? req.query.get(String.self, at: "platform")
-        let platform: Platform? = {
-            guard let platformString = platformString else {
-                return nil
-            }
-
-            do {
-                let data = platformString.data(using: .utf8) ?? Data()
-                let decoder = JSONDecoder()
-                return try decoder.decode(Platform.self, from: data)
-            } catch {
-                req.logger.warning("Failed to decode platform JSON: \(platformString)")
-                return nil
-            }
-        }()
+        let platform = try platformString.map(platformOrThrow)
 
         guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
             throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")

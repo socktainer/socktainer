@@ -54,6 +54,27 @@ enum AppleContainerTimestampResolver {
         return Int64(date.timeIntervalSince1970)
     }
 
+    static func iso8601Date(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        if let date = formatter.date(from: value) {
+            return date
+        }
+
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
+    static func unixTimestampSeconds(_ value: String?) -> Int64 {
+        unixTimestampSeconds(iso8601Date(value))
+    }
+
     static func iso8601Timestamp(_ date: Date?) -> String {
         guard let date else {
             return "1970-01-01T00:00:00Z"
