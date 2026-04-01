@@ -399,8 +399,11 @@ extension BuildRoute {
             buildID: buildID,
             contentStore: RemoteContentStoreClient(),
             buildArgs: buildArgs,
+            // TODO: Implement secrets once integration with buildkit materializes
+            secrets: [:],
             contextDir: contextDir,
             dockerfile: dockerfileData,
+            hiddenDockerDir: nil,
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
