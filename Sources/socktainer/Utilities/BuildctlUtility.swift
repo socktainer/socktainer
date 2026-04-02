@@ -5,7 +5,7 @@ import Logging
 enum BuildctlUtility {
     static let executable = "/usr/bin/buildctl"
 
-    struct PruneCommand {
+    struct Command {
         let executable: String
         let arguments: [String]
 
@@ -36,7 +36,102 @@ enum BuildctlUtility {
         }
     }
 
-    static func pruneCommand(from request: BuilderPruneRequest) throws -> PruneCommand {
+    struct DuRecord: Decodable {
+        let id: String?
+        let parents: [String]?
+        let recordType: String?
+        let recordDescription: String?
+        let inUse: Bool?
+        let shared: Bool?
+        let size: Int64?
+        let createdAt: String?
+        let lastUsedAt: String?
+        let usageCount: Int?
+
+        init(
+            id: String?,
+            parents: [String]?,
+            recordType: String?,
+            recordDescription: String?,
+            inUse: Bool?,
+            shared: Bool?,
+            size: Int64?,
+            createdAt: String?,
+            lastUsedAt: String?,
+            usageCount: Int?
+        ) {
+            self.id = id
+            self.parents = parents
+            self.recordType = recordType
+            self.recordDescription = recordDescription
+            self.inUse = inUse
+            self.shared = shared
+            self.size = size
+            self.createdAt = createdAt
+            self.lastUsedAt = lastUsedAt
+            self.usageCount = usageCount
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case parents
+            case recordType = "type"
+            case recordDescription = "description"
+            case inUse
+            case shared
+            case size
+            case createdAt
+            case lastUsedAt
+            case usageCount
+
+            case idLegacy = "ID"
+            case parentsLegacy = "Parents"
+            case typeLegacy = "Type"
+            case descriptionLegacy = "Description"
+            case inUseLegacy = "InUse"
+            case sharedLegacy = "Shared"
+            case sizeLegacy = "Size"
+            case createdAtLegacy = "CreatedAt"
+            case lastUsedAtLegacy = "LastUsedAt"
+            case usageCountLegacy = "UsageCount"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id =
+                try container.decodeIfPresent(String.self, forKey: .id)
+                ?? container.decodeIfPresent(String.self, forKey: .idLegacy)
+            parents =
+                try container.decodeIfPresent([String].self, forKey: .parents)
+                ?? container.decodeIfPresent([String].self, forKey: .parentsLegacy)
+            recordType =
+                try container.decodeIfPresent(String.self, forKey: .recordType)
+                ?? container.decodeIfPresent(String.self, forKey: .typeLegacy)
+            recordDescription =
+                try container.decodeIfPresent(String.self, forKey: .recordDescription)
+                ?? container.decodeIfPresent(String.self, forKey: .descriptionLegacy)
+            inUse =
+                try container.decodeIfPresent(Bool.self, forKey: .inUse)
+                ?? container.decodeIfPresent(Bool.self, forKey: .inUseLegacy)
+            shared =
+                try container.decodeIfPresent(Bool.self, forKey: .shared)
+                ?? container.decodeIfPresent(Bool.self, forKey: .sharedLegacy)
+            size =
+                try container.decodeIfPresent(Int64.self, forKey: .size)
+                ?? container.decodeIfPresent(Int64.self, forKey: .sizeLegacy)
+            createdAt =
+                try container.decodeIfPresent(String.self, forKey: .createdAt)
+                ?? container.decodeIfPresent(String.self, forKey: .createdAtLegacy)
+            lastUsedAt =
+                try container.decodeIfPresent(String.self, forKey: .lastUsedAt)
+                ?? container.decodeIfPresent(String.self, forKey: .lastUsedAtLegacy)
+            usageCount =
+                try container.decodeIfPresent(Int.self, forKey: .usageCount)
+                ?? container.decodeIfPresent(Int.self, forKey: .usageCountLegacy)
+        }
+    }
+
+    static func pruneCommand(from request: BuilderPruneRequest) throws -> Command {
         var arguments = [
             "--addr", "unix:///run/buildkit/buildkitd.sock",
             "prune",
@@ -71,7 +166,16 @@ enum BuildctlUtility {
             arguments.append(contentsOf: ["--filter", filter])
         }
 
-        return PruneCommand(executable: executable, arguments: arguments)
+        return Command(executable: executable, arguments: arguments)
+    }
+
+    static func duCommand() -> Command {
+        var arguments = [
+            "--addr", "unix:///run/buildkit/buildkitd.sock",
+            "du",
+            "--format=json",
+        ]
+        return Command(executable: executable, arguments: arguments)
     }
 
     static func parsePruneOutput(_ output: String, logger: Logger) -> [PruneRecord] {
@@ -94,6 +198,18 @@ enum BuildctlUtility {
         }
 
         return results
+    }
+
+    static func parseDuOutput(_ output: String, logger: Logger) -> [DuRecord] {
+        guard let data = output.data(using: .utf8) else {
+            return []
+        }
+        do {
+            return try JSONDecoder().decode([DuRecord].self, from: data)
+        } catch {
+            logger.debug("Failed to decode buildctl du JSON output: \(error)")
+            return []
+        }
     }
 
     private static func toBuildkitFilters(_ filters: [String: [String]]) -> [String] {

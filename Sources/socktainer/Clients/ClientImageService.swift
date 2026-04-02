@@ -6,7 +6,7 @@ import Logging
 import TerminalProgress
 
 protocol ClientImageProtocol: Sendable {
-    func list() async throws -> [ClientImage]
+    func list(includeSystemImages: Bool) async throws -> [ClientImage]
     func delete(id: String) async throws
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
@@ -17,6 +17,12 @@ protocol ClientImageProtocol: Sendable {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
+}
+
+extension ClientImageProtocol {
+    func list() async throws -> [ClientImage] {
+        try await list(includeSystemImages: false)
+    }
 }
 
 enum ClientImageError: Error {
@@ -60,8 +66,11 @@ struct ClientImageService: ClientImageProtocol {
         return nil
     }
 
-    func list() async throws -> [ClientImage] {
+    func list(includeSystemImages: Bool = false) async throws -> [ClientImage] {
         let allImages = try await ClientImage.list()
+        guard !includeSystemImages else {
+            return allImages
+        }
         // filter out infra images
         // also filter images based on digests
         let filteredImages = allImages.filter { img in

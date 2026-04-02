@@ -24,10 +24,24 @@ struct BuilderPruneResult: Sendable {
     let spaceReclaimed: Int64
 }
 
+struct BuilderCacheRecord: Sendable {
+    let id: String
+    let parents: [String]
+    let kind: String
+    let description: String
+    let inUse: Bool
+    let shared: Bool
+    let size: Int64
+    let createdAt: String
+    let lastUsedAt: String?
+    let usageCount: Int
+}
+
 protocol ClientBuilderProtocol: Sendable {
     func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws
     func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult
+    func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord]
 }
 
 struct ClientBuilderService: ClientBuilderProtocol {
@@ -56,46 +70,37 @@ struct ClientBuilderService: ClientBuilderProtocol {
         let container = try await runningBuilderContainer(logger: logger)
 
         let command = try BuildctlUtility.pruneCommand(from: request)
-
-        var processConfig = container.configuration.initProcess
-        processConfig.executable = command.executable
-        processConfig.arguments = command.arguments
-        processConfig.terminal = false
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let process = try await containerClient.createProcess(
-            containerId: container.id,
-            processId: UUID().uuidString.lowercased(),
-            configuration: processConfig,
-            stdio: [nil, stdoutPipe.fileHandleForWriting, stderrPipe.fileHandleForWriting]
-        )
-
-        try await process.start()
-        let exitCode = try await process.wait()
-
-        try? stdoutPipe.fileHandleForWriting.close()
-        try? stderrPipe.fileHandleForWriting.close()
-
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
-        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
-
-        if !stderrText.isEmpty {
-            logger.error("buildctl prune stderr:\n\(stderrText)")
-        }
-
-        guard exitCode == 0 else {
-            let details = stderrText.isEmpty ? stdoutText : stderrText
-            throw ContainerizationError(.unknown, message: "buildctl prune failed with exit code \(exitCode): \(details)")
-        }
+        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl prune", logger: logger)
 
         let entries = BuildctlUtility.parsePruneOutput(stdoutText, logger: logger)
         let deletedIds = entries.compactMap(\.id)
         let reclaimed = entries.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
 
         return BuilderPruneResult(deletedCaches: deletedIds, spaceReclaimed: reclaimed)
+    }
+
+    func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord] {
+        let container = try await runningBuilderContainer(logger: logger)
+        let command = BuildctlUtility.duCommand()
+        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl du", logger: logger)
+
+        return BuildctlUtility.parseDuOutput(stdoutText, logger: logger).compactMap { record in
+            guard let id = record.id else {
+                return nil
+            }
+            return BuilderCacheRecord(
+                id: id,
+                parents: record.parents ?? [],
+                kind: record.recordType ?? "regular",
+                description: record.recordDescription ?? "",
+                inUse: record.inUse ?? false,
+                shared: record.shared ?? false,
+                size: record.size ?? 0,
+                createdAt: record.createdAt ?? "",
+                lastUsedAt: record.lastUsedAt,
+                usageCount: record.usageCount ?? 0
+            )
+        }
     }
 
     func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
@@ -261,6 +266,44 @@ struct ClientBuilderService: ClientBuilderProtocol {
             }
             throw ContainerizationError(.internalError, message: "failed to start BuildKit: \(error)")
         }
+    }
+
+    private func execute(command: BuildctlUtility.Command, in container: ContainerSnapshot, actionName: String, logger: Logger) async throws -> String {
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = command.executable
+        processConfig.arguments = command.arguments
+        processConfig.terminal = false
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let process = try await containerClient.createProcess(
+            containerId: container.id,
+            processId: UUID().uuidString.lowercased(),
+            configuration: processConfig,
+            stdio: [nil, stdoutPipe.fileHandleForWriting, stderrPipe.fileHandleForWriting]
+        )
+
+        try await process.start()
+        let exitCode = try await process.wait()
+
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if !stderrText.isEmpty {
+            logger.error("\(actionName) stderr:\n\(stderrText)")
+        }
+
+        guard exitCode == 0 else {
+            let details = stderrText.isEmpty ? stdoutText : stderrText
+            throw ContainerizationError(.unknown, message: "\(actionName) failed with exit code \(exitCode): \(details)")
+        }
+
+        return stdoutText
     }
 
 }
