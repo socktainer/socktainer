@@ -152,7 +152,7 @@ func configure(_ app: Application) async throws {
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: CommitRoute())
-    try app.register(collection: SystemDFRoute())
+    try app.register(collection: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClinet, builderClient: builderClient))
     try app.register(collection: VersionRoute())
 
     // Initialize broadcaster
