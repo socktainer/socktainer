@@ -43,10 +43,11 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
     }
 
     @Test
-    func headPingReturnsOK() async throws {
+    func headPingReturnsOKWithNoBody() async throws {
         try await withRoute { app in
             try await app.testing().test(.HEAD, "/_ping") { res async in
                 #expect(res.status == .ok)
+                #expect(res.body.readableBytes == 0)
             }
         }
     }
