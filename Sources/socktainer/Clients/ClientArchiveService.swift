@@ -179,13 +179,18 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
-        try validateArchiveEntries(
-            reader: reader,
-            tarPath: tarPath,
-            destinationPath: normalizedPath,
-            noOverwriteDirNonDir: noOverwriteDirNonDir
-        )
+        // Scope the reader to this block so it is released before putArchiveFallback
+        // opens its own EXT4.EXT4Reader on the same rootfs file. Two concurrent readers
+        // on the same block device can deadlock if the EXT4 library uses exclusive locking.
+        do {
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+            try validateArchiveEntries(
+                reader: reader,
+                tarPath: tarPath,
+                destinationPath: normalizedPath,
+                noOverwriteDirNonDir: noOverwriteDirNonDir
+            )
+        }
 
         try await putArchiveFallback(
             rootfsPath: rootfsPath,
