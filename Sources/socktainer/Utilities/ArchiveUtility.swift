@@ -88,7 +88,8 @@ struct ArchiveUtility {
             return entryPath
         }
 
-        return destinationPath + entryPath
+        let base = destinationPath.hasSuffix("/") ? String(destinationPath.dropLast()) : destinationPath
+        return base + entryPath
     }
 
     static func unpack(
@@ -96,11 +97,7 @@ struct ArchiveUtility {
         to formatter: EXT4.Formatter,
         destinationPath targetPath: String
     ) throws {
-        let archiveReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: tarPath
-        )
+        let archiveReader = try ArchiveReader(file: tarPath)
 
         let bufferSize = 128 * 1024
         let reusableBuffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: bufferSize)

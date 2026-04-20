@@ -176,98 +176,77 @@ struct ClientArchiveService: ClientArchiveProtocol {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
         }
 
-        // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
-        // Scope the reader to this block so it is released before putArchiveFallback
-        // opens its own EXT4.EXT4Reader on the same rootfs file. Two concurrent readers
-        // on the same block device can deadlock if the EXT4 library uses exclusive locking.
-        do {
-            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
-            try validateArchiveEntries(
-                reader: reader,
-                tarPath: tarPath,
-                destinationPath: normalizedPath,
-                noOverwriteDirNonDir: noOverwriteDirNonDir
-            )
+        // Pre-scan for dir/non-dir conflicts. Reader is scoped here and released
+        // before EXT4Editor opens the same file, avoiding any exclusive-lock conflict.
+        if noOverwriteDirNonDir {
+            do {
+                let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+                try validateArchiveEntries(reader: reader, tarPath: tarPath, destinationPath: normalizedPath)
+            }
         }
 
-        try await putArchiveFallback(
-            rootfsPath: rootfsPath,
-            destinationPath: normalizedPath,
-            inputTarPath: tarPath
-        )
+        let editor = try EXT4Editor(devicePath: FilePath(rootfsPath.path))
+        let archiveReader = try ArchiveReader(file: tarPath)
+
+        for (entry, streamReader) in archiveReader.makeStreamingIterator() {
+            guard let fullPath = ArchiveUtility.destinationPath(for: entry.path, under: normalizedPath) else {
+                continue
+            }
+
+            switch entry.fileType {
+            case .directory:
+                if !editor.exists(path: fullPath) {
+                    try ensureParentDirectories(of: fullPath, editor: editor)
+                    try editor.createDirectory(
+                        path: fullPath,
+                        mode: UInt16(entry.permissions),
+                        uid: entry.owner ?? 0,
+                        gid: entry.group ?? 0
+                    )
+                }
+            case .symbolicLink:
+                try ensureParentDirectories(of: fullPath, editor: editor)
+                try editor.addSymlink(
+                    path: fullPath,
+                    target: entry.symlinkTarget ?? "",
+                    uid: entry.owner ?? 0,
+                    gid: entry.group ?? 0
+                )
+            case .regular:
+                try ensureParentDirectories(of: fullPath, editor: editor)
+                var data = Data()
+                var buf = Data(count: 65536)
+                while true {
+                    let n = buf.withUnsafeMutableBytes { raw -> Int in
+                        guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+                        return streamReader.read(ptr, maxLength: raw.count)
+                    }
+                    if n <= 0 { break }
+                    data.append(buf.prefix(n))
+                }
+                try editor.addFile(
+                    path: fullPath,
+                    data: data,
+                    mode: UInt16(entry.permissions),
+                    uid: entry.owner ?? 0,
+                    gid: entry.group ?? 0
+                )
+            default:
+                continue
+            }
+        }
+
+        try editor.sync()
     }
 
-    /// Fallback PUT using full read-modify-write approach
-    private func putArchiveFallback(
-        rootfsPath: URL,
-        destinationPath: String,
-        inputTarPath: URL
-    ) async throws {
-        // Create temporary files for the operation
-        let tempDir = FileManager.default.temporaryDirectory
-        let sessionId = UUID().uuidString
-        let exportedTarPath = tempDir.appendingPathComponent("\(sessionId)-export.tar")
-        let newRootfsPath = tempDir.appendingPathComponent("\(sessionId)-rootfs.ext4")
-
-        defer {
-            try? FileManager.default.removeItem(at: exportedTarPath)
-            try? FileManager.default.removeItem(at: newRootfsPath)
-        }
-
-        // Step 1: Export existing filesystem to tar
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
-        try reader.export(archive: FilePath(exportedTarPath.path))
-
-        // Step 2: Get the size of the existing rootfs to create a new one of similar size
-        let rootfsAttributes = try FileManager.default.attributesOfItem(atPath: rootfsPath.path)
-        let rootfsSize = (rootfsAttributes[.size] as? UInt64) ?? (2 * 1024 * 1024 * 1024)  // Default 2GB
-
-        // Step 3: Create a new ext4 formatter
-        // Use a minimum size that can accommodate the filesystem
-        let minSize = max(rootfsSize, 256 * 1024)  // At least 256KB
-        let formatter = try EXT4.Formatter(
-            FilePath(newRootfsPath.path),
-            blockSize: 4096,
-            minDiskSize: minSize
-        )
-
-        // Step 4: Unpack the existing filesystem
-        let existingReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: exportedTarPath
-        )
-        try formatter.unpack(reader: existingReader)
-
-        // Step 5: Unpack the new tar at the specified destination path
-        try ArchiveUtility.unpack(
-            tarPath: inputTarPath,
-            to: formatter,
-            destinationPath: destinationPath
-        )
-
-        // Step 6: Finalize the new filesystem
-        try formatter.close()
-
-        // Step 7: Atomically replace the old rootfs with the new one
-        let backupPath = rootfsPath.appendingPathExtension("backup")
-        try? FileManager.default.removeItem(at: backupPath)
-
-        // Move old rootfs to backup
-        try FileManager.default.moveItem(at: rootfsPath, to: backupPath)
-
-        do {
-            // Move new rootfs into place
-            try FileManager.default.moveItem(at: newRootfsPath, to: rootfsPath)
-            // Remove backup on success
-            try? FileManager.default.removeItem(at: backupPath)
-        } catch {
-            // Restore backup on failure
-            try? FileManager.default.moveItem(at: backupPath, to: rootfsPath)
-            throw ClientArchiveError.operationFailed(message: "Failed to replace rootfs: \(error.localizedDescription)")
-        }
+    private func ensureParentDirectories(of path: String, editor: EXT4Editor) throws {
+        let parent = (path as NSString).deletingLastPathComponent
+        guard parent != "/" else { return }
+        if editor.exists(path: parent) { return }
+        try ensureParentDirectories(of: parent, editor: editor)
+        try editor.createDirectory(path: parent)
     }
 
     /// Read symlink target using the reader's public API
@@ -281,21 +260,16 @@ struct ClientArchiveService: ClientArchiveProtocol {
     private func validateArchiveEntries(
         reader: EXT4.EXT4Reader,
         tarPath: URL,
-        destinationPath: String,
-        noOverwriteDirNonDir: Bool
+        destinationPath: String
     ) throws {
-        let archiveReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: tarPath
-        )
+        let archiveReader = try ArchiveReader(file: tarPath)
 
         for (entry, _) in archiveReader.makeStreamingIterator() {
             guard let fullPath = ArchiveUtility.destinationPath(for: entry.path, under: destinationPath) else {
                 continue
             }
 
-            guard noOverwriteDirNonDir, reader.exists(FilePath(fullPath)) else {
+            guard reader.exists(FilePath(fullPath)) else {
                 continue
             }
 
