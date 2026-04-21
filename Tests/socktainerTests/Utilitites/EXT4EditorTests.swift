@@ -257,6 +257,26 @@ struct EXT4EditorTests {
         }
     }
 
+    @Test("Directory extent tree promotion to depth-1")
+    func testDirectoryExtentTreePromotion() throws {
+        // Use a larger filesystem to accommodate many directory blocks
+        let fsPath = try createTestFilesystem(name: "large.ext4")
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // 600 files × ~24 bytes/entry ≈ 14400 bytes > 3 blocks (12288 bytes), forcing the
+        // inline extent tree (max 4 leaves) to exhaust and promote to depth=1.
+        for i in 0..<600 {
+            try editor.addFile(path: "/file_\(i).txt", data: Data("x".utf8))
+        }
+        try editor.sync()
+
+        for i in 0..<600 {
+            #expect(try verifyFileExists(fsPath: fsPath, path: "/file_\(i).txt"))
+        }
+    }
+
     @Test("Create directory")
     func testCreateDirectory() throws {
         let fsPath = try createTestFilesystem()
