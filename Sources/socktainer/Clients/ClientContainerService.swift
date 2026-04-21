@@ -134,6 +134,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
+        let id = ContainerNameUtility.sanitize(id)
         do {
             return try await containerClient.get(id: id)
         } catch let error as ContainerizationError where error.code == .notFound {
@@ -179,6 +180,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
+        let id = ContainerNameUtility.sanitize(id)
         let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
@@ -191,6 +193,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func kill(id: String, signal: String?) async throws {
+        let id = ContainerNameUtility.sanitize(id)
         let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
@@ -206,6 +209,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
+        let id = ContainerNameUtility.sanitize(id)
         let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
@@ -219,6 +223,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func delete(id: String) async throws {
+        let id = ContainerNameUtility.sanitize(id)
         let container = try await containerClient.list().filter { $0.id == id }.first
         guard let container else {
             throw ClientContainerError.notFound(id: id)
@@ -229,6 +234,7 @@ struct ClientContainerService: ClientContainerProtocol {
     // NOTE: For Apple Container, we'll implement a simple polling mechanism
     //       since there's no direct wait API
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
+        let id = ContainerNameUtility.sanitize(id)
         var container = try await containerClient.list().filter { $0.id == id }.first
         guard let initialContainer = container else {
             throw ClientContainerError.notFound(id: id)
