@@ -45,6 +45,7 @@ let package = Package(
             name: "socktainerTests",
             dependencies: [
                 .target(name: "socktainer"),
+                .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
         ),
