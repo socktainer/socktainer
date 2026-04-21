@@ -65,7 +65,8 @@ extension ContainerCreateRoute {
 
             req.logger.info("Creating container for image: \(body.Image)")
 
-            let id = Utility.createContainerID(name: containerName)
+            let rawId = Utility.createContainerID(name: containerName)
+            let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
 
             // Validate the requested platform only if provided
