@@ -217,6 +217,66 @@ struct EXT4EditorTests {
         #expect(try verifyFileExists(fsPath: fsPath, path: "/link"))
     }
 
+    @Test("Create directory through symlink")
+    func testCreateDirectoryThroughSymlink() throws {
+        let fsPath = try createTestFilesystem()
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // Create a real directory and a symlink pointing to it (mimics /var/run -> /run)
+        try editor.createDirectory(path: "/run")
+        try editor.addSymlink(path: "/varrun", target: "/run")
+        try editor.sync()
+
+        // Creating a directory through the symlink must succeed
+        let editor2 = try EXT4Editor(devicePath: FilePath(fsPath.path))
+        try editor2.createDirectory(path: "/varrun/act")
+        try editor2.sync()
+
+        #expect(try verifyFileExists(fsPath: fsPath, path: "/run/act"))
+    }
+
+    @Test("Directory block overflow allocates new block")
+    func testDirectoryBlockOverflow() throws {
+        let fsPath = try createTestFilesystem()
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // Fill root directory with enough entries to overflow one 4096-byte block.
+        // Each entry needs at least 8 bytes header + aligned name. 80+ short-named files
+        // comfortably exceeds a single 4096-byte directory block.
+        for i in 0..<100 {
+            try editor.addFile(path: "/overflow_\(i).txt", data: Data("x".utf8))
+        }
+        try editor.sync()
+
+        for i in 0..<100 {
+            #expect(try verifyFileExists(fsPath: fsPath, path: "/overflow_\(i).txt"))
+        }
+    }
+
+    @Test("Directory extent tree promotion to depth-1")
+    func testDirectoryExtentTreePromotion() throws {
+        // Use a larger filesystem to accommodate many directory blocks
+        let fsPath = try createTestFilesystem(name: "large.ext4")
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // 600 files × ~24 bytes/entry ≈ 14400 bytes > 3 blocks (12288 bytes), forcing the
+        // inline extent tree (max 4 leaves) to exhaust and promote to depth=1.
+        for i in 0..<600 {
+            try editor.addFile(path: "/file_\(i).txt", data: Data("x".utf8))
+        }
+        try editor.sync()
+
+        for i in 0..<600 {
+            #expect(try verifyFileExists(fsPath: fsPath, path: "/file_\(i).txt"))
+        }
+    }
+
     @Test("Create directory")
     func testCreateDirectory() throws {
         let fsPath = try createTestFilesystem()

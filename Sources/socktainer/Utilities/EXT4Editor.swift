@@ -175,6 +175,14 @@ struct EXT4ExtentLeaf {
     var startLow: UInt32 = 0
 }
 
+/// Extent index node structure (used in depth > 0 extent trees)
+struct EXT4ExtentIndex {
+    var block: UInt32 = 0     // first logical block covered by this index
+    var leafLow: UInt32 = 0   // physical block number (low 32 bits)
+    var leafHigh: UInt16 = 0  // physical block number (high 16 bits)
+    var unused: UInt16 = 0
+}
+
 private enum EXT4FileType: UInt8 {
     case unknown = 0
     case regular = 1
@@ -528,15 +536,51 @@ public final class EXT4Editor {
         try handle.write(contentsOf: padding)
     }
 
-    private func resolvePathToInode(_ path: String) throws -> UInt32 {
+    private func readSymlinkTarget(inode: EXT4Inode) throws -> String {
+        let size = Int(inode.sizeLow)
+        // Short symlink: target stored directly in block field (no allocated blocks)
+        if inode.blocksLow == 0 {
+            let bytes = withUnsafeBytes(of: inode.block) { ptr -> [UInt8] in
+                Array(ptr.prefix(size))
+            }
+            guard let target = String(bytes: bytes, encoding: .utf8) else {
+                throw EXT4EditorError.readError("Invalid symlink target encoding")
+            }
+            return target
+        }
+        // Long symlink: target stored in data blocks
+        let extents = try getExtents(from: inode)
+        var data = Data()
+        for (startBlock, endBlock) in extents {
+            for blockNum in startBlock..<endBlock {
+                let blockOffset = UInt64(blockNum) * UInt64(blockSize)
+                try handle.seek(toOffset: blockOffset)
+                guard let blockData = try handle.read(upToCount: Int(blockSize)) else {
+                    throw EXT4EditorError.readError("Failed to read symlink block")
+                }
+                data.append(blockData)
+            }
+        }
+        guard let target = String(data: data.prefix(size), encoding: .utf8) else {
+            throw EXT4EditorError.readError("Invalid symlink target encoding")
+        }
+        return target
+    }
+
+    private func resolvePathToInode(_ path: String, depth: Int = 0) throws -> UInt32 {
+        guard depth < 40 else {
+            throw EXT4EditorError.invalidPath("Symlink loop detected resolving: \(path)")
+        }
+
         if path == "/" || path.isEmpty {
             return EXT4Constants.rootInode
         }
 
         var currentInode = EXT4Constants.rootInode
+        var currentPath = "/"
         let components = path.split(separator: "/").map(String.init)
 
-        for component in components {
+        for (index, component) in components.enumerated() {
             if component.isEmpty || component == "." {
                 continue
             }
@@ -550,7 +594,23 @@ public final class EXT4Editor {
             guard let entry = entries.first(where: { $0.name == component }) else {
                 throw EXT4EditorError.parentNotFound(path)
             }
+
+            let inode = try readInode(number: entry.inode)
+            if (inode.mode & 0xF000) == EXT4ModeFlag.S_IFLNK.rawValue {
+                let target = try readSymlinkTarget(inode: inode)
+                let remaining = components[(index + 1)...].joined(separator: "/")
+                let resolvedTarget: String
+                if target.hasPrefix("/") {
+                    resolvedTarget = remaining.isEmpty ? target : "\(target)/\(remaining)"
+                } else {
+                    let base = currentPath == "/" ? "" : currentPath
+                    resolvedTarget = remaining.isEmpty ? "\(base)/\(target)" : "\(base)/\(target)/\(remaining)"
+                }
+                return try resolvePathToInode(resolvedTarget, depth: depth + 1)
+            }
+
             currentInode = entry.inode
+            currentPath = currentPath == "/" ? "/\(component)" : "\(currentPath)/\(component)"
         }
 
         return currentInode
@@ -617,19 +677,39 @@ public final class EXT4Editor {
         let headerSize = MemoryLayout<EXT4ExtentHeader>.size
         let leafSize = MemoryLayout<EXT4ExtentLeaf>.size
 
+        let indexSize = MemoryLayout<EXT4ExtentIndex>.size
+
         if header.depth == 0 {
-            // Direct extents
             for i in 0..<Int(header.entries) {
                 let leafOffset = headerSize + i * leafSize
                 guard leafOffset + leafSize <= blockData.count else { break }
-
-                let leaf = blockData.subdata(in: leafOffset..<leafOffset + leafSize).withUnsafeBytes { ptr in
-                    ptr.load(as: EXT4ExtentLeaf.self)
+                let leaf = blockData.subdata(in: leafOffset..<leafOffset + leafSize).withUnsafeBytes {
+                    $0.load(as: EXT4ExtentLeaf.self)
                 }
                 extents.append((start: leaf.startLow, end: leaf.startLow + UInt32(leaf.length)))
             }
+        } else if header.depth == 1 {
+            for i in 0..<Int(header.entries) {
+                let indexOffset = headerSize + i * indexSize
+                guard indexOffset + indexSize <= blockData.count else { break }
+                let index = blockData.subdata(in: indexOffset..<indexOffset + indexSize).withUnsafeBytes {
+                    $0.load(as: EXT4ExtentIndex.self)
+                }
+                let leafBlockOffset = UInt64(index.leafLow) * UInt64(blockSize)
+                try handle.seek(toOffset: leafBlockOffset)
+                guard let lpData = try handle.read(upToCount: Int(blockSize)) else { continue }
+                let lpHeader = lpData.withUnsafeBytes { $0.load(as: EXT4ExtentHeader.self) }
+                guard lpHeader.magic == EXT4Constants.extentHeaderMagic, lpHeader.depth == 0 else { continue }
+                for j in 0..<Int(lpHeader.entries) {
+                    let leafOffset = headerSize + j * leafSize
+                    guard leafOffset + leafSize <= lpData.count else { break }
+                    let leaf = lpData.subdata(in: leafOffset..<leafOffset + leafSize).withUnsafeBytes {
+                        $0.load(as: EXT4ExtentLeaf.self)
+                    }
+                    extents.append((start: leaf.startLow, end: leaf.startLow + UInt32(leaf.length)))
+                }
+            }
         }
-        // For depth > 0, we'd need to follow extent index nodes (not implemented for MVP)
 
         return extents
     }
@@ -929,129 +1009,338 @@ public final class EXT4Editor {
         return tupleFromArray(blockData)
     }
 
+    /// Append a new allocated block to a directory inode's extent tree.
+    /// Promotes from depth=0 to depth=1 when the inline leaf slots are exhausted.
+    private func appendBlockToDirectoryInode(_ inode: inout EXT4Inode, newBlock: UInt32) throws {
+        var bd = withUnsafeBytes(of: inode.block) { Data($0) }
+        let headerSize = MemoryLayout<EXT4ExtentHeader>.size
+        let leafSize = MemoryLayout<EXT4ExtentLeaf>.size
+        let indexSize = MemoryLayout<EXT4ExtentIndex>.size
+
+        var header = bd.withUnsafeBytes { $0.load(as: EXT4ExtentHeader.self) }
+        guard header.magic == EXT4Constants.extentHeaderMagic else {
+            throw EXT4EditorError.notImplemented("Cannot grow directory with non-extent inode")
+        }
+
+        if header.depth == 0 {
+            let lastLeafOffset = headerSize + Int(header.entries - 1) * leafSize
+            var lastLeaf = bd.subdata(in: lastLeafOffset..<lastLeafOffset + leafSize).withUnsafeBytes {
+                $0.load(as: EXT4ExtentLeaf.self)
+            }
+
+            if lastLeaf.startLow + UInt32(lastLeaf.length) == newBlock {
+                // Contiguous — extend last extent
+                lastLeaf.length += 1
+                withUnsafeBytes(of: lastLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { bd[lastLeafOffset + i] = byte }
+                }
+                inode.block = bd.withUnsafeBytes { tupleFromArray(Array($0.prefix(60))) }
+            } else if header.entries < header.max {
+                // Non-contiguous, space available — add new inline leaf
+                var logicalBlock: UInt32 = 0
+                for i in 0..<Int(header.entries) {
+                    let off = headerSize + i * leafSize
+                    let leaf = bd.subdata(in: off..<off + leafSize).withUnsafeBytes { $0.load(as: EXT4ExtentLeaf.self) }
+                    logicalBlock = leaf.block + UInt32(leaf.length)
+                }
+                var newLeaf = EXT4ExtentLeaf()
+                newLeaf.block = logicalBlock
+                newLeaf.length = 1
+                newLeaf.startLow = newBlock
+                let off = headerSize + Int(header.entries) * leafSize
+                withUnsafeBytes(of: newLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { bd[off + i] = byte }
+                }
+                header.entries += 1
+                withUnsafeBytes(of: header) { ptr in
+                    for (i, byte) in ptr.enumerated() { bd[i] = byte }
+                }
+                inode.block = bd.withUnsafeBytes { tupleFromArray(Array($0.prefix(60))) }
+            } else {
+                // Inline leaf slots exhausted — promote to depth=1.
+                // Allocate one block to hold all existing leaves plus the new leaf.
+                let lpBlocks = try allocateBlocks(count: 1)
+                let lpBlock = lpBlocks[0]
+
+                let leavesPerBlock = (Int(blockSize) - headerSize) / leafSize
+                var lpData = Data(repeating: 0, count: Int(blockSize))
+
+                // Compute logical block offset for the new leaf
+                var logicalBlock: UInt32 = 0
+                for i in 0..<Int(header.entries) {
+                    let off = headerSize + i * leafSize
+                    let leaf = bd.subdata(in: off..<off + leafSize).withUnsafeBytes { $0.load(as: EXT4ExtentLeaf.self) }
+                    logicalBlock = leaf.block + UInt32(leaf.length)
+                }
+
+                // Write leaf page header
+                var lpHeader = EXT4ExtentHeader()
+                lpHeader.magic = EXT4Constants.extentHeaderMagic
+                lpHeader.entries = header.entries + 1
+                lpHeader.max = UInt16(leavesPerBlock)
+                lpHeader.depth = 0
+                withUnsafeBytes(of: lpHeader) { ptr in
+                    for (i, byte) in ptr.enumerated() { lpData[i] = byte }
+                }
+                // Copy existing inline leaves
+                for i in 0..<Int(header.entries) {
+                    let off = headerSize + i * leafSize
+                    for j in 0..<leafSize { lpData[off + j] = bd[off + j] }
+                }
+                // Append the new leaf
+                var newLeaf = EXT4ExtentLeaf()
+                newLeaf.block = logicalBlock
+                newLeaf.length = 1
+                newLeaf.startLow = newBlock
+                let newLeafOff = headerSize + Int(header.entries) * leafSize
+                withUnsafeBytes(of: newLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { lpData[newLeafOff + i] = byte }
+                }
+
+                try handle.seek(toOffset: UInt64(lpBlock) * UInt64(blockSize))
+                try handle.write(contentsOf: lpData)
+
+                // Rewrite inode block field as depth=1 with one index entry
+                var newBd = Data(repeating: 0, count: 60)
+                var newHeader = EXT4ExtentHeader()
+                newHeader.magic = EXT4Constants.extentHeaderMagic
+                newHeader.entries = 1
+                newHeader.max = UInt16((60 - headerSize) / indexSize)
+                newHeader.depth = 1
+                withUnsafeBytes(of: newHeader) { ptr in
+                    for (i, byte) in ptr.enumerated() { newBd[i] = byte }
+                }
+                var idx = EXT4ExtentIndex()
+                idx.block = 0
+                idx.leafLow = lpBlock
+                withUnsafeBytes(of: idx) { ptr in
+                    for (i, byte) in ptr.enumerated() { newBd[headerSize + i] = byte }
+                }
+                inode.block = newBd.withUnsafeBytes { tupleFromArray(Array($0.prefix(60))) }
+                // Extra block used for the leaf page
+                inode.blocksLow += blockSize / 512
+                try updateSuperBlockAfterAllocation(blocksUsed: 1, inodesUsed: 0)
+            }
+        } else if header.depth == 1 {
+            // Find the last index entry and its leaf block
+            let lastIdxOff = headerSize + Int(header.entries - 1) * indexSize
+            let lastIdx = bd.subdata(in: lastIdxOff..<lastIdxOff + indexSize).withUnsafeBytes {
+                $0.load(as: EXT4ExtentIndex.self)
+            }
+            let lpBlockNum = lastIdx.leafLow
+            let lpOffset = UInt64(lpBlockNum) * UInt64(blockSize)
+            try handle.seek(toOffset: lpOffset)
+            guard var lpData = try handle.read(upToCount: Int(blockSize)) else {
+                throw EXT4EditorError.readError("Failed to read extent leaf block")
+            }
+            var lpHeader = lpData.withUnsafeBytes { $0.load(as: EXT4ExtentHeader.self) }
+            guard lpHeader.magic == EXT4Constants.extentHeaderMagic, lpHeader.depth == 0 else {
+                throw EXT4EditorError.readError("Invalid extent leaf block header")
+            }
+
+            let lastLeafOff = headerSize + Int(lpHeader.entries - 1) * leafSize
+            var lastLeaf = lpData.subdata(in: lastLeafOff..<lastLeafOff + leafSize).withUnsafeBytes {
+                $0.load(as: EXT4ExtentLeaf.self)
+            }
+
+            if lastLeaf.startLow + UInt32(lastLeaf.length) == newBlock {
+                // Contiguous — extend last leaf in this leaf block
+                lastLeaf.length += 1
+                withUnsafeBytes(of: lastLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { lpData[lastLeafOff + i] = byte }
+                }
+            } else if lpHeader.entries < lpHeader.max {
+                // Space in existing leaf block — add a new leaf
+                let logicalBlock = lastLeaf.block + UInt32(lastLeaf.length)
+                var newLeaf = EXT4ExtentLeaf()
+                newLeaf.block = logicalBlock
+                newLeaf.length = 1
+                newLeaf.startLow = newBlock
+                let newLeafOff = headerSize + Int(lpHeader.entries) * leafSize
+                withUnsafeBytes(of: newLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { lpData[newLeafOff + i] = byte }
+                }
+                lpHeader.entries += 1
+                withUnsafeBytes(of: lpHeader) { ptr in
+                    for (i, byte) in ptr.enumerated() { lpData[i] = byte }
+                }
+            } else if header.entries < header.max {
+                // Leaf block full — add a new index entry pointing to a fresh leaf block
+                let newLpBlocks = try allocateBlocks(count: 1)
+                let newLpBlock = newLpBlocks[0]
+                let leavesPerBlock = (Int(blockSize) - headerSize) / leafSize
+
+                let logicalBlock = lastLeaf.block + UInt32(lastLeaf.length)
+                var newLpData = Data(repeating: 0, count: Int(blockSize))
+                var newLpHeader = EXT4ExtentHeader()
+                newLpHeader.magic = EXT4Constants.extentHeaderMagic
+                newLpHeader.entries = 1
+                newLpHeader.max = UInt16(leavesPerBlock)
+                newLpHeader.depth = 0
+                withUnsafeBytes(of: newLpHeader) { ptr in
+                    for (i, byte) in ptr.enumerated() { newLpData[i] = byte }
+                }
+                var newLeaf = EXT4ExtentLeaf()
+                newLeaf.block = logicalBlock
+                newLeaf.length = 1
+                newLeaf.startLow = newBlock
+                withUnsafeBytes(of: newLeaf) { ptr in
+                    for (i, byte) in ptr.enumerated() { newLpData[headerSize + i] = byte }
+                }
+                try handle.seek(toOffset: UInt64(newLpBlock) * UInt64(blockSize))
+                try handle.write(contentsOf: newLpData)
+
+                var newIdx = EXT4ExtentIndex()
+                newIdx.block = logicalBlock
+                newIdx.leafLow = newLpBlock
+                let newIdxOff = headerSize + Int(header.entries) * indexSize
+                withUnsafeBytes(of: newIdx) { ptr in
+                    for (i, byte) in ptr.enumerated() { bd[newIdxOff + i] = byte }
+                }
+                header.entries += 1
+                withUnsafeBytes(of: header) { ptr in
+                    for (i, byte) in ptr.enumerated() { bd[i] = byte }
+                }
+                inode.block = bd.withUnsafeBytes { tupleFromArray(Array($0.prefix(60))) }
+                inode.blocksLow += blockSize / 512
+                try updateSuperBlockAfterAllocation(blocksUsed: 1, inodesUsed: 0)
+            } else {
+                throw EXT4EditorError.notImplemented("Directory too large: extent index tree full")
+            }
+
+            try handle.seek(toOffset: lpOffset)
+            try handle.write(contentsOf: lpData)
+        } else {
+            throw EXT4EditorError.notImplemented("Cannot grow directory with extent tree depth > 1")
+        }
+
+        inode.blocksLow += blockSize / 512
+    }
+
+    private func writeDirectoryEntry(
+        into blockData: inout Data,
+        atOffset newEntryOffset: Int,
+        recordLen: UInt16,
+        childInodeNum: UInt32,
+        nameBytes: [UInt8],
+        fileType: EXT4FileType
+    ) {
+        let newEntryAlignedSize = (MemoryLayout<EXT4DirectoryEntry>.size + nameBytes.count + 3) & ~3
+        var newEntry = EXT4DirectoryEntry()
+        newEntry.inode = childInodeNum
+        newEntry.recordLength = recordLen
+        newEntry.nameLength = UInt8(nameBytes.count)
+        newEntry.fileType = fileType.rawValue
+
+        withUnsafeBytes(of: newEntry) { ptr in
+            for (i, byte) in ptr.enumerated() { blockData[newEntryOffset + i] = byte }
+        }
+        for (i, byte) in nameBytes.enumerated() {
+            blockData[newEntryOffset + MemoryLayout<EXT4DirectoryEntry>.size + i] = byte
+        }
+        let entryEnd = newEntryOffset + newEntryAlignedSize
+        for i in (newEntryOffset + MemoryLayout<EXT4DirectoryEntry>.size + nameBytes.count)..<entryEnd {
+            if i < blockData.count { blockData[i] = 0 }
+        }
+    }
+
     private func addDirectoryEntry(
         parentInodeNum: UInt32,
         childInodeNum: UInt32,
         childName: String,
         fileType: EXT4FileType
     ) throws {
-        let parentInode = try readInode(number: parentInodeNum)
+        var parentInode = try readInode(number: parentInodeNum)
         let extents = try getExtents(from: parentInode)
 
-        guard let lastExtent = extents.last, lastExtent.end > lastExtent.start else {
-            throw EXT4EditorError.directoryFull("Parent directory has no blocks")
-        }
-
-        // Read the last block of the directory
-        let lastBlock = lastExtent.end - 1
-        let blockOffset = UInt64(lastBlock) * UInt64(blockSize)
-        try handle.seek(toOffset: blockOffset)
-        guard var blockData = try handle.read(upToCount: Int(blockSize)) else {
-            throw EXT4EditorError.readError("Failed to read directory block")
-        }
-
-        // Parse all directory entries to find the last REAL entry (with inode != 0)
-        // and any sentinel entry (inode == 0) or free space at the end
-        var offset = 0
-        var lastRealEntryOffset = -1
-        var lastRealEntryRecordLen: UInt16 = 0
-        var lastRealEntryNameLen: UInt8 = 0
-        var sentinelOffset = -1
-        var sentinelRecordLen: UInt16 = 0
-
-        while offset < Int(blockSize) {
-            guard offset + MemoryLayout<EXT4DirectoryEntry>.size <= blockData.count else { break }
-
-            let entryData = blockData.subdata(in: offset..<offset + MemoryLayout<EXT4DirectoryEntry>.size)
-            let entry = entryData.withUnsafeBytes { ptr in
-                ptr.load(as: EXT4DirectoryEntry.self)
-            }
-
-            if entry.recordLength == 0 {
-                // No more entries
-                break
-            }
-
-            if entry.inode == 0 {
-                // This is a sentinel/free entry - we can use this space
-                sentinelOffset = offset
-                sentinelRecordLen = entry.recordLength
-                break
-            }
-
-            // This is a real entry
-            lastRealEntryOffset = offset
-            lastRealEntryRecordLen = entry.recordLength
-            lastRealEntryNameLen = entry.nameLength
-            offset += Int(entry.recordLength)
-        }
-
-        // Calculate space needed for new entry
         let nameBytes = Array(childName.utf8)
         let newEntryMinSize = MemoryLayout<EXT4DirectoryEntry>.size + nameBytes.count
         let newEntryAlignedSize = (newEntryMinSize + 3) & ~3
 
-        var newEntryOffset: Int
-        var newRecordLen: UInt16
-
-        if sentinelOffset >= 0 {
-            // There's a sentinel entry - check if we can fit in its space
-            guard Int(sentinelRecordLen) >= newEntryAlignedSize else {
-                throw EXT4EditorError.directoryFull("No space in directory block for new entry")
+        // Try to fit the new entry in the existing last block
+        if let lastExtent = extents.last, lastExtent.end > lastExtent.start {
+            let lastBlock = lastExtent.end - 1
+            let blockOffset = UInt64(lastBlock) * UInt64(blockSize)
+            try handle.seek(toOffset: blockOffset)
+            guard var blockData = try handle.read(upToCount: Int(blockSize)) else {
+                throw EXT4EditorError.readError("Failed to read directory block")
             }
-            newEntryOffset = sentinelOffset
-            newRecordLen = sentinelRecordLen
-        } else if lastRealEntryOffset >= 0 {
-            // No sentinel - check if we can split the last real entry's record
-            let lastEntryActualSize = (MemoryLayout<EXT4DirectoryEntry>.size + Int(lastRealEntryNameLen) + 3) & ~3
-            let availableSpace = Int(lastRealEntryRecordLen) - lastEntryActualSize
 
-            guard availableSpace >= newEntryAlignedSize else {
-                throw EXT4EditorError.directoryFull("No space in directory block for new entry")
+            // Scan for free space in the last block
+            var offset = 0
+            var lastRealEntryOffset = -1
+            var lastRealEntryRecordLen: UInt16 = 0
+            var lastRealEntryNameLen: UInt8 = 0
+            var sentinelOffset = -1
+            var sentinelRecordLen: UInt16 = 0
+
+            while offset < Int(blockSize) {
+                guard offset + MemoryLayout<EXT4DirectoryEntry>.size <= blockData.count else { break }
+                let entry = blockData.subdata(in: offset..<offset + MemoryLayout<EXT4DirectoryEntry>.size)
+                    .withUnsafeBytes { $0.load(as: EXT4DirectoryEntry.self) }
+
+                if entry.recordLength == 0 { break }
+
+                if entry.inode == 0 {
+                    sentinelOffset = offset
+                    sentinelRecordLen = entry.recordLength
+                    break
+                }
+
+                lastRealEntryOffset = offset
+                lastRealEntryRecordLen = entry.recordLength
+                lastRealEntryNameLen = entry.nameLength
+                offset += Int(entry.recordLength)
             }
-            // Shrink last entry's record length to its actual size
-            let updatedRecordLen = UInt16(lastEntryActualSize)
-            blockData[lastRealEntryOffset + 4] = UInt8(updatedRecordLen & 0xFF)
-            blockData[lastRealEntryOffset + 5] = UInt8((updatedRecordLen >> 8) & 0xFF)
 
-            newEntryOffset = lastRealEntryOffset + lastEntryActualSize
-            newRecordLen = UInt16(Int(blockSize) - newEntryOffset)
-        } else {
-            // Empty directory block (shouldn't happen for valid directories)
-            newEntryOffset = 0
-            newRecordLen = UInt16(blockSize)
+            var newEntryOffset: Int? = nil
+            var newRecordLen: UInt16 = 0
+
+            if sentinelOffset >= 0, Int(sentinelRecordLen) >= newEntryAlignedSize {
+                newEntryOffset = sentinelOffset
+                newRecordLen = sentinelRecordLen
+            } else if lastRealEntryOffset >= 0 {
+                let lastEntryActualSize = (MemoryLayout<EXT4DirectoryEntry>.size + Int(lastRealEntryNameLen) + 3) & ~3
+                let available = Int(lastRealEntryRecordLen) - lastEntryActualSize
+                if available >= newEntryAlignedSize {
+                    let updatedRecordLen = UInt16(lastEntryActualSize)
+                    blockData[lastRealEntryOffset + 4] = UInt8(updatedRecordLen & 0xFF)
+                    blockData[lastRealEntryOffset + 5] = UInt8((updatedRecordLen >> 8) & 0xFF)
+                    newEntryOffset = lastRealEntryOffset + lastEntryActualSize
+                    newRecordLen = UInt16(Int(blockSize) - newEntryOffset!)
+                }
+            } else {
+                // Empty block
+                newEntryOffset = 0
+                newRecordLen = UInt16(blockSize)
+            }
+
+            if let entryOffset = newEntryOffset {
+                writeDirectoryEntry(
+                    into: &blockData, atOffset: entryOffset, recordLen: newRecordLen,
+                    childInodeNum: childInodeNum, nameBytes: nameBytes, fileType: fileType)
+                try handle.seek(toOffset: blockOffset)
+                try handle.write(contentsOf: blockData)
+                return
+            }
         }
 
-        // Create new directory entry
-        var newEntry = EXT4DirectoryEntry()
-        newEntry.inode = childInodeNum
-        newEntry.recordLength = newRecordLen
-        newEntry.nameLength = UInt8(nameBytes.count)
-        newEntry.fileType = fileType.rawValue
+        // No space in any existing block — allocate a new directory block
+        let newBlocks = try allocateBlocks(count: 1)
+        let newBlock = newBlocks[0]
 
-        // Write new entry header
-        withUnsafeBytes(of: newEntry) { ptr in
-            for (i, byte) in ptr.enumerated() {
-                blockData[newEntryOffset + i] = byte
-            }
-        }
+        var newBlockData = Data(repeating: 0, count: Int(blockSize))
+        writeDirectoryEntry(
+            into: &newBlockData, atOffset: 0, recordLen: UInt16(blockSize),
+            childInodeNum: childInodeNum, nameBytes: nameBytes, fileType: fileType)
 
-        // Write name
-        for (i, byte) in nameBytes.enumerated() {
-            blockData[newEntryOffset + MemoryLayout<EXT4DirectoryEntry>.size + i] = byte
-        }
+        let newBlockOffset = UInt64(newBlock) * UInt64(blockSize)
+        try handle.seek(toOffset: newBlockOffset)
+        try handle.write(contentsOf: newBlockData)
 
-        // Zero out remaining bytes of the entry (padding)
-        let entryEnd = newEntryOffset + newEntryAlignedSize
-        for i in (newEntryOffset + MemoryLayout<EXT4DirectoryEntry>.size + nameBytes.count)..<entryEnd {
-            if i < blockData.count {
-                blockData[i] = 0
-            }
-        }
-
-        // Write updated block
-        try handle.seek(toOffset: blockOffset)
-        try handle.write(contentsOf: blockData)
+        try appendBlockToDirectoryInode(&parentInode, newBlock: newBlock)
+        try writeInode(number: parentInodeNum, inode: &parentInode)
+        try updateSuperBlockAfterAllocation(blocksUsed: 1, inodesUsed: 0)
     }
 
     private func writeInitialDirectoryEntries(
