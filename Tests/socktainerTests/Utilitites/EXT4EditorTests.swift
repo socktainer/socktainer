@@ -237,6 +237,26 @@ struct EXT4EditorTests {
         #expect(try verifyFileExists(fsPath: fsPath, path: "/run/act"))
     }
 
+    @Test("Directory block overflow allocates new block")
+    func testDirectoryBlockOverflow() throws {
+        let fsPath = try createTestFilesystem()
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // Fill root directory with enough entries to overflow one 4096-byte block.
+        // Each entry needs at least 8 bytes header + aligned name. 80+ short-named files
+        // comfortably exceeds a single 4096-byte directory block.
+        for i in 0..<100 {
+            try editor.addFile(path: "/overflow_\(i).txt", data: Data("x".utf8))
+        }
+        try editor.sync()
+
+        for i in 0..<100 {
+            #expect(try verifyFileExists(fsPath: fsPath, path: "/overflow_\(i).txt"))
+        }
+    }
+
     @Test("Create directory")
     func testCreateDirectory() throws {
         let fsPath = try createTestFilesystem()
