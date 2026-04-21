@@ -19,7 +19,8 @@ struct ClientArchiveServiceTests {
     /// Builds a minimal ext4 rootfs at `appSupportPath/containers/{id}/rootfs.ext4`
     /// with `/var/run` pre-created so tests can extract into paths beneath it.
     private func createRootfs(containerId: String, appSupportPath: URL) throws -> URL {
-        let containerDir = appSupportPath
+        let containerDir =
+            appSupportPath
             .appendingPathComponent("containers")
             .appendingPathComponent(containerId)
         try FileManager.default.createDirectory(at: containerDir, withIntermediateDirectories: true)
