@@ -528,15 +528,51 @@ public final class EXT4Editor {
         try handle.write(contentsOf: padding)
     }
 
-    private func resolvePathToInode(_ path: String) throws -> UInt32 {
+    private func readSymlinkTarget(inode: EXT4Inode) throws -> String {
+        let size = Int(inode.sizeLow)
+        // Short symlink: target stored directly in block field (no allocated blocks)
+        if inode.blocksLow == 0 {
+            let bytes = withUnsafeBytes(of: inode.block) { ptr -> [UInt8] in
+                Array(ptr.prefix(size))
+            }
+            guard let target = String(bytes: bytes, encoding: .utf8) else {
+                throw EXT4EditorError.readError("Invalid symlink target encoding")
+            }
+            return target
+        }
+        // Long symlink: target stored in data blocks
+        let extents = try getExtents(from: inode)
+        var data = Data()
+        for (startBlock, endBlock) in extents {
+            for blockNum in startBlock..<endBlock {
+                let blockOffset = UInt64(blockNum) * UInt64(blockSize)
+                try handle.seek(toOffset: blockOffset)
+                guard let blockData = try handle.read(upToCount: Int(blockSize)) else {
+                    throw EXT4EditorError.readError("Failed to read symlink block")
+                }
+                data.append(blockData)
+            }
+        }
+        guard let target = String(data: data.prefix(size), encoding: .utf8) else {
+            throw EXT4EditorError.readError("Invalid symlink target encoding")
+        }
+        return target
+    }
+
+    private func resolvePathToInode(_ path: String, depth: Int = 0) throws -> UInt32 {
+        guard depth < 40 else {
+            throw EXT4EditorError.invalidPath("Symlink loop detected resolving: \(path)")
+        }
+
         if path == "/" || path.isEmpty {
             return EXT4Constants.rootInode
         }
 
         var currentInode = EXT4Constants.rootInode
+        var currentPath = "/"
         let components = path.split(separator: "/").map(String.init)
 
-        for component in components {
+        for (index, component) in components.enumerated() {
             if component.isEmpty || component == "." {
                 continue
             }
@@ -550,7 +586,23 @@ public final class EXT4Editor {
             guard let entry = entries.first(where: { $0.name == component }) else {
                 throw EXT4EditorError.parentNotFound(path)
             }
+
+            let inode = try readInode(number: entry.inode)
+            if (inode.mode & 0xF000) == EXT4ModeFlag.S_IFLNK.rawValue {
+                let target = try readSymlinkTarget(inode: inode)
+                let remaining = components[(index + 1)...].joined(separator: "/")
+                let resolvedTarget: String
+                if target.hasPrefix("/") {
+                    resolvedTarget = remaining.isEmpty ? target : "\(target)/\(remaining)"
+                } else {
+                    let base = currentPath == "/" ? "" : currentPath
+                    resolvedTarget = remaining.isEmpty ? "\(base)/\(target)" : "\(base)/\(target)/\(remaining)"
+                }
+                return try resolvePathToInode(resolvedTarget, depth: depth + 1)
+            }
+
             currentInode = entry.inode
+            currentPath = currentPath == "/" ? "/\(component)" : "\(currentPath)/\(component)"
         }
 
         return currentInode

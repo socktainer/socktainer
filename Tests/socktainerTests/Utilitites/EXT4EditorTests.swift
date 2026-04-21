@@ -217,6 +217,26 @@ struct EXT4EditorTests {
         #expect(try verifyFileExists(fsPath: fsPath, path: "/link"))
     }
 
+    @Test("Create directory through symlink")
+    func testCreateDirectoryThroughSymlink() throws {
+        let fsPath = try createTestFilesystem()
+        defer { cleanup(fsPath: fsPath) }
+
+        let editor = try EXT4Editor(devicePath: FilePath(fsPath.path))
+
+        // Create a real directory and a symlink pointing to it (mimics /var/run -> /run)
+        try editor.createDirectory(path: "/run")
+        try editor.addSymlink(path: "/varrun", target: "/run")
+        try editor.sync()
+
+        // Creating a directory through the symlink must succeed
+        let editor2 = try EXT4Editor(devicePath: FilePath(fsPath.path))
+        try editor2.createDirectory(path: "/varrun/act")
+        try editor2.sync()
+
+        #expect(try verifyFileExists(fsPath: fsPath, path: "/run/act"))
+    }
+
     @Test("Create directory")
     func testCreateDirectory() throws {
         let fsPath = try createTestFilesystem()
