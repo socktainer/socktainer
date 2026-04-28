@@ -27,9 +27,9 @@ enum AppleContainerTimestampResolver {
         let labels: [String: String]
         switch networkState {
         case .created(let config):
-            labels = config.labels
+            labels = config.labels.dictionary
         case .running(let config, _):
-            labels = config.labels
+            labels = config.labels.dictionary
         }
 
         return legacyLabelCreationDate(from: labels)

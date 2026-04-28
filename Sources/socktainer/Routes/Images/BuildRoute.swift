@@ -403,7 +403,7 @@ extension BuildRoute {
             secrets: [:],
             contextDir: contextDir,
             dockerfile: dockerfileData,
-            hiddenDockerDir: nil,
+            dockerignore: nil,
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),

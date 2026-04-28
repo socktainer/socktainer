@@ -46,6 +46,7 @@ protocol ClientBuilderProtocol: Sendable {
 
 struct ClientBuilderService: ClientBuilderProtocol {
     private let containerClient = ContainerClient()
+    private let networkClient = NetworkClient()
     private let builderContainerId: String
     private let builderPort: UInt32
     private let builderCPUs: Int64
@@ -140,7 +141,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
             do {
                 let socket = try await dialBuilderSocket()
                 let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                let builder = try Builder(socket: socket, group: group)
+                let builder = try Builder(socket: socket, group: group, logger: logger)
                 do {
                     _ = try await builder.info()
                     return builder
@@ -231,7 +232,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
         ]
         config.rosetta = useRosetta
 
-        guard let defaultNetwork = try await ClientNetwork.builtin else {
+        guard let defaultNetwork = try await networkClient.builtin else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
         guard case .running(_, let networkStatus) = defaultNetwork else {
