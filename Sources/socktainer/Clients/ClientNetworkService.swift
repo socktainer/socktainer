@@ -12,8 +12,10 @@ protocol ClientNetworkProtocol: Sendable {
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
+    private let networkClient = NetworkClient()
+
     func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
-        let networksList = try await ClientNetwork.list()
+        let networksList = try await networkClient.list()
         var allNetworks = networksList.map { RESTNetworkSummary(networkState: $0) }
         let containerClient = ClientContainerService()
         let allContainers = try await containerClient.list(showAll: true, filters: [:])
@@ -120,7 +122,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
     }
 
     func delete(id: String, logger: Logger) async throws {
-        try await ClientNetwork.delete(id: id)
+        try await networkClient.delete(id: id)
         logger.debug("Deleted network with id: \(id)")
     }
 
@@ -129,10 +131,10 @@ struct ClientNetworkService: ClientNetworkProtocol {
         let configuration = try NetworkConfiguration(
             id: name,
             mode: NetworkMode.nat,
-            labels: labels,
+            labels: ResourceLabels(labels),
             pluginInfo: NetworkPluginInfo(plugin: "container-network-vmnet")
         )
-        _ = try await ClientNetwork.create(configuration: configuration)
+        _ = try await networkClient.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
         return RESTNetworkCreate(Id: configuration.id, Warning: "")
     }
@@ -152,13 +154,13 @@ extension RESTNetworkSummary {
             id = config.id
             driver = String(describing: config.mode)
             subnet = config.ipv4Subnet.map { String(describing: $0) }
-            labels = config.labels
+            labels = config.labels.dictionary
         case .running(let config, let status):
             id = config.id
             driver = String(describing: config.mode)
             subnet = config.ipv4Subnet.map { String(describing: $0) } ?? String(describing: status.ipv4Subnet)
             gateway = String(describing: status.ipv4Gateway)
-            labels = config.labels
+            labels = config.labels.dictionary
         }
 
         let createdTimestamp = AppleContainerTimestampResolver.iso8601Timestamp(

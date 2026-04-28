@@ -234,7 +234,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             filter: .none,
             file: exportedTarPath
         )
-        try formatter.unpack(reader: existingReader)
+        try await formatter.unpack(reader: existingReader)
 
         // Step 5: Unpack the new tar at the specified destination path
         try ArchiveUtility.unpack(
