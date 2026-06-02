@@ -299,6 +299,9 @@ extension ContainerAttachRoute {
                             let code = try await process.wait()
                             await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                         } catch {
+                            // process.wait() failed — record a synthetic exit code so
+                            // /containers/{id}/wait can't block forever.
+                            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                         }
                     }
 
@@ -538,6 +541,9 @@ extension ContainerAttachRoute {
                         let code = try await process.wait()
                         await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                     } catch {
+                        // process.wait() failed — record a synthetic exit code so
+                        // /containers/{id}/wait can't block forever.
+                        await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                     }
 
                     // Give a small delay for any final output to be processed
