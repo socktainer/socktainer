@@ -241,13 +241,21 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
-                let process = try await ContainerClient().createProcess(
-                    containerId: container.id,
-                    processId: UUID().uuidString.lowercased(),
-                    configuration: processConfig,
-                    stdio: [nil, nil, nil]
-                )
-                try await process.start()
+                do {
+                    let process = try await ContainerClient().createProcess(
+                        containerId: container.id,
+                        processId: UUID().uuidString.lowercased(),
+                        configuration: processConfig,
+                        stdio: [nil, nil, nil]
+                    )
+                    try await process.start()
+                } catch {
+                    // The exec was marked started; if creating/starting the
+                    // process fails we must record an exit code, otherwise the
+                    // exec is stuck reporting Running forever.
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw error
+                }
                 await ExecManager.shared.remove(id: execId)
                 return Response(status: .ok)
             }
@@ -289,7 +297,14 @@ struct ExecRoute: RouteCollection {
                         stdio: stdio.asArray
                     )
 
-                    try await process.start()
+                    do {
+                        try await process.start()
+                    } catch {
+                        // Record an exit code so a failed start doesn't leave
+                        // the exec stuck reporting Running forever.
+                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        throw error
+                    }
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
@@ -385,6 +400,9 @@ struct ExecRoute: RouteCollection {
                                 let exitCode = try await process.wait()
                                 await ExecManager.shared.setExitCode(id: execId, code: exitCode)
                             } catch {
+                                // process.wait() failed — record a synthetic exit
+                                // code so the exec leaves the Running state.
+                                await ExecManager.shared.setExitCode(id: execId, code: -1)
                             }
                         }
 
@@ -434,7 +452,14 @@ struct ExecRoute: RouteCollection {
                     stdio: stdio.asArray
                 )
 
-                try await process.start()
+                do {
+                    try await process.start()
+                } catch {
+                    // Record an exit code so a failed start doesn't leave the
+                    // exec stuck reporting Running forever.
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw error
+                }
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
@@ -587,7 +612,10 @@ struct ExecRoute: RouteCollection {
                             let exitCode = try await process.wait()
                             await ExecManager.shared.setExitCode(id: execId, code: exitCode)
                         } catch {
-                            // Process wait error - handle gracefully
+                            // process.wait() failed — record a synthetic exit code
+                            // so the exec leaves the Running state instead of
+                            // hanging there forever.
+                            await ExecManager.shared.setExitCode(id: execId, code: -1)
                         }
 
                         // Give a small delay for any final output to be processed
