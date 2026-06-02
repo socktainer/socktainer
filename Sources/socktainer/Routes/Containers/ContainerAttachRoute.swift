@@ -113,103 +113,94 @@ extension ContainerAttachRoute {
             headers.add(name: "Upgrade", value: "tcp")
         }
 
+        let shouldAttachStdout = stdout || (!stdout && !stderr)
+
         // Create streaming response body using container logs when not using stdin
         let body = Response.Body { writer in
             Task.detached {
-                let pollInterval: UInt64 = 200_000_000  // 200ms
-                var containerWasRunning = false
-
                 defer {
                     _ = writer.write(.end)
                 }
 
-                // Continuously poll for log handles and send data
-                while true {
-                    // Check if container still exists
-                    do {
-                        _ = try await client.getContainer(id: id)
-                    } catch {
+                // Flush the response head immediately. `docker run` opens the attach
+                // connection and waits for the attach response before sending /start;
+                // a Vapor streaming body otherwise withholds headers until the first
+                // write, deadlocking attach-before-start. An empty buffer sends the head.
+                _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+
+                // Wait until the log file is available (container must be created first).
+                var logHandle: FileHandle? = nil
+                while logHandle == nil {
+                    if let fhs = try? await ContainerClient().logs(id: container.id), !fhs.isEmpty {
+                        logHandle = fhs[0]
+                        // Close the boot-log handle we don't need.
+                        if fhs.count > 1 { try? fhs[1].close() }
                         break
                     }
+                    // Container may not be created yet; retry shortly.
+                    try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                }
 
-                    var logHandles: [FileHandle] = []
-                    var hasValidHandles = false
+                guard let fileHandle = logHandle, shouldAttachStdout else { return }
+                defer { try? fileHandle.close() }
 
-                    // Try to get log handles
-                    do {
-                        logHandles = try await ContainerClient().logs(id: container.id)
-                        hasValidHandles = !logHandles.isEmpty
-                    } catch {
-                        hasValidHandles = false
+                // Drain a chunk of log data, framing it as a Docker stdout stream.
+                // Returns true if any bytes were written.
+                @Sendable func drainAvailable() -> Bool {
+                    var wrote = false
+                    while true {
+                        guard let data = try? fileHandle.read(upToCount: 4096),
+                              !data.isEmpty else { break }
+                        wrote = true
+                        let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                        var buf = sharedAllocator.buffer(capacity: capacity)
+                        buf.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
+                        _ = writer.write(.buffer(buf))
+                    }
+                    return wrote
+                }
+
+                // Stream log output using a DispatchSource file-write notification so
+                // we catch data as soon as it lands in the log file. When the container
+                // exits we do one final drain to capture any last bytes, then close.
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    let fd = fileHandle.fileDescriptor
+                    let source = DispatchSource.makeFileSystemObjectSource(
+                        fileDescriptor: fd,
+                        eventMask: .write,
+                        queue: .global(qos: .userInitiated)
+                    )
+
+                    // Drain any data already written before the source was set up.
+                    _ = drainAvailable()
+
+                    source.setEventHandler {
+                        _ = drainAvailable()
                     }
 
-                    defer {
-                        for handle in logHandles {
-                            try? handle.close()
-                        }
-                    }
-
-                    if hasValidHandles {
-                        let shouldAttachStdout = stdout || (!stdout && !stderr)
-                        var consecutiveEmptyReads = 0
-                        let maxEmptyReads = 50  // Switch to polling after 100 empty reads
+                    // Poll for container exit in the background; when stopped, do a
+                    // final drain and cancel the source (which resumes the continuation).
+                    let containerClient = ContainerClient()
+                    Task.detached {
                         while true {
-                            // Check if container still exists before reading data
-                            do {
-                                let currentContainer = try await client.getContainer(id: id)
-                                guard let container = currentContainer else {
-                                    return
-                                }
-                                if container.status == .running {
-                                    containerWasRunning = true
-                                } else if containerWasRunning {
-                                    // Container was running but now stopped - exit
-                                    return
-                                }
-                            } catch {
-                                // Container not available, exit
-                                return
-                            }
-
-                            var hasData = false
-
-                            if shouldAttachStdout && logHandles.indices.contains(0) {
-                                let stdoutData = logHandles[0].availableData
-                                if !stdoutData.isEmpty {
-                                    hasData = true
-                                    let capacity = min(stdoutData.count + (isTTY ? 0 : 8), 65536)
-                                    var buffer = sharedAllocator.buffer(capacity: capacity)
-                                    buffer.writeDockerFrame(streamType: .stdout, data: stdoutData, ttyMode: isTTY)
-                                    _ = writer.write(.buffer(buffer))
-                                }
-                            }
-
-                            if !hasData {
-                                consecutiveEmptyReads += 1
-
-                                // After many empty reads, send keep-alive less frequently
-                                if consecutiveEmptyReads >= maxEmptyReads {
-                                    consecutiveEmptyReads = 0  // Reset counter
-                                    try await Task.sleep(nanoseconds: 500_000_000)  // 500ms
-                                } else {
-                                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                }
-                            } else {
-                                consecutiveEmptyReads = 0
-                                try await Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
+                            try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                            let current = try? await containerClient.get(id: container.id)
+                            // Container stopped or removed — exit monitoring.
+                            if current == nil || current?.status != .running {
+                                break
                             }
                         }
-
-                    } else {
-                        // No valid handles, just wait
-                        try await Task.sleep(nanoseconds: pollInterval)
+                        // Final drain: give the log a brief moment to flush, then read rest.
+                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                        _ = drainAvailable()
+                        source.cancel()
                     }
 
-                    do {
-                        try await Task.sleep(nanoseconds: pollInterval)
-                    } catch {
-                        break
+                    source.setCancelHandler {
+                        continuation.resume()
                     }
+
+                    source.resume()
                 }
             }
         }
@@ -315,7 +306,9 @@ extension ContainerAttachRoute {
                         }
 
                         do {
-                            let _ = try await process.wait()
+                            // Record the real exit code so /containers/{id}/wait can return it.
+                            let code = try await process.wait()
+                            await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                         } catch {
                         }
                     }
@@ -328,9 +321,12 @@ extension ContainerAttachRoute {
 
                             while true {
                                 do {
+                                    // A blocking pipe read returns empty Data only at EOF —
+                                    // the attached process exited and closed its stdout writer.
+                                    // Break so the stream finishes; sleeping/continuing here
+                                    // spins forever and the attached client hangs.
                                     guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
 
                                     let capacity = min(data.count + (isTTY ? 0 : 8), 65536)  // Cap buffer size
@@ -352,9 +348,12 @@ extension ContainerAttachRoute {
 
                             while true {
                                 do {
+                                    // A blocking pipe read returns empty Data only at EOF —
+                                    // the attached process exited and closed its stderr writer.
+                                    // Break so the stream finishes; sleeping/continuing here
+                                    // spins forever and the attached client hangs.
                                     guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
 
                                     let capacity = min(data.count + 8, 65536)  // Cap buffer size
@@ -546,7 +545,9 @@ extension ContainerAttachRoute {
 
                 group.addTask {
                     do {
-                        let _ = try await process.wait()
+                        // Record the real exit code so /containers/{id}/wait can return it.
+                        let code = try await process.wait()
+                        await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                     } catch {
                     }
 
