@@ -149,17 +149,18 @@ extension ContainerAttachRoute {
                 defer { try? fileHandle.close() }
 
                 // Drain a chunk of log data, framing it as a Docker stdout stream.
-                // Returns true if any bytes were written.
-                @Sendable func drainAvailable() -> Bool {
+                // Returns true if any bytes were written. Awaits each write so a
+                // client disconnect (the write future fails once the channel is
+                // closed) throws and ends the poll promptly instead of looping
+                // until the container stops.
+                @Sendable func drainAvailable() async throws -> Bool {
                     var wrote = false
-                    while true {
-                        guard let data = try? fileHandle.read(upToCount: 4096),
-                              !data.isEmpty else { break }
+                    while let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
                         wrote = true
                         let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                         var buf = sharedAllocator.buffer(capacity: capacity)
                         buf.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
-                        _ = writer.write(.buffer(buf))
+                        try await writer.write(.buffer(buf)).get()
                     }
                     return wrote
                 }
@@ -172,19 +173,23 @@ extension ContainerAttachRoute {
                 // bug in the logs route). Polling is robust. Drain, then poll
                 // until the container is no longer running, then do a final drain.
                 let containerClient = ContainerClient()
-                _ = drainAvailable()
-                while true {
-                    let wrote = drainAvailable()
-                    if !wrote {
-                        let current = try? await containerClient.get(id: container.id)
-                        if current == nil || current?.status != .running {
-                            // Give the log a brief moment to flush the last bytes.
-                            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                            _ = drainAvailable()
-                            break
+                do {
+                    _ = try await drainAvailable()
+                    while true {
+                        let wrote = try await drainAvailable()
+                        if !wrote {
+                            let current = try? await containerClient.get(id: container.id)
+                            if current == nil || current?.status != .running {
+                                // Give the log a brief moment to flush the last bytes.
+                                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                                _ = try await drainAvailable()
+                                break
+                            }
+                            try? await Task.sleep(nanoseconds: 150_000_000)  // 150ms
                         }
-                        try? await Task.sleep(nanoseconds: 150_000_000)  // 150ms
                     }
+                } catch {
+                    // Client disconnected (a write failed) — stop streaming.
                 }
             }
         }
