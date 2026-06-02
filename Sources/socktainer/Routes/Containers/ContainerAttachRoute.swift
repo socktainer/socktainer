@@ -113,7 +113,11 @@ extension ContainerAttachRoute {
             headers.add(name: "Upgrade", value: "tcp")
         }
 
-        let shouldAttachStdout = stdout || (!stdout && !stderr)
+        // A non-stdin attach streams the container's log regardless of whether
+        // stdout, stderr, or both (the default) were requested. Apple container
+        // exposes a single primary log handle, so a stderr-only attach streams
+        // that same source rather than short-circuiting to no output.
+        let shouldStreamOutput = stdout || stderr || (!stdout && !stderr)
 
         // Create streaming response body using container logs when not using stdin
         let body = Response.Body { writer in
@@ -141,7 +145,7 @@ extension ContainerAttachRoute {
                     try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
                 }
 
-                guard let fileHandle = logHandle, shouldAttachStdout else { return }
+                guard let fileHandle = logHandle, shouldStreamOutput else { return }
                 defer { try? fileHandle.close() }
 
                 // Drain a chunk of log data, framing it as a Docker stdout stream.

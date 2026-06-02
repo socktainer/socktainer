@@ -19,6 +19,7 @@ actor ExecManager {
 
     private var storage: [String: ExecConfig] = [:]
     private var exitCodes: [String: Int32] = [:]
+    private var startedIds: Set<String> = []
 
     func create(config: ExecConfig) -> String {
         let id = UUID().uuidString
@@ -33,6 +34,21 @@ actor ExecManager {
     func remove(id: String) {
         storage.removeValue(forKey: id)
         exitCodes.removeValue(forKey: id)
+        startedIds.remove(id)
+    }
+
+    // Marks an exec as started. Returns false if it doesn't exist or was already
+    // started — Docker rejects starting an exec instance more than once.
+    func markStarted(id: String) -> Bool {
+        guard storage[id] != nil, !startedIds.contains(id) else { return false }
+        startedIds.insert(id)
+        return true
+    }
+
+    // An exec is "running" only once it has been started and has not yet
+    // recorded an exit code — distinct from created-but-not-started.
+    func isRunning(id: String) -> Bool {
+        startedIds.contains(id) && exitCodes[id] == nil
     }
 
     // The Docker client calls `GET /exec/{id}/json` after the start stream
@@ -114,12 +130,12 @@ struct ExecRoute: RouteCollection {
                 }
             }
 
-            // The start handler records the exit code when the process finishes.
-            // If it's present the exec has completed; if not, it's still running.
+            // Running is true only once started and before an exit code is
+            // recorded — a created-but-not-yet-started exec is not running.
             let recordedExitCode = await ExecManager.shared.exitCode(id: execId)
             let response = ExecInspectResponse(
                 ID: execId,
-                Running: recordedExitCode == nil,
+                Running: await ExecManager.shared.isRunning(id: execId),
                 ExitCode: recordedExitCode.map { Int($0) },
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
@@ -198,6 +214,11 @@ struct ExecRoute: RouteCollection {
             }
 
             try client.enforceContainerRunning(container: container)
+
+            // Reject starting an exec instance more than once (Docker semantics).
+            guard await ExecManager.shared.markStarted(id: execId) else {
+                throw Abort(.conflict, reason: "Exec instance \(execId) has already been started")
+            }
 
             struct StartExecRequest: Content {
                 let Detach: Bool?

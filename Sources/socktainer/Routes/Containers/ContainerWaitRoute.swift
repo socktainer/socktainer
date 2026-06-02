@@ -30,6 +30,13 @@ struct ContainerWaitRoute: RouteCollection {
                 condition = ContainerWaitCondition.default
             }
 
+            // Preflight before flushing headers so a missing container returns a
+            // real 404 instead of a streamed `200 {"StatusCode":0}` — the latter
+            // would make "no such container" indistinguishable from a clean exit.
+            guard try await client.getContainer(id: containerId) != nil else {
+                throw Abort(.notFound, reason: "No such container: \(containerId)")
+            }
+
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: "application/json")
 

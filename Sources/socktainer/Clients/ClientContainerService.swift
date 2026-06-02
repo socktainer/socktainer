@@ -187,6 +187,10 @@ struct ClientContainerService: ClientContainerProtocol {
 
         do {
             let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
+            // Clear any exit code recorded by a previous run of this container so
+            // /wait blocks for the new init process rather than immediately
+            // returning the stale code (e.g. after a restart).
+            await ContainerExitCodeStore.shared.remove(id: container.id)
             try await process.start()
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.
@@ -278,25 +282,29 @@ struct ClientContainerService: ClientContainerProtocol {
         // removal and we fall back to the recorded code (or 0).
         switch condition {
         case .notRunning, .nextExit, .removed:
-            while true {
-                if let code = await ContainerExitCodeStore.shared.get(id: id) {
-                    return RESTContainerWait(statusCode: Int64(code))
-                }
+            // Wait until the init process exits and its code is recorded. For
+            // `--rm` the container can be deleted the instant it exits (racing
+            // the recorder), so also stop once it's gone, then grace-poll the
+            // store below.
+            while await ContainerExitCodeStore.shared.get(id: id) == nil {
                 let current = try await containerClient.list().filter { $0.id == id }.first
                 if current == nil {
-                    // The container is gone — for `--rm` (AutoRemove) it is
-                    // deleted the instant it exits, which can race ahead of the
-                    // background waiter recording the exit code. Grace-poll the
-                    // store briefly so we still return the real code instead of 0.
-                    for _ in 0..<30 {
-                        if let code = await ContainerExitCodeStore.shared.get(id: id) {
-                            return RESTContainerWait(statusCode: Int64(code))
-                        }
+                    var graceTries = 0
+                    while await ContainerExitCodeStore.shared.get(id: id) == nil && graceTries < 30 {
                         try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                        graceTries += 1
                     }
                     break
                 }
                 try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+            }
+
+            // `removed` must block until the container is actually gone, not just
+            // exited — otherwise the requested condition was never satisfied.
+            if condition == .removed {
+                while (try await containerClient.list().filter { $0.id == id }.first) != nil {
+                    try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                }
             }
         }
 
