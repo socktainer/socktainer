@@ -1,11 +1,15 @@
 import Vapor
 
+/// Route collection for the Docker `POST /volumes/create` endpoint.
 struct VolumeCreateRoute: RouteCollection {
     let client: ClientVolumeService
+
+    /// Creates the route, backed by the given volume client.
     init(client: ClientVolumeService) {
         self.client = client
     }
 
+    /// Registers the `POST /volumes/create` route on the given builder.
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.POST, pattern: "/volumes/create", use: self.handler)
     }
