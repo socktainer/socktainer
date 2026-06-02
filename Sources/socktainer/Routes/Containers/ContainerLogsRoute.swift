@@ -64,18 +64,29 @@ extension ContainerLogsRoute {
                     // libdispatch trap. Polling is robust. Exit once the
                     // container is no longer running.
                     let logFollowClient = ContainerClient()
-                    while true {
+                    follow: while true {
                         var gotData = false
+                        var frames: [ByteBuffer] = []
                         do {
                             while let data = try fileHandle.read(upToCount: 4096), !data.isEmpty {
                                 gotData = true
                                 buffer.append(data)
                                 buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
-                                    _ = writer.write(.buffer(outputBuffer))
+                                    frames.append(outputBuffer)
                                 }
                             }
                         } catch {
                             break
+                        }
+                        // Await each write so a client disconnect (the write future
+                        // fails once the channel is closed) ends this task promptly
+                        // instead of polling on until the container stops.
+                        for frame in frames {
+                            do {
+                                try await writer.write(.buffer(frame)).get()
+                            } catch {
+                                break follow
+                            }
                         }
                         if !gotData {
                             let current = try? await logFollowClient.get(id: container.id)
