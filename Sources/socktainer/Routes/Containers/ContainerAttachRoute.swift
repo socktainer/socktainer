@@ -164,47 +164,27 @@ extension ContainerAttachRoute {
                     return wrote
                 }
 
-                // Stream log output using a DispatchSource file-write notification so
-                // we catch data as soon as it lands in the log file. When the container
-                // exits we do one final drain to capture any last bytes, then close.
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    let fd = fileHandle.fileDescriptor
-                    let source = DispatchSource.makeFileSystemObjectSource(
-                        fileDescriptor: fd,
-                        eventMask: .write,
-                        queue: .global(qos: .userInitiated)
-                    )
-
-                    // Drain any data already written before the source was set up.
-                    _ = drainAvailable()
-
-                    source.setEventHandler {
-                        _ = drainAvailable()
-                    }
-
-                    // Poll for container exit in the background; when stopped, do a
-                    // final drain and cancel the source (which resumes the continuation).
-                    let containerClient = ContainerClient()
-                    Task.detached {
-                        while true {
-                            try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
-                            let current = try? await containerClient.get(id: container.id)
-                            // Container stopped or removed — exit monitoring.
-                            if current == nil || current?.status != .running {
-                                break
-                            }
+                // Stream log output by polling the log file for new writes. A
+                // DispatchSource on the log fd is fragile: it can fire on a
+                // closed/invalidated fd during teardown (container removed or
+                // client disconnect) and crash the whole process with a
+                // libdispatch trap (see socktainer/socktainer#205 for the same
+                // bug in the logs route). Polling is robust. Drain, then poll
+                // until the container is no longer running, then do a final drain.
+                let containerClient = ContainerClient()
+                _ = drainAvailable()
+                while true {
+                    let wrote = drainAvailable()
+                    if !wrote {
+                        let current = try? await containerClient.get(id: container.id)
+                        if current == nil || current?.status != .running {
+                            // Give the log a brief moment to flush the last bytes.
+                            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                            _ = drainAvailable()
+                            break
                         }
-                        // Final drain: give the log a brief moment to flush, then read rest.
-                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                        _ = drainAvailable()
-                        source.cancel()
+                        try? await Task.sleep(nanoseconds: 150_000_000)  // 150ms
                     }
-
-                    source.setCancelHandler {
-                        continuation.resume()
-                    }
-
-                    source.resume()
                 }
             }
         }
