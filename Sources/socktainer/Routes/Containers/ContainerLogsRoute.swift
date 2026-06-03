@@ -91,7 +91,7 @@ extension ContainerLogsRoute {
                         if !gotData {
                             let current = try? await logFollowClient.get(id: container.id)
                             if current == nil || current?.status != .running { break }
-                            try? await Task.sleep(nanoseconds: 150_000_000)  // 150ms
+                            try? await Task.sleep(for: .milliseconds(150))
                         }
                     }
                     try? fileHandle.close()
