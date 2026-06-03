@@ -148,18 +148,22 @@ extension ContainerAttachRoute {
                 guard let fileHandle = logHandle, shouldStreamOutput else { return }
                 defer { try? fileHandle.close() }
 
-                // Drain a chunk of log data, framing it as a Docker stdout stream.
+                // Drain a chunk of log data, framing it as a Docker stdout/stderr stream.
                 // Returns true if any bytes were written. Awaits each write so a
                 // client disconnect (the write future fails once the channel is
                 // closed) throws and ends the poll promptly instead of looping
                 // until the container stops.
                 @Sendable func drainAvailable() async throws -> Bool {
+                    // When the client requested stderr only, label frames as stderr so
+                    // demultiplexing clients route the bytes correctly; otherwise stdout.
+                    // Apple exposes a single primary log handle, so the source is the same.
+                    let frameStreamType: DockerStreamFrame.StreamType = (stderr && !stdout) ? .stderr : .stdout
                     var wrote = false
                     while let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
                         wrote = true
                         let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
                         var buf = sharedAllocator.buffer(capacity: capacity)
-                        buf.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
+                        buf.writeDockerFrame(streamType: frameStreamType, data: data, ttyMode: isTTY)
                         try await writer.write(.buffer(buf)).get()
                     }
                     return wrote
@@ -261,16 +265,24 @@ extension ContainerAttachRoute {
             stderrPipe?.fileHandleForWriting,
         ]
 
+        // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
+        // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
+        // before starting and record a synthetic one if bootstrap/start fails (so
+        // /wait can't return a stale status or poll forever).
+        await ContainerExitCodeStore.shared.remove(id: container.id)
+
         let process: ClientProcess
         do {
             process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
         } catch {
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
 
         do {
             try await process.start()
         } catch {
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
 
