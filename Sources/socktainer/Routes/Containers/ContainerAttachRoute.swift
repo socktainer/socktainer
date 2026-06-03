@@ -176,10 +176,12 @@ extension ContainerAttachRoute {
                 // libdispatch trap (see socktainer/socktainer#205 for the same
                 // bug in the logs route). Polling is robust. Drain, then poll
                 // until the container is no longer running, then do a final drain.
+                // A snapshot attach (stream=0) drains once and ends instead of
+                // following.
                 let containerClient = ContainerClient()
                 do {
                     _ = try await drainAvailable()
-                    while true {
+                    while stream {
                         let wrote = try await drainAvailable()
                         if !wrote {
                             let current = try? await containerClient.get(id: container.id)
@@ -205,6 +207,16 @@ extension ContainerAttachRoute {
             headers: headers,
             body: body
         )
+    }
+
+    // ContainerClient surfaces a concurrent attach/start as a "booted" /
+    // "expected to be in created state" error; ClientContainerService.start
+    // treats it as a benign race (another request already started the container).
+    // Don't record a synthetic exit code for it — the container may be running
+    // fine — so /wait isn't told the container exited.
+    private static func isBenignStartRace(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.contains("booted") || message.contains("expected to be in created state")
     }
 
     private static func handleAttachWithStdin(
@@ -275,6 +287,9 @@ extension ContainerAttachRoute {
         do {
             process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
         } catch {
+            if isBenignStartRace(error) {
+                throw Abort(.conflict, reason: "Container is already starting")
+            }
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
@@ -282,6 +297,9 @@ extension ContainerAttachRoute {
         do {
             try await process.start()
         } catch {
+            if isBenignStartRace(error) {
+                throw Abort(.conflict, reason: "Container is already starting")
+            }
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
