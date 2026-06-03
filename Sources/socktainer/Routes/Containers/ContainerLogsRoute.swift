@@ -29,8 +29,6 @@ extension ContainerLogsRoute {
             // `follow=1` means tail like
             let follow = (try? req.query.get(Bool.self, at: "follow")) ?? false
 
-            let fd = fileHandle.fileDescriptor
-
             let body = Response.Body { writer in
                 Task.detached {
                     var buffer = Data()
@@ -59,36 +57,45 @@ extension ContainerLogsRoute {
                         return
                     }
 
-                    // For follow mode, set up a DispatchSource to stream future writes
-                    let source = DispatchSource.makeFileSystemObjectSource(
-                        fileDescriptor: fd,
-                        eventMask: .write,
-                        queue: .global()
-                    )
-
-                    source.setEventHandler {
+                    // For follow mode, poll the log file for new writes. A
+                    // DispatchSource on the log fd is fragile: it can fire on a
+                    // closed/invalidated fd during teardown (container removed or
+                    // client disconnect) and crash the whole process with a
+                    // libdispatch trap. Polling is robust. Exit once the
+                    // container is no longer running.
+                    let logFollowClient = ContainerClient()
+                    follow: while true {
+                        var gotData = false
+                        var frames: [ByteBuffer] = []
                         do {
-                            while true {
-                                let data = try fileHandle.read(upToCount: 4096)
-                                guard let data, !data.isEmpty else { break }
+                            while let data = try fileHandle.read(upToCount: 4096), !data.isEmpty {
+                                gotData = true
                                 buffer.append(data)
-
-                                // Process complete frames from buffer
                                 buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
-                                    _ = writer.write(.buffer(outputBuffer))
+                                    frames.append(outputBuffer)
                                 }
                             }
                         } catch {
-                            source.cancel()
+                            break
+                        }
+                        // Await each write so a client disconnect (the write future
+                        // fails once the channel is closed) ends this task promptly
+                        // instead of polling on until the container stops.
+                        for frame in frames {
+                            do {
+                                try await writer.write(.buffer(frame)).get()
+                            } catch {
+                                break follow
+                            }
+                        }
+                        if !gotData {
+                            let current = try? await logFollowClient.get(id: container.id)
+                            if current == nil || current?.status != .running { break }
+                            try? await Task.sleep(for: .milliseconds(150))
                         }
                     }
-
-                    source.setCancelHandler {
-                        try? fileHandle.close()
-                        _ = writer.write(.end)
-                    }
-
-                    source.resume()
+                    try? fileHandle.close()
+                    _ = writer.write(.end)
                 }
             }
 
