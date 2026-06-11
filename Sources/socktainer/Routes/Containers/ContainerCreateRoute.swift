@@ -198,8 +198,10 @@ extension ContainerCreateRoute {
                 containerConfiguration.rosetta = true
             }
 
-            // Handle hostname from request - ensure uniqueness to avoid collision
-            let hostname = (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())"
+            // Handle hostname from request - ensure uniqueness to avoid collision,
+            // capped at 64 chars (Linux/VZ hostname limit; longer values fail start with EINVAL)
+            let hostname = ContainerNameUtility.sanitize(
+                (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())")
 
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,

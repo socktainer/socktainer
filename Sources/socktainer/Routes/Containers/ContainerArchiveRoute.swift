@@ -146,7 +146,7 @@ struct ContainerArchiveRoute: RouteCollection {
 
             do {
                 try await archiveClient.putArchive(
-                    containerId: container.id,
+                    container: container,
                     path: query.path,
                     tarPath: tarPath,
                     noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false

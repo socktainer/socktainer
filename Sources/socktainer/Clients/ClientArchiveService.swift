@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -49,6 +50,7 @@ enum ClientArchiveError: Error, LocalizedError {
     case pathNotFound(path: String)
     case rootfsNotFound(id: String)
     case invalidPath(path: String)
+    case notADirectory(path: String)
     case operationFailed(message: String)
 
     var errorDescription: String? {
@@ -61,6 +63,8 @@ enum ClientArchiveError: Error, LocalizedError {
             return "Rootfs not found for container: \(id)"
         case .invalidPath(let path):
             return "Invalid path: \(path)"
+        case .notADirectory(let path):
+            return "Extraction point is not a directory: \(path)"
         case .operationFailed(let message):
             return "Archive operation failed: \(message)"
         }
@@ -93,7 +97,7 @@ protocol ClientArchiveProtocol: Sendable {
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
+    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 }
 
 /// Service for performing archive operations on container filesystems
@@ -169,15 +173,29 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
-        let rootfsPath = getRootfsPath(containerId: containerId)
-
-        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
-        }
-
+    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+
+        // A running container's VM holds rootfs.ext4 open as its block device:
+        // rewriting and swapping the file on the host is never seen by the guest
+        // (and guest writes would diverge from the swapped file). Inject through
+        // the live container instead.
+        if container.status == .running {
+            try await putArchiveViaCopyIn(
+                container: container,
+                destinationPath: normalizedPath,
+                tarPath: tarPath,
+                noOverwriteDirNonDir: noOverwriteDirNonDir
+            )
+            return
+        }
+
+        let rootfsPath = getRootfsPath(containerId: container.id)
+
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
 
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
         try validateArchiveEntries(
@@ -192,6 +210,268 @@ struct ClientArchiveService: ClientArchiveProtocol {
             destinationPath: normalizedPath,
             inputTarPath: tarPath
         )
+    }
+
+    /// One parsed entry of the uploaded archive.
+    private struct ArchiveEntryPlan {
+        enum Kind {
+            case directory
+            case file
+            case symlink(target: String)
+        }
+        let relativePath: String
+        let guestPath: String
+        let kind: Kind
+        let mode: UInt32
+    }
+
+    /// Inject the archive into a RUNNING container.
+    ///
+    /// Docker semantics require extracting *into* the destination without
+    /// disturbing what already exists (e.g. a tar entry `tmp/foo` must not
+    /// change the ownership/mode/sticky bit of an existing `/tmp`). So instead
+    /// of pushing whole directories through copyIn (whose in-guest extraction
+    /// applies archived directory metadata over existing directories), this:
+    ///  1. runs ONE `/bin/sh` exec in the guest that validates the destination
+    ///     (404/400/conflict semantics that copyIn cannot express) and creates
+    ///     missing directories and symlinks (`mkdir` skips existing dirs), then
+    ///  2. streams each regular file individually over vsock via the daemon's
+    ///     copyIn API with the mode recorded in the tar.
+    private func putArchiveViaCopyIn(
+        container: ContainerSnapshot,
+        destinationPath: String,
+        tarPath: URL,
+        noOverwriteDirNonDir: Bool
+    ) async throws {
+        let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
+
+        try await prepareGuestForCopy(
+            container: container,
+            destinationPath: destinationPath,
+            entries: plan,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
+
+        let files = plan.filter {
+            if case .file = $0.kind { return true }
+            return false
+        }
+        guard !files.isEmpty else { return }
+
+        // Unpack the uploaded tar to a staging directory for the file contents
+        // (modes are taken from the tar entries, not the staged files).
+        let stagingDir = FileManager.default.temporaryDirectory.appendingPathComponent("put-archive-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
+
+        let client = ContainerClient()
+        for file in files {
+            let stagedURL = stagingDir.appendingPathComponent(file.relativePath)
+            guard FileManager.default.fileExists(atPath: stagedURL.path) else {
+                throw ClientArchiveError.operationFailed(message: "archive entry missing after extraction: \(file.relativePath)")
+            }
+            do {
+                try await client.copyIn(
+                    id: container.id,
+                    source: stagedURL.path,
+                    destination: file.guestPath,
+                    mode: file.mode
+                )
+            } catch {
+                throw ClientArchiveError.operationFailed(
+                    message: "Failed to copy \(file.relativePath) into running container: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Parse the uploaded tar into a copy plan.
+    private func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
+        let archiveReader = try ArchiveReader(
+            format: .paxRestricted,
+            filter: .none,
+            file: tarPath
+        )
+
+        var plan: [ArchiveEntryPlan] = []
+        for (entry, _) in archiveReader.makeStreamingIterator() {
+            guard let entryPath = entry.path,
+                let guestPath = ArchiveUtility.destinationPath(for: entryPath, under: destinationPath),
+                guestPath != destinationPath
+            else {
+                continue
+            }
+
+            var relativePath = entryPath
+            if relativePath.hasPrefix("./") {
+                relativePath = String(relativePath.dropFirst(2))
+            }
+
+            let mode = UInt32(entry.permissions) & 0o7777
+            switch entry.fileType {
+            case .directory:
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .directory, mode: mode))
+            case .regular:
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .file, mode: mode))
+            case .symbolicLink:
+                guard let target = entry.symlinkTarget else { continue }
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .symlink(target: target), mode: mode))
+            default:
+                throw ClientArchiveError.operationFailed(
+                    message: "unsupported archive entry type for copy into a running container: \(relativePath)")
+            }
+        }
+        return plan
+    }
+
+    /// Run Docker's PUT-archive validation inside the running guest and create
+    /// the directory/symlink structure for the incoming archive: destination
+    /// must exist (404) and be a directory (400), optional per-entry
+    /// noOverwriteDirNonDir conflict checks, `mkdir` for missing directories
+    /// (existing ones are left untouched), and `ln -sfn` for symlinks.
+    private func prepareGuestForCopy(
+        container: ContainerSnapshot,
+        destinationPath: String,
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) async throws {
+        let script = buildPreparationScript(
+            entries: entries,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
+
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-c", script, "sh", destinationPath]
+        processConfig.terminal = false
+        // Validate as root so restrictive permissions on parent directories
+        // cannot mask the existence checks.
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        let stderrPipe = Pipe()
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: [nil, nil, stderrPipe.fileHandleForWriting]
+            )
+            try await process.start()
+        } catch {
+            try? stderrPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+
+        // Close our copy of the remote end so EOF propagates once the guest
+        // process exits (the daemon holds its own duplicate).
+        try? stderrPipe.fileHandleForWriting.close()
+
+        let stderrReader = stderrPipe.fileHandleForReading
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader.close() }
+            var collected = Data()
+            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < 16 * 1024 {
+                    collected.append(chunk)
+                }
+            }
+            return collected
+        }
+
+        let exitCode: Int32
+        do {
+            exitCode = try await process.wait()
+        } catch {
+            throw ClientArchiveError.operationFailed(message: "Failed waiting for validation in running container: \(error.localizedDescription)")
+        }
+
+        let stderrText =
+            String(data: await stderrTask.value, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        switch exitCode {
+        case 0:
+            return
+        case 40:
+            throw ClientArchiveError.pathNotFound(path: destinationPath)
+        case 41:
+            throw ClientArchiveError.notADirectory(path: destinationPath)
+        default:
+            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
+            throw ClientArchiveError.operationFailed(message: "Validation in running container failed (exit \(exitCode))\(detail)")
+        }
+    }
+
+    /// Build the validation/preparation shell script run inside the guest.
+    /// Only `sh`, `mkdir`, `ln` and `test` are required. Existing directories
+    /// are never modified, mirroring how tar treats implicit parents.
+    private func buildPreparationScript(
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) -> String {
+        var lines = [
+            "set -u",
+            "dest=\"$1\"",
+            "if [ ! -e \"$dest\" ]; then echo \"destination does not exist: $dest\" >&2; exit 40; fi",
+            "if [ ! -d \"$dest\" ]; then echo \"extraction point is not a directory: $dest\" >&2; exit 41; fi",
+        ]
+
+        if noOverwriteDirNonDir {
+            for entry in entries {
+                let quoted = shellSingleQuoted(entry.guestPath)
+                if case .directory = entry.kind {
+                    lines.append("if [ -e \(quoted) ] && [ ! -d \(quoted) ]; then echo \"refusing to overwrite non-directory with directory\" >&2; exit 43; fi")
+                } else {
+                    lines.append("if [ -d \(quoted) ]; then echo \"refusing to overwrite directory with non-directory\" >&2; exit 43; fi")
+                }
+            }
+        }
+
+        // Explicit directory entries: create missing ones with the archived
+        // mode (parents first); never touch directories that already exist.
+        let directories =
+            entries
+            .compactMap { entry -> (path: String, mode: UInt32)? in
+                guard case .directory = entry.kind else { return nil }
+                return (entry.guestPath, entry.mode)
+            }
+            .sorted { $0.path.count < $1.path.count }
+        for directory in directories {
+            let quoted = shellSingleQuoted(directory.path)
+            let parent = shellSingleQuoted((directory.path as NSString).deletingLastPathComponent)
+            let octal = String(directory.mode, radix: 8)
+            lines.append(
+                "if [ ! -d \(quoted) ]; then mkdir -p \(parent) && mkdir -m \(octal) \(quoted) || { echo \"failed to create directory \(directory.path)\" >&2; exit 44; }; fi")
+        }
+
+        // Implicit parents of file/symlink entries (mkdir -p is a no-op on
+        // existing directories).
+        var parents = Set<String>()
+        for entry in entries {
+            if case .directory = entry.kind { continue }
+            let parent = (entry.guestPath as NSString).deletingLastPathComponent
+            if !parent.isEmpty, parent != "/" {
+                parents.insert(parent)
+            }
+        }
+        for parent in parents.sorted() {
+            lines.append("mkdir -p \(shellSingleQuoted(parent)) || { echo \"failed to create parent directory \(parent)\" >&2; exit 44; }")
+        }
+
+        for entry in entries {
+            guard case .symlink(let target) = entry.kind else { continue }
+            lines.append(
+                "ln -sfn \(shellSingleQuoted(target)) \(shellSingleQuoted(entry.guestPath)) || { echo \"failed to create symlink \(entry.guestPath)\" >&2; exit 45; }")
+        }
+
+        lines.append("exit 0")
+        return lines.joined(separator: "\n")
+    }
+
+    private func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Fallback PUT using full read-modify-write approach
