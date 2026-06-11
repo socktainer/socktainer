@@ -69,6 +69,18 @@ struct RESTBuildQuery: Vapor.Content {
 }
 
 extension BuildRoute {
+    /// Parses a Docker API build query parameter (`buildargs` or `labels`).
+    ///
+    /// The Docker Engine API sends these as a JSON-encoded `{"KEY":"VALUE"}` map.
+    /// Returns `["KEY=VALUE", ...]` strings suitable for passing to BuildKit.
+    static func parseBuildQueryParam(_ value: String?) -> [String] {
+        guard let value,
+            let data = value.data(using: .utf8),
+            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        else { return [] }
+        return dict.map { "\($0.key)=\($0.value)" }
+    }
+
     static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
@@ -196,17 +208,8 @@ extension BuildRoute {
                 throw error
             }
 
-            // Parse build arguments
-            let buildArgs: [String] = {
-                guard let buildArgsString = query.buildargs else { return [] }
-                return buildArgsString.split(separator: ",").map(String.init)
-            }()
-
-            // Parse labels
-            let labels: [String] = {
-                guard let labelsString = query.labels else { return [] }
-                return labelsString.split(separator: ",").map(String.init)
-            }()
+            let buildArgs = BuildRoute.parseBuildQueryParam(query.buildargs)
+            let labels = BuildRoute.parseBuildQueryParam(query.labels)
 
             // Create streaming response for build output
             let body = Response.Body { writer in
