@@ -31,6 +31,8 @@ enum ClientImageError: Error {
 }
 
 struct ClientImageService: ClientImageProtocol {
+    private let containerSystemConfig = ContainerSystemConfig()
+
     // Workaround for narrowing an unspecified push from all platforms to a single platform available.
     // This avoids container push failures caused by missing blobs for non local platforms.
     private func resolvedPushPlatform(for image: ClientImage, requestedPlatform: Platform?, logger: Logger) async throws -> Platform? {
@@ -85,7 +87,7 @@ struct ClientImageService: ClientImageProtocol {
 
     func delete(id: String) async throws {
         do {
-            _ = try await ClientImage.get(reference: id, containerSystemConfig: ContainerSystemConfig())
+            _ = try await ClientImage.get(reference: id, containerSystemConfig: containerSystemConfig)
         } catch {
             // Handle specific error if needed
             throw ClientImageError.notFound(id: id)
@@ -96,7 +98,6 @@ struct ClientImageService: ClientImageProtocol {
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let containerSystemConfig = ContainerSystemConfig()
         let reference = try {
             guard let tag, !tag.isEmpty else {
                 return try ClientImage.normalizeReference(image, containerSystemConfig: containerSystemConfig)
@@ -122,7 +123,7 @@ struct ClientImageService: ClientImageProtocol {
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
-                        containerSystemConfig: ContainerSystemConfig(),
+                        containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
                                 switch event {
@@ -165,7 +166,6 @@ struct ClientImageService: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let containerSystemConfig = ContainerSystemConfig()
         let normalizedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
 
         logger.info("Pushing image reference: \(normalizedReference)")
@@ -192,7 +192,7 @@ struct ClientImageService: ClientImageProtocol {
                     try await image.push(
                         platform: effectivePlatform,
                         scheme: .auto,
-                        containerSystemConfig: ContainerSystemConfig(),
+                        containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
                                 switch event {
@@ -463,7 +463,7 @@ struct ClientImageService: ClientImageProtocol {
 
         for reference in references {
             do {
-                let image = try await ClientImage.get(reference: reference, containerSystemConfig: ContainerSystemConfig())
+                let image = try await ClientImage.get(reference: reference, containerSystemConfig: containerSystemConfig)
                 logger.debug("Image exists: \(image.reference)")
                 resolvedRefs.append(image.reference)
             } catch {
