@@ -113,103 +113,89 @@ extension ContainerAttachRoute {
             headers.add(name: "Upgrade", value: "tcp")
         }
 
+        // A non-stdin attach streams the container's log regardless of whether
+        // stdout, stderr, or both (the default) were requested. Apple container
+        // exposes a single primary log handle, so a stderr-only attach streams
+        // that same source rather than short-circuiting to no output.
+        let shouldStreamOutput = stdout || stderr || (!stdout && !stderr)
+
         // Create streaming response body using container logs when not using stdin
         let body = Response.Body { writer in
             Task.detached {
-                let pollInterval: UInt64 = 200_000_000  // 200ms
-                var containerWasRunning = false
-
                 defer {
                     _ = writer.write(.end)
                 }
 
-                // Continuously poll for log handles and send data
-                while true {
-                    // Check if container still exists
-                    do {
-                        _ = try await client.getContainer(id: id)
-                    } catch {
+                // Flush the response head immediately. `docker run` opens the attach
+                // connection and waits for the attach response before sending /start;
+                // a Vapor streaming body otherwise withholds headers until the first
+                // write, deadlocking attach-before-start. An empty buffer sends the head.
+                _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+
+                // Wait until the log file is available (container must be created first).
+                var logHandle: FileHandle? = nil
+                while logHandle == nil {
+                    if let fhs = try? await ContainerClient().logs(id: container.id), !fhs.isEmpty {
+                        logHandle = fhs[0]
+                        // Close the boot-log handle we don't need.
+                        if fhs.count > 1 { try? fhs[1].close() }
                         break
                     }
+                    // Container may not be created yet; retry shortly.
+                    try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                }
 
-                    var logHandles: [FileHandle] = []
-                    var hasValidHandles = false
+                guard let fileHandle = logHandle, shouldStreamOutput else { return }
+                defer { try? fileHandle.close() }
 
-                    // Try to get log handles
-                    do {
-                        logHandles = try await ContainerClient().logs(id: container.id)
-                        hasValidHandles = !logHandles.isEmpty
-                    } catch {
-                        hasValidHandles = false
+                // Drain a chunk of log data, framing it as a Docker stdout/stderr stream.
+                // Returns true if any bytes were written. Awaits each write so a
+                // client disconnect (the write future fails once the channel is
+                // closed) throws and ends the poll promptly instead of looping
+                // until the container stops.
+                @Sendable func drainAvailable() async throws -> Bool {
+                    // When the client requested stderr only, label frames as stderr so
+                    // demultiplexing clients route the bytes correctly; otherwise stdout.
+                    // Apple exposes a single primary log handle, so the source is the same.
+                    let frameStreamType: DockerStreamFrame.StreamType = (stderr && !stdout) ? .stderr : .stdout
+                    var wrote = false
+                    while let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
+                        wrote = true
+                        let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                        var buf = sharedAllocator.buffer(capacity: capacity)
+                        buf.writeDockerFrame(streamType: frameStreamType, data: data, ttyMode: isTTY)
+                        try await writer.write(.buffer(buf)).get()
                     }
+                    return wrote
+                }
 
-                    defer {
-                        for handle in logHandles {
-                            try? handle.close()
+                // Stream log output by polling the log file for new writes. A
+                // DispatchSource on the log fd is fragile: it can fire on a
+                // closed/invalidated fd during teardown (container removed or
+                // client disconnect) and crash the whole process with a
+                // libdispatch trap (see socktainer/socktainer#205 for the same
+                // bug in the logs route). Polling is robust. Drain, then poll
+                // until the container is no longer running, then do a final drain.
+                // A snapshot attach (stream=0) drains once and ends instead of
+                // following.
+                let containerClient = ContainerClient()
+                do {
+                    _ = try await drainAvailable()
+                    while stream {
+                        let wrote = try await drainAvailable()
+                        if !wrote {
+                            let current = try? await containerClient.get(id: container.id)
+                            if current == nil || current?.status != .running {
+                                // Give the log a brief moment to flush the last bytes.
+                                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                                _ = try await drainAvailable()
+                                break
+                            }
+                            try? await Task.sleep(nanoseconds: 150_000_000)  // 150ms
                         }
                     }
-
-                    if hasValidHandles {
-                        let shouldAttachStdout = stdout || (!stdout && !stderr)
-                        var consecutiveEmptyReads = 0
-                        let maxEmptyReads = 50  // Switch to polling after 100 empty reads
-                        while true {
-                            // Check if container still exists before reading data
-                            do {
-                                let currentContainer = try await client.getContainer(id: id)
-                                guard let container = currentContainer else {
-                                    return
-                                }
-                                if container.status == .running {
-                                    containerWasRunning = true
-                                } else if containerWasRunning {
-                                    // Container was running but now stopped - exit
-                                    return
-                                }
-                            } catch {
-                                // Container not available, exit
-                                return
-                            }
-
-                            var hasData = false
-
-                            if shouldAttachStdout && logHandles.indices.contains(0) {
-                                let stdoutData = logHandles[0].availableData
-                                if !stdoutData.isEmpty {
-                                    hasData = true
-                                    let capacity = min(stdoutData.count + (isTTY ? 0 : 8), 65536)
-                                    var buffer = sharedAllocator.buffer(capacity: capacity)
-                                    buffer.writeDockerFrame(streamType: .stdout, data: stdoutData, ttyMode: isTTY)
-                                    _ = writer.write(.buffer(buffer))
-                                }
-                            }
-
-                            if !hasData {
-                                consecutiveEmptyReads += 1
-
-                                // After many empty reads, send keep-alive less frequently
-                                if consecutiveEmptyReads >= maxEmptyReads {
-                                    consecutiveEmptyReads = 0  // Reset counter
-                                    try await Task.sleep(nanoseconds: 500_000_000)  // 500ms
-                                } else {
-                                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                }
-                            } else {
-                                consecutiveEmptyReads = 0
-                                try await Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
-                            }
-                        }
-
-                    } else {
-                        // No valid handles, just wait
-                        try await Task.sleep(nanoseconds: pollInterval)
-                    }
-
-                    do {
-                        try await Task.sleep(nanoseconds: pollInterval)
-                    } catch {
-                        break
-                    }
+                } catch {
+                    // Client disconnected (a write failed) — stop streaming.
                 }
             }
         }
@@ -221,6 +207,16 @@ extension ContainerAttachRoute {
             headers: headers,
             body: body
         )
+    }
+
+    // ContainerClient surfaces a concurrent attach/start as a "booted" /
+    // "expected to be in created state" error; ClientContainerService.start
+    // treats it as a benign race (another request already started the container).
+    // Don't record a synthetic exit code for it — the container may be running
+    // fine — so /wait isn't told the container exited.
+    private static func isBenignStartRace(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.contains("booted") || message.contains("expected to be in created state")
     }
 
     private static func handleAttachWithStdin(
@@ -281,16 +277,30 @@ extension ContainerAttachRoute {
             stderrPipe?.fileHandleForWriting,
         ]
 
+        // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
+        // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
+        // before starting and record a synthetic one if bootstrap/start fails (so
+        // /wait can't return a stale status or poll forever).
+        await ContainerExitCodeStore.shared.remove(id: container.id)
+
         let process: ClientProcess
         do {
             process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
         } catch {
+            if isBenignStartRace(error) {
+                throw Abort(.conflict, reason: "Container is already starting")
+            }
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
 
         do {
             try await process.start()
         } catch {
+            if isBenignStartRace(error) {
+                throw Abort(.conflict, reason: "Container is already starting")
+            }
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
 
@@ -315,8 +325,13 @@ extension ContainerAttachRoute {
                         }
 
                         do {
-                            let _ = try await process.wait()
+                            // Record the real exit code so /containers/{id}/wait can return it.
+                            let code = try await process.wait()
+                            await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                         } catch {
+                            // process.wait() failed — record a synthetic exit code so
+                            // /containers/{id}/wait can't block forever.
+                            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                         }
                     }
 
@@ -328,9 +343,12 @@ extension ContainerAttachRoute {
 
                             while true {
                                 do {
+                                    // A blocking pipe read returns empty Data only at EOF —
+                                    // the attached process exited and closed its stdout writer.
+                                    // Break so the stream finishes; sleeping/continuing here
+                                    // spins forever and the attached client hangs.
                                     guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
 
                                     let capacity = min(data.count + (isTTY ? 0 : 8), 65536)  // Cap buffer size
@@ -352,9 +370,12 @@ extension ContainerAttachRoute {
 
                             while true {
                                 do {
+                                    // A blocking pipe read returns empty Data only at EOF —
+                                    // the attached process exited and closed its stderr writer.
+                                    // Break so the stream finishes; sleeping/continuing here
+                                    // spins forever and the attached client hangs.
                                     guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
+                                        break
                                     }
 
                                     let capacity = min(data.count + 8, 65536)  // Cap buffer size
@@ -546,8 +567,13 @@ extension ContainerAttachRoute {
 
                 group.addTask {
                     do {
-                        let _ = try await process.wait()
+                        // Record the real exit code so /containers/{id}/wait can return it.
+                        let code = try await process.wait()
+                        await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                     } catch {
+                        // process.wait() failed — record a synthetic exit code so
+                        // /containers/{id}/wait can't block forever.
+                        await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                     }
 
                     // Give a small delay for any final output to be processed
