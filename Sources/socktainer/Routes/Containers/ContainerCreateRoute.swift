@@ -1,5 +1,6 @@
 import ContainerAPIClient
-import ContainerNetworkService
+import ContainerNetworkClient
+import ContainerPersistence
 import ContainerResource
 import Containerization
 import ContainerizationError
@@ -74,7 +75,7 @@ extension ContainerCreateRoute {
 
             // Check if image exists locally
             do {
-                _ = try await ClientImage.get(reference: body.Image)
+                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: ContainerSystemConfig())
             } catch {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
@@ -82,6 +83,7 @@ extension ContainerCreateRoute {
             let img = try await ClientImage.fetch(
                 reference: body.Image,
                 platform: requestedPlatform,
+                containerSystemConfig: ContainerSystemConfig()
             )
 
             // Unpack a fetched image before use
@@ -92,7 +94,8 @@ extension ContainerCreateRoute {
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
             let initImage = try await ClientImage.fetch(
-                reference: ClientImage.initImageRef, platform: .current
+                reference: ContainerSystemConfig().vminit.image, platform: .current,
+                containerSystemConfig: ContainerSystemConfig()
             )
 
             _ = try await initImage.getCreateSnapshot(
@@ -313,7 +316,7 @@ extension ContainerCreateRoute {
                     let existingVolumes = try await ClientVolume.list()
                     let existingVolume = existingVolumes.first { $0.name == parsed.name }
 
-                    let volume: ContainerResource.Volume
+                    let volume: ContainerResource.VolumeConfiguration
                     if let existing = existingVolume {
                         // Volume exists, use it
                         volume = existing
@@ -419,7 +422,7 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
                 hostPort = UInt16(try findAvailablePort())
             }
 
-            let publishPort = PublishPort(
+            let publishPort = try PublishPort(
                 hostAddress: try IPAddress(hostAddress),
                 hostPort: hostPort,
                 containerPort: containerPort,

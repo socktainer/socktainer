@@ -205,11 +205,11 @@ struct ClientBuilderService: ClientBuilderProtocol {
             try FileManager.default.createDirectory(at: exportsMount, withIntermediateDirectories: true)
         }
 
-        let builderImage = DefaultsStore.get(key: .defaultBuilderImage)
+        let builderImage = BuildConfig.defaultImage
         let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
-        let useRosetta = DefaultsStore.getBool(key: .buildRosetta) ?? true
+        let useRosetta = BuildConfig.defaultRosetta
 
-        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform)
+        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform, containerSystemConfig: ContainerSystemConfig())
         _ = try await image.getCreateSnapshot(platform: builderPlatform)
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
@@ -224,20 +224,18 @@ struct ClientBuilderService: ClientBuilderProtocol {
         )
 
         var config = ContainerConfiguration(id: builderContainerId, image: imageDesc, process: processConfig)
-        config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory)
+        config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory, defaultCPUs: BuildConfig.defaultCPUs, defaultMemory: BuildConfig.defaultMemory)
         config.labels = [ResourceLabelKeys.role: ResourceRoleValues.builder]
         config.mounts = [
-            .init(type: .tmpfs, source: "", destination: "/run", options: []),
-            .init(type: .virtiofs, source: exportsMount.path, destination: "/var/lib/container-builder-shim/exports", options: []),
+            Filesystem.tmpfs(destination: "/run", options: []),
+            Filesystem.virtiofs(source: exportsMount.path, destination: "/var/lib/container-builder-shim/exports", options: []),
         ]
         config.rosetta = useRosetta
 
         guard let defaultNetwork = try await networkClient.builtin else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
-        guard case .running(_, let networkStatus) = defaultNetwork else {
-            throw ContainerizationError(.invalidState, message: "default network is not running")
-        }
+        let networkStatus = defaultNetwork.status
 
         config.networks = [
             AttachmentConfiguration(network: defaultNetwork.id, options: AttachmentOptions(hostname: builderContainerId))

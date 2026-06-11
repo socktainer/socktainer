@@ -72,7 +72,6 @@ extension ImageListRoute {
             var imagesSummaries: [RESTImageSummary] = []
 
             for image in images {
-                let details: ImageDetail = try await image.details()
                 let imageIndex = try await image.index()
                 let manifests = imageIndex.manifests
                 var manifestSummaries: [ImageManifestSummary] = []
@@ -131,7 +130,7 @@ extension ImageListRoute {
                                 Descriptor: makeOCIDescriptor(
                                     from: descriptor,
                                     appSupportURL: appleContainerAppSupportUrl,
-                                    parentDigest: details.index.digest
+                                    parentDigest: image.descriptor.digest
                                 ),
                                 Available: available,
                                 Kind: "image",
@@ -154,9 +153,9 @@ extension ImageListRoute {
                     }
                 }
 
-                let repoTags = details.name.isEmpty ? [] : [details.name]
+                let repoTags = image.reference.isEmpty ? [] : [image.reference]
                 let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
-                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference || $0.configuration.image.reference == details.name }
+                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference }
                 let summary = RESTImageSummary(
                     Id: image.digest,
                     ParentId: "",
@@ -169,7 +168,7 @@ extension ImageListRoute {
                     Containers: containersUsingImage.count,
                     Manifests: includeManifests ? manifestSummaries : nil,
                     Descriptor: makeOCIDescriptor(
-                        from: details.index,
+                        from: image.descriptor,
                         appSupportURL: appleContainerAppSupportUrl
                     )
                 )

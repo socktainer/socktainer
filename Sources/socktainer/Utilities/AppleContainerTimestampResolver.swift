@@ -19,20 +19,11 @@ enum AppleContainerTimestampResolver {
         return legacyLabelCreationDate(from: container.configuration.labels)
     }
 
-    static func networkCreationDate(_ networkState: NetworkState) -> Date? {
-        if networkState.creationDate > epoch {
-            return networkState.creationDate
+    static func networkCreationDate(_ networkResource: NetworkResource) -> Date? {
+        if networkResource.configuration.creationDate > epoch {
+            return networkResource.configuration.creationDate
         }
-
-        let labels: [String: String]
-        switch networkState {
-        case .created(let config):
-            labels = config.labels.dictionary
-        case .running(let config, _):
-            labels = config.labels.dictionary
-        }
-
-        return legacyLabelCreationDate(from: labels)
+        return legacyLabelCreationDate(from: networkResource.configuration.labels.dictionary)
     }
 
     static func legacyLabelCreationDate(from labels: [String: String]) -> Date? {

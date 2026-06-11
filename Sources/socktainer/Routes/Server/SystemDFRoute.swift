@@ -111,7 +111,6 @@ extension SystemDFRoute {
         try await withThrowingTaskGroup(of: RESTImageSummary.self) { group in
             for image in images {
                 group.addTask {
-                    let details: ImageDetail = try await image.details()
                     let manifests = try await image.index().manifests
                     var created = 0
                     var totalSize: Int64 = 0
@@ -143,7 +142,7 @@ extension SystemDFRoute {
                         totalSize += descriptor.size
                     }
 
-                    let repoTags = details.name.isEmpty ? [] : [details.name]
+                    let repoTags = image.reference.isEmpty ? [] : [image.reference]
                     let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
                     let containerCount = usageByImageReference[image.reference] ?? 0
 
