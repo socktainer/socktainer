@@ -1,5 +1,5 @@
 import ContainerAPIClient
-import ContainerNetworkService
+import ContainerNetworkClient
 import ContainerResource
 import Foundation
 import Logging
@@ -16,7 +16,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
         let networksList = try await networkClient.list()
-        var allNetworks = networksList.map { RESTNetworkSummary(networkState: $0) }
+        var allNetworks = networksList.map { RESTNetworkSummary(networkResource: $0) }
         let containerClient = ClientContainerService()
         let allContainers = try await containerClient.list(showAll: true, filters: [:])
 
@@ -129,42 +129,30 @@ struct ClientNetworkService: ClientNetworkProtocol {
     func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
         let configuration = try NetworkConfiguration(
-            id: name,
+            name: name,
             mode: NetworkMode.nat,
             labels: ResourceLabels(labels),
-            pluginInfo: NetworkPluginInfo(plugin: "container-network-vmnet")
+            plugin: "container-network-vmnet"
         )
         _ = try await networkClient.create(configuration: configuration)
-        logger.debug("Created network with id: \(configuration.id)")
-        return RESTNetworkCreate(Id: configuration.id, Warning: "")
+        logger.debug("Created network with id: \(configuration.name)")
+        return RESTNetworkCreate(Id: configuration.name, Warning: "")
     }
 }
 
 extension RESTNetworkSummary {
-    init(networkState: NetworkState) {
-        let id: String
-        let driver: String
+    init(networkResource: NetworkResource) {
+        let id = networkResource.configuration.name
+        let driver = String(describing: networkResource.configuration.mode)
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels: [String: String]
-        var subnet: String? = nil
-        var gateway: String? = nil
-
-        switch networkState {
-        case .created(let config):
-            id = config.id
-            driver = String(describing: config.mode)
-            subnet = config.ipv4Subnet.map { String(describing: $0) }
-            labels = config.labels.dictionary
-        case .running(let config, let status):
-            id = config.id
-            driver = String(describing: config.mode)
-            subnet = config.ipv4Subnet.map { String(describing: $0) } ?? String(describing: status.ipv4Subnet)
-            gateway = String(describing: status.ipv4Gateway)
-            labels = config.labels.dictionary
-        }
+        let labels = networkResource.configuration.labels.dictionary
+        let subnet =
+            networkResource.configuration.ipv4Subnet.map { String(describing: $0) }
+            ?? String(describing: networkResource.status.ipv4Subnet)
+        let gateway = String(describing: networkResource.status.ipv4Gateway)
 
         let createdTimestamp = AppleContainerTimestampResolver.iso8601Timestamp(
-            AppleContainerTimestampResolver.networkCreationDate(networkState)
+            AppleContainerTimestampResolver.networkCreationDate(networkResource)
         )
 
         self.init(

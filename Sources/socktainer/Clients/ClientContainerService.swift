@@ -186,7 +186,7 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
-        let signal = try parseSignal(signal ?? "SIGTERM")
+        let signal = signal ?? "SIGTERM"
 
         let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
         try await containerClient.stop(id: container.id, opts: options)
@@ -203,7 +203,7 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notRunning(id: id)
         }
 
-        let signal = try parseSignal(signal ?? "SIGKILL")
+        let signal = signal ?? "SIGKILL"
 
         try await containerClient.kill(id: container.id, signal: signal)
     }

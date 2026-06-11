@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerResource
 import ContainerizationOCI
 import Vapor
@@ -38,7 +39,6 @@ extension ImageHistoryRoute {
     private static func historyResponseItems(
         for image: ClientImage,
         requestedName: String,
-        details: ImageDetail,
         preferredPlatform: Platform?
     ) async throws -> [RESTImageHistoryResponseItem] {
         let imageIndex = try await image.index()
@@ -86,7 +86,7 @@ extension ImageHistoryRoute {
                     itemSize = 0
                 }
 
-                let tags = index == history.index(before: history.endIndex) ? [details.name] : []
+                let tags = index == history.index(before: history.endIndex) ? [image.reference] : []
 
                 items.append(
                     RESTImageHistoryResponseItem(
@@ -109,7 +109,7 @@ extension ImageHistoryRoute {
                     Id: image.digest,
                     Created: AppleContainerTimestampResolver.unixTimestampSeconds(config.created),
                     CreatedBy: "",
-                    Tags: [details.name],
+                    Tags: [image.reference],
                     Size: manifest.layers.reduce(0) { $0 + $1.size },
                     Comment: ""
                 )
@@ -137,16 +137,14 @@ extension ImageHistoryRoute {
 
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId)
+                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: ContainerSystemConfig())
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }
 
-            let details = try await image.details()
             return try await historyResponseItems(
                 for: image,
                 requestedName: refOrId,
-                details: details,
                 preferredPlatform: preferredPlatform
             )
         }

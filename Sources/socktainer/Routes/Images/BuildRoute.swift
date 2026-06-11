@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerBuild
 import ContainerImagesServiceClient
+import ContainerPersistence
 import Containerization
 import ContainerizationError
 import ContainerizationOCI
@@ -414,7 +415,8 @@ extension BuildRoute {
             exports: exports,
             cacheIn: [],
             cacheOut: [],
-            pull: pull
+            pull: pull,
+            containerSystemConfig: ContainerSystemConfig()
         )
 
         sendStreamMessage(" ---> Starting build process")

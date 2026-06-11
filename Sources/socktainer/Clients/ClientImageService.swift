@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import Containerization
 import ContainerizationOCI
 import Foundation
@@ -76,7 +77,7 @@ struct ClientImageService: ClientImageProtocol {
         let filteredImages = allImages.filter { img in
             let ref = img.reference.trimmingCharacters(in: .whitespacesAndNewlines)
             let isDigest = ref.contains("@sha256:")
-            let isInfra = Utility.isInfraImage(name: ref)
+            let isInfra = Utility.isInfraImage(name: ref, builderImage: BuildConfig.defaultImage, initImage: VminitConfig.defaultImage)
             return isDigest || !isInfra
         }
         return filteredImages
@@ -84,7 +85,7 @@ struct ClientImageService: ClientImageProtocol {
 
     func delete(id: String) async throws {
         do {
-            _ = try await ClientImage.get(reference: id)
+            _ = try await ClientImage.get(reference: id, containerSystemConfig: ContainerSystemConfig())
         } catch {
             // Handle specific error if needed
             throw ClientImageError.notFound(id: id)
@@ -95,9 +96,10 @@ struct ClientImageService: ClientImageProtocol {
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
+        let containerSystemConfig = ContainerSystemConfig()
         let reference = try {
             guard let tag, !tag.isEmpty else {
-                return try ClientImage.normalizeReference(image)
+                return try ClientImage.normalizeReference(image, containerSystemConfig: containerSystemConfig)
             }
 
             let parsedReference = try Reference.parse(image)
@@ -107,7 +109,7 @@ struct ClientImageService: ClientImageProtocol {
             } else {
                 updatedReference = try parsedReference.withTag(tag)
             }
-            return try ClientImage.normalizeReference(updatedReference.description)
+            return try ClientImage.normalizeReference(updatedReference.description, containerSystemConfig: containerSystemConfig)
         }()
 
         logger.info("Pulling image reference: \(reference)")
@@ -120,6 +122,7 @@ struct ClientImageService: ClientImageProtocol {
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
+                        containerSystemConfig: ContainerSystemConfig(),
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
                                 switch event {
@@ -162,13 +165,14 @@ struct ClientImageService: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let normalizedReference = try ClientImage.normalizeReference(reference)
+        let containerSystemConfig = ContainerSystemConfig()
+        let normalizedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
 
         logger.info("Pushing image reference: \(normalizedReference)")
 
         let image: ClientImage
         do {
-            image = try await ClientImage.get(reference: normalizedReference)
+            image = try await ClientImage.get(reference: normalizedReference, containerSystemConfig: containerSystemConfig)
         } catch {
             logger.error("Image not found: \(normalizedReference)")
             throw ClientImageError.notFound(id: normalizedReference)
@@ -188,6 +192,7 @@ struct ClientImageService: ClientImageProtocol {
                     try await image.push(
                         platform: effectivePlatform,
                         scheme: .auto,
+                        containerSystemConfig: ContainerSystemConfig(),
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
                                 switch event {
@@ -248,7 +253,7 @@ struct ClientImageService: ClientImageProtocol {
             let reference = image.reference
 
             do {
-                _ = try await image.details()
+                _ = try await image.index()
 
                 if imagesInUse.contains(reference) {
                     continue
@@ -458,7 +463,7 @@ struct ClientImageService: ClientImageProtocol {
 
         for reference in references {
             do {
-                let image = try await ClientImage.get(reference: reference)
+                let image = try await ClientImage.get(reference: reference, containerSystemConfig: ContainerSystemConfig())
                 logger.debug("Image exists: \(image.reference)")
                 resolvedRefs.append(image.reference)
             } catch {

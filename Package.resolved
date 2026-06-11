@@ -1,5 +1,5 @@
 {
-  "originHash" : "072feede2d671af957d2918680e34fc8282fff750f0cbc0866b53ef87e064fca",
+  "originHash" : "47de8369a8f87d87a5a96bb2d7cb3b21d73e728d2a33469fb1a379204adf1524",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/container.git",
       "state" : {
-        "revision" : "651811cc090937457956643dd2c454df77eb141b",
-        "version" : "0.12.0"
+        "revision" : "ee848e3ebfd7c73b04dd419683be54fb450b8779",
+        "version" : "1.0.0"
       }
     },
     {
@@ -42,8 +42,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/containerization.git",
       "state" : {
-        "revision" : "f1ee6f8b737ab8dffbd620bfa47283f6f0bc1822",
-        "version" : "0.31.0"
+        "revision" : "a2a1add6c7e1a1665e5397edc49d925c49090b3a",
+        "version" : "0.33.3"
       }
     },
     {
@@ -161,6 +161,15 @@
       "state" : {
         "revision" : "be76c4ad929eb6c4bcaf3351799f2adf9e6848a9",
         "version" : "1.2.0"
+      }
+    },
+    {
+      "identity" : "swift-configuration-toml",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mattt/swift-configuration-toml",
+      "state" : {
+        "revision" : "4ea16b4dfa4b023cecae5ae0368402c4d846d613",
+        "version" : "2.0.0"
       }
     },
     {

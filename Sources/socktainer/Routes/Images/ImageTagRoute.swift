@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import Vapor
 
 struct ImageTagRoute: RouteCollection {
@@ -24,16 +25,17 @@ extension ImageTagRoute {
             throw Abort(.badRequest, reason: "repo parameter is required")
         }
 
+        let containerSystemConfig = ContainerSystemConfig()
         let targetReference = try {
             if let tag = query.tag, !tag.isEmpty {
-                return try ClientImage.normalizeReference("\(repo):\(tag)")
+                return try ClientImage.normalizeReference("\(repo):\(tag)", containerSystemConfig: containerSystemConfig)
             }
-            return try ClientImage.normalizeReference(repo)
+            return try ClientImage.normalizeReference(repo, containerSystemConfig: containerSystemConfig)
         }()
 
         let sourceImage: ClientImage
         do {
-            sourceImage = try await ClientImage.get(reference: sourceImageName)
+            sourceImage = try await ClientImage.get(reference: sourceImageName, containerSystemConfig: containerSystemConfig)
         } catch {
             throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
         }

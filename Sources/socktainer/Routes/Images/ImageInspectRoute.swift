@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerResource
 import ContainerizationOCI
 import Vapor
@@ -90,7 +91,13 @@ extension ImageInspectRoute {
         return "\(name)@\(digest)"
     }
 
-    private static func prioritizeVariants(_ variants: [ImageDetail.Variants]) -> [ImageDetail.Variants] {
+    private struct ImageVariant {
+        let platform: Platform
+        let config: ContainerizationOCI.Image
+        let size: Int64
+    }
+
+    private static func prioritizeVariants(_ variants: [ImageVariant]) -> [ImageVariant] {
         let hostPlatform = requestedOrDefaultPlatform(nil)
 
         return variants.enumerated().sorted { leftVariant, rightVariant in
@@ -133,20 +140,37 @@ extension ImageInspectRoute {
 
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId)
+                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: ContainerSystemConfig())
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }
 
             let containers = includeManifests ? try await ContainerClient().list() : []
-            let details: ImageDetail = try await image.details()
             let imageIndex = try await image.index()
             let manifests = imageIndex.manifests
-            let availablePlatforms = Set(details.variants.map(\.platform))
+
+            var variants: [ImageVariant] = []
+            for descriptor in manifests {
+                guard let platform = descriptor.platform,
+                    descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
+                else {
+                    continue
+                }
+                do {
+                    let config = try await image.config(for: platform)
+                    let manifest = try await image.manifest(for: platform)
+                    let variantSize = descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
+                    variants.append(ImageVariant(platform: platform, config: config, size: variantSize))
+                } catch {
+                    continue
+                }
+            }
+
+            let availablePlatforms = Set(variants.map(\.platform))
             var manifestSummaries: [ImageManifestSummary] = []
             let containerIDs =
                 containers
-                .filter { $0.configuration.image.reference == image.reference || $0.configuration.image.reference == details.name }
+                .filter { $0.configuration.image.reference == image.reference }
                 .map(\.id)
 
             for descriptor in manifests {
@@ -202,7 +226,7 @@ extension ImageInspectRoute {
                             Descriptor: makeOCIDescriptor(
                                 from: descriptor,
                                 appSupportURL: appleContainerAppSupportUrl,
-                                parentDigest: details.index.digest
+                                parentDigest: image.descriptor.digest
                             ),
                             Available: available,
                             Kind: kind,
@@ -224,9 +248,9 @@ extension ImageInspectRoute {
 
             let selectedVariant =
                 if let requestedPlatform {
-                    details.variants.first(where: { $0.platform == requestedPlatform })
+                    variants.first(where: { $0.platform == requestedPlatform })
                 } else {
-                    prioritizeVariants(details.variants).first
+                    prioritizeVariants(variants).first
                 }
 
             if let selectedVariant {
@@ -262,12 +286,12 @@ extension ImageInspectRoute {
                 let summary = RESTImageInspect(
                     Id: selectedManifest?.config.digest ?? image.digest,
                     Descriptor: makeOCIDescriptor(
-                        from: details.index,
+                        from: image.descriptor,
                         appSupportURL: appleContainerAppSupportUrl
                     ),
                     Manifests: includeManifests ? manifestSummaries : nil,
-                    RepoTags: [details.name],
-                    RepoDigests: repoDigestReference(name: details.name, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
+                    RepoTags: [image.reference],
+                    RepoDigests: repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
                     Parent: "",
                     Comment: selectedVariant.config.history?.last?.comment ?? "",
                     Created: selectedVariant.config.created,
