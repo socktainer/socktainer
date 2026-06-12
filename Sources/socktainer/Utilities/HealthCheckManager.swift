@@ -7,6 +7,10 @@ struct HealthCheckManagerKey: StorageKey {
     typealias Value = HealthCheckManager
 }
 
+/// A function that runs a healthcheck command inside a container and returns
+/// its exit code. Injected so tests can stub the side-effecting exec path.
+typealias HealthProbe = @Sendable (_ containerId: String, _ cmd: [String], _ timeoutNs: UInt64) async -> Int32
+
 /// Runs Docker `HEALTHCHECK` probes inside containers and tracks their status.
 ///
 /// Apple Container 1.0.0 has no native runtime healthcheck support, so we
@@ -22,9 +26,29 @@ struct HealthCheckManagerKey: StorageKey {
 actor HealthCheckManager {
     static let healthcheckLabel = "socktainer.healthcheck"
 
+    // Docker's documented defaults when the field is absent from the request.
+    // See https://docs.docker.com/reference/dockerfile/#healthcheck.
+    static let defaultIntervalNs: UInt64 = 30 * 1_000_000_000
+    static let defaultTimeoutNs: UInt64 = 30 * 1_000_000_000
+    static let defaultRetries: Int = 3
+
+    // Lower bounds applied to the user-supplied values. The interval floor is
+    // overridable so tests can drive the loop at sub-second cadence; the
+    // timeout floor stays fixed because there's no test scenario where we
+    // want a sub-second timeout on a real exec.
+    static let defaultMinimumIntervalNs: UInt64 = 1_000_000_000
+    static let minimumTimeoutNs: UInt64 = 1_000_000_000
+
     private var statuses: [String: ContainerHealth] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private let log = Logger(label: "socktainer.healthcheck")
+    private let probe: HealthProbe
+    private let intervalFloorNs: UInt64
+
+    init(probe: @escaping HealthProbe = HealthCheckManager.execProbe, intervalFloorNs: UInt64 = HealthCheckManager.defaultMinimumIntervalNs) {
+        self.probe = probe
+        self.intervalFloorNs = intervalFloorNs
+    }
 
     func currentHealth(for id: String) -> ContainerHealth? {
         statuses[id]
@@ -47,6 +71,23 @@ actor HealthCheckManager {
         statuses.removeValue(forKey: containerId)
     }
 
+    /// Parses Docker's `Test` field into a runnable command vector.
+    /// Returns nil for empty input or `["NONE"]` (the disable sentinel).
+    static func parseTest(_ test: [String]?) -> [String]? {
+        guard let test, !test.isEmpty else { return nil }
+        switch test.first {
+        case "NONE":
+            return nil
+        case "CMD-SHELL":
+            return ["/bin/sh", "-c", test.dropFirst().joined(separator: " ")]
+        case "CMD":
+            let args = Array(test.dropFirst())
+            return args.isEmpty ? nil : args
+        default:
+            return test
+        }
+    }
+
     // MARK: - Private
 
     private func updateStatus(id: String, health: ContainerHealth) {
@@ -60,10 +101,12 @@ actor HealthCheckManager {
 
     private func runLoop(containerId: String, config: HealthcheckConfig) async {
         // Intervals on the Docker API are nanoseconds.
-        let startPeriodNs = UInt64(max((config.StartPeriod ?? 0), 0))
-        let intervalNs = UInt64(max((config.Interval ?? 30_000_000_000), 1_000_000_000))
-        let timeoutNs = UInt64(max((config.Timeout ?? 30_000_000_000), 1_000_000_000))
-        let maxRetries = config.Retries ?? 3
+        let startPeriodNs = UInt64(max(config.StartPeriod ?? 0, 0))
+        let configIntervalNs = config.Interval.map { UInt64(max($0, 0)) } ?? Self.defaultIntervalNs
+        let intervalNs = max(configIntervalNs, intervalFloorNs)
+        let configTimeoutNs = config.Timeout.map { UInt64(max($0, 0)) } ?? Self.defaultTimeoutNs
+        let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
+        let maxRetries = config.Retries ?? Self.defaultRetries
 
         if startPeriodNs > 0 {
             try? await Task.sleep(nanoseconds: startPeriodNs)
@@ -93,23 +136,15 @@ actor HealthCheckManager {
     }
 
     private func runCheck(containerId: String, config: HealthcheckConfig, timeoutNs: UInt64) async -> Int32 {
-        guard let test = config.Test, !test.isEmpty else { return 0 }
+        guard let cmd = Self.parseTest(config.Test) else { return 0 }
+        return await probe(containerId, cmd, timeoutNs)
+    }
 
-        // Docker spec: ["NONE"] disables an inherited check, ["CMD", ...] runs
-        // the args directly, ["CMD-SHELL", ...] wraps in /bin/sh -c.
-        let cmd: [String]
-        switch test.first {
-        case "NONE":
-            return 0
-        case "CMD-SHELL":
-            cmd = ["/bin/sh", "-c", test.dropFirst().joined(separator: " ")]
-        case "CMD":
-            cmd = Array(test.dropFirst())
-        default:
-            cmd = test
-        }
-        guard !cmd.isEmpty else { return 0 }
+    // MARK: - Default probe (real exec)
 
+    /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
+    /// Returns the exit code, or 1 on any failure.
+    static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
         do {
             let containerClient = ContainerClient()
             guard let container = try? await containerClient.get(id: containerId) else { return 1 }
@@ -142,7 +177,6 @@ actor HealthCheckManager {
                 return result
             }
         } catch {
-            log.debug("[healthcheck] \(containerId) exec error: \(error)")
             return 1
         }
     }
