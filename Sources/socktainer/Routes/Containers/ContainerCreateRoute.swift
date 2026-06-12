@@ -249,7 +249,38 @@ extension ContainerCreateRoute {
                 searchDomains: searchDomains,
                 options: dnsOptions
             )
-            containerConfiguration.labels = body.Labels ?? [:]
+            // Collect Compose service aliases from EndpointsConfig.
+            // These are stored in a label so the start route can register them
+            // in the DNS server once the container has an IP.
+            let dnsNames =
+                (body.NetworkingConfig?.EndpointsConfig?.values)
+                .map { settings in settings.compactMap(\.Aliases).flatMap { $0 }.filter { !$0.isEmpty } }
+                ?? []
+
+            var containerLabels = body.Labels ?? [:]
+            if !dnsNames.isEmpty {
+                containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+
+                // Ensure a CoreDNS container for the first network and point this
+                // container's DNS at it so service names resolve inside the VM.
+                if let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
+                    let firstNetwork = body.NetworkingConfig?.EndpointsConfig?.keys.first
+                {
+                    do {
+                        let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                        let existing = containerConfiguration.dns
+                        containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                            nameservers: [dnsIP],
+                            domain: existing?.domain ?? nil,
+                            searchDomains: existing?.searchDomains ?? [],
+                            options: existing?.options ?? []
+                        )
+                    } catch {
+                        req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    }
+                }
+            }
+            containerConfiguration.labels = containerLabels
 
             var resolvedMounts: [Filesystem] = []
 
