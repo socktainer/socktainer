@@ -98,7 +98,13 @@ extension ContainerCreateRoute {
                 {
                     throw ContainerizationError(.notFound, message: "no arm64 content")
                 }
-            } catch  where requestedPlatform.architecture == "arm64" {
+            } catch let fetchError
+                where requestedPlatform.architecture == "arm64"
+                && {
+                    let msg = String(describing: fetchError)
+                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
+                }()
+            {
                 let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
                 req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
                 img = try await ClientImage.fetch(

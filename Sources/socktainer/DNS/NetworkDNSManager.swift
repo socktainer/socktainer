@@ -94,6 +94,8 @@ actor NetworkDNSManager {
                 do {
                     try await client.delete(id: containerId)
                     log.info("[dns-manager] removed DNS container for network \(networkId)")
+                    let corefileDir = appSupportURL.appendingPathComponent("dns/\(networkId)")
+                    try? FileManager.default.removeItem(at: corefileDir)
                     return
                 } catch {
                     guard attempt < 3 else {
