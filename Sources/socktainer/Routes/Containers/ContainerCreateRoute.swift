@@ -71,7 +71,7 @@ extension ContainerCreateRoute {
             try Utility.validEntityName(id)
 
             // Validate the requested platform only if provided
-            let requestedPlatform = try Platform(from: containerPlatform)
+            var requestedPlatform = try Platform(from: containerPlatform)
 
             // Check if image exists locally
             do {
@@ -80,11 +80,34 @@ extension ContainerCreateRoute {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
 
-            let img = try await ClientImage.fetch(
-                reference: body.Image,
-                platform: requestedPlatform,
-                containerSystemConfig: ContainerSystemConfig()
-            )
+            // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
+            // variant is available. Two cases handled:
+            //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
+            //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
+            // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
+            var img: ClientImage
+            do {
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: requestedPlatform,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                // Case 2: image exists locally but may have been pulled as amd64
+                if requestedPlatform.architecture == "arm64",
+                    (try? await img.config(for: requestedPlatform)) == nil
+                {
+                    throw ContainerizationError(.notFound, message: "no arm64 content")
+                }
+            } catch  where requestedPlatform.architecture == "arm64" {
+                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
+                req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: amd64,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                requestedPlatform = amd64
+            }
 
             // Unpack a fetched image before use
             try await img.getCreateSnapshot(
