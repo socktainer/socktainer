@@ -241,6 +241,15 @@ struct ExecRoute: RouteCollection {
 
             try client.enforceContainerRunning(container: container)
 
+            // Apply the request's Env/User/WorkingDir before marking the exec
+            // started: applying them can throw, and doing so after markStarted
+            // would leave the exec reported as running forever.
+            let baseProcessConfig: ProcessConfiguration = try {
+                var processConfig = container.configuration.initProcess
+                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
+                return processConfig
+            }()
+
             // Reject starting an exec instance more than once (Docker semantics).
             guard await ExecManager.shared.markStarted(id: execId) else {
                 throw Abort(.conflict, reason: "Exec instance \(execId) has already been started")
@@ -262,11 +271,10 @@ struct ExecRoute: RouteCollection {
             if detach {
                 let executable = config.cmd.first!
                 let arguments = Array(config.cmd.dropFirst())
-                var processConfig = container.configuration.initProcess
+                var processConfig = baseProcessConfig
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
-                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                 do {
                     let process = try await ContainerClient().createProcess(
@@ -312,11 +320,10 @@ struct ExecRoute: RouteCollection {
 
                     let executable = config.cmd.first!
                     let arguments = Array(config.cmd.dropFirst())
-                    var processConfig = container.configuration.initProcess
+                    var processConfig = baseProcessConfig
                     processConfig.executable = executable
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
-                    try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                     let process = try await ContainerClient().createProcess(
                         containerId: container.id,
@@ -468,11 +475,10 @@ struct ExecRoute: RouteCollection {
                 let executable = config.cmd.first!
                 let arguments = Array(config.cmd.dropFirst())
 
-                var processConfig = container.configuration.initProcess
+                var processConfig = baseProcessConfig
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
-                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                 let process = try await ContainerClient().createProcess(
                     containerId: container.id,
