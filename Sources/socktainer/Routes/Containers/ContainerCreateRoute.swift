@@ -284,6 +284,25 @@ extension ContainerCreateRoute {
 
             var resolvedMounts: [Filesystem] = []
 
+            // Docker creates missing bind-mount source directories on the host automatically.
+            // Parser.mounts() validates that the source path exists and throws if not, so we
+            // must create missing directories BEFORE parsing, not after.
+            if let binds = body.HostConfig?.Binds {
+                for bind in binds {
+                    let parts = bind.split(separator: ":").map(String.init)
+                    if let source = parts.first, source.hasPrefix("/") {
+                        try? FileManager.default.createDirectory(
+                            atPath: source, withIntermediateDirectories: true)
+                    }
+                }
+            }
+            if let mounts = body.HostConfig?.Mounts {
+                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty {
+                    try? FileManager.default.createDirectory(
+                        atPath: mount.Source, withIntermediateDirectories: true)
+                }
+            }
+
             // Process bind mounts from HostConfig.Binds
             var volumesOrFs: [VolumeOrFilesystem] = []
             if let binds = body.HostConfig?.Binds, !binds.isEmpty {
