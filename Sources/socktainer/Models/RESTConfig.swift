@@ -14,6 +14,19 @@ struct HealthcheckConfig: Content {
     let StartPeriod: Int?
 }
 
+struct HealthLogEntry: Content {
+    let Start: String
+    let End: String
+    let ExitCode: Int32
+    let Output: String
+}
+
+struct ContainerHealth: Content {
+    let Status: String
+    let FailingStreak: Int
+    let Log: [HealthLogEntry]
+}
+
 struct HostConfig: Content {
     let Binds: [String]?
     let BlkioWeight: Int?

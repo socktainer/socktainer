@@ -183,6 +183,10 @@ func configure(_ app: Application) async throws {
     let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort)
     app.storage[NetworkDNSManagerKey.self] = dnsManager
 
+    // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and
+    // tracks status so `/containers/{id}/json` can return `.State.Health`.
+    app.storage[HealthCheckManagerKey.self] = HealthCheckManager()
+
     // Clean up any CoreDNS containers left from a previous run
     await dnsManager.cleanupStaleDNSContainers()
 
