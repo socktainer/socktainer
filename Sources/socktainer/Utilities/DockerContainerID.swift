@@ -41,11 +41,13 @@ enum DockerContainerID {
         if entries.contains(where: { $0.nativeId == reference }) {
             return .match(reference)
         }
-        // Only lowercase hex strings can be (truncated) Docker IDs.
-        guard !reference.isEmpty, reference.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+        // Only hex strings can be (truncated) Docker IDs; normalize to
+        // lowercase so callers can supply uppercase or mixed-case references.
+        guard !reference.isEmpty, reference.allSatisfy({ $0.isHexDigit }) else {
             return .none
         }
-        let matches = entries.filter { $0.hexId.hasPrefix(reference) }.map(\.nativeId)
+        let refLower = reference.lowercased()
+        let matches = entries.filter { $0.hexId.hasPrefix(refLower) }.map(\.nativeId)
         switch matches.count {
         case 0: return .none
         case 1: return .match(matches[0])

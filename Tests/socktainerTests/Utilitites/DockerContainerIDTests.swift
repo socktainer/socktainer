@@ -103,6 +103,16 @@ struct DockerContainerIDTests {
         #expect(Set(matches) == Set([first, second]))
     }
 
+    @Test("Resolves an uppercase hex prefix case-insensitively")
+    func resolvesUppercaseHexId() {
+        let truncated = String(DockerContainerID.hexId(nativeId: "exampleproject-web-1", createdAt: created).prefix(12)).uppercased()
+        let result = DockerContainerID.resolve(
+            reference: truncated,
+            entries: entries(["exampleproject-web-1", "exampleproject-db-1"])
+        )
+        #expect(result == .match("exampleproject-web-1"))
+    }
+
     @Test("Non-hex references never resolve as ID prefixes")
     func nonHexReference() {
         // A truncated *name* (the bug this type exists to prevent) contains
