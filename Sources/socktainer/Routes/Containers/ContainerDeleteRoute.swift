@@ -15,13 +15,20 @@ extension ContainerDeleteRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            // if running, stop it first
-            if let container = try await client.getContainer(id: id),
-                container.status == .running
-            {
-                try await client.stop(id: id, signal: nil, timeout: nil)
+            do {
+                // if running, stop it first
+                if let container = try await client.getContainer(id: id),
+                    container.status == .running
+                {
+                    try await client.stop(id: id, signal: nil, timeout: nil)
+                }
+                try await client.delete(id: id)
+            } catch ClientContainerError.notFound {
+                throw Abort(.notFound, reason: "No such container: \(id)")
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
-            try await client.delete(id: id)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
 

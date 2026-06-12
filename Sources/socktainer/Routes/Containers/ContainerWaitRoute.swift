@@ -33,8 +33,13 @@ struct ContainerWaitRoute: RouteCollection {
             // Preflight before flushing headers so a missing container returns a
             // real 404 instead of a streamed `200 {"StatusCode":0}` — the latter
             // would make "no such container" indistinguishable from a clean exit.
-            guard try await client.getContainer(id: containerId) != nil else {
-                throw Abort(.notFound, reason: "No such container: \(containerId)")
+            do {
+                guard try await client.getContainer(id: containerId) != nil else {
+                    throw Abort(.notFound, reason: "No such container: \(containerId)")
+                }
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
             var headers = HTTPHeaders()
