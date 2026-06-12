@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct ContainerStartRoute: RouteCollection {
@@ -49,6 +50,20 @@ extension ContainerStartRoute {
                     throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
                 }
                 req.logger.debug("Container \(id) was already running or bootstrapped")
+            }
+
+            // Register DNS names now that the container has an IP.
+            // Names were stored in the label at create time (Compose service aliases).
+            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
+                let snapshot = try? await ContainerClient().get(id: id),
+                snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
+                let namesLabel = snapshot.configuration.labels["socktainer.dns.names"],
+                let firstAttachment = snapshot.networks.first
+            {
+                let ip = firstAttachment.ipv4Address.address.description
+                for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                    dnsServer.register(hostname: name, ip: ip)
+                }
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!

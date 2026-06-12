@@ -166,4 +166,24 @@ func configure(_ app: Application) async throws {
     // Await starting watching
     watcher.startWatching()
 
+    // Initialize inter-container DNS infrastructure.
+    // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
+    // is taken, Socktainer auto-increments until a free port is found.
+    let preferredDNSPort =
+        ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
+        .flatMap(Int.init) ?? 2054
+    let dnsServer = SocktainerDNSServer()
+    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
+        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
+        return
+    }
+    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+    app.storage[SocktainerDNSServerKey.self] = dnsServer
+
+    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort)
+    app.storage[NetworkDNSManagerKey.self] = dnsManager
+
+    // Clean up any CoreDNS containers left from a previous run
+    await dnsManager.cleanupStaleDNSContainers()
+
 }
