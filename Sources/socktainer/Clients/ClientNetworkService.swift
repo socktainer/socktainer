@@ -25,6 +25,13 @@ struct ClientNetworkService: ClientNetworkProtocol {
             let network = allNetworks[i]
             var containersForNetwork: [String: NetworkContainer] = [:]
             for container in allContainers {
+                // Exclude internal Socktainer DNS sidecars from the Docker API view.
+                // If CoreDNS shows up as an attached container, docker compose down
+                // reports "Resource is still in use" and skips the DELETE /networks/{id}
+                // call — preventing our cleanup hook from firing.
+                guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole else {
+                    continue
+                }
                 for attachment in container.networks {
                     if attachment.network == network.Id || attachment.network == network.Name {
                         let nc = NetworkContainer(

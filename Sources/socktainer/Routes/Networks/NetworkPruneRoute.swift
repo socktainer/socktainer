@@ -27,6 +27,10 @@ struct NetworkPruneRoute: RouteCollection {
                     continue
                 }
                 do {
+                    // Clean up CoreDNS sidecar before deleting the network
+                    if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
+                        await dnsManager.cleanupDNSContainer(networkId: network.Id)
+                    }
                     try await networkClient.delete(id: network.Id, logger: req.logger)
                     deletedNetworks.append(network.Id)
                 } catch {

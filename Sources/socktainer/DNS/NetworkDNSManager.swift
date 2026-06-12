@@ -44,12 +44,17 @@ actor NetworkDNSManager {
     /// Returns the IP of the CoreDNS container for `networkId`, creating it lazily.
     /// Concurrent callers for the same network are coalesced — only one container is created.
     func ensureDNSContainer(networkId: String) async throws -> String {
-        if let ip = containerIPs[networkId] { return ip }
+        if let ip = containerIPs[networkId] {
+            log.info("[dns-manager] reusing cached CoreDNS at \(ip) for network \(networkId)")
+            return ip
+        }
 
         if let pending = pendingCreation[networkId] {
+            log.info("[dns-manager] waiting for in-flight CoreDNS creation for network \(networkId)")
             return try await pending.value
         }
 
+        log.info("[dns-manager] creating CoreDNS container for network \(networkId)")
         let appSupportURL = self.appSupportURL
         let dnsPort = self.dnsPort
         let task = Task<String, Error> {
@@ -61,6 +66,7 @@ actor NetworkDNSManager {
             let ip = try await task.value
             containerIPs[networkId] = ip
             pendingCreation.removeValue(forKey: networkId)
+            log.info("[dns-manager] CoreDNS running at \(ip) for network \(networkId)")
             return ip
         } catch {
             pendingCreation.removeValue(forKey: networkId)
@@ -72,14 +78,30 @@ actor NetworkDNSManager {
     /// Called when a user network is deleted.
     func cleanupDNSContainer(networkId: String) async {
         containerIPs.removeValue(forKey: networkId)
-        let containerId = Self.containerPrefix + networkId
+        let containerId = ContainerNameUtility.sanitize(Self.containerPrefix + networkId)
         let client = ContainerClient()
         do {
-            if let snapshot = try? await client.get(id: containerId), snapshot.status == .running {
+            guard let snapshot = try? await client.get(id: containerId) else {
+                return  // container already gone
+            }
+            if snapshot.status == .running {
                 try? await client.stop(id: containerId)
             }
-            try await client.delete(id: containerId)
-            log.info("[dns-manager] removed DNS container for network \(networkId)")
+            // Retry deletion: Apple Container may need a moment to fully release
+            // the container from the network after stop. Retry up to 3 times with
+            // short gaps rather than a fixed 1s sleep so we stay fast.
+            for attempt in 1...3 {
+                do {
+                    try await client.delete(id: containerId)
+                    log.info("[dns-manager] removed DNS container for network \(networkId)")
+                    return
+                } catch {
+                    guard attempt < 3 else {
+                        throw error
+                    }
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
         } catch {
             log.warning("[dns-manager] could not remove DNS container \(containerId): \(error)")
         }
@@ -104,7 +126,8 @@ actor NetworkDNSManager {
     /// Runs outside the actor's executor to avoid deadlock with the Task created in ensureDNSContainer.
     private static func createDNSContainerWork(networkId: String, appSupportURL: URL, dnsPort: Int) async throws -> String {
         let containerClient = ContainerClient()
-        let containerId = containerPrefix + networkId
+        // Sanitize to respect Apple Container's 64-char container ID limit
+        let containerId = ContainerNameUtility.sanitize(containerPrefix + networkId)
 
         // Reuse if already running
         if let snapshot = try? await containerClient.get(id: containerId),
@@ -158,7 +181,7 @@ actor NetworkDNSManager {
         config.networks = [
             AttachmentConfiguration(
                 network: networkId,
-                options: AttachmentOptions(hostname: containerPrefix + networkId)
+                options: AttachmentOptions(hostname: ContainerNameUtility.sanitize(containerPrefix + networkId))
             )
         ]
         // Point CoreDNS to the vmnet gateway for upstream resolution
