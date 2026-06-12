@@ -4,7 +4,8 @@ import Vapor
 struct ContainerDeleteRoute: RouteCollection {
     let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.DELETE, pattern: "/containers/{id}", use: ContainerDeleteRoute.handler(client: client))
+        try routes.registerVersionedRoute(
+            .DELETE, pattern: "/containers/{id}", use: ContainerDeleteRoute.handler(client: client))
     }
 
 }
@@ -18,9 +19,14 @@ extension ContainerDeleteRoute {
 
             do {
                 // Resolve the reference once — it may be a hex ID or a
-                // truncated prefix — and reuse the snapshot for both DNS
+                // truncated prefix — and reuse the snapshot for DNS
                 // unregistration and the running check.
                 let container = try await client.getContainer(id: id)
+
+                // Cancel the healthcheck probe loop if one is running.
+                if let healthManager = req.application.storage[HealthCheckManagerKey.self] {
+                    await healthManager.stop(containerId: id)
+                }
 
                 // Unregister DNS names before deletion
                 if let container,
@@ -45,13 +51,10 @@ extension ContainerDeleteRoute {
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-
             let event = DockerEvent.simpleEvent(id: id, type: "container", status: "remove")
-
             await broadcaster.broadcast(event)
 
             return .ok
-
         }
     }
 }

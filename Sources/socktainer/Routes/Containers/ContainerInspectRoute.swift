@@ -164,6 +164,11 @@ extension ContainerInspectRoute {
 
             let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
 
+            // Live healthcheck status, if a probe loop is running for this
+            // container. Returns nil when no healthcheck is configured or
+            // the loop hasn't recorded its first result yet.
+            let health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(for: container.id)
+
             let containerState: ContainerState = ContainerState(
                 Status: container.status.mobyState,
                 Running: container.status == .running,
@@ -175,7 +180,8 @@ extension ContainerInspectRoute {
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""
+                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                Health: health
             )
 
             return RESTContainerInspect(

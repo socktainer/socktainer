@@ -69,6 +69,17 @@ extension ContainerStartRoute {
                 }
             }
 
+            // Kick off the healthcheck probe loop if a healthcheck label is set.
+            // The label was JSON-encoded by the create route from body.Healthcheck.
+            if let healthManager = req.application.storage[HealthCheckManagerKey.self],
+                let snapshot = try? await ContainerClient().get(id: id),
+                let labelValue = snapshot.configuration.labels[HealthCheckManager.healthcheckLabel],
+                let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8)),
+                let test = healthcheck.Test, !test.isEmpty, test.first != "NONE"
+            {
+                await healthManager.start(containerId: id, config: healthcheck)
+            }
+
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
 
             let event = DockerEvent.simpleEvent(id: id, type: "container", status: "start")

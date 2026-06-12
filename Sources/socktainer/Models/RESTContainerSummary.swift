@@ -12,6 +12,7 @@ struct ContainerState: Content {
     let Error: String
     let StartedAt: String
     let FinishedAt: String
+    let Health: ContainerHealth?
 }
 
 struct RESTContainerSummary: Content {
