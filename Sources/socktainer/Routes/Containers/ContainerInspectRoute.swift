@@ -37,6 +37,15 @@ extension ContainerInspectRoute {
                     }
             )
 
+            // Apple Container has no native healthcheck field; we round-trip
+            // the original config via a JSON-encoded label set by the create
+            // route, so Compose / Docker clients see the same Healthcheck
+            // block they sent.
+            let healthcheckConfig: HealthcheckConfig? =
+                container.configuration.labels[HealthCheckManager.healthcheckLabel]
+                .flatMap { Data($0.utf8) }
+                .flatMap { try? JSONDecoder().decode(HealthcheckConfig.self, from: $0) }
+
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
                 Domainname: container.configuration.dns?.domain,
@@ -50,7 +59,7 @@ extension ContainerInspectRoute {
                 StdinOnce: false,  // no mechanism to derive this value
                 Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
                 Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,
-                Healthcheck: nil,  // Apple containers don't have a healthcheck
+                Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
                 Image: container.configuration.image.reference,
                 Volumes: nil,  // Could be derived from mounts if needed

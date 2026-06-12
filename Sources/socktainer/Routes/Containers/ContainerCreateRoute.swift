@@ -287,6 +287,18 @@ extension ContainerCreateRoute {
                 ?? []
 
             var containerLabels = body.Labels ?? [:]
+
+            // Persist the requested healthcheck across create → start so the
+            // start route can launch the probe loop and inspect can return it
+            // in Config.Healthcheck. Apple Container has no native field for
+            // this, so a JSON-encoded label is the carrier.
+            if let healthcheck = body.Healthcheck,
+                let json = try? JSONEncoder().encode(healthcheck),
+                let jsonString = String(data: json, encoding: .utf8)
+            {
+                containerLabels[HealthCheckManager.healthcheckLabel] = jsonString
+            }
+
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
 
