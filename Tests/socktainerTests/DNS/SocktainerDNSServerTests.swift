@@ -101,8 +101,10 @@ struct SocktainerDNSServerTests {
         let server = SocktainerDNSServer()
         let port = server.start(preferredPort: 19800, maxAttempts: 5)
         #expect(port != nil)
-        #expect(port != 19800)  // must have fallen back
-        #expect(port! > 19800 && port! < 19805)
+        if let p = port {
+            #expect(p != 19800)  // must have fallen back
+            #expect(p > 19800 && p < 19805)
+        }
     }
 
     // MARK: - Multiple entries
