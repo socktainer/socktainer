@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import NIOCore
 import Vapor
@@ -15,6 +16,9 @@ actor ExecManager {
         let attachStderr: Bool
         let tty: Bool
         let detach: Bool
+        let env: [String]
+        let user: String?
+        let workingDir: String?
     }
 
     private var storage: [String: ExecConfig] = [:]
@@ -69,6 +73,9 @@ struct CreateExecRequest: Content {
     let AttachStdout: Bool?
     let AttachStderr: Bool?
     let Tty: Bool?
+    let Env: [String]?
+    let User: String?
+    let WorkingDir: String?
 }
 
 struct CreateExecResponse: Content {
@@ -139,12 +146,12 @@ struct ExecRoute: RouteCollection {
                 ExitCode: recordedExitCode.map { Int($0) },
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
-                    user: "",
+                    user: config.user ?? "",
                     tty: config.tty,
                     entrypoint: config.cmd.first ?? "",
                     arguments: Array(config.cmd.dropFirst()),
-                    workingDir: "",
-                    env: []
+                    workingDir: config.workingDir ?? "",
+                    env: config.env
                 ),
                 OpenStdin: config.attachStdin,
                 OpenStderr: config.attachStderr,
@@ -191,11 +198,30 @@ struct ExecRoute: RouteCollection {
                 attachStdout: body.AttachStdout ?? true,
                 attachStderr: attachStderr,
                 tty: body.Tty ?? false,
-                detach: false
+                detach: false,
+                env: body.Env ?? [],
+                user: body.User,
+                workingDir: body.WorkingDir
             )
 
             let id = await ExecManager.shared.create(config: config)
             return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
+        }
+    }
+
+    // Applies the exec request's Env, User and WorkingDir on top of the
+    // container's init process configuration, mirroring how container create
+    // handles the same fields. Without this the Docker API fields are ignored
+    // and execs always run with the container's defaults.
+    static func applyProcessOverrides(_ processConfig: inout ProcessConfiguration, config: ExecManager.ExecConfig) throws {
+        if !config.env.isEmpty {
+            processConfig.environment = try Parser.allEnv(imageEnvs: processConfig.environment, envFiles: [], envs: config.env)
+        }
+        if let workingDir = config.workingDir, !workingDir.isEmpty {
+            processConfig.workingDirectory = workingDir
+        }
+        if let user = config.user, !user.isEmpty {
+            processConfig.user = .raw(userString: user)
         }
     }
 
@@ -240,6 +266,7 @@ struct ExecRoute: RouteCollection {
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
+                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                 do {
                     let process = try await ContainerClient().createProcess(
@@ -289,6 +316,7 @@ struct ExecRoute: RouteCollection {
                     processConfig.executable = executable
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
+                    try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                     let process = try await ContainerClient().createProcess(
                         containerId: container.id,
@@ -444,6 +472,7 @@ struct ExecRoute: RouteCollection {
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
+                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
 
                 let process = try await ContainerClient().createProcess(
                     containerId: container.id,
