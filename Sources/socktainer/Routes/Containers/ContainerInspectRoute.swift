@@ -170,7 +170,7 @@ extension ContainerInspectRoute {
             )
 
             return RESTContainerInspect(
-                Id: container.id,
+                Id: DockerContainerID.hexId(for: container),
                 Created: AppleContainerTimestampResolver.iso8601Timestamp(createdAt),
                 Path: container.configuration.initProcess.executable,
                 Args: container.configuration.initProcess.arguments,

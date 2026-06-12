@@ -99,7 +99,7 @@ extension ContainerListRoute {
                 )
 
                 return RESTContainerSummary(
-                    Id: container.id,
+                    Id: DockerContainerID.hexId(for: container),
                     Names: ["/" + container.id],
                     Image: container.configuration.image.reference,
                     ImageID: container.configuration.image.digest,

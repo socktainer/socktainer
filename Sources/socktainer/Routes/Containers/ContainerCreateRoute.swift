@@ -360,7 +360,7 @@ extension ContainerCreateRoute {
             }
 
             return RESTContainerCreate(
-                Id: container.id,
+                Id: DockerContainerID.hexId(for: container),
                 Warnings: []
             )
         }
