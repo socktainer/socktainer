@@ -10,6 +10,9 @@ struct CLIOptions: ParsableArguments {
 
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility and exit")
     var checkCompatibility: Bool = true
+
+    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
+    var dockerContext: Bool = true
 }
 
 // Parse CLI before starting the app
@@ -34,7 +37,14 @@ try LoggingSystem.bootstrap(from: &env)
 
 // Create and configure the Vapor application
 let app = try await Application.make(env)
-try prepareUnixSocket(for: app, homeDirectory: ProcessInfo.processInfo.environment["HOME"])
+let homeDirectory = ProcessInfo.processInfo.environment["HOME"]
+try prepareUnixSocket(for: app, homeDirectory: homeDirectory)
+if options.dockerContext,
+    let homeDir = homeDirectory,
+    !homeDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+{
+    DockerContextSetup.install(homeDirectory: homeDir)
+}
 try await configure(app)
 
 // Start the app
