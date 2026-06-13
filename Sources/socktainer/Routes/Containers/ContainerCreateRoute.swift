@@ -71,7 +71,7 @@ extension ContainerCreateRoute {
             try Utility.validEntityName(id)
 
             // Validate the requested platform only if provided
-            let requestedPlatform = try Platform(from: containerPlatform)
+            var requestedPlatform = try Platform(from: containerPlatform)
 
             // Check if image exists locally
             do {
@@ -80,11 +80,40 @@ extension ContainerCreateRoute {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
 
-            let img = try await ClientImage.fetch(
-                reference: body.Image,
-                platform: requestedPlatform,
-                containerSystemConfig: ContainerSystemConfig()
-            )
+            // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
+            // variant is available. Two cases handled:
+            //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
+            //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
+            // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
+            var img: ClientImage
+            do {
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: requestedPlatform,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                // Case 2: image exists locally but may have been pulled as amd64
+                if requestedPlatform.architecture == "arm64",
+                    (try? await img.config(for: requestedPlatform)) == nil
+                {
+                    throw ContainerizationError(.notFound, message: "no arm64 content")
+                }
+            } catch let fetchError
+                where requestedPlatform.architecture == "arm64"
+                && {
+                    let msg = String(describing: fetchError)
+                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
+                }()
+            {
+                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
+                req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: amd64,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                requestedPlatform = amd64
+            }
 
             // Unpack a fetched image before use
             try await img.getCreateSnapshot(
@@ -249,9 +278,59 @@ extension ContainerCreateRoute {
                 searchDomains: searchDomains,
                 options: dnsOptions
             )
-            containerConfiguration.labels = body.Labels ?? [:]
+            // Collect Compose service aliases from EndpointsConfig.
+            // These are stored in a label so the start route can register them
+            // in the DNS server once the container has an IP.
+            let dnsNames =
+                (body.NetworkingConfig?.EndpointsConfig?.values)
+                .map { settings in settings.compactMap(\.Aliases).flatMap { $0 }.filter { !$0.isEmpty } }
+                ?? []
+
+            var containerLabels = body.Labels ?? [:]
+            if !dnsNames.isEmpty {
+                containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+
+                // Ensure a CoreDNS container for the first network and point this
+                // container's DNS at it so service names resolve inside the VM.
+                if let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
+                    let firstNetwork = body.NetworkingConfig?.EndpointsConfig?.keys.first
+                {
+                    do {
+                        let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                        let existing = containerConfiguration.dns
+                        containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                            nameservers: [dnsIP],
+                            domain: existing?.domain ?? nil,
+                            searchDomains: existing?.searchDomains ?? [],
+                            options: existing?.options ?? []
+                        )
+                    } catch {
+                        req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    }
+                }
+            }
+            containerConfiguration.labels = containerLabels
 
             var resolvedMounts: [Filesystem] = []
+
+            // Docker creates missing bind-mount source directories on the host automatically.
+            // Parser.mounts() validates that the source path exists and throws if not, so we
+            // must create missing directories BEFORE parsing, not after.
+            if let binds = body.HostConfig?.Binds {
+                for bind in binds {
+                    let parts = bind.split(separator: ":").map(String.init)
+                    if let source = parts.first, source.hasPrefix("/") {
+                        try? FileManager.default.createDirectory(
+                            atPath: source, withIntermediateDirectories: true)
+                    }
+                }
+            }
+            if let mounts = body.HostConfig?.Mounts {
+                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty {
+                    try? FileManager.default.createDirectory(
+                        atPath: mount.Source, withIntermediateDirectories: true)
+                }
+            }
 
             // Process bind mounts from HostConfig.Binds
             var volumesOrFs: [VolumeOrFilesystem] = []

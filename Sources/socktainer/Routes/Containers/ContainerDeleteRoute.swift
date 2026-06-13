@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct ContainerDeleteRoute: RouteCollection {
@@ -16,10 +17,23 @@ extension ContainerDeleteRoute {
             }
 
             do {
-                // if running, stop it first
-                if let container = try await client.getContainer(id: id),
-                    container.status == .running
+                // Resolve the reference once — it may be a hex ID or a
+                // truncated prefix — and reuse the snapshot for both DNS
+                // unregistration and the running check.
+                let container = try await client.getContainer(id: id)
+
+                // Unregister DNS names before deletion
+                if let container,
+                    let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
+                    let namesLabel = container.configuration.labels["socktainer.dns.names"]
                 {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.unregister(hostname: name)
+                    }
+                }
+
+                // if running, stop it first
+                if let container, container.status == .running {
                     try await client.stop(id: id, signal: nil, timeout: nil)
                 }
                 try await client.delete(id: id)

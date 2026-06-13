@@ -155,9 +155,36 @@ struct ClientImageService: ClientImageProtocol {
                     continuation.yield("Image digest: \(image.digest)")
                     continuation.finish()
                 } catch {
-                    logger.error("Failed to pull image \(reference): \(error)")
-                    continuation.yield(String(describing: error))
-                    continuation.finish(throwing: error)
+                    // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
+                    // Apple Container enables Rosetta automatically when the container platform is amd64.
+                    let errMsg = String(describing: error)
+                    if platform.architecture == "arm64",
+                        errMsg.contains("does not support required platforms")
+                    {
+                        let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
+                        logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
+                        continuation.yield("linux/arm64 not available — retrying with linux/amd64 (Rosetta)")
+                        do {
+                            let fallbackImage = try await ClientImage.pull(
+                                reference: reference,
+                                platform: amd64,
+                                containerSystemConfig: containerSystemConfig,
+                                progressUpdate: nil
+                            )
+                            try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
+                            logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
+                            continuation.yield("Image digest: \(fallbackImage.digest)")
+                            continuation.finish()
+                        } catch let fallbackError {
+                            logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
+                            continuation.yield(String(describing: fallbackError))
+                            continuation.finish(throwing: fallbackError)
+                        }
+                    } else {
+                        logger.error("Failed to pull image \(reference): \(error)")
+                        continuation.yield(errMsg)
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
         }

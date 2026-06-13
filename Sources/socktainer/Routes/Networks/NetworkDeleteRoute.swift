@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct NetworkDeletetRoute: RouteCollection {
@@ -14,6 +15,11 @@ struct NetworkDeletetRoute: RouteCollection {
             throw Abort(.badRequest, reason: "Missing network id parameter")
         }
         do {
+            // Remove the CoreDNS sidecar BEFORE deleting the network —
+            // the network can't be deleted while the DNS container is still attached.
+            if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
+                await dnsManager.cleanupDNSContainer(networkId: id)
+            }
             try await client.delete(id: id, logger: logger)
             return Response(status: .noContent)
         } catch {
