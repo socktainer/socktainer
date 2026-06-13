@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import socktainer
@@ -113,6 +114,119 @@ struct HealthCheckManagerTests {
         let h = await mgr.currentHealth(for: "c1")
         #expect(h?.Status == "unhealthy")
         #expect((h?.FailingStreak ?? 0) >= 2)
+        await mgr.stop(containerId: "c1")
+    }
+
+    // MARK: - Health log entries
+
+    @Test("Log entries are recorded after each probe")
+    func logEntriesRecorded() async throws {
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.Log.count ?? 0) > 0)
+        #expect(h?.Log.first?.ExitCode == 0)
+        #expect(h?.Log.first?.Start.isEmpty == false)
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("Log is capped at 5 entries")
+    func logCappedAt5() async throws {
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        // Wait long enough for >5 probe calls at 1ms interval
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.Log.count ?? 0) <= 5)
+        await mgr.stop(containerId: "c1")
+    }
+
+    // MARK: - health_status events
+
+    @Test("health_status events are emitted on status transition to healthy")
+    func healthStatusEventsEmitted() async throws {
+        actor Collector {
+            var statuses: [String] = []
+            func append(_ s: String) { statuses.append(s) }
+        }
+        let collector = Collector()
+        let broadcaster = EventBroadcaster()
+
+        let collectTask = Task { @Sendable in
+            for await event in await broadcaster.stream() {
+                if event.status.hasPrefix("health_status:") {
+                    await collector.append(event.status)
+                }
+                if await collector.statuses.count >= 1 { break }
+            }
+        }
+
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000,
+            broadcaster: broadcaster
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        collectTask.cancel()
+        await mgr.stop(containerId: "c1")
+
+        let received = await collector.statuses
+        #expect(received.contains("health_status: healthy"))
+    }
+
+    // MARK: - Log entry detail for failing probe
+
+    @Test("Log entry records non-zero exit code on failure")
+    func logEntryForFailingProbe() async throws {
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 1 },  // always fail
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "false"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 1, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("unhealthy", on: mgr, id: "c1")
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.Log.count ?? 0) > 0)
+        #expect(h?.Log.first?.ExitCode == 1)
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("Log entry Start and End are non-empty ISO8601 strings")
+    func logEntryTimestampsAreISO8601() async throws {
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in 0 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        let h = await mgr.currentHealth(for: "c1")
+        guard let entry = h?.Log.first else {
+            Issue.record("No log entries")
+            return
+        }
+        // ISO8601 with fractional seconds: e.g. "2026-06-13T01:23:45.678Z"
+        #expect(entry.Start.contains("T"))
+        #expect(entry.Start.contains("Z"))
+        #expect(entry.End.contains("T"))
+        // End must be >= Start (both valid timestamps)
+        let start = ISO8601DateFormatter().date(from: entry.Start)
+        let end = ISO8601DateFormatter().date(from: entry.End)
+        if let s = start, let e = end {
+            #expect(e >= s)
+        }
         await mgr.stop(containerId: "c1")
     }
 

@@ -8,6 +8,8 @@ public enum ContainerWaitCondition: String, CaseIterable, Codable, Sendable {
     case healthy = "healthy"
 
     public static let `default`: ContainerWaitCondition = .notRunning
+    /// Poll interval when waiting for condition=healthy.
+    static let healthyPollIntervalNs: UInt64 = 500_000_000  // 500 ms
 }
 
 struct ContainerWaitRoute: RouteCollection {
@@ -71,7 +73,7 @@ struct ContainerWaitRoute: RouteCollection {
                                     guard let c = try? await client.getContainer(id: containerId),
                                         c.status == .running
                                     else { break }
-                                    try await Task.sleep(nanoseconds: 500_000_000)
+                                    try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
                                 }
                             }
                             result = RESTContainerWait(statusCode: 0)
