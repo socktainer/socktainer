@@ -42,6 +42,7 @@ protocol ClientContainerProtocol: Sendable {
 enum ClientContainerError: Error {
     case notFound(id: String)
     case notRunning(id: String)
+    case ambiguousId(reference: String, matches: [String])
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -77,7 +78,11 @@ struct ClientContainerService: ClientContainerProtocol {
             case "name":
                 containers = containers.filter { values.contains($0.id) }
             case "id":
-                containers = containers.filter { values.contains($0.id) }
+                containers = containers.filter { container in
+                    values.contains { value in
+                        container.id == value || DockerContainerID.hexId(for: container).hasPrefix(value)
+                    }
+                }
             case "ancestor":
                 containers = containers.filter { values.contains($0.configuration.image.reference) }
             case "before":
@@ -160,7 +165,19 @@ struct ClientContainerService: ClientContainerProtocol {
         do {
             return try await containerClient.get(id: id)
         } catch let error as ContainerizationError where error.code == .notFound {
-            return nil
+            // The reference may be a Docker-shaped hex ID, or a truncated
+            // prefix of one fed back from `docker ps` output; resolve it
+            // against the derived IDs of all containers.
+            let allContainers = try await containerClient.list()
+            let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
+            switch DockerContainerID.resolve(reference: id, entries: entries) {
+            case .match(let nativeId):
+                return allContainers.first { $0.id == nativeId }
+            case .ambiguous(let matches):
+                throw ClientContainerError.ambiguousId(reference: id, matches: matches)
+            case .none:
+                return nil
+            }
         }
     }
 
@@ -214,8 +231,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
         let id = ContainerNameUtility.sanitize(id)
-        let container = try await containerClient.list().filter { $0.id == id }.first
-        guard let container else {
+        guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
 
@@ -227,8 +243,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func kill(id: String, signal: String?) async throws {
         let id = ContainerNameUtility.sanitize(id)
-        let container = try await containerClient.list().filter { $0.id == id }.first
-        guard let container else {
+        guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
 
@@ -243,8 +258,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
         let id = ContainerNameUtility.sanitize(id)
-        let container = try await containerClient.list().filter { $0.id == id }.first
-        guard let container else {
+        guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
 
@@ -257,8 +271,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func delete(id: String) async throws {
         let id = ContainerNameUtility.sanitize(id)
-        let container = try await containerClient.list().filter { $0.id == id }.first
-        guard let container else {
+        guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.delete(id: container.id)
@@ -268,10 +281,12 @@ struct ClientContainerService: ClientContainerProtocol {
     // code recorded by the background waiter started in start() (or by the
     // stdin-attach bootstrap path).
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
-        let id = ContainerNameUtility.sanitize(id)
-        guard (try await containerClient.list().filter { $0.id == id }.first) != nil else {
+        guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
+        // Poll by the native ID; the request reference may have been a hex ID
+        // or a truncated prefix of one.
+        let id = container.id
 
         // `docker run` issues /wait BEFORE /start, so the container is still in
         // `.created` state when we arrive here — we must NOT treat "not running"

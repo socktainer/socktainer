@@ -54,8 +54,11 @@ extension ContainerStartRoute {
 
             // Register DNS names now that the container has an IP.
             // Names were stored in the label at create time (Compose service aliases).
+            // Resolve through getContainer: clients commonly start containers by
+            // the hex ID returned from create, which the native lookup rejects.
+            let startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
-                let snapshot = try? await ContainerClient().get(id: id),
+                let snapshot = startedSnapshot,
                 snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
                 let namesLabel = snapshot.configuration.labels["socktainer.dns.names"],
                 let firstAttachment = snapshot.networks.first
