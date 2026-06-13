@@ -41,17 +41,30 @@ actor HealthCheckManager {
 
     private var statuses: [String: ContainerHealth] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
+    private var logs: [String: [HealthLogEntry]] = [:]  // ring buffer, max 5 entries per container
     private let log = Logger(label: "socktainer.healthcheck")
     private let probe: HealthProbe
     private let intervalFloorNs: UInt64
+    /// Optional broadcaster for Docker `health_status` events. Nil in tests.
+    private let broadcaster: EventBroadcaster?
 
-    init(probe: @escaping HealthProbe = HealthCheckManager.execProbe, intervalFloorNs: UInt64 = HealthCheckManager.defaultMinimumIntervalNs) {
+    private static let maxLogEntries = 5
+
+    private static func formatISO8601(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: date)
+    }
+
+    init(probe: @escaping HealthProbe = HealthCheckManager.execProbe, intervalFloorNs: UInt64 = HealthCheckManager.defaultMinimumIntervalNs, broadcaster: EventBroadcaster? = nil) {
         self.probe = probe
         self.intervalFloorNs = intervalFloorNs
+        self.broadcaster = broadcaster
     }
 
     func currentHealth(for id: String) -> ContainerHealth? {
-        statuses[id]
+        guard let status = statuses[id] else { return nil }
+        return ContainerHealth(Status: status.Status, FailingStreak: status.FailingStreak, Log: logs[id] ?? [])
     }
 
     /// Start running healthchecks for a container. No-op if already running.
@@ -69,6 +82,7 @@ actor HealthCheckManager {
     func stop(containerId: String) {
         tasks.removeValue(forKey: containerId)?.cancel()
         statuses.removeValue(forKey: containerId)
+        logs.removeValue(forKey: containerId)
     }
 
     /// Parses Docker's `Test` field into a runnable command vector.
@@ -90,9 +104,28 @@ actor HealthCheckManager {
 
     // MARK: - Private
 
-    private func updateStatus(id: String, health: ContainerHealth) {
+    private func updateStatus(id: String, health: ContainerHealth, logEntry: HealthLogEntry? = nil) {
         guard tasks[id] != nil else { return }  // already stopped
+        let previous = statuses[id]?.Status
         statuses[id] = health
+        if let entry = logEntry {
+            var entries = logs[id] ?? []
+            entries.append(entry)
+            if entries.count > Self.maxLogEntries {
+                entries.removeFirst(entries.count - Self.maxLogEntries)
+            }
+            logs[id] = entries
+        }
+        // Emit Docker health_status event on every transition (including starting → healthy).
+        if previous != health.Status, let broadcaster {
+            Task {
+                let event = DockerEvent.simpleEvent(
+                    id: id, type: "container",
+                    status: "health_status: \(health.Status)"
+                )
+                await broadcaster.broadcast(event)
+            }
+        }
     }
 
     private func isActive(id: String) -> Bool {
@@ -117,17 +150,26 @@ actor HealthCheckManager {
         while !Task.isCancelled {
             guard isActive(id: containerId) else { return }
 
+            let start = Date()
             let exitCode = await runCheck(containerId: containerId, config: config, timeoutNs: timeoutNs)
+            let end = Date()
 
             guard !Task.isCancelled else { return }
 
+            let entry = HealthLogEntry(
+                Start: Self.formatISO8601(start),
+                End: Self.formatISO8601(end),
+                ExitCode: exitCode,
+                Output: ""  // stdout capture from container VMs requires pipe infrastructure
+            )
+
             if exitCode == 0 {
                 failingStreak = 0
-                updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []))
+                updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
                 let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
-                updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []))
+                updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
 

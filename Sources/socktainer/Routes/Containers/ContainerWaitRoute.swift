@@ -5,6 +5,7 @@ public enum ContainerWaitCondition: String, CaseIterable, Codable, Sendable {
     case notRunning = "not-running"
     case nextExit = "next-exit"
     case removed = "removed"
+    case healthy = "healthy"
 
     public static let `default`: ContainerWaitCondition = .notRunning
 }
@@ -60,7 +61,23 @@ struct ContainerWaitRoute: RouteCollection {
 
                     let result: RESTContainerWait
                     do {
-                        result = try await client.wait(id: containerId, condition: condition)
+                        if condition == .healthy {
+                            // Poll HealthCheckManager until the container becomes healthy
+                            // or stops running (in which case it can never reach healthy).
+                            if let manager = req.application.storage[HealthCheckManagerKey.self] {
+                                while true {
+                                    let health = await manager.currentHealth(for: containerId)
+                                    if health?.Status == "healthy" { break }
+                                    guard let c = try? await client.getContainer(id: containerId),
+                                        c.status == .running
+                                    else { break }
+                                    try await Task.sleep(nanoseconds: 500_000_000)
+                                }
+                            }
+                            result = RESTContainerWait(statusCode: 0)
+                        } else {
+                            result = try await client.wait(id: containerId, condition: condition)
+                        }
                     } catch {
                         // Emit a 0-status body so the client unblocks rather than
                         // hanging on a half-open stream.

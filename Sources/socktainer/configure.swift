@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -185,7 +186,21 @@ func configure(_ app: Application) async throws {
 
     // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and
     // tracks status so `/containers/{id}/json` can return `.State.Health`.
-    app.storage[HealthCheckManagerKey.self] = HealthCheckManager()
+    let healthCheckManager = HealthCheckManager(broadcaster: broadcaster)
+    app.storage[HealthCheckManagerKey.self] = healthCheckManager
+
+    // Resume healthcheck loops for any containers that were running when
+    // Socktainer last stopped — their socktainer.healthcheck label persists.
+    let resumeClient = ContainerClient()
+    if let runningContainers = try? await resumeClient.list() {
+        for container in runningContainers where container.status == .running {
+            guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
+                let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8))
+            else { continue }
+            await healthCheckManager.start(containerId: container.id, config: config)
+            app.logger.info("Resumed healthcheck for \(container.id)")
+        }
+    }
 
     // Clean up any CoreDNS containers left from a previous run
     await dnsManager.cleanupStaleDNSContainers()
