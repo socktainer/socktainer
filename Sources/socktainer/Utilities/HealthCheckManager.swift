@@ -67,8 +67,10 @@ actor HealthCheckManager {
         return ContainerHealth(Status: status.Status, FailingStreak: status.FailingStreak, Log: logs[id] ?? [])
     }
 
-    /// Start running healthchecks for a container. No-op if already running.
+    /// Start running healthchecks for a container. No-op if already running or if the
+    /// test is disabled (`NONE`, empty, or bare `CMD` with no arguments).
     func start(containerId: String, config: HealthcheckConfig) {
+        guard Self.parseTest(config.Test) != nil else { return }
         guard tasks[containerId] == nil else { return }
         statuses[containerId] = ContainerHealth(Status: "starting", FailingStreak: 0, Log: [])
         let task = Task { [self] in
@@ -185,6 +187,11 @@ actor HealthCheckManager {
 
     // MARK: - Default probe (real exec)
 
+    private enum ProbeOutcome {
+        case exited(Int32)
+        case timedOut
+    }
+
     /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
     /// Returns the exit code, or 1 on any failure.
     static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
@@ -209,7 +216,6 @@ actor HealthCheckManager {
             )
             try await process.start()
 
-            enum ProbeOutcome { case exited(Int32); case timedOut }
             let outcome: ProbeOutcome = try await withThrowingTaskGroup(of: ProbeOutcome.self) { group in
                 group.addTask { .exited(try await process.wait()) }
                 group.addTask {
@@ -224,8 +230,7 @@ actor HealthCheckManager {
             case .exited(let code):
                 return code
             case .timedOut:
-                // The probe process may linger in the VM until it exits on its own —
-                // Apple Container has no public per-process kill API beyond container-level signals.
+                try? await process.kill(SIGTERM)
                 return 1
             }
         } catch {

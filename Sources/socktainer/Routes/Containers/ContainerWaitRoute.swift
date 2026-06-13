@@ -71,7 +71,13 @@ struct ContainerWaitRoute: RouteCollection {
                                 while true {
                                     let health = await manager.currentHealth(for: containerId)
                                     if health?.Status == "healthy" { break }
-                                    // No healthcheck configured on this container — cannot become healthy
+                                    // health==nil means no probe loop was registered for this container.
+                                    // HealthCheckManager.start() is called by ContainerStartRoute after
+                                    // container.start() returns, so there is a brief window where the
+                                    // container is running but health is still nil. We break here because
+                                    // by the next poll (500ms later) start() would have run; if it's still
+                                    // nil then, it means no HEALTHCHECK was configured and the container
+                                    // can never become healthy.
                                     if health == nil {
                                         statusCode = 1
                                         break
