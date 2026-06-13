@@ -178,7 +178,8 @@ actor HealthCheckManager {
     }
 
     private func runCheck(containerId: String, config: HealthcheckConfig, timeoutNs: UInt64) async -> Int32 {
-        guard let cmd = Self.parseTest(config.Test) else { return 0 }
+        // nil means NONE / disabled / empty — do not mark the container healthy
+        guard let cmd = Self.parseTest(config.Test) else { return 1 }
         return await probe(containerId, cmd, timeoutNs)
     }
 
@@ -208,15 +209,24 @@ actor HealthCheckManager {
             )
             try await process.start()
 
-            return try await withThrowingTaskGroup(of: Int32.self) { group in
-                group.addTask { try await process.wait() }
+            enum ProbeOutcome { case exited(Int32); case timedOut }
+            let outcome: ProbeOutcome = try await withThrowingTaskGroup(of: ProbeOutcome.self) { group in
+                group.addTask { .exited(try await process.wait()) }
                 group.addTask {
                     try await Task.sleep(nanoseconds: timeoutNs)
-                    return 1
+                    return .timedOut
                 }
-                let result = try await group.next() ?? 1
+                let result = try await group.next() ?? .timedOut
                 group.cancelAll()
                 return result
+            }
+            switch outcome {
+            case .exited(let code):
+                return code
+            case .timedOut:
+                // The probe process may linger in the VM until it exits on its own —
+                // Apple Container has no public per-process kill API beyond container-level signals.
+                return 1
             }
         } catch {
             return 1

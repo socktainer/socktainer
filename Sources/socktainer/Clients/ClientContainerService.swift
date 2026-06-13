@@ -43,6 +43,7 @@ enum ClientContainerError: Error {
     case notFound(id: String)
     case notRunning(id: String)
     case ambiguousId(reference: String, matches: [String])
+    case unsupportedCondition(ContainerWaitCondition)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -298,8 +299,8 @@ struct ClientContainerService: ClientContainerProtocol {
         switch condition {
         case .healthy:
             // ContainerWaitRoute intercepts condition=healthy and polls HealthCheckManager
-            // directly — this branch in the service is never reached in production.
-            preconditionFailure("ContainerWaitCondition.healthy must be handled by ContainerWaitRoute, not the service layer")
+            // directly — this branch in the service should never be reached in production.
+            throw ClientContainerError.unsupportedCondition(.healthy)
 
         case .notRunning, .nextExit, .removed:
             // Wait until the init process exits and its code is recorded. For

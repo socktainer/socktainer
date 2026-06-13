@@ -195,7 +195,8 @@ func configure(_ app: Application) async throws {
     if let runningContainers = try? await resumeClient.list() {
         for container in runningContainers where container.status == .running {
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
-                let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8))
+                let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8)),
+                HealthCheckManager.parseTest(config.Test) != nil  // skip NONE / disabled checks
             else { continue }
             await healthCheckManager.start(containerId: container.id, config: config)
             app.logger.info("Resumed healthcheck for \(container.id)")

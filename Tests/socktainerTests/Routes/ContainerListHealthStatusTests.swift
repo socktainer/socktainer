@@ -86,7 +86,7 @@ struct ContainerListHealthStatusTests {
             try await app.testing().test(.GET, "/v1.51/containers/json") { res async in
                 let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
                 #expect(summaries.first?.Status.hasPrefix("Up") == true)
-                #expect(!summaries.first!.Status.contains("health:"))
+                #expect(summaries.first?.Status.range(of: "\\((starting|healthy|unhealthy)\\)", options: .regularExpression) == nil)
             }
         }
     }
@@ -125,7 +125,7 @@ struct ContainerListHealthStatusTests {
                 let summaries = (try? JSONDecoder().decode([RESTContainerSummary].self, from: res.body)) ?? []
                 // Status should be plain "running" (no health suffix)
                 #expect(summaries.first?.Status.hasPrefix("Up") == true)
-                #expect(!summaries.first!.Status.contains("health:"))
+                #expect(summaries.first?.Status.range(of: "\\((starting|healthy|unhealthy)\\)", options: .regularExpression) == nil)
             }
             // Filter by health=none should return the container
             try await app.testing().test(.GET, "/v1.51/containers/json?filters=%7B%22health%22%3A%5B%22none%22%5D%7D") { res async in

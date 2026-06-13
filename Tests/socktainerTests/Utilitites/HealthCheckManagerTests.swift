@@ -233,6 +233,7 @@ struct HealthCheckManagerTests {
     // MARK: - Helpers
 
     /// Polls every 5ms up to ~3s for the manager to report `expected` status.
+    /// Fails the test if the status is never reached.
     private static func waitForStatus(_ expected: String, on mgr: HealthCheckManager, id: String) async throws {
         for _ in 0..<600 {
             if await mgr.currentHealth(for: id)?.Status == expected {
@@ -240,5 +241,9 @@ struct HealthCheckManagerTests {
             }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
+        let actual = await mgr.currentHealth(for: id)?.Status
+        Issue.record("waitForStatus timed out: expected '\(expected)' but got '\(actual ?? "nil")' for container '\(id)'")
+        struct TimeoutError: Error {}
+        throw TimeoutError()
     }
 }

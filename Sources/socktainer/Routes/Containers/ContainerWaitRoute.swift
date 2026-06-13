@@ -66,17 +66,31 @@ struct ContainerWaitRoute: RouteCollection {
                         if condition == .healthy {
                             // Poll HealthCheckManager until the container becomes healthy
                             // or stops running (in which case it can never reach healthy).
+                            var statusCode: Int64 = 0
                             if let manager = req.application.storage[HealthCheckManagerKey.self] {
                                 while true {
                                     let health = await manager.currentHealth(for: containerId)
                                     if health?.Status == "healthy" { break }
+                                    // No healthcheck configured on this container — cannot become healthy
+                                    if health == nil {
+                                        statusCode = 1
+                                        break
+                                    }
+                                    // Container stopped — return its real exit code
                                     guard let c = try? await client.getContainer(id: containerId),
                                         c.status == .running
-                                    else { break }
+                                    else {
+                                        let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                                        statusCode = Int64(code)
+                                        break
+                                    }
                                     try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
                                 }
+                            } else {
+                                // HealthCheckManager unavailable — healthchecks not supported
+                                statusCode = 1
                             }
-                            result = RESTContainerWait(statusCode: 0)
+                            result = RESTContainerWait(statusCode: statusCode)
                         } else {
                             result = try await client.wait(id: containerId, condition: condition)
                         }

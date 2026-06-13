@@ -168,7 +168,7 @@ extension ContainerListRoute {
 
     /// Returns a human-readable duration string matching Docker's "Up X seconds/minutes/hours/days" format.
     static func humanReadableAge(since date: Date) -> String {
-        let seconds = Int(-date.timeIntervalSinceNow)
+        let seconds = max(0, Int(-date.timeIntervalSinceNow))
         if seconds < 60 { return "\(seconds) second\(seconds == 1 ? "" : "s")" }
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
