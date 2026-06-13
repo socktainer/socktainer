@@ -22,6 +22,7 @@
       - [Pre Release](#pre-release)
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
+    - [Volume sync mode](#volume-sync-mode)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
     - [Build & Run](#build-run)
@@ -168,6 +169,50 @@ Download from socktainer [releases](https://github.com/socktainer/socktainer/rel
 ## Usage 🚀
 
 Refer to **Quick Start** above for immediate usage examples.
+
+### Volume sync mode
+
+Named volumes default to `nosync` — guest `fsync()` calls are not flushed to the
+host disk on demand, matching Colima's behavior and giving ~1.5× speedup for
+write-heavy workloads (postgres WAL, Kafka, Redis AOF).
+
+**Tradeoff:** data written to a volume since the last OS page-cache flush could be
+lost if the **host** (Mac) crashes or loses power. In a dev environment this is
+acceptable; data is safe across normal `docker stop` / host restarts.
+
+**Override globally** — apply the same mode to all named volumes (bind mounts and anonymous volumes are not affected):
+
+```bash
+socktainer --volume-sync=fsync   # honor guest fsyncs (durable)
+socktainer --volume-sync=full    # fully synchronous writes (slowest)
+socktainer --volume-sync=nosync  # default
+```
+
+**Override per volume** — `docker volume create -o sync=<mode>` persists the
+choice for that volume regardless of the global flag:
+
+```bash
+docker volume create -o sync=fsync my-pgdata
+docker run -v my-pgdata:/var/lib/postgresql/data postgres
+```
+
+Or using Docker Compose with `driver_opts`:
+
+```yaml
+services:
+  postgres:
+    image: postgres:latest
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+    driver: local
+    driver_opts:
+      sync: fsync
+```
+
+Valid modes: `nosync` · `fsync` · `full`
 
 ---
 

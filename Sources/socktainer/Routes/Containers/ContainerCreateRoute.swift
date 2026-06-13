@@ -413,12 +413,19 @@ extension ContainerCreateRoute {
                         )
                     }
 
+                    // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
+                    let syncMode =
+                        volume.labels[Filesystem.SyncMode.socktainerLabel]
+                        .flatMap { Filesystem.SyncMode(rawString: $0) }
+                        ?? req.application.storage[VolumeSyncModeKey.self]
+                        ?? .nosync
                     let volumeMount = Filesystem.volume(
                         name: parsed.name,
                         format: volume.format,
                         source: volume.source,
                         destination: parsed.destination,
-                        options: parsed.options
+                        options: parsed.options,
+                        sync: syncMode
                     )
                     resolvedMounts.append(volumeMount)
                 }

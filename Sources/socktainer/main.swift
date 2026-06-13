@@ -1,5 +1,6 @@
 import ArgumentParser
 import BuildInfo
+import ContainerResource
 import Foundation
 import Vapor
 
@@ -13,6 +14,13 @@ struct CLIOptions: ParsableArguments {
 
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
     var dockerContext: Bool = true
+
+    @ArgumentParser.Option(
+        name: .long,
+        help:
+            "Sync mode for named volumes: nosync (default, ~1.5x faster for write-heavy workloads), fsync (honors guest fsyncs for durability), full (fully synchronous writes). Override per-volume with: docker volume create -o sync=fsync <name>"
+    )
+    var volumeSync: String = "nosync"
 }
 
 // Parse CLI before starting the app
@@ -45,6 +53,7 @@ if options.dockerContext,
 {
     DockerContextSetup.install(homeDirectory: homeDir)
 }
+app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
 try await configure(app)
 
 // Start the app
