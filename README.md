@@ -82,7 +82,8 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 - Provides **Docker REST API compatibility** 🔄 (partial)
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock`
 - Supports container lifecycle operations: inspect, stop, remove 🛠️
-- Supports image listing, pulling, deletion, logs, health checks. Exec without interactive mode 📄
+- Supports image listing, pulling, deletion, logs, health checks, container stats. Exec without interactive mode 📄
+- `docker stats` reports memory against the Apple Container VM limit (default 1 GiB), not the host RAM
 - Broadcasts container events for client liveness monitoring 📡
 
 ---
