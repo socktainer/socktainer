@@ -5,8 +5,11 @@ public enum ContainerWaitCondition: String, CaseIterable, Codable, Sendable {
     case notRunning = "not-running"
     case nextExit = "next-exit"
     case removed = "removed"
+    case healthy = "healthy"
 
     public static let `default`: ContainerWaitCondition = .notRunning
+    /// Poll interval when waiting for condition=healthy.
+    static let healthyPollIntervalNs: UInt64 = 500_000_000  // 500 ms
 }
 
 struct ContainerWaitRoute: RouteCollection {
@@ -60,7 +63,43 @@ struct ContainerWaitRoute: RouteCollection {
 
                     let result: RESTContainerWait
                     do {
-                        result = try await client.wait(id: containerId, condition: condition)
+                        if condition == .healthy {
+                            // Poll HealthCheckManager until the container becomes healthy
+                            // or stops running (in which case it can never reach healthy).
+                            var statusCode: Int64 = 0
+                            if let manager = req.application.storage[HealthCheckManagerKey.self] {
+                                while true {
+                                    let health = await manager.currentHealth(for: containerId)
+                                    if health?.Status == "healthy" { break }
+                                    // health==nil means no probe loop was registered for this container.
+                                    // HealthCheckManager.start() is called by ContainerStartRoute after
+                                    // container.start() returns, so there is a brief window where the
+                                    // container is running but health is still nil. We break here because
+                                    // by the next poll (500ms later) start() would have run; if it's still
+                                    // nil then, it means no HEALTHCHECK was configured and the container
+                                    // can never become healthy.
+                                    if health == nil {
+                                        statusCode = 1
+                                        break
+                                    }
+                                    // Container stopped — return its real exit code
+                                    guard let c = try? await client.getContainer(id: containerId),
+                                        c.status == .running
+                                    else {
+                                        let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                                        statusCode = Int64(code)
+                                        break
+                                    }
+                                    try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
+                                }
+                            } else {
+                                // HealthCheckManager unavailable — healthchecks not supported
+                                statusCode = 1
+                            }
+                            result = RESTContainerWait(statusCode: statusCode)
+                        } else {
+                            result = try await client.wait(id: containerId, condition: condition)
+                        }
                     } catch {
                         // Emit a 0-status body so the client unblocks rather than
                         // hanging on a half-open stream.

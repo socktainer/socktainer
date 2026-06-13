@@ -37,6 +37,15 @@ extension ContainerInspectRoute {
                     }
             )
 
+            // Apple Container has no native healthcheck field; we round-trip
+            // the original config via a JSON-encoded label set by the create
+            // route, so Compose / Docker clients see the same Healthcheck
+            // block they sent.
+            let healthcheckConfig: HealthcheckConfig? =
+                container.configuration.labels[HealthCheckManager.healthcheckLabel]
+                .flatMap { Data($0.utf8) }
+                .flatMap { try? JSONDecoder().decode(HealthcheckConfig.self, from: $0) }
+
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
                 Domainname: container.configuration.dns?.domain,
@@ -50,7 +59,7 @@ extension ContainerInspectRoute {
                 StdinOnce: false,  // no mechanism to derive this value
                 Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
                 Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,
-                Healthcheck: nil,  // Apple containers don't have a healthcheck
+                Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
                 Image: container.configuration.image.reference,
                 Volumes: nil,  // Could be derived from mounts if needed
@@ -155,6 +164,11 @@ extension ContainerInspectRoute {
 
             let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
 
+            // Live healthcheck status, if a probe loop is running for this
+            // container. Returns nil when no healthcheck is configured or
+            // the loop hasn't recorded its first result yet.
+            let health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(for: container.id)
+
             let containerState: ContainerState = ContainerState(
                 Status: container.status.mobyState,
                 Running: container.status == .running,
@@ -166,7 +180,8 @@ extension ContainerInspectRoute {
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""
+                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                Health: health
             )
 
             return RESTContainerInspect(

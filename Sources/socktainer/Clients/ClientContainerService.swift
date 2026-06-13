@@ -43,6 +43,7 @@ enum ClientContainerError: Error {
     case notFound(id: String)
     case notRunning(id: String)
     case ambiguousId(reference: String, matches: [String])
+    case unsupportedCondition(ContainerWaitCondition)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -114,10 +115,10 @@ struct ClientContainerService: ClientContainerProtocol {
                     return false
                 }
             case "health":
-                containers = containers.filter { container in
-                    let healthStatus = container.status == .running ? "healthy" : "unhealthy"
-                    return values.contains(healthStatus)
-                }
+                // Health filtering requires the HealthCheckManager (available in
+                // ContainerListRoute). The filter is applied there after this call
+                // so we skip it here to avoid a stale heuristic.
+                break
             case "volume":
                 containers = containers.filter { container in
                     values.contains("volume-filter-not-implemented")
@@ -296,6 +297,11 @@ struct ClientContainerService: ClientContainerProtocol {
         // only after /wait returns), so disappearing means a race/out-of-band
         // removal and we fall back to the recorded code (or 0).
         switch condition {
+        case .healthy:
+            // ContainerWaitRoute intercepts condition=healthy and polls HealthCheckManager
+            // directly — this branch in the service should never be reached in production.
+            throw ClientContainerError.unsupportedCondition(.healthy)
+
         case .notRunning, .nextExit, .removed:
             // Wait until the init process exits and its code is recorded. For
             // `--rm` the container can be deleted the instant it exits (racing
