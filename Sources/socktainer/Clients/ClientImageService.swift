@@ -446,19 +446,36 @@ struct ClientImageService: ClientImageProtocol {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        let dockerFormatPath = tempDir.appendingPathComponent("docker-format")
-        try FileManager.default.createDirectory(at: dockerFormatPath, withIntermediateDirectories: true)
+        let extractedPath = tempDir.appendingPathComponent("extracted")
+        try FileManager.default.createDirectory(at: extractedPath, withIntermediateDirectories: true)
 
-        try ArchiveUtility.extract(tarPath: tarballPath, to: dockerFormatPath)
+        try ArchiveUtility.extract(tarPath: tarballPath, to: extractedPath)
 
-        let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
-        try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
+        // `docker buildx build --load`, the containerd "docker" exporter, and
+        // `docker save` on modern Docker emit a tarball that is already a valid
+        // OCI image layout (an `oci-layout` marker, an `index.json`, and blobs
+        // under `blobs/sha256/`). Such tarballs also include a legacy
+        // `manifest.json` for backwards compatibility, but its `Config`/`Layers`
+        // entries point at `blobs/sha256/<digest>` rather than the legacy
+        // `<digest>.json` / `<digest>/layer.tar` paths, so the docker-archive
+        // converter cannot consume them. Load the OCI layout directly and only
+        // fall back to conversion for genuinely legacy docker-archive tarballs.
+        let ociLayoutPath: URL
+        let hasOCILayout =
+            FileManager.default.fileExists(atPath: extractedPath.appendingPathComponent("oci-layout").path)
+            && FileManager.default.fileExists(atPath: extractedPath.appendingPathComponent("index.json").path)
 
-        let loadedImages = try await ContainerImageUtility.convertDockerTarToOCI(
-            dockerFormatPath: dockerFormatPath,
-            ociLayoutPath: ociLayoutPath,
-            logger: logger
-        )
+        if hasOCILayout {
+            ociLayoutPath = extractedPath
+        } else {
+            ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
+            try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
+            _ = try await ContainerImageUtility.convertDockerTarToOCI(
+                dockerFormatPath: extractedPath,
+                ociLayoutPath: ociLayoutPath,
+                logger: logger
+            )
+        }
 
         let images = try await imageStore.load(
             from: ociLayoutPath,
@@ -468,6 +485,7 @@ struct ClientImageService: ClientImageProtocol {
                 }
             })
 
+        let loadedImages = images.map { $0.reference }
         for image in loadedImages {
             logger.info("Loaded image: \(image)")
         }
