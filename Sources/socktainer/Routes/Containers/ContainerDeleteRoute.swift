@@ -23,9 +23,14 @@ extension ContainerDeleteRoute {
                 // unregistration and the running check.
                 let container = try await client.getContainer(id: id)
 
-                // Cancel the healthcheck probe loop if one is running. Use the Apple
-                // Container native ID (container?.id) to match the key stored at start time.
+                // Cancel the healthcheck probe loop if one is running. Use the native
+                // Apple Container ID (container?.id) to match the key stored at start time.
+                // When container is nil (lookup failed), fall back to the request-provided id,
+                // which may be a hex digest and could miss the loop — log a warning in that case.
                 if let healthManager = req.application.storage[HealthCheckManagerKey.self] {
+                    if container == nil {
+                        req.logger.warning("healthcheck stop: container not found for id \(id), falling back — loop may be orphaned")
+                    }
                     await healthManager.stop(containerId: container?.id ?? id)
                 }
 
