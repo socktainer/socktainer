@@ -14,6 +14,19 @@ struct HealthcheckConfig: Content {
     let StartPeriod: Int?
 }
 
+struct HealthLogEntry: Content {
+    let Start: String
+    let End: String
+    let ExitCode: Int32
+    let Output: String
+}
+
+struct ContainerHealth: Content {
+    let Status: String
+    let FailingStreak: Int
+    let Log: [HealthLogEntry]
+}
+
 struct HostConfig: Content {
     let Binds: [String]?
     let BlkioWeight: Int?
@@ -352,6 +365,10 @@ struct VolumeRequest: Content {
 struct VolumeUsageData: Content {
     let Size: Int64
     let RefCount: Int64
+    init(Size: Int64, RefCount: Int64) {
+        self.Size = Size
+        self.RefCount = RefCount
+    }
     init() {
         self.Size = -1  // will return -1, we have no option to calculate the actual usage of volume
         self.RefCount = -1  // will return -1, we don't map attached containers to volumes

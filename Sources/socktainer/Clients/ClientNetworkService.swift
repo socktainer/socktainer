@@ -1,5 +1,5 @@
 import ContainerAPIClient
-import ContainerNetworkService
+import ContainerNetworkClient
 import ContainerResource
 import Foundation
 import Logging
@@ -12,9 +12,11 @@ protocol ClientNetworkProtocol: Sendable {
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
+    private let networkClient = NetworkClient()
+
     func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
-        let networksList = try await ClientNetwork.list()
-        var allNetworks = networksList.map { RESTNetworkSummary(networkState: $0) }
+        let networksList = try await networkClient.list()
+        var allNetworks = networksList.map { RESTNetworkSummary(networkResource: $0) }
         let containerClient = ClientContainerService()
         let allContainers = try await containerClient.list(showAll: true, filters: [:])
 
@@ -23,6 +25,13 @@ struct ClientNetworkService: ClientNetworkProtocol {
             let network = allNetworks[i]
             var containersForNetwork: [String: NetworkContainer] = [:]
             for container in allContainers {
+                // Exclude internal Socktainer DNS sidecars from the Docker API view.
+                // If CoreDNS shows up as an attached container, docker compose down
+                // reports "Resource is still in use" and skips the DELETE /networks/{id}
+                // call — preventing our cleanup hook from firing.
+                guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole else {
+                    continue
+                }
                 for attachment in container.networks {
                     if attachment.network == network.Id || attachment.network == network.Name {
                         let nc = NetworkContainer(
@@ -120,62 +129,38 @@ struct ClientNetworkService: ClientNetworkProtocol {
     }
 
     func delete(id: String, logger: Logger) async throws {
-        try await ClientNetwork.delete(id: id)
+        try await networkClient.delete(id: id)
         logger.debug("Deleted network with id: \(id)")
     }
 
     func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
-        // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
-        //       https://github.com/apple/container/issues/665
-        var mutableLabels = labels
-        mutableLabels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
         let configuration = try NetworkConfiguration(
-            id: name,
+            name: name,
             mode: NetworkMode.nat,
-            labels: mutableLabels,
-            pluginInfo: NetworkPluginInfo(plugin: "container-network-vmnet")
+            labels: ResourceLabels(labels),
+            plugin: "container-network-vmnet"
         )
-        _ = try await ClientNetwork.create(configuration: configuration)
-        logger.debug("Created network with id: \(configuration.id)")
-        return RESTNetworkCreate(Id: configuration.id, Warning: "")
+        _ = try await networkClient.create(configuration: configuration)
+        logger.debug("Created network with id: \(configuration.name)")
+        return RESTNetworkCreate(Id: configuration.name, Warning: "")
     }
 }
 
 extension RESTNetworkSummary {
-    init(networkState: NetworkState) {
-        let id: String
-        let driver: String
+    init(networkResource: NetworkResource) {
+        let id = networkResource.configuration.name
+        let driver = String(describing: networkResource.configuration.mode)
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels: [String: String]
-        var subnet: String? = nil
-        var gateway: String? = nil
+        let labels = networkResource.configuration.labels.dictionary
+        let subnet =
+            networkResource.configuration.ipv4Subnet.map { String(describing: $0) }
+            ?? String(describing: networkResource.status.ipv4Subnet)
+        let gateway = String(describing: networkResource.status.ipv4Gateway)
 
-        switch networkState {
-        case .created(let config):
-            id = config.id
-            driver = String(describing: config.mode)
-            subnet = config.ipv4Subnet.map { String(describing: $0) }
-            labels = config.labels
-        case .running(let config, let status):
-            id = config.id
-            driver = String(describing: config.mode)
-            subnet = config.ipv4Subnet.map { String(describing: $0) } ?? String(describing: status.ipv4Subnet)
-            gateway = String(describing: status.ipv4Gateway)
-            labels = config.labels
-        }
-
-        let createdTimestamp: String
-        if let timestampStr = labels["io.github.socktainer.creation-timestamp"],
-            let timestamp = Double(timestampStr)
-        {
-            let date = Date(timeIntervalSince1970: timestamp)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            createdTimestamp = formatter.string(from: date)
-        } else {
-            createdTimestamp = "1970-01-01T00:00:00Z"
-        }
+        let createdTimestamp = AppleContainerTimestampResolver.iso8601Timestamp(
+            AppleContainerTimestampResolver.networkCreationDate(networkResource)
+        )
 
         self.init(
             Name: id,

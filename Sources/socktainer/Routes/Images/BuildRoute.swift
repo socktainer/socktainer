@@ -1,10 +1,12 @@
 import ContainerAPIClient
 import ContainerBuild
 import ContainerImagesServiceClient
+import ContainerPersistence
 import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import ContainerizationOS
+import DataCompression
 import Foundation
 import NIO
 import TerminalProgress
@@ -13,9 +15,15 @@ import Vapor
 struct BuildRoute: RouteCollection {
 
     let client: ClientContainerProtocol
+    let builderClient: ClientBuilderProtocol
+
+    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) {
+        self.client = client
+        self.builderClient = builderClient
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient))
 
     }
 
@@ -62,7 +70,41 @@ struct RESTBuildQuery: Vapor.Content {
 }
 
 extension BuildRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    /// Parses a Docker API build query parameter (`buildargs` or `labels`).
+    ///
+    /// The Docker Engine API sends these as a JSON-encoded `{"KEY":"VALUE"}` map.
+    /// Returns `["KEY=VALUE", ...]` strings suitable for passing to BuildKit.
+    static func parseBuildQueryParam(_ value: String?) -> [String] {
+        guard let value,
+            let data = value.data(using: .utf8),
+            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        else { return [] }
+        return dict.map { "\($0.key)=\($0.value)" }
+    }
+
+    /// Appends a zero-filled end-of-archive terminator to a received build
+    /// context tar so libarchive accepts contexts that omit the trailing
+    /// block padding (notably `docker compose build` with the classic builder).
+    /// For a gzip-compressed context a second gzip member of zeros is appended
+    /// (gzip streams concatenate, so the inflated output gains the missing
+    /// padding); for a plain tar, raw zero bytes are appended.
+    static func appendTarTerminator(to tarPath: URL) throws {
+        let handle = try FileHandle(forReadingFrom: tarPath)
+        let magic = try handle.read(upToCount: 2)
+        try handle.close()
+
+        let zeros = Data(count: 4096)
+        // `gzip()` of a fixed in-memory buffer is infallible.
+        let isGzip = magic == Data([0x1f, 0x8b])
+        let terminator = isGzip ? zeros.gzip()! : zeros
+
+        let writeHandle = try FileHandle(forWritingTo: tarPath)
+        defer { try? writeHandle.close() }
+        try writeHandle.seekToEnd()
+        try writeHandle.write(contentsOf: terminator)
+    }
+
+    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
 
@@ -86,6 +128,16 @@ extension BuildRoute {
             let target = query.target!
             let platform = query.platform!
             let memory = query.memory ?? 2_048_000_000  // 2GB default
+
+            do {
+                try await builderClient.ensureReachable(
+                    timeout: .seconds(3),
+                    retryInterval: .milliseconds(250),
+                    logger: req.logger
+                )
+            } catch {
+                throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
+            }
 
             // Extract tar archive from request body and unpack to temporary directory
             let contextDir: String
@@ -120,14 +172,18 @@ extension BuildRoute {
                             try fileHandle?.write(contentsOf: data)
                             totalBytesWritten = data.count
                         } else {
-                            // Use ByteBuffer streaming to avoid loading all data into memory
-                            for try await chunk in req.body {
-                                let data = Data(buffer: chunk)
+                            var chunkCount = 0
+                            for try await var chunk in req.body {
+                                guard let data = chunk.readData(length: chunk.readableBytes) else {
+                                    continue
+                                }
+                                chunkCount += 1
                                 try fileHandle?.write(contentsOf: data)
                                 totalBytesWritten += data.count
                             }
                         }
 
+                        try fileHandle?.synchronize()
                         try fileHandle?.close()
                         fileHandle = nil
                     } catch {
@@ -139,27 +195,36 @@ extension BuildRoute {
                     }
 
                     if totalBytesWritten > 0 {
+                        guard FileManager.default.fileExists(atPath: tarPath.path),
+                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
+                            let fileSize = fileAttributes[.size] as? Int64,
+                            fileSize > 0
+                        else {
+                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
+                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+                        }
+
+                        // `docker compose build` (classic builder) streams a build
+                        // context whose final tar entry is not padded out to a 512-byte
+                        // block and which omits the end-of-archive marker. The Docker
+                        // daemon's Go tar reader tolerates this, but libarchive treats
+                        // the short final block as a truncated archive and aborts
+                        // extraction. Append a terminator of zero bytes so the last
+                        // entry's block is completed and a valid end-of-archive marker
+                        // is present. Trailing zeros after a well-formed archive are
+                        // ignored, so this is safe for already-terminated contexts too.
+                        try Self.appendTarTerminator(to: tarPath)
+
                         // Extract the tar archive
                         let extractDir = tempContextDir.appendingPathComponent("context")
                         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
 
-                        // Use tar command to extract the archive
-                        let process = Process()
-                        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-                        process.arguments = ["-xf", tarPath.path, "-C", extractDir.path]
+                        do {
+                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
+                        } catch {
+                            req.logger.error("Tar extraction failed: \(error)")
 
-                        // Capture stderr for debugging
-                        let pipe = Pipe()
-                        process.standardError = pipe
-
-                        try process.run()
-                        process.waitUntilExit()
-
-                        guard process.terminationStatus == 0 else {
-                            let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
-                            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-                            req.logger.error("Tar extraction failed with status \(process.terminationStatus): \(errorMessage)")
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(errorMessage)")
+                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
                         }
                         contextDir = extractDir.path
                     } else {
@@ -177,17 +242,8 @@ extension BuildRoute {
                 throw error
             }
 
-            // Parse build arguments
-            let buildArgs: [String] = {
-                guard let buildArgsString = query.buildargs else { return [] }
-                return buildArgsString.split(separator: ",").map(String.init)
-            }()
-
-            // Parse labels
-            let labels: [String] = {
-                guard let labelsString = query.labels else { return [] }
-                return labelsString.split(separator: ",").map(String.init)
-            }()
+            let buildArgs = BuildRoute.parseBuildQueryParam(query.buildargs)
+            let labels = BuildRoute.parseBuildQueryParam(query.labels)
 
             // Create streaming response for build output
             let body = Response.Body { writer in
@@ -205,6 +261,7 @@ extension BuildRoute {
                             platform: platform,
                             memory: memory,
                             quiet: quiet,
+                            builderClient: builderClient,
                             writer: writer,
                             logger: req.logger
                         )
@@ -279,6 +336,7 @@ extension BuildRoute {
         platform: String,
         memory: Int,
         quiet: Bool,
+        builderClient: ClientBuilderProtocol,
         writer: BodyStreamWriter,
         logger: Logger
     ) async throws {
@@ -325,43 +383,12 @@ extension BuildRoute {
 
         sendStreamMessage(" ---> Connecting to build daemon")
 
-        // Connect to builder (similar to BuildCommand logic)
-        let builder: Builder? = try await withThrowingTaskGroup(of: Builder.self) { group in
-            defer {
-                group.cancelAll()
-            }
-
-            group.addTask {
-                while true {
-                    do {
-                        let container = try await ContainerClient().get(id: "buildkit")
-                        let fh = try await ContainerClient().dial(id: container.id, port: 8088)  // Default vsock port
-
-                        let threadGroup: MultiThreadedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                        let b = try Builder(socket: fh, group: threadGroup)
-
-                        // If this call succeeds, then BuildKit is running.
-                        let _ = try await b.info()
-                        sendStreamMessage(" ---> Successfully connected to builder")
-                        return b
-                    } catch {
-                        // Builder not available - throw error
-                        throw ContainerizationError(.unknown, message: "BuildKit container is not running. Please start the builder first.")
-                    }
-                }
-            }
-
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw ContainerizationError(.timeout, message: "Timeout waiting for connection to builder")
-            }
-
-            return try await group.next()
-        }
-
-        guard let builder else {
-            throw ContainerizationError(.unknown, message: "builder is not running")
-        }
+        let builder = try await builderClient.connect(
+            timeout: timeout,
+            retryInterval: .seconds(1),
+            logger: logger
+        )
+        sendStreamMessage(" ---> Successfully connected to builder")
 
         // resolve the full path to the Dockerfile
         sendStreamMessage(" ---> Reading Dockerfile")
@@ -410,8 +437,11 @@ extension BuildRoute {
             buildID: buildID,
             contentStore: RemoteContentStoreClient(),
             buildArgs: buildArgs,
+            // TODO: Implement secrets once integration with buildkit materializes
+            secrets: [:],
             contextDir: contextDir,
             dockerfile: dockerfileData,
+            dockerignore: nil,
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
@@ -422,7 +452,8 @@ extension BuildRoute {
             exports: exports,
             cacheIn: [],
             cacheOut: [],
-            pull: pull
+            pull: pull,
+            containerSystemConfig: ContainerSystemConfig()
         )
 
         sendStreamMessage(" ---> Starting build process")

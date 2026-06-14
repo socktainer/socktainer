@@ -19,9 +19,7 @@ struct ImagesGetRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Image name is required")
             }
 
-            let normalizedName = ContainerImageUtility.normalizeImageReference(name)
-
-            return try await saveImages(references: [normalizedName], req: req, client: client)
+            return try await saveImages(references: [name], req: req, client: client)
         }
     }
 
@@ -33,28 +31,13 @@ struct ImagesGetRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "At least one image name is required in 'names' query parameter")
             }
 
-            let normalizedNames = names.map { ContainerImageUtility.normalizeImageReference($0) }
-
-            return try await saveImages(references: normalizedNames, req: req, client: client)
+            return try await saveImages(references: names, req: req, client: client)
         }
     }
 
     private static func saveImages(references: [String], req: Request, client: ClientImageProtocol) async throws -> Response {
         let platformString = try? req.query.get(String.self, at: "platform")
-        let platform: Platform? = {
-            guard let platformString = platformString else {
-                return nil
-            }
-
-            do {
-                let data = platformString.data(using: .utf8) ?? Data()
-                let decoder = JSONDecoder()
-                return try decoder.decode(Platform.self, from: data)
-            } catch {
-                req.logger.warning("Failed to decode platform JSON: \(platformString)")
-                return nil
-            }
-        }()
+        let platform = try platformString.map(platformOrThrow)
 
         guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
             throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")

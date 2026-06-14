@@ -109,12 +109,12 @@ struct ClientVolumeService: ClientVolumeProtocol {
         return Self.convert(result)
     }
 
-    private static func convert(_ v: ContainerResource.Volume) -> Volume {
+    private static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
         Volume(
             Name: v.name,
             Driver: v.driver,
             Mountpoint: v.source,
-            CreatedAt: ISO8601DateFormatter().string(from: v.createdAt),
+            CreatedAt: ISO8601DateFormatter().string(from: v.creationDate),
             Status: nil,  // we have no mechanism to report status for the time being
             Labels: v.labels,
             Scope: "local",  // Assuming local for now

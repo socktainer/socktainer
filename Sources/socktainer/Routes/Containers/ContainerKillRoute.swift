@@ -29,6 +29,9 @@ extension ContainerKillRoute {
                 return Response(status: .noContent)
             } catch ClientContainerError.notFound {
                 return Response(status: .notFound, body: .init(string: "container \(containerId) not found"))
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                return Response(status: .badRequest, body: .init(string: "ambiguous container reference \(reference): matches \(matchList)"))
             } catch ClientContainerError.notRunning {
                 return Response(status: .conflict, body: .init(string: "container \(containerId) is not running"))
             } catch {

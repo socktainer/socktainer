@@ -27,6 +27,9 @@ extension ContainerRestartRoute {
                 try await client.restart(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {
                 throw Abort(.notFound, reason: "No such container: \(id)")
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             } catch {
                 req.logger.error("Failed to restart container \(id): \(error)")
                 throw Abort(.internalServerError, reason: "Failed to restart container: \(error)")

@@ -18,6 +18,18 @@ struct RESTImagePushQuery: Vapor.Content {
 }
 
 extension ImagePushRoute {
+    private static func resolvedReference(imageName: String, tag: String?) throws -> String {
+        guard let tag, !tag.isEmpty else {
+            return imageName
+        }
+
+        let parsedReference = try Reference.parse(imageName)
+        if tag.starts(with: "sha256:") {
+            return try parsedReference.withDigest(tag).description
+        }
+        return try parsedReference.withTag(tag).description
+    }
+
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let imageName = req.parameters.get("name") else {
@@ -26,24 +38,7 @@ extension ImagePushRoute {
 
             let query = try req.query.decode(RESTImagePushQuery.self)
 
-            // Extract and decode X-Registry-Auth header
-            var registryAuth: AuthConfig?
-            if let xAuthConfigHeader = req.headers.first(name: "X-Registry-Auth") {
-                if let decodedData = Data(base64Encoded: xAuthConfigHeader),
-                    let auth = try? JSONDecoder().decode(AuthConfig.self, from: decodedData)
-                {
-                    registryAuth = auth
-                }
-            }
-
-            // Build the full reference (name:tag)
-            let reference: String
-            if let tag = query.tag, !tag.isEmpty {
-                reference = "\(imageName):\(tag)"
-            } else {
-                // If no tag is provided, push all tags (use the name as-is)
-                reference = imageName
-            }
+            let reference = try resolvedReference(imageName: imageName, tag: query.tag)
 
             // Parse platform if provided
             let platform: Platform?
@@ -60,18 +55,12 @@ extension ImagePushRoute {
                 platform = nil
             }
 
-            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
-                throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
-            }
-
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
 
             let progressStream = try await client.push(
                 reference: reference,
                 platform: platform,
-                registryAuth: registryAuth,
-                appleContainerAppSupportUrl: appleContainerAppSupportUrl,
                 logger: req.logger
             )
 

@@ -1,4 +1,3 @@
-import ContainerPersistence
 import CryptoKit
 import Foundation
 import Logging
@@ -7,27 +6,6 @@ enum ContainerImageUtility {
 
     enum Error: Swift.Error {
         case invalidTarball(reason: String)
-    }
-
-    static func normalizeImageReference(_ reference: String) -> String {
-        guard !reference.isEmpty else { return reference }
-
-        let components = reference.split(separator: "/", maxSplits: 1)
-        if components.count > 1 {
-            let firstComponent = String(components[0])
-            if firstComponent.contains(".") || firstComponent.contains(":") || firstComponent == "localhost" {
-                return reference
-            }
-        }
-
-        let defaultRegistry = DefaultsStore.get(key: .defaultRegistryDomain)
-        let defaultRepo = "library"
-
-        if components.count == 1 {
-            return "\(defaultRegistry)/\(defaultRepo)/\(reference)"
-        }
-
-        return "\(defaultRegistry)/\(reference)"
     }
 
     static func convertDockerTarToOCI(

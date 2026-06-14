@@ -1,5 +1,6 @@
 import ContainerAPIClient
-import ContainerNetworkService
+import ContainerNetworkClient
+import ContainerPersistence
 import ContainerResource
 import Containerization
 import ContainerizationError
@@ -65,23 +66,54 @@ extension ContainerCreateRoute {
 
             req.logger.info("Creating container for image: \(body.Image)")
 
-            let id = Utility.createContainerID(name: containerName)
+            let rawId = Utility.createContainerID(name: containerName)
+            let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
 
             // Validate the requested platform only if provided
-            let requestedPlatform = try Platform(from: containerPlatform)
+            var requestedPlatform = try Platform(from: containerPlatform)
 
             // Check if image exists locally
             do {
-                _ = try await ClientImage.get(reference: body.Image)
+                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: ContainerSystemConfig())
             } catch {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
 
-            let img = try await ClientImage.fetch(
-                reference: body.Image,
-                platform: requestedPlatform,
-            )
+            // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
+            // variant is available. Two cases handled:
+            //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
+            //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
+            // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
+            var img: ClientImage
+            do {
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: requestedPlatform,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                // Case 2: image exists locally but may have been pulled as amd64
+                if requestedPlatform.architecture == "arm64",
+                    (try? await img.config(for: requestedPlatform)) == nil
+                {
+                    throw ContainerizationError(.notFound, message: "no arm64 content")
+                }
+            } catch let fetchError
+                where requestedPlatform.architecture == "arm64"
+                && {
+                    let msg = String(describing: fetchError)
+                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
+                }()
+            {
+                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
+                req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
+                img = try await ClientImage.fetch(
+                    reference: body.Image,
+                    platform: amd64,
+                    containerSystemConfig: ContainerSystemConfig()
+                )
+                requestedPlatform = amd64
+            }
 
             // Unpack a fetched image before use
             try await img.getCreateSnapshot(
@@ -91,7 +123,8 @@ extension ContainerCreateRoute {
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
             let initImage = try await ClientImage.fetch(
-                reference: ClientImage.initImageRef, platform: .current
+                reference: ContainerSystemConfig().vminit.image, platform: .current,
+                containerSystemConfig: ContainerSystemConfig()
             )
 
             _ = try await initImage.getCreateSnapshot(
@@ -194,8 +227,10 @@ extension ContainerCreateRoute {
                 containerConfiguration.rosetta = true
             }
 
-            // Handle hostname from request - ensure uniqueness to avoid collision
-            let hostname = (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())"
+            // Handle hostname from request - ensure uniqueness to avoid collision,
+            // capped at 64 chars (Linux/VZ hostname limit; longer values fail start with EINVAL)
+            let hostname = ContainerNameUtility.sanitize(
+                (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())")
 
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,
@@ -243,13 +278,75 @@ extension ContainerCreateRoute {
                 searchDomains: searchDomains,
                 options: dnsOptions
             )
-            var labels = body.Labels ?? [:]
-            // NOTE: [WORKAROUND] to include creation timestamp since it is not handled by Apple Container
-            //       https://github.com/apple/container/issues/302
-            labels["io.github.socktainer.creation-timestamp"] = String(Date().timeIntervalSince1970)
-            containerConfiguration.labels = labels
+            // Collect Compose service aliases from EndpointsConfig.
+            // These are stored in a label so the start route can register them
+            // in the DNS server once the container has an IP.
+            let dnsNames =
+                (body.NetworkingConfig?.EndpointsConfig?.values)
+                .map { settings in settings.compactMap(\.Aliases).flatMap { $0 }.filter { !$0.isEmpty } }
+                ?? []
+
+            var containerLabels = body.Labels ?? [:]
+
+            // Persist the requested healthcheck across create → start so the
+            // start route can launch the probe loop and inspect can return it
+            // in Config.Healthcheck. Apple Container has no native field for
+            // this, so a JSON-encoded label is the carrier.
+            if let healthcheck = body.Healthcheck {
+                do {
+                    let json = try JSONEncoder().encode(healthcheck)
+                    if let jsonString = String(data: json, encoding: .utf8) {
+                        containerLabels[HealthCheckManager.healthcheckLabel] = jsonString
+                    }
+                } catch {
+                    req.logger.warning("Failed to encode healthcheck config: \(error) — healthcheck will not be persisted")
+                }
+            }
+
+            if !dnsNames.isEmpty {
+                containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+
+                // Ensure a CoreDNS container for the first network and point this
+                // container's DNS at it so service names resolve inside the VM.
+                if let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
+                    let firstNetwork = body.NetworkingConfig?.EndpointsConfig?.keys.first
+                {
+                    do {
+                        let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                        let existing = containerConfiguration.dns
+                        containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                            nameservers: [dnsIP],
+                            domain: existing?.domain ?? nil,
+                            searchDomains: existing?.searchDomains ?? [],
+                            options: existing?.options ?? []
+                        )
+                    } catch {
+                        req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    }
+                }
+            }
+            containerConfiguration.labels = containerLabels
 
             var resolvedMounts: [Filesystem] = []
+
+            // Docker creates missing bind-mount source directories on the host automatically.
+            // Parser.mounts() validates that the source path exists and throws if not, so we
+            // must create missing directories BEFORE parsing, not after.
+            if let binds = body.HostConfig?.Binds {
+                for bind in binds {
+                    let parts = bind.split(separator: ":").map(String.init)
+                    if let source = parts.first, source.hasPrefix("/") {
+                        try? FileManager.default.createDirectory(
+                            atPath: source, withIntermediateDirectories: true)
+                    }
+                }
+            }
+            if let mounts = body.HostConfig?.Mounts {
+                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty {
+                    try? FileManager.default.createDirectory(
+                        atPath: mount.Source, withIntermediateDirectories: true)
+                }
+            }
 
             // Process bind mounts from HostConfig.Binds
             var volumesOrFs: [VolumeOrFilesystem] = []
@@ -316,7 +413,7 @@ extension ContainerCreateRoute {
                     let existingVolumes = try await ClientVolume.list()
                     let existingVolume = existingVolumes.first { $0.name == parsed.name }
 
-                    let volume: ContainerResource.Volume
+                    let volume: ContainerResource.VolumeConfiguration
                     if let existing = existingVolume {
                         // Volume exists, use it
                         volume = existing
@@ -332,12 +429,19 @@ extension ContainerCreateRoute {
                         )
                     }
 
+                    // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
+                    let syncMode =
+                        volume.labels[Filesystem.SyncMode.socktainerLabel]
+                        .flatMap { Filesystem.SyncMode(rawString: $0) }
+                        ?? req.application.storage[VolumeSyncModeKey.self]
+                        ?? .nosync
                     let volumeMount = Filesystem.volume(
                         name: parsed.name,
                         format: volume.format,
                         source: volume.source,
                         destination: parsed.destination,
-                        options: parsed.options
+                        options: parsed.options,
+                        sync: syncMode
                     )
                     resolvedMounts.append(volumeMount)
                 }
@@ -358,7 +462,7 @@ extension ContainerCreateRoute {
             }
 
             return RESTContainerCreate(
-                Id: container.id,
+                Id: DockerContainerID.hexId(for: container),
                 Warnings: []
             )
         }
@@ -422,7 +526,7 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
                 hostPort = UInt16(try findAvailablePort())
             }
 
-            let publishPort = PublishPort(
+            let publishPort = try PublishPort(
                 hostAddress: try IPAddress(hostAddress),
                 hostPort: hostPort,
                 containerPort: containerPort,

@@ -23,7 +23,14 @@ extension ContainerStopRoute {
             let signal = query.signal
             let timeout = query.t
 
-            try await client.stop(id: id, signal: signal, timeout: timeout)
+            do {
+                try await client.stop(id: id, signal: signal, timeout: timeout)
+            } catch ClientContainerError.notFound {
+                throw Abort(.notFound, reason: "No such container: \(id)")
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+            }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
 

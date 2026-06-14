@@ -25,7 +25,7 @@ extension ImageCreateRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             let query = try req.query.decode(RESTImageCreateQuery.self)
-            let image = ContainerImageUtility.normalizeImageReference(query.fromImage ?? "")
+            let image = query.fromImage ?? ""
             let tag = query.tag ?? ""
             let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform
@@ -43,24 +43,10 @@ extension ImageCreateRoute {
                 platform = currentPlatform()
             }
 
-            // Extract and decode X-Registry-Auth header
-            var registryAuth: AuthConfig?
-            if let xAuthConfigHeader = req.headers.first(name: "X-Registry-Auth") {
-                if let decodedData = Data(base64Encoded: xAuthConfigHeader),
-                    let auth = try? JSONDecoder().decode(AuthConfig.self, from: decodedData)
-                {
-                    registryAuth = auth
-                }
-            }
-
-            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
-                throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
-            }
-
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
             let progressStream = try await client.pull(
-                image: image, tag: decodedTag, platform: platform, registryAuth: registryAuth, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
+                image: image, tag: decodedTag, platform: platform, logger: req.logger)
 
             response.body = .init(stream: { writer in
                 Task {

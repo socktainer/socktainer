@@ -22,6 +22,7 @@
       - [Pre Release](#pre-release)
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
+    - [Volume sync mode](#volume-sync-mode)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
     - [Build & Run](#build-run)
@@ -58,13 +59,49 @@ FolderWatcher] Started watching $HOME/Library/Application Support/com.apple.cont
 
 ### Using Docker CLI 🐳
 
-Export the socket path as `DOCKER_HOST`:
+Socktainer automatically registers a `socktainer` Docker context on startup.
+Activate it once:
 
 ```bash
-export DOCKER_HOST=unix://$HOME/.socktainer/container.sock
+docker context use socktainer
+```
+
+Then use Docker normally — no `DOCKER_HOST` needed:
+
+```bash
 docker ps        # List running containers
 docker ps -a     # List all containers
 docker images    # List available images
+```
+
+Switch back to another runtime at any time:
+
+```bash
+docker context use colima    # or "default", etc.
+```
+
+<details>
+<summary>Opt out of automatic context creation</summary>
+
+Pass `--no-docker-context` to skip writing the context file on startup — useful
+in CI or when managing Docker contexts manually:
+
+```bash
+socktainer --no-docker-context
+```
+
+Note: this flag skips **creating** the context but does not remove one that was
+already created. To remove it: `docker context rm socktainer`.
+
+</details>
+
+<details>
+<summary>Alternative: set DOCKER_HOST manually</summary>
+
+```bash
+export DOCKER_HOST=unix://$HOME/.socktainer/container.sock
+docker ps
+docker images
 ```
 
 Or inline without exporting:
@@ -74,15 +111,18 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker ps
 DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ```
 
+</details>
+
 ---
 
 ## Key Features ✨
 
 - Built on **Apple’s Container Framework** 🍏
 - Provides **Docker REST API compatibility** 🔄 (partial)
-- Listens on a Unix domain socket `$HOME/.socktainer/container.sock`
+- Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
 - Supports container lifecycle operations: inspect, stop, remove 🛠️
-- Supports image listing, pulling, deletion, logs, health checks. Exec without interactive mode 📄
+- Supports image listing, pulling, deletion, logs, health checks, container stats. Exec without interactive mode 📄
+- `docker stats` reports memory against the Apple Container VM limit (default 1 GiB), not the host RAM
 - Broadcasts container events for client liveness monitoring 📡
 
 ---
@@ -129,6 +169,50 @@ Download from socktainer [releases](https://github.com/socktainer/socktainer/rel
 ## Usage 🚀
 
 Refer to **Quick Start** above for immediate usage examples.
+
+### Volume sync mode
+
+Named volumes default to `nosync` — guest `fsync()` calls are not flushed to the
+host disk on demand, matching Colima's behavior and giving ~1.5× speedup for
+write-heavy workloads (postgres WAL, Kafka, Redis AOF).
+
+**Tradeoff:** data written to a volume since the last OS page-cache flush could be
+lost if the **host** (Mac) crashes or loses power. In a dev environment this is
+acceptable; data is safe across normal `docker stop` / host restarts.
+
+**Override globally** — apply the same mode to all named volumes (bind mounts and anonymous volumes are not affected):
+
+```bash
+socktainer --volume-sync=fsync   # honor guest fsyncs (durable)
+socktainer --volume-sync=full    # fully synchronous writes (slowest)
+socktainer --volume-sync=nosync  # default
+```
+
+**Override per volume** — `docker volume create -o sync=<mode>` persists the
+choice for that volume regardless of the global flag:
+
+```bash
+docker volume create -o sync=fsync my-pgdata
+docker run -v my-pgdata:/var/lib/postgresql/data postgres
+```
+
+Or using Docker Compose with `driver_opts`:
+
+```yaml
+services:
+  postgres:
+    image: postgres:latest
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+    driver: local
+    driver_opts:
+      sync: fsync
+```
+
+Valid modes: `nosync` · `fsync` · `full`
 
 ---
 
@@ -203,6 +287,7 @@ We welcome contributions!
 - Intended for **local development and experimentation** 🏠
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
+- Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
 
 ---
 

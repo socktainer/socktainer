@@ -1,3 +1,5 @@
+import ContainerAPIClient
+import ContainerResource
 import Vapor
 
 struct ContainerListQuery: Content {
@@ -22,7 +24,23 @@ extension ContainerListRoute {
             let parsedFilters = try DockerContainerFilterUtility.parseContainerFilters(filtersParam: query.filters, logger: req.logger)
             let containers = try await client.list(showAll: showAll, filters: parsedFilters)
 
-            return containers.map { container in
+            // Apply health filter here using the real HealthCheckManager state.
+            // ClientContainerService skips the health filter to avoid a stale heuristic.
+            let healthFilter = parsedFilters["health"]
+            let healthManager = req.application.storage[HealthCheckManagerKey.self]
+            var filteredContainers: [ContainerSnapshot] = []
+            for container in containers {
+                if let healthFilter, !healthFilter.isEmpty {
+                    // Containers with no healthcheck configured report "none"
+                    let status =
+                        await healthManager?.currentHealth(for: container.id)?.Status ?? "none"
+                    guard healthFilter.contains(status) else { continue }
+                }
+                filteredContainers.append(container)
+            }
+
+            var summaries: [RESTContainerSummary] = []
+            for container in filteredContainers {
                 let ports = container.configuration.publishedPorts.map { port in
                     ContainerPort(
                         IP: port.hostAddress.description,
@@ -94,17 +112,37 @@ extension ContainerListRoute {
                     )
                 }
 
-                let createdTimestamp: Int64
-                if let timestampStr = container.configuration.labels["io.github.socktainer.creation-timestamp"],
-                    let timestamp = Double(timestampStr)
+                let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(
+                    AppleContainerTimestampResolver.containerCreationDate(container)
+                )
+
+                let mobyState = container.status.mobyState
+                // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
+                let baseStatus: String
+                switch container.status {
+                case .running:
+                    if let started = container.startedDate {
+                        baseStatus = "Up \(Self.humanReadableAge(since: started))"
+                    } else {
+                        baseStatus = "Up"
+                    }
+                case .stopped:
+                    baseStatus = "Exited"
+                default:
+                    baseStatus = mobyState
+                }
+                let statusStr: String
+                if let health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(
+                    for: container.id)
                 {
-                    createdTimestamp = Int64(timestamp)
+                    // Match Docker's format: "Up 2 minutes (healthy)" not "(health: healthy)"
+                    statusStr = "\(baseStatus) (\(health.Status))"
                 } else {
-                    createdTimestamp = 0
+                    statusStr = baseStatus
                 }
 
-                return RESTContainerSummary(
-                    Id: container.id,
+                let summary = RESTContainerSummary(
+                    Id: DockerContainerID.hexId(for: container),
                     Names: ["/" + container.id],
                     Image: container.configuration.image.reference,
                     ImageID: container.configuration.image.digest,
@@ -115,14 +153,28 @@ extension ContainerListRoute {
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container
                     SizeRootFs: nil,  // there is no mechanism to retrieve this value from apple container
                     Labels: container.configuration.labels,
-                    State: container.status.mobyState,
-                    Status: container.status.mobyState,
+                    State: mobyState,
+                    Status: statusStr,
                     HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),
                     NetworkSettings: ContainerNetworkSummary(Networks: networkSettings.isEmpty ? nil : networkSettings),
                     Mounts: mounts,
                     Platform: "linux"  // Apple containers always run linux platform
                 )
+                summaries.append(summary)
             }
+            return summaries
         }
+    }
+
+    /// Returns a human-readable duration string matching Docker's "Up X seconds/minutes/hours/days" format.
+    static func humanReadableAge(since date: Date) -> String {
+        let seconds = max(0, Int(-date.timeIntervalSinceNow))
+        if seconds < 60 { return "\(seconds) second\(seconds == 1 ? "" : "s")" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours) hour\(hours == 1 ? "" : "s")" }
+        let days = hours / 24
+        return "\(days) day\(days == 1 ? "" : "s")"
     }
 }

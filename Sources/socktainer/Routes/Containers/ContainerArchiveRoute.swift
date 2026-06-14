@@ -103,17 +103,52 @@ struct ContainerArchiveRoute: RouteCollection {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
-            // Collect the tar data from request body
-            guard let tarBuffer = try await req.body.collect().get() else {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let tarPath = tempDir.appendingPathComponent("archive.tar")
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+            defer {
+                try? FileManager.default.removeItem(at: tempDir)
+            }
+
+            var fileHandle: FileHandle?
+            var totalBytesWritten = 0
+
+            do {
+                FileManager.default.createFile(atPath: tarPath.path, contents: nil)
+                fileHandle = try FileHandle(forWritingTo: tarPath)
+
+                if let bodyData = req.body.data {
+                    let data = Data(buffer: bodyData)
+                    try fileHandle?.write(contentsOf: data)
+                    totalBytesWritten = data.count
+                } else {
+                    for try await var chunk in req.body {
+                        guard let data = chunk.readData(length: chunk.readableBytes) else {
+                            continue
+                        }
+                        try fileHandle?.write(contentsOf: data)
+                        totalBytesWritten += data.count
+                    }
+                }
+
+                try fileHandle?.synchronize()
+                try fileHandle?.close()
+                fileHandle = nil
+            } catch {
+                try? fileHandle?.close()
+                throw Abort(.badRequest, reason: "Failed to process archive upload: \(error.localizedDescription)")
+            }
+
+            guard totalBytesWritten > 0 else {
                 throw Abort(.badRequest, reason: "Request body is required")
             }
-            let tarData = Data(buffer: tarBuffer)
 
             do {
                 try await archiveClient.putArchive(
-                    containerId: container.id,
+                    container: container,
                     path: query.path,
-                    tarData: tarData,
+                    tarPath: tarPath,
                     noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false
                 )
 

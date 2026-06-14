@@ -19,10 +19,7 @@ enum ClientRegistryError: Error {
 // WARN: There is no option to remove entry from keychain when client logs out.
 struct ClientRegistryService: ClientRegistryProtocol {
 
-    // WARN: Socktainer doesn't integrate with container's keychain items.
-    //       This is kept as a placeholder for the time being.
-    //       See: https://github.com/socktainer/socktainer/issues/96#issuecomment-3344370243
-    let keychainEntryId = "io.github.socktainer"
+    let keychainEntryId = Constants.keychainID
 
     // (workaround) normalize server address to match `container` CLI behavior
     private func normalizeServerAddress(_ serverAddress: String) -> String {
@@ -30,6 +27,23 @@ struct ClientRegistryService: ClientRegistryProtocol {
             return "registry-1.docker.io"
         }
         return serverAddress
+    }
+
+    private func discoverContainerCLIPath() -> String? {
+        let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+
+        for directory in pathDirectories {
+            let candidatePath = URL(fileURLWithPath: directory).appendingPathComponent("container").path
+            guard FileManager.default.isExecutableFile(atPath: candidatePath) else {
+                continue
+            }
+
+            return URL(fileURLWithPath: candidatePath).resolvingSymlinksInPath().path
+        }
+
+        return nil
     }
 
     func validateCredentials(serverAddress: String, username: String, password: String) async throws -> Bool {
@@ -73,13 +87,17 @@ struct ClientRegistryService: ClientRegistryProtocol {
 
     func storeCredentials(serverAddress: String, username: String, password: String, logger: Logger) async throws {
         let normalizedServer = normalizeServerAddress(serverAddress)
-        let keychainHelper = KeychainHelper(securityDomain: keychainEntryId)
 
         do {
-            try keychainHelper.save(hostname: normalizedServer, username: username, password: password)
-            logger.debug("Credentials stored successfully in keychain for \(normalizedServer)")
+            // Work around apple/container private-registry auth issues by delegating persistence
+            // to the Apple CLI instead of maintaining Socktainer-owned keychain items here.
+            // Manual intervention may still be required for affected users; see:
+            // https://github.com/apple/container/issues/816#issuecomment-3534438608
+            // https://github.com/apple/container/issues/816#issuecomment-3503618765
+            try runContainerRegistryLogin(serverAddress: normalizedServer, username: username, password: password)
+            logger.info("Credentials stored successfully using container registry login for \(normalizedServer)")
         } catch {
-            logger.error("Failed to store credentials in keychain: \(error)")
+            logger.error("Failed to store credentials using container registry login: \(error)")
             throw ClientRegistryError.storageError("Failed to store credentials: \(error.localizedDescription)")
         }
     }
@@ -103,24 +121,7 @@ struct ClientRegistryService: ClientRegistryProtocol {
         }
     }
 
-    private func hasStoredCredentials(serverAddress: String, logger: Logger) async -> Bool {
-        do {
-            let credentials = try await retrieveCredentials(serverAddress: serverAddress, logger: logger)
-            return credentials != nil
-        } catch {
-            logger.debug("Error checking stored credentials: \(error)")
-            return false
-        }
-    }
-
     func login(serverAddress: String, username: String, password: String, logger: Logger) async throws -> String {
-        // TODO: In the future, validate stored credentials are still valid and refresh if needed
-        //       Check if credentials already exist for this server
-        if await hasStoredCredentials(serverAddress: serverAddress, logger: logger) {
-            logger.debug("Credentials already exist for \(serverAddress), skipping login")
-            return ""
-        }
-
         let identityToken: String
         do {
             identityToken = try await testRegistryWithAppleContainer(serverAddress: serverAddress, username: username, password: password)
@@ -133,5 +134,49 @@ struct ClientRegistryService: ClientRegistryProtocol {
 
         logger.info("Successfully logged in to registry: \(serverAddress)")
         return identityToken
+    }
+
+    private func runContainerRegistryLogin(serverAddress: String, username: String, password: String) throws {
+        guard let containerCLIPath = discoverContainerCLIPath() else {
+            throw ClientRegistryError.storageError("Unable to find `container` executable in PATH")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: containerCLIPath)
+        process.arguments = [
+            "registry", "login",
+            "--username", username,
+            "--password-stdin",
+            serverAddress,
+        ]
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        if let passwordData = "\(password)\n".data(using: .utf8) {
+            try stdinPipe.fileHandleForWriting.write(contentsOf: passwordData)
+        }
+        try stdinPipe.fileHandleForWriting.close()
+
+        process.waitUntilExit()
+
+        let stdout =
+            String(data: try stdoutPipe.fileHandleForReading.readToEnd() ?? Data(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderr =
+            String(data: try stderrPipe.fileHandleForReading.readToEnd() ?? Data(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            throw ClientRegistryError.storageError(
+                "container registry login failed with exit code \(process.terminationStatus). stdout: \(stdout). stderr: \(stderr)"
+            )
+        }
     }
 }

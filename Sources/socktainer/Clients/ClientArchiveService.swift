@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -49,6 +50,7 @@ enum ClientArchiveError: Error, LocalizedError {
     case pathNotFound(path: String)
     case rootfsNotFound(id: String)
     case invalidPath(path: String)
+    case notADirectory(path: String)
     case operationFailed(message: String)
 
     var errorDescription: String? {
@@ -61,6 +63,8 @@ enum ClientArchiveError: Error, LocalizedError {
             return "Rootfs not found for container: \(id)"
         case .invalidPath(let path):
             return "Invalid path: \(path)"
+        case .notADirectory(let path):
+            return "Extraction point is not a directory: \(path)"
         case .operationFailed(let message):
             return "Archive operation failed: \(message)"
         }
@@ -93,7 +97,7 @@ protocol ClientArchiveProtocol: Sendable {
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws
+    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 }
 
 /// Service for performing archive operations on container filesystems
@@ -160,7 +164,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
 
         // Create tar archive from the staging directory
-        try TarUtility.create(tarPath: tarPath, from: stagingDir)
+        try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
 
         // Read the tar data
         let tarData = try Data(contentsOf: tarPath)
@@ -169,168 +173,323 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws {
-        let rootfsPath = getRootfsPath(containerId: containerId)
-
-        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
-        }
-
+    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
-        // Try optimized in-place modification first
-        // This is O(tar size) instead of O(filesystem size)
-        if let success = try? await putArchiveOptimized(
-            rootfsPath: rootfsPath,
-            destinationPath: normalizedPath,
-            tarData: tarData
-        ), success {
+        // A running container's VM holds rootfs.ext4 open as its block device:
+        // rewriting and swapping the file on the host is never seen by the guest
+        // (and guest writes would diverge from the swapped file). Inject through
+        // the live container instead.
+        if container.status == .running {
+            try await putArchiveViaCopyIn(
+                container: container,
+                destinationPath: normalizedPath,
+                tarPath: tarPath,
+                noOverwriteDirNonDir: noOverwriteDirNonDir
+            )
             return
         }
 
-        // Fall back to full read-modify-write approach
+        let rootfsPath = getRootfsPath(containerId: container.id)
+
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        try validateArchiveEntries(
+            reader: reader,
+            tarPath: tarPath,
+            destinationPath: normalizedPath,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
+
         try await putArchiveFallback(
             rootfsPath: rootfsPath,
             destinationPath: normalizedPath,
-            tarData: tarData
+            inputTarPath: tarPath
         )
     }
 
-    /// Optimized PUT using EXT4Editor for in-place modification
-    /// Returns true if successful, false if fallback is needed
-    private func putArchiveOptimized(
-        rootfsPath: URL,
+    /// One parsed entry of the uploaded archive.
+    private struct ArchiveEntryPlan {
+        enum Kind {
+            case directory
+            case file
+            case symlink(target: String)
+        }
+        let relativePath: String
+        let guestPath: String
+        let kind: Kind
+        let mode: UInt32
+    }
+
+    /// Inject the archive into a RUNNING container.
+    ///
+    /// Docker semantics require extracting *into* the destination without
+    /// disturbing what already exists (e.g. a tar entry `tmp/foo` must not
+    /// change the ownership/mode/sticky bit of an existing `/tmp`). So instead
+    /// of pushing whole directories through copyIn (whose in-guest extraction
+    /// applies archived directory metadata over existing directories), this:
+    ///  1. runs ONE `/bin/sh` exec in the guest that validates the destination
+    ///     (404/400/conflict semantics that copyIn cannot express) and creates
+    ///     missing directories and symlinks (`mkdir` skips existing dirs), then
+    ///  2. streams each regular file individually over vsock via the daemon's
+    ///     copyIn API with the mode recorded in the tar.
+    private func putArchiveViaCopyIn(
+        container: ContainerSnapshot,
         destinationPath: String,
-        tarData: Data
-    ) async throws -> Bool {
-        // Extract tar to temp directory first to examine contents
-        let tempDir = FileManager.default.temporaryDirectory
-        let sessionId = UUID().uuidString
-        let extractDir = tempDir.appendingPathComponent("\(sessionId)-extract")
+        tarPath: URL,
+        noOverwriteDirNonDir: Bool
+    ) async throws {
+        let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
 
-        defer {
-            try? FileManager.default.removeItem(at: extractDir)
-        }
-
-        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
-
-        // Write tar and extract it
-        let tarPath = tempDir.appendingPathComponent("\(sessionId).tar")
-        defer { try? FileManager.default.removeItem(at: tarPath) }
-        try tarData.write(to: tarPath)
-
-        // Extract tar to temp directory
-        try TarUtility.extract(tarPath: tarPath, to: extractDir)
-
-        // Open EXT4Editor
-        let editor = try EXT4Editor(devicePath: FilePath(rootfsPath.path))
-
-        // Process extracted files
-        let success = try processExtractedFiles(
-            editor: editor,
-            extractDir: extractDir,
-            basePath: extractDir.path,
-            destinationPath: destinationPath
+        try await prepareGuestForCopy(
+            container: container,
+            destinationPath: destinationPath,
+            entries: plan,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
-        if success {
-            try editor.sync()
+        let files = plan.filter {
+            if case .file = $0.kind { return true }
+            return false
         }
+        guard !files.isEmpty else { return }
 
-        return success
+        // Unpack the uploaded tar to a staging directory for the file contents
+        // (modes are taken from the tar entries, not the staged files).
+        let stagingDir = FileManager.default.temporaryDirectory.appendingPathComponent("put-archive-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
+
+        let client = ContainerClient()
+        for file in files {
+            let stagedURL = stagingDir.appendingPathComponent(file.relativePath)
+            guard FileManager.default.fileExists(atPath: stagedURL.path) else {
+                throw ClientArchiveError.operationFailed(message: "archive entry missing after extraction: \(file.relativePath)")
+            }
+            do {
+                try await client.copyIn(
+                    id: container.id,
+                    source: stagedURL.path,
+                    destination: file.guestPath,
+                    mode: file.mode
+                )
+            } catch {
+                throw ClientArchiveError.operationFailed(
+                    message: "Failed to copy \(file.relativePath) into running container: \(error.localizedDescription)")
+            }
+        }
     }
 
-    /// Recursively process extracted files and add them to the filesystem
-    private func processExtractedFiles(
-        editor: EXT4Editor,
-        extractDir: URL,
-        basePath: String,
-        destinationPath: String
-    ) throws -> Bool {
-        let fileManager = FileManager.default
-        let contents = try fileManager.contentsOfDirectory(
-            at: extractDir,
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+    /// Parse the uploaded tar into a copy plan.
+    private func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
+        let archiveReader = try ArchiveReader(
+            format: .paxRestricted,
+            filter: .none,
+            file: tarPath
         )
 
-        for itemURL in contents {
-            let relativePath = String(itemURL.path.dropFirst(basePath.count))
-            let fullDestPath =
-                destinationPath == "/"
-                ? relativePath
-                : destinationPath + relativePath
+        var plan: [ArchiveEntryPlan] = []
+        for (entry, _) in archiveReader.makeStreamingIterator() {
+            guard let entryPath = entry.path,
+                let guestPath = ArchiveUtility.destinationPath(for: entryPath, under: destinationPath),
+                guestPath != destinationPath
+            else {
+                continue
+            }
 
-            let resourceValues = try itemURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            let isDirectory = resourceValues.isDirectory ?? false
-            let isSymlink = resourceValues.isSymbolicLink ?? false
+            var relativePath = entryPath
+            if relativePath.hasPrefix("./") {
+                relativePath = String(relativePath.dropFirst(2))
+            }
 
-            if isSymlink {
-                // Handle symlink
-                let target = try fileManager.destinationOfSymbolicLink(atPath: itemURL.path)
-                if editor.exists(path: fullDestPath) {
-                    // Can't overwrite with EXT4Editor, fall back
-                    return false
-                }
-                try editor.addSymlink(path: fullDestPath, target: target)
-            } else if isDirectory {
-                // Handle directory
-                if !editor.exists(path: fullDestPath) {
-                    try editor.createDirectory(path: fullDestPath)
-                }
-                // Recursively process contents
-                let success = try processExtractedFiles(
-                    editor: editor,
-                    extractDir: itemURL,
-                    basePath: basePath,
-                    destinationPath: destinationPath
-                )
-                if !success {
-                    return false
-                }
-            } else {
-                // Handle regular file
-                if editor.exists(path: fullDestPath) {
-                    // Can't overwrite with EXT4Editor, fall back
-                    return false
-                }
+            let mode = UInt32(entry.permissions) & 0o7777
+            switch entry.fileType {
+            case .directory:
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .directory, mode: mode))
+            case .regular:
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .file, mode: mode))
+            case .symbolicLink:
+                guard let target = entry.symlinkTarget else { continue }
+                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .symlink(target: target), mode: mode))
+            default:
+                throw ClientArchiveError.operationFailed(
+                    message: "unsupported archive entry type for copy into a running container: \(relativePath)")
+            }
+        }
+        return plan
+    }
 
-                let fileData = try Data(contentsOf: itemURL)
-                let attributes = try fileManager.attributesOfItem(atPath: itemURL.path)
-                let posixPermissions = (attributes[.posixPermissions] as? UInt16) ?? 0o644
+    /// Run Docker's PUT-archive validation inside the running guest and create
+    /// the directory/symlink structure for the incoming archive: destination
+    /// must exist (404) and be a directory (400), optional per-entry
+    /// noOverwriteDirNonDir conflict checks, `mkdir` for missing directories
+    /// (existing ones are left untouched), and `ln -sfn` for symlinks.
+    private func prepareGuestForCopy(
+        container: ContainerSnapshot,
+        destinationPath: String,
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) async throws {
+        let script = buildPreparationScript(
+            entries: entries,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
 
-                try editor.addFile(
-                    path: fullDestPath,
-                    data: fileData,
-                    mode: posixPermissions
-                )
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-c", script, "sh", destinationPath]
+        processConfig.terminal = false
+        // Validate as root so restrictive permissions on parent directories
+        // cannot mask the existence checks.
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        let stderrPipe = Pipe()
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: [nil, nil, stderrPipe.fileHandleForWriting]
+            )
+            try await process.start()
+        } catch {
+            try? stderrPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+
+        // Close our copy of the remote end so EOF propagates once the guest
+        // process exits (the daemon holds its own duplicate).
+        try? stderrPipe.fileHandleForWriting.close()
+
+        let stderrReader = stderrPipe.fileHandleForReading
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader.close() }
+            var collected = Data()
+            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < 16 * 1024 {
+                    collected.append(chunk)
+                }
+            }
+            return collected
+        }
+
+        let exitCode: Int32
+        do {
+            exitCode = try await process.wait()
+        } catch {
+            throw ClientArchiveError.operationFailed(message: "Failed waiting for validation in running container: \(error.localizedDescription)")
+        }
+
+        let stderrText =
+            String(data: await stderrTask.value, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        switch exitCode {
+        case 0:
+            return
+        case 40:
+            throw ClientArchiveError.pathNotFound(path: destinationPath)
+        case 41:
+            throw ClientArchiveError.notADirectory(path: destinationPath)
+        default:
+            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
+            throw ClientArchiveError.operationFailed(message: "Validation in running container failed (exit \(exitCode))\(detail)")
+        }
+    }
+
+    /// Build the validation/preparation shell script run inside the guest.
+    /// Only `sh`, `mkdir`, `ln` and `test` are required. Existing directories
+    /// are never modified, mirroring how tar treats implicit parents.
+    private func buildPreparationScript(
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) -> String {
+        var lines = [
+            "set -u",
+            "dest=\"$1\"",
+            "if [ ! -e \"$dest\" ]; then echo \"destination does not exist: $dest\" >&2; exit 40; fi",
+            "if [ ! -d \"$dest\" ]; then echo \"extraction point is not a directory: $dest\" >&2; exit 41; fi",
+        ]
+
+        if noOverwriteDirNonDir {
+            for entry in entries {
+                let quoted = shellSingleQuoted(entry.guestPath)
+                if case .directory = entry.kind {
+                    lines.append("if [ -e \(quoted) ] && [ ! -d \(quoted) ]; then echo \"refusing to overwrite non-directory with directory\" >&2; exit 43; fi")
+                } else {
+                    lines.append("if [ -d \(quoted) ]; then echo \"refusing to overwrite directory with non-directory\" >&2; exit 43; fi")
+                }
             }
         }
 
-        return true
+        // Explicit directory entries: create missing ones with the archived
+        // mode (parents first); never touch directories that already exist.
+        let directories =
+            entries
+            .compactMap { entry -> (path: String, mode: UInt32)? in
+                guard case .directory = entry.kind else { return nil }
+                return (entry.guestPath, entry.mode)
+            }
+            .sorted { $0.path.count < $1.path.count }
+        for directory in directories {
+            let quoted = shellSingleQuoted(directory.path)
+            let parent = shellSingleQuoted((directory.path as NSString).deletingLastPathComponent)
+            let octal = String(directory.mode, radix: 8)
+            lines.append(
+                "if [ ! -d \(quoted) ]; then mkdir -p \(parent) && mkdir -m \(octal) \(quoted) || { echo \"failed to create directory \(directory.path)\" >&2; exit 44; }; fi")
+        }
+
+        // Implicit parents of file/symlink entries (mkdir -p is a no-op on
+        // existing directories).
+        var parents = Set<String>()
+        for entry in entries {
+            if case .directory = entry.kind { continue }
+            let parent = (entry.guestPath as NSString).deletingLastPathComponent
+            if !parent.isEmpty, parent != "/" {
+                parents.insert(parent)
+            }
+        }
+        for parent in parents.sorted() {
+            lines.append("mkdir -p \(shellSingleQuoted(parent)) || { echo \"failed to create parent directory \(parent)\" >&2; exit 44; }")
+        }
+
+        for entry in entries {
+            guard case .symlink(let target) = entry.kind else { continue }
+            lines.append(
+                "ln -sfn \(shellSingleQuoted(target)) \(shellSingleQuoted(entry.guestPath)) || { echo \"failed to create symlink \(entry.guestPath)\" >&2; exit 45; }")
+        }
+
+        lines.append("exit 0")
+        return lines.joined(separator: "\n")
+    }
+
+    private func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Fallback PUT using full read-modify-write approach
     private func putArchiveFallback(
         rootfsPath: URL,
         destinationPath: String,
-        tarData: Data
+        inputTarPath: URL
     ) async throws {
         // Create temporary files for the operation
         let tempDir = FileManager.default.temporaryDirectory
         let sessionId = UUID().uuidString
         let exportedTarPath = tempDir.appendingPathComponent("\(sessionId)-export.tar")
-        let inputTarPath = tempDir.appendingPathComponent("\(sessionId)-input.tar")
         let newRootfsPath = tempDir.appendingPathComponent("\(sessionId)-rootfs.ext4")
 
         defer {
             try? FileManager.default.removeItem(at: exportedTarPath)
-            try? FileManager.default.removeItem(at: inputTarPath)
             try? FileManager.default.removeItem(at: newRootfsPath)
         }
-
-        // Write the input tar data to a temporary file
-        try tarData.write(to: inputTarPath)
 
         // Step 1: Export existing filesystem to tar
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
@@ -355,10 +514,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
             filter: .none,
             file: exportedTarPath
         )
-        try formatter.unpack(reader: existingReader)
+        try await formatter.unpack(reader: existingReader)
 
         // Step 5: Unpack the new tar at the specified destination path
-        try unpackTarToPath(formatter: formatter, tarPath: inputTarPath, destinationPath: destinationPath)
+        try ArchiveUtility.unpack(
+            tarPath: inputTarPath,
+            to: formatter,
+            destinationPath: destinationPath
+        )
 
         // Step 6: Finalize the new filesystem
         try formatter.close()
@@ -390,21 +553,56 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return String(data: data, encoding: .utf8)
     }
 
+    private func validateArchiveEntries(
+        reader: EXT4.EXT4Reader,
+        tarPath: URL,
+        destinationPath: String,
+        noOverwriteDirNonDir: Bool
+    ) throws {
+        let archiveReader = try ArchiveReader(
+            format: .paxRestricted,
+            filter: .none,
+            file: tarPath
+        )
+
+        for (entry, _) in archiveReader.makeStreamingIterator() {
+            guard let fullPath = ArchiveUtility.destinationPath(for: entry.path, under: destinationPath) else {
+                continue
+            }
+
+            guard noOverwriteDirNonDir, reader.exists(FilePath(fullPath)) else {
+                continue
+            }
+
+            let (_, inode) = try reader.stat(FilePath(fullPath))
+            let existingIsDirectory = inode.isDirectory
+            let incomingIsDirectory = entry.fileType == .directory
+
+            if existingIsDirectory != incomingIsDirectory {
+                throw ClientArchiveError.operationFailed(
+                    message: "Refusing to overwrite \(existingIsDirectory ? "directory" : "non-directory") at \(fullPath)"
+                )
+            }
+        }
+    }
+
     /// Extract a path from the ext4 filesystem to a local directory
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
         let (_, inode) = try reader.stat(FilePath(sourcePath))
-        let baseName = (sourcePath as NSString).lastPathComponent
+        let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
-            // Create the directory
-            let dirDest = destDir.appendingPathComponent(baseName)
-            try FileManager.default.createDirectory(at: dirDest, withIntermediateDirectories: true)
-
-            // Set permissions
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: inode.permissions)],
-                ofItemAtPath: dirDest.path
-            )
+            let dirDest: URL
+            if let baseName {
+                dirDest = destDir.appendingPathComponent(baseName)
+                try FileManager.default.createDirectory(at: dirDest, withIntermediateDirectories: true)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: inode.permissions)],
+                    ofItemAtPath: dirDest.path
+                )
+            } else {
+                dirDest = destDir
+            }
 
             // Recursively extract contents
             let entries = try reader.listDirectory(FilePath(sourcePath))
@@ -415,6 +613,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } else if inode.isRegularFile {
             // Read file contents
             let fileData = try reader.readFile(at: FilePath(sourcePath))
+            guard let baseName else {
+                throw ClientArchiveError.invalidPath(path: sourcePath)
+            }
             let fileDest = destDir.appendingPathComponent(baseName)
 
             // Write file
@@ -432,6 +633,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } else if inode.isSymlink {
             // Read symlink target
             if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
+                guard let baseName else {
+                    throw ClientArchiveError.invalidPath(path: sourcePath)
+                }
                 let linkDest = destDir.appendingPathComponent(baseName)
                 try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
             }
@@ -439,84 +643,4 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Skip other file types (devices, fifos, sockets)
     }
 
-    private func unpackTarToPath(formatter: EXT4.Formatter, tarPath: URL, destinationPath: String) throws {
-        let archiveReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: tarPath
-        )
-
-        // Reusable buffer for file content
-        let bufferSize = 128 * 1024
-        let reusableBuffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: bufferSize)
-        defer { reusableBuffer.deallocate() }
-
-        for (entry, streamReader) in archiveReader.makeStreamingIterator() {
-            guard var entryPath = entry.path else {
-                continue
-            }
-
-            // Normalize the entry path
-            if entryPath.hasPrefix("./") {
-                entryPath = String(entryPath.dropFirst(1))
-            }
-            if !entryPath.hasPrefix("/") {
-                entryPath = "/" + entryPath
-            }
-
-            // Construct the full destination path
-            let fullPath: String
-            if destinationPath == "/" {
-                fullPath = entryPath
-            } else {
-                fullPath = destinationPath + entryPath
-            }
-
-            let filePath = FilePath(fullPath)
-            let ts = FileTimestamps(
-                access: entry.contentAccessDate,
-                modification: entry.modificationDate,
-                creation: entry.creationDate
-            )
-
-            switch entry.fileType {
-            case .directory:
-                try formatter.create(
-                    path: filePath,
-                    mode: EXT4.Inode.Mode(.S_IFDIR, entry.permissions),
-                    ts: ts,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs
-                )
-            case .regular:
-                try formatter.create(
-                    path: filePath,
-                    mode: EXT4.Inode.Mode(.S_IFREG, entry.permissions),
-                    ts: ts,
-                    buf: streamReader,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs,
-                    fileBuffer: reusableBuffer
-                )
-            case .symbolicLink:
-                var symlinkTarget: FilePath?
-                if let target = entry.symlinkTarget {
-                    symlinkTarget = FilePath(target)
-                }
-                try formatter.create(
-                    path: filePath,
-                    link: symlinkTarget,
-                    mode: EXT4.Inode.Mode(.S_IFLNK, entry.permissions),
-                    ts: ts,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs
-                )
-            default:
-                continue
-            }
-        }
-    }
 }

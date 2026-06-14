@@ -7,8 +7,8 @@ let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unsp
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "unspecified"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "unspecified"
-let appleContainerVersion = "0.10.0"
-let appleContainerizationVersion = "0.26.3"
+let appleContainerVersion = "1.0.0"
+let appleContainerizationVersion = "0.33.3"
 
 let package = Package(
     name: "socktainer",
@@ -18,9 +18,10 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/container.git", exact: Version(stringLiteral: appleContainerVersion)),
         .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: appleContainerizationVersion)),
-        .package(url: "https://github.com/vapor/vapor.git", from: "4.119.2"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.7.1"),
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.2"),
+        .package(url: "https://github.com/vapor/vapor.git", from: "4.121.3"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
+        .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
     ],
     targets: [
         .executableTarget(
@@ -28,7 +29,8 @@ let package = Package(
             dependencies: [
                 .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerAPIClient", package: "container"),
-                .product(name: "ContainerNetworkService", package: "container"),
+                .product(name: "ContainerNetworkClient", package: "container"),
+                .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerResource", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationArchive", package: "containerization"),
@@ -37,6 +39,7 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "DataCompression", package: "DataCompression"),
                 "BuildInfo",
             ],
         ),
@@ -44,6 +47,7 @@ let package = Package(
             name: "socktainerTests",
             dependencies: [
                 .target(name: "socktainer"),
+                .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
         ),
@@ -60,7 +64,6 @@ let package = Package(
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(appleContainerVersion)\""),
             ]
         ),
-
     ]
 
 )

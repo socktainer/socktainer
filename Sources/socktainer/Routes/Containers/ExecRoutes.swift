@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import NIOCore
 import Vapor
@@ -15,9 +16,14 @@ actor ExecManager {
         let attachStderr: Bool
         let tty: Bool
         let detach: Bool
+        let env: [String]
+        let user: String?
+        let workingDir: String?
     }
 
     private var storage: [String: ExecConfig] = [:]
+    private var exitCodes: [String: Int32] = [:]
+    private var startedIds: Set<String> = []
 
     func create(config: ExecConfig) -> String {
         let id = UUID().uuidString
@@ -31,6 +37,32 @@ actor ExecManager {
 
     func remove(id: String) {
         storage.removeValue(forKey: id)
+        exitCodes.removeValue(forKey: id)
+        startedIds.remove(id)
+    }
+
+    // Marks an exec as started. Returns false if it doesn't exist or was already
+    // started — Docker rejects starting an exec instance more than once.
+    func markStarted(id: String) -> Bool {
+        guard storage[id] != nil, !startedIds.contains(id) else { return false }
+        startedIds.insert(id)
+        return true
+    }
+
+    // An exec is "running" only once it has been started and has not yet
+    // recorded an exit code — distinct from created-but-not-started.
+    func isRunning(id: String) -> Bool {
+        startedIds.contains(id) && exitCodes[id] == nil
+    }
+
+    // The Docker client calls `GET /exec/{id}/json` after the start stream
+    // closes to read the exit code, so the exec entry must outlive the stream.
+    func setExitCode(id: String, code: Int32) {
+        exitCodes[id] = code
+    }
+
+    func exitCode(id: String) -> Int32? {
+        exitCodes[id]
     }
 }
 
@@ -41,6 +73,9 @@ struct CreateExecRequest: Content {
     let AttachStdout: Bool?
     let AttachStderr: Bool?
     let Tty: Bool?
+    let Env: [String]?
+    let User: String?
+    let WorkingDir: String?
 }
 
 struct CreateExecResponse: Content {
@@ -102,20 +137,21 @@ struct ExecRoute: RouteCollection {
                 }
             }
 
-            // For simplicity, we'll assume the exec is not running if we can inspect it
-            // In a real implementation, you'd track the actual process state
+            // Running is true only once started and before an exit code is
+            // recorded — a created-but-not-yet-started exec is not running.
+            let recordedExitCode = await ExecManager.shared.exitCode(id: execId)
             let response = ExecInspectResponse(
                 ID: execId,
-                Running: false,  // We'd need to track this properly
-                ExitCode: nil,  // We'd need to track this from the actual process
+                Running: await ExecManager.shared.isRunning(id: execId),
+                ExitCode: recordedExitCode.map { Int($0) },
                 ProcessConfig: ExecInspectResponse.ProcessConfigInfo(
                     privileged: false,
-                    user: "",
+                    user: config.user ?? "",
                     tty: config.tty,
                     entrypoint: config.cmd.first ?? "",
                     arguments: Array(config.cmd.dropFirst()),
-                    workingDir: "",
-                    env: []
+                    workingDir: config.workingDir ?? "",
+                    env: config.env
                 ),
                 OpenStdin: config.attachStdin,
                 OpenStderr: config.attachStderr,
@@ -162,11 +198,30 @@ struct ExecRoute: RouteCollection {
                 attachStdout: body.AttachStdout ?? true,
                 attachStderr: attachStderr,
                 tty: body.Tty ?? false,
-                detach: false
+                detach: false,
+                env: body.Env ?? [],
+                user: body.User,
+                workingDir: body.WorkingDir
             )
 
             let id = await ExecManager.shared.create(config: config)
             return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
+        }
+    }
+
+    // Applies the exec request's Env, User and WorkingDir on top of the
+    // container's init process configuration, mirroring how container create
+    // handles the same fields. Without this the Docker API fields are ignored
+    // and execs always run with the container's defaults.
+    static func applyProcessOverrides(_ processConfig: inout ProcessConfiguration, config: ExecManager.ExecConfig) throws {
+        if !config.env.isEmpty {
+            processConfig.environment = try Parser.allEnv(imageEnvs: processConfig.environment, envFiles: [], envs: config.env)
+        }
+        if let workingDir = config.workingDir, !workingDir.isEmpty {
+            processConfig.workingDirectory = workingDir
+        }
+        if let user = config.user, !user.isEmpty {
+            processConfig.user = .raw(userString: user)
         }
     }
 
@@ -186,6 +241,20 @@ struct ExecRoute: RouteCollection {
 
             try client.enforceContainerRunning(container: container)
 
+            // Apply the request's Env/User/WorkingDir before marking the exec
+            // started: applying them can throw, and doing so after markStarted
+            // would leave the exec reported as running forever.
+            let baseProcessConfig: ProcessConfiguration = try {
+                var processConfig = container.configuration.initProcess
+                try ExecRoute.applyProcessOverrides(&processConfig, config: config)
+                return processConfig
+            }()
+
+            // Reject starting an exec instance more than once (Docker semantics).
+            guard await ExecManager.shared.markStarted(id: execId) else {
+                throw Abort(.conflict, reason: "Exec instance \(execId) has already been started")
+            }
+
             struct StartExecRequest: Content {
                 let Detach: Bool?
                 let Tty: Bool?
@@ -202,18 +271,26 @@ struct ExecRoute: RouteCollection {
             if detach {
                 let executable = config.cmd.first!
                 let arguments = Array(config.cmd.dropFirst())
-                var processConfig = container.configuration.initProcess
+                var processConfig = baseProcessConfig
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
-                let process = try await ContainerClient().createProcess(
-                    containerId: container.id,
-                    processId: UUID().uuidString.lowercased(),
-                    configuration: processConfig,
-                    stdio: [nil, nil, nil]
-                )
-                try await process.start()
+                do {
+                    let process = try await ContainerClient().createProcess(
+                        containerId: container.id,
+                        processId: UUID().uuidString.lowercased(),
+                        configuration: processConfig,
+                        stdio: [nil, nil, nil]
+                    )
+                    try await process.start()
+                } catch {
+                    // The exec was marked started; if creating/starting the
+                    // process fails we must record an exit code, otherwise the
+                    // exec is stuck reporting Running forever.
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw error
+                }
                 await ExecManager.shared.remove(id: execId)
                 return Response(status: .ok)
             }
@@ -243,7 +320,7 @@ struct ExecRoute: RouteCollection {
 
                     let executable = config.cmd.first!
                     let arguments = Array(config.cmd.dropFirst())
-                    var processConfig = container.configuration.initProcess
+                    var processConfig = baseProcessConfig
                     processConfig.executable = executable
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
@@ -255,7 +332,14 @@ struct ExecRoute: RouteCollection {
                         stdio: stdio.asArray
                     )
 
-                    try await process.start()
+                    do {
+                        try await process.start()
+                    } catch {
+                        // Record an exit code so a failed start doesn't leave
+                        // the exec stuck reporting Running forever.
+                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        throw error
+                    }
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
@@ -269,9 +353,13 @@ struct ExecRoute: RouteCollection {
 
                                 while !state.shouldStop() {
                                     do {
+                                        // A blocking pipe read returns empty Data only at EOF —
+                                        // the process exited and its stdout writer was closed.
+                                        // Break so the task group can finish and the response
+                                        // stream is closed; sleeping/continuing here spins forever
+                                        // and the Docker client hangs waiting for the stream to end.
                                         guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                            continue
+                                            break
                                         }
 
                                         let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
@@ -296,9 +384,13 @@ struct ExecRoute: RouteCollection {
 
                                 while !state.shouldStop() {
                                     do {
+                                        // A blocking pipe read returns empty Data only at EOF —
+                                        // the process exited and its stderr writer was closed.
+                                        // Break so the task group can finish and the response
+                                        // stream is closed; sleeping/continuing here spins forever
+                                        // and the Docker client hangs waiting for the stream to end.
                                         guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
-                                            continue
+                                            break
                                         }
 
                                         let bufferSize = min(data.count + 8, 65536)
@@ -340,15 +432,20 @@ struct ExecRoute: RouteCollection {
                             }
 
                             do {
-                                let _ = try await process.wait()
+                                let exitCode = try await process.wait()
+                                await ExecManager.shared.setExitCode(id: execId, code: exitCode)
                             } catch {
+                                // process.wait() failed — record a synthetic exit
+                                // code so the exec leaves the Running state.
+                                await ExecManager.shared.setExitCode(id: execId, code: -1)
                             }
                         }
 
                         for await _ in group {}
                     }
 
-                    await ExecManager.shared.remove(id: execId)
+                    // Keep the exec entry so the client's follow-up
+                    // `GET /exec/{id}/json` can read the recorded exit code.
                     streamContinuation.finish()
                 }
             }
@@ -378,7 +475,7 @@ struct ExecRoute: RouteCollection {
                 let executable = config.cmd.first!
                 let arguments = Array(config.cmd.dropFirst())
 
-                var processConfig = container.configuration.initProcess
+                var processConfig = baseProcessConfig
                 processConfig.executable = executable
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
@@ -390,7 +487,14 @@ struct ExecRoute: RouteCollection {
                     stdio: stdio.asArray
                 )
 
-                try await process.start()
+                do {
+                    try await process.start()
+                } catch {
+                    // Record an exit code so a failed start doesn't leave the
+                    // exec stuck reporting Running forever.
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw error
+                }
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
@@ -540,9 +644,13 @@ struct ExecRoute: RouteCollection {
                     // Process monitor with proper cleanup
                     group.addTask {
                         do {
-                            let _ = try await process.wait()
+                            let exitCode = try await process.wait()
+                            await ExecManager.shared.setExitCode(id: execId, code: exitCode)
                         } catch {
-                            // Process wait error - handle gracefully
+                            // process.wait() failed — record a synthetic exit code
+                            // so the exec leaves the Running state instead of
+                            // hanging there forever.
+                            await ExecManager.shared.setExitCode(id: execId, code: -1)
                         }
 
                         // Give a small delay for any final output to be processed
@@ -562,7 +670,8 @@ struct ExecRoute: RouteCollection {
                     for await _ in group {}
                 }
 
-                await ExecManager.shared.remove(id: execId)
+                // Keep the exec entry so the client's follow-up
+                // `GET /exec/{id}/json` can read the recorded exit code.
             }
         }
     }

@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct ContainerStartRoute: RouteCollection {
@@ -49,6 +50,34 @@ extension ContainerStartRoute {
                     throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
                 }
                 req.logger.debug("Container \(id) was already running or bootstrapped")
+            }
+
+            // Register DNS names now that the container has an IP.
+            // Names were stored in the label at create time (Compose service aliases).
+            // Resolve through getContainer: clients commonly start containers by
+            // the hex ID returned from create, which the native lookup rejects.
+            let startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
+                let snapshot = startedSnapshot,
+                snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
+                let namesLabel = snapshot.configuration.labels["socktainer.dns.names"],
+                let firstAttachment = snapshot.networks.first
+            {
+                let ip = firstAttachment.ipv4Address.address.description
+                for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                    dnsServer.register(hostname: name, ip: ip)
+                }
+            }
+
+            // Kick off the healthcheck probe loop if a healthcheck label is set.
+            // The label was JSON-encoded by the create route from body.Healthcheck.
+            if let healthManager = req.application.storage[HealthCheckManagerKey.self],
+                let snapshot = try? await ContainerClient().get(id: id),
+                let labelValue = snapshot.configuration.labels[HealthCheckManager.healthcheckLabel],
+                let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8)),
+                let test = healthcheck.Test, !test.isEmpty, test.first != "NONE"
+            {
+                await healthManager.start(containerId: id, config: healthcheck)
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!

@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -17,6 +18,7 @@ func configure(_ app: Application) async throws {
     let volumeClinet = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
+    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -62,7 +64,7 @@ func configure(_ app: Application) async throws {
 
     // /images
     try app.register(collection: ImageDeleteRoute(client: imageClient))
-    try app.register(collection: ImageHistoryRoute())
+    try app.register(collection: ImageHistoryRoute(client: imageClient))
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
     try app.register(collection: ImageCreateRoute(client: imageClient))
@@ -99,8 +101,8 @@ func configure(_ app: Application) async throws {
     try app.register(collection: NetworkDeletetRoute(client: networkClient))
 
     // --- build/distribution routes ---
-    try app.register(collection: BuildPruneRoute())
-    try app.register(collection: BuildRoute(client: containerClient))
+    try app.register(collection: BuildPruneRoute(builderClient: builderClient))
+    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient))
     try app.register(collection: DistributionJsonRoute())
 
     // --- plugin routes ---
@@ -151,7 +153,7 @@ func configure(_ app: Application) async throws {
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: CommitRoute())
-    try app.register(collection: SystemDFRoute())
+    try app.register(collection: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClinet, builderClient: builderClient))
     try app.register(collection: VersionRoute())
 
     // Initialize broadcaster
@@ -164,5 +166,44 @@ func configure(_ app: Application) async throws {
 
     // Await starting watching
     watcher.startWatching()
+
+    // Initialize inter-container DNS infrastructure.
+    // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
+    // is taken, Socktainer auto-increments until a free port is found.
+    let preferredDNSPort =
+        ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
+        .flatMap(Int.init) ?? 2054
+    let dnsServer = SocktainerDNSServer()
+    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
+        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
+        return
+    }
+    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+    app.storage[SocktainerDNSServerKey.self] = dnsServer
+
+    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort)
+    app.storage[NetworkDNSManagerKey.self] = dnsManager
+
+    // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and
+    // tracks status so `/containers/{id}/json` can return `.State.Health`.
+    let healthCheckManager = HealthCheckManager(broadcaster: broadcaster)
+    app.storage[HealthCheckManagerKey.self] = healthCheckManager
+
+    // Resume healthcheck loops for any containers that were running when
+    // Socktainer last stopped — their socktainer.healthcheck label persists.
+    let resumeClient = ContainerClient()
+    if let runningContainers = try? await resumeClient.list() {
+        for container in runningContainers where container.status == .running {
+            guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
+                let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8)),
+                HealthCheckManager.parseTest(config.Test) != nil  // skip NONE / disabled checks
+            else { continue }
+            await healthCheckManager.start(containerId: container.id, config: config)
+            app.logger.info("Resumed healthcheck for \(container.id)")
+        }
+    }
+
+    // Clean up any CoreDNS containers left from a previous run
+    await dnsManager.cleanupStaleDNSContainers()
 
 }
