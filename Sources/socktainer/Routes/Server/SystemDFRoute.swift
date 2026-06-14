@@ -212,7 +212,7 @@ extension SystemDFRoute {
                         Mountpoint: volume.Mountpoint,
                         CreatedAt: volume.CreatedAt,
                         Status: volume.Status,
-                        Labels: volume.Labels,
+                        Labels: volume.Labels,  // already restored by ClientVolumeService.convert()
                         Scope: volume.Scope,
                         ClusterVolume: volume.ClusterVolume,
                         Options: volume.Options,
@@ -316,7 +316,7 @@ extension SystemDFRoute {
             Ports: ports,
             SizeRw: size,
             SizeRootFs: size,
-            Labels: container.configuration.labels,
+            Labels: LabelNormalization.restore(container.configuration.labels),
             State: container.status.mobyState,
             Status: container.status.mobyState,
             HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),

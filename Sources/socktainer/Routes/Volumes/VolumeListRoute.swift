@@ -32,7 +32,7 @@ struct VolumeListRoute: RouteCollection {
             VolumeInfo(
                 CreatedAt: v.CreatedAt ?? "",
                 Driver: v.Driver,
-                Labels: v.Labels,
+                Labels: v.Labels,  // already restored by ClientVolumeService.convert()
                 Mountpoint: v.Mountpoint,
                 Name: v.Name,
                 Options: v.Options,

@@ -152,7 +152,7 @@ extension ContainerListRoute {
                     Ports: ports,
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container
                     SizeRootFs: nil,  // there is no mechanism to retrieve this value from apple container
-                    Labels: container.configuration.labels,
+                    Labels: LabelNormalization.restore(container.configuration.labels),
                     State: mobyState,
                     Status: statusStr,
                     HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),

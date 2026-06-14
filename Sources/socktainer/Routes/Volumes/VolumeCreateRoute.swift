@@ -20,7 +20,14 @@ struct VolumeCreateRoute: RouteCollection {
         // Socktainer-specific) and persist it as a label so ContainerCreateRoute
         // can apply the right Filesystem.SyncMode when mounting this volume.
         var driverOpts = createRequest.DriverOpts ?? [:]
-        var labels = createRequest.Labels ?? [:]
+        let originalLabels = createRequest.Labels ?? [:]
+        guard !LabelNormalization.containsReservedKey(originalLabels) else {
+            throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
+        }
+        var labels = LabelNormalization.sanitize(originalLabels)
+        if let mapping = LabelNormalization.buildMapping(originalLabels) {
+            labels[LabelNormalization.mappingKey] = mapping
+        }
         if let syncValue = driverOpts.removeValue(forKey: "sync") {
             guard Filesystem.SyncMode(rawString: syncValue) != nil else {
                 throw Abort(.badRequest, reason: "Invalid sync mode '\(syncValue)'. Valid values: nosync, fsync, full")
