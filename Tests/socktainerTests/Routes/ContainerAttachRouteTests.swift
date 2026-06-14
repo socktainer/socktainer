@@ -20,14 +20,7 @@ struct ContainerAttachRouteTests {
 
     @Test("Container not found returns 404")
     func unknownContainerReturns404() async throws {
-        let client = NullContainerMock()
-        try await withApp(configure: { _ in }) { app in
-            let regexRouter = app.regexRouter(with: app.logger)
-            app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
-            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
-            try app.register(collection: ContainerAttachRoute(client: client))
-
+        try await withAttachRouteApp(client: NullContainerMock()) { app in
             try await app.testing().test(
                 .POST,
                 "/v1.51/containers/nonexistent/attach?stream=1&stdout=1"
@@ -39,14 +32,7 @@ struct ContainerAttachRouteTests {
 
     @Test("Attach without stream=1 or logs=1 returns 400")
     func noStreamOrLogsReturns400() async throws {
-        let client = NullContainerMock()
-        try await withApp(configure: { _ in }) { app in
-            let regexRouter = app.regexRouter(with: app.logger)
-            app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
-            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
-            try app.register(collection: ContainerAttachRoute(client: client))
-
+        try await withAttachRouteApp(client: NullContainerMock()) { app in
             // No stream or logs param → should be rejected before even looking up container
             try await app.testing().test(
                 .POST,
@@ -59,6 +45,20 @@ struct ContainerAttachRouteTests {
 }
 
 // MARK: - Helpers
+
+private func withAttachRouteApp(
+    client: some ClientContainerProtocol,
+    test: @escaping (Application) async throws -> Void
+) async throws {
+    try await withApp(configure: { _ in }) { app in
+        let regexRouter = app.regexRouter(with: app.logger)
+        app.setRegexRouter(regexRouter)
+        regexRouter.installMiddleware(on: app)
+        app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+        try app.register(collection: ContainerAttachRoute(client: client))
+        try await test(app)
+    }
+}
 
 /// Mock that returns nil for all container lookups (simulates "not found").
 private struct NullContainerMock: ClientContainerProtocol {
