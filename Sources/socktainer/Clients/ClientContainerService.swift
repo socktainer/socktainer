@@ -69,11 +69,11 @@ struct ClientContainerService: ClientContainerProtocol {
                     let labels = container.configuration.labels
                     return values.allSatisfy { labelFilter in
                         guard let eqIdx = labelFilter.firstIndex(of: "=") else {
-                            return labels.keys.contains(labelFilter)
+                            return LabelNormalization.filterContainsKey(labelFilter, in: labels)
                         }
                         let k = String(labelFilter.prefix(upTo: eqIdx))
                         let v = String(labelFilter.suffix(from: labelFilter.index(after: eqIdx)))
-                        return labels[k] == v
+                        return LabelNormalization.filterValue(in: labels, forKey: k) == v
                     }
                 }
             case "name":
@@ -372,23 +372,23 @@ struct ClientContainerService: ClientContainerProtocol {
                     return values.allSatisfy { labelFilter in
                         if labelFilter.contains("!=") {
                             if let eqIdx = labelFilter.range(of: "!=") {
-                                let prefix = String(labelFilter.prefix(upTo: eqIdx.lowerBound))
+                                let key = String(labelFilter.prefix(upTo: eqIdx.lowerBound))
                                 let suffix = String(labelFilter.suffix(from: eqIdx.upperBound))
                                 guard suffix.isEmpty else {
-                                    return labels[prefix] != suffix
+                                    return LabelNormalization.filterValue(in: labels, forKey: key) != suffix
                                 }
-                                return !labels.keys.contains(prefix)
+                                return !LabelNormalization.filterContainsKey(key, in: labels)
                             }
                             return false
                         } else if labelFilter.contains("=") {
                             if let eqIdx = labelFilter.firstIndex(of: "=") {
                                 let k = String(labelFilter.prefix(upTo: eqIdx))
                                 let v = String(labelFilter.suffix(from: labelFilter.index(after: eqIdx)))
-                                return labels[k] == v
+                                return LabelNormalization.filterValue(in: labels, forKey: k) == v
                             }
                             return false
                         } else {
-                            return labels.keys.contains(labelFilter)
+                            return LabelNormalization.filterContainsKey(labelFilter, in: labels)
                         }
                     }
                 }

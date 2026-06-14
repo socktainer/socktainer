@@ -98,9 +98,13 @@ struct ClientNetworkService: ClientNetworkProtocol {
                         let parts = label.split(separator: "=", maxSplits: 1)
                         let key = String(parts[0])
                         let value = String(parts[1])
-                        if network.Labels[key] != value { excludedReason = "label key=value mismatch" }
+                        if LabelNormalization.filterValue(in: network.Labels, forKey: key) != value {
+                            excludedReason = "label key=value mismatch"
+                        }
                     } else {
-                        if network.Labels[label] == nil { excludedReason = "label key missing" }
+                        if !LabelNormalization.filterContainsKey(label, in: network.Labels) {
+                            excludedReason = "label key missing"
+                        }
                     }
                 }
             }
@@ -152,7 +156,7 @@ extension RESTNetworkSummary {
         let id = networkResource.configuration.name
         let driver = String(describing: networkResource.configuration.mode)
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels = networkResource.configuration.labels.dictionary
+        let labels = LabelNormalization.restore(networkResource.configuration.labels.dictionary)
         let subnet =
             networkResource.configuration.ipv4Subnet.map { String(describing: $0) }
             ?? String(describing: networkResource.status.ipv4Subnet)

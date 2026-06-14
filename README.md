@@ -289,6 +289,26 @@ We welcome contributions!
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
 
+### Label key normalization
+
+Apple Container only accepts lowercase label keys matching `[a-z0-9](?:[a-z0-9\-\.\/]*[a-z0-9])?`. Docker allows mixed-case, underscores, and other characters. Socktainer automatically normalizes label keys at create time:
+
+- Uppercase → lowercase (`sessionId` → `sessionid`)
+- Underscores → hyphens (`my_key` → `my-key`)
+- Other invalid characters are dropped
+- An `INFO` log is emitted for every key that is changed
+- A `WARNING` is logged when a key becomes empty after normalization (dropped) or when two keys normalize to the same string (collision, last value wins)
+
+Original keys are preserved via an internal mapping label (`socktainer.label-original-keys`) that is stored alongside the normalized keys and stripped from all API responses. As a result, `docker inspect`, filter lookups, and Go-template label access all return and match the original key exactly:
+
+```bash
+# Works — original key is restored transparently
+docker inspect --format '{{index .Config.Labels "MyApp"}}' <container>
+docker ps --filter label=MyApp=value
+```
+
+The one edge case: if two keys normalize to the same string (e.g. `MyKey` and `mykey`), the last one wins — a `WARNING` is logged so the loss is visible in Socktainer's output.
+
 ---
 
 ## Community 💬

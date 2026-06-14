@@ -67,11 +67,11 @@ struct ClientVolumeService: ClientVolumeProtocol {
             if let labels = parsedFilters["label"], !labels.isEmpty, let volumeLabels = volume.Labels {
                 let labelMatches = labels.contains { labelFilter in
                     guard let eqIdx = labelFilter.firstIndex(of: "=") else {
-                        return volumeLabels.keys.contains(labelFilter)
+                        return LabelNormalization.filterContainsKey(labelFilter, in: volumeLabels)
                     }
                     let key = String(labelFilter[..<eqIdx])
                     let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
-                    return volumeLabels[key] == value
+                    return LabelNormalization.filterValue(in: volumeLabels, forKey: key) == value
                 }
                 matches = matches && labelMatches
             }
@@ -107,7 +107,7 @@ struct ClientVolumeService: ClientVolumeProtocol {
             Mountpoint: v.source,
             CreatedAt: ISO8601DateFormatter().string(from: v.creationDate),
             Status: nil,  // we have no mechanism to report status for the time being
-            Labels: v.labels,
+            Labels: LabelNormalization.restore(v.labels),
             Scope: "local",  // Assuming local for now
             ClusterVolume: nil,
             Options: v.options,

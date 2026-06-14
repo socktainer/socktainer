@@ -68,7 +68,10 @@ extension ContainerInspectRoute {
                 NetworkDisabled: container.networks.isEmpty,
                 MacAddress: nil,  // no mechanism to derive this value
                 OnBuild: nil,  // no mechanism to derive this value
-                Labels: container.configuration.labels.isEmpty ? nil : container.configuration.labels,
+                Labels: {
+                    let restored = LabelNormalization.restore(container.configuration.labels)
+                    return restored.isEmpty ? nil : restored
+                }(),
                 StopSignal: nil,  // no mechanism to derive this value
                 StopTimeout: nil,  // no mechanism to derive this value
                 Shell: nil  // no mechanism to derive this value
