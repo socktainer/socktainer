@@ -63,18 +63,16 @@ struct BuildContextTarTests {
         // inside the gzip stream, matching what `docker compose build` sends
         // (Content-Type: application/x-tar, gzip payload).
         let gzTar = plainTar.deletingLastPathComponent().appendingPathComponent("context.tar.gz")
+        FileManager.default.createFile(atPath: gzTar.path, contents: nil)
+        let out = try FileHandle(forWritingTo: gzTar)
         let gzip = Process()
-        gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-        gzip.arguments = ["-c", plainTar.path]
-        let out = try FileHandle(
-            forWritingTo: {
-                FileManager.default.createFile(atPath: gzTar.path, contents: nil)
-                return gzTar
-            }())
+        gzip.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        gzip.arguments = ["gzip", "-c", plainTar.path]
         gzip.standardOutput = out
         try gzip.run()
         gzip.waitUntilExit()
         try out.close()
+        #expect(gzip.terminationStatus == 0)
 
         let destBefore = gzTar.deletingLastPathComponent().appendingPathComponent("gzbefore")
         #expect(throws: (any Error).self) {
