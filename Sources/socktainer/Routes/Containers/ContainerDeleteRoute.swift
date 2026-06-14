@@ -23,9 +23,10 @@ extension ContainerDeleteRoute {
                 // unregistration and the running check.
                 let container = try await client.getContainer(id: id)
 
-                // Cancel the healthcheck probe loop if one is running.
+                // Cancel the healthcheck probe loop if one is running. Use the Apple
+                // Container native ID (container?.id) to match the key stored at start time.
                 if let healthManager = req.application.storage[HealthCheckManagerKey.self] {
-                    await healthManager.stop(containerId: id)
+                    await healthManager.stop(containerId: container?.id ?? id)
                 }
 
                 // Unregister DNS names before deletion

@@ -71,13 +71,18 @@ extension ContainerStartRoute {
 
             // Kick off the healthcheck probe loop if a healthcheck label is set.
             // The label was JSON-encoded by the create route from body.Healthcheck.
+            // Reuse startedSnapshot (already resolved via client.getContainer, which handles
+            // hex IDs) rather than calling ContainerClient().get(id:) directly — the raw call
+            // would fail when the client sends the hex digest instead of the Apple Container name.
+            // Use snapshot.id (the native Apple Container name) as the HealthCheckManager key so
+            // it matches the lookup in ContainerInspectRoute and ContainerListRoute, which read
+            // health via container.id (the native name, not the hex digest).
             if let healthManager = req.application.storage[HealthCheckManagerKey.self],
-                let snapshot = try? await ContainerClient().get(id: id),
+                let snapshot = startedSnapshot,
                 let labelValue = snapshot.configuration.labels[HealthCheckManager.healthcheckLabel],
-                let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8)),
-                let test = healthcheck.Test, !test.isEmpty, test.first != "NONE"
+                let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8))
             {
-                await healthManager.start(containerId: id, config: healthcheck)
+                await healthManager.start(containerId: snapshot.id, config: healthcheck)
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
