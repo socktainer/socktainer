@@ -6,6 +6,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import ContainerizationOS
+import DataCompression
 import Foundation
 import NIO
 import TerminalProgress
@@ -81,27 +82,21 @@ extension BuildRoute {
         return dict.map { "\($0.key)=\($0.value)" }
     }
 
-    /// A 38-byte gzip member that decompresses to 4096 zero bytes. Appending it
-    /// to a gzip-compressed tar yields a valid concatenated gzip stream whose
-    /// inflated output gains a completed final block and end-of-archive marker.
-    private static let gzipZeroTerminator: [UInt8] = [
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xed, 0xc1, 0x01, 0x0d, 0x00, 0x00,
-        0x00, 0xc2, 0xa0, 0xf7, 0x4f, 0x6d, 0x0f, 0x07, 0x14, 0x00, 0x00, 0x00, 0xf0, 0x6e, 0x11, 0x00,
-        0x1c, 0xc7, 0x00, 0x10, 0x00, 0x00,
-    ]
-
     /// Appends a zero-filled end-of-archive terminator to a received build
     /// context tar so libarchive accepts contexts that omit the trailing
     /// block padding (notably `docker compose build` with the classic builder).
     /// For a gzip-compressed context a second gzip member of zeros is appended
-    /// (gzip streams concatenate); for a plain tar, raw zero bytes are appended.
+    /// (gzip streams concatenate, so the inflated output gains the missing
+    /// padding); for a plain tar, raw zero bytes are appended.
     static func appendTarTerminator(to tarPath: URL) throws {
         let handle = try FileHandle(forReadingFrom: tarPath)
         let magic = try handle.read(upToCount: 2)
         try handle.close()
 
+        let zeros = Data(count: 4096)
+        // `gzip()` of a fixed in-memory buffer is infallible.
         let isGzip = magic == Data([0x1f, 0x8b])
-        let terminator = isGzip ? Data(gzipZeroTerminator) : Data(count: 4096)
+        let terminator = isGzip ? zeros.gzip()! : zeros
 
         let writeHandle = try FileHandle(forWritingTo: tarPath)
         defer { try? writeHandle.close() }
