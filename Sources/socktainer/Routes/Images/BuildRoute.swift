@@ -81,6 +81,34 @@ extension BuildRoute {
         return dict.map { "\($0.key)=\($0.value)" }
     }
 
+    /// A 38-byte gzip member that decompresses to 4096 zero bytes. Appending it
+    /// to a gzip-compressed tar yields a valid concatenated gzip stream whose
+    /// inflated output gains a completed final block and end-of-archive marker.
+    private static let gzipZeroTerminator: [UInt8] = [
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xed, 0xc1, 0x01, 0x0d, 0x00, 0x00,
+        0x00, 0xc2, 0xa0, 0xf7, 0x4f, 0x6d, 0x0f, 0x07, 0x14, 0x00, 0x00, 0x00, 0xf0, 0x6e, 0x11, 0x00,
+        0x1c, 0xc7, 0x00, 0x10, 0x00, 0x00,
+    ]
+
+    /// Appends a zero-filled end-of-archive terminator to a received build
+    /// context tar so libarchive accepts contexts that omit the trailing
+    /// block padding (notably `docker compose build` with the classic builder).
+    /// For a gzip-compressed context a second gzip member of zeros is appended
+    /// (gzip streams concatenate); for a plain tar, raw zero bytes are appended.
+    static func appendTarTerminator(to tarPath: URL) throws {
+        let handle = try FileHandle(forReadingFrom: tarPath)
+        let magic = try handle.read(upToCount: 2)
+        try handle.close()
+
+        let isGzip = magic == Data([0x1f, 0x8b])
+        let terminator = isGzip ? Data(gzipZeroTerminator) : Data(count: 4096)
+
+        let writeHandle = try FileHandle(forWritingTo: tarPath)
+        defer { try? writeHandle.close() }
+        try writeHandle.seekToEnd()
+        try writeHandle.write(contentsOf: terminator)
+    }
+
     static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
@@ -180,6 +208,17 @@ extension BuildRoute {
                             req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
                             throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
                         }
+
+                        // `docker compose build` (classic builder) streams a build
+                        // context whose final tar entry is not padded out to a 512-byte
+                        // block and which omits the end-of-archive marker. The Docker
+                        // daemon's Go tar reader tolerates this, but libarchive treats
+                        // the short final block as a truncated archive and aborts
+                        // extraction. Append a terminator of zero bytes so the last
+                        // entry's block is completed and a valid end-of-archive marker
+                        // is present. Trailing zeros after a well-formed archive are
+                        // ignored, so this is safe for already-terminated contexts too.
+                        try Self.appendTarTerminator(to: tarPath)
 
                         // Extract the tar archive
                         let extractDir = tempContextDir.appendingPathComponent("context")
