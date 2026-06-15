@@ -23,6 +23,8 @@ extension ContainerStopRoute {
             let signal = query.signal
             let timeout = query.t
 
+            let snapshot = try? await client.getContainer(id: id)
+
             do {
                 try await client.stop(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {
@@ -33,9 +35,14 @@ extension ContainerStopRoute {
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-
-            let event = DockerEvent.simpleEvent(id: id, type: "container", status: "stop")
-
+            let event = DockerEvent.simpleEvent(
+                id: id,
+                type: "container",
+                status: "stop",
+                image: snapshot?.configuration.image.reference ?? "",
+                name: snapshot?.id ?? id,
+                labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:])
+            )
             await broadcaster.broadcast(event)
 
             return .noContent

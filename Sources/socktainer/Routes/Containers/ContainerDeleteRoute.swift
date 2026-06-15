@@ -17,16 +17,28 @@ extension ContainerDeleteRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
+            let snapshot = try? await client.getContainer(id: id)
+            let cached = await ContainerInfoCache.shared.get(id: id)
+
+            let eventImage = snapshot?.configuration.image.reference ?? cached?.image ?? ""
+            let eventName = snapshot?.id ?? cached?.nativeId ?? id
+            let eventLabels =
+                snapshot.map { LabelNormalization.restore($0.configuration.labels) }
+                ?? cached?.labels ?? [:]
+
+            func broadcastRemove() async {
+                let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+                await broadcaster.broadcast(
+                    DockerEvent.simpleEvent(
+                        id: id, type: "container", status: "remove",
+                        image: eventImage, name: eventName, labels: eventLabels
+                    ))
+                await ContainerInfoCache.shared.remove(id: id)
+            }
+
             do {
-                // Resolve the reference once — it may be a hex ID or a
-                // truncated prefix — and reuse the snapshot for DNS
-                // unregistration and the running check.
                 let container = try await client.getContainer(id: id)
 
-                // Cancel the healthcheck probe loop if one is running. Use the native
-                // Apple Container ID (container?.id) to match the key stored at start time.
-                // When container is nil (lookup failed), fall back to the request-provided id,
-                // which may be a hex digest and could miss the loop — log a warning in that case.
                 if let healthManager = req.application.storage[HealthCheckManagerKey.self] {
                     if container == nil {
                         req.logger.warning("healthcheck stop: container not found for id \(id), falling back — loop may be orphaned")
@@ -34,7 +46,6 @@ extension ContainerDeleteRoute {
                     await healthManager.stop(containerId: container?.id ?? id)
                 }
 
-                // Unregister DNS names before deletion
                 if let container,
                     let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
                     let namesLabel = container.configuration.labels["socktainer.dns.names"]
@@ -44,22 +55,21 @@ extension ContainerDeleteRoute {
                     }
                 }
 
-                // if running, stop it first
                 if let container, container.status == .running {
                     try await client.stop(id: id, signal: nil, timeout: nil)
                 }
                 try await client.delete(id: id)
             } catch ClientContainerError.notFound {
+                if snapshot != nil || cached != nil {
+                    await broadcastRemove()
+                }
                 throw Abort(.notFound, reason: "No such container: \(id)")
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-            let event = DockerEvent.simpleEvent(id: id, type: "container", status: "remove")
-            await broadcaster.broadcast(event)
-
+            await broadcastRemove()
             return .ok
         }
     }

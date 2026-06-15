@@ -48,71 +48,78 @@ struct ContainerWaitRoute: RouteCollection {
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: "application/json")
 
-            // `docker run` reads the /wait response HEAD before it sends /start,
-            // then reads the body once the container exits. If we withhold the
-            // head until the body is ready (the default when returning a Content
-            // value), /start is never sent and the run deadlocks. So flush the
-            // head immediately with an empty write, then stream the exit-code
-            // JSON once client.wait() resolves (it blocks until the init process
-            // actually exits and its real code is recorded).
-            let body = Response.Body { writer in
-                Task.detached {
-                    defer { _ = writer.write(.end) }
+            // Flush the response head before the body so docker run can issue /start
+            // without waiting for the container to exit first.
+            let body = Response.Body(asyncStream: { writer in
+                _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
-                    _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
-
-                    let result: RESTContainerWait
-                    do {
-                        if condition == .healthy {
-                            // Poll HealthCheckManager until the container becomes healthy
-                            // or stops running (in which case it can never reach healthy).
-                            var statusCode: Int64 = 0
-                            if let manager = req.application.storage[HealthCheckManagerKey.self] {
-                                while true {
-                                    let health = await manager.currentHealth(for: containerId)
-                                    if health?.Status == "healthy" { break }
-                                    // health==nil means no probe loop was registered for this container.
-                                    // HealthCheckManager.start() is called by ContainerStartRoute after
-                                    // container.start() returns, so there is a brief window where the
-                                    // container is running but health is still nil. We break here because
-                                    // by the next poll (500ms later) start() would have run; if it's still
-                                    // nil then, it means no HEALTHCHECK was configured and the container
-                                    // can never become healthy.
-                                    if health == nil {
-                                        statusCode = 1
-                                        break
-                                    }
-                                    // Container stopped — return its real exit code
-                                    guard let c = try? await client.getContainer(id: containerId),
-                                        c.status == .running
-                                    else {
-                                        let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
-                                        statusCode = Int64(code)
-                                        break
-                                    }
-                                    try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
+                let result: RESTContainerWait
+                do {
+                    if condition == .healthy {
+                        var statusCode: Int64 = 0
+                        if let manager = req.application.storage[HealthCheckManagerKey.self] {
+                            while true {
+                                let health = await manager.currentHealth(for: containerId)
+                                if health?.Status == "healthy" { break }
+                                if health == nil {
+                                    statusCode = 1
+                                    break
                                 }
-                            } else {
-                                // HealthCheckManager unavailable — healthchecks not supported
-                                statusCode = 1
+                                guard let container = try? await client.getContainer(id: containerId),
+                                    container.status == .running
+                                else {
+                                    let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                                    statusCode = Int64(code)
+                                    break
+                                }
+                                try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
                             }
-                            result = RESTContainerWait(statusCode: statusCode)
                         } else {
-                            result = try await client.wait(id: containerId, condition: condition)
+                            statusCode = 1
                         }
-                    } catch {
-                        // Emit a 0-status body so the client unblocks rather than
-                        // hanging on a half-open stream.
-                        result = RESTContainerWait(statusCode: 0)
+                        result = RESTContainerWait(statusCode: statusCode)
+                    } else if condition == .removed {
+                        result = try await client.wait(id: containerId, condition: condition)
+                    } else {
+                        // Race native wait against ContainerExitCodeStore polling.
+                        // Pipe-bootstrapped containers (docker run) may not surface
+                        // their exit through client.wait(), so we poll the store in
+                        // parallel and take whichever resolves first.
+                        result = await withTaskGroup(of: RESTContainerWait?.self) { group in
+                            group.addTask {
+                                try? await client.wait(id: containerId, condition: condition)
+                            }
+                            group.addTask {
+                                let pollIntervalNs: UInt64 = 100_000_000
+                                let maxPolls = Int(30_000_000_000 / pollIntervalNs)
+                                for _ in 0..<maxPolls {
+                                    if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
+                                        return RESTContainerWait(statusCode: Int64(code))
+                                    }
+                                    try? await Task.sleep(nanoseconds: pollIntervalNs)
+                                }
+                                return nil
+                            }
+                            for await waitResult in group {
+                                if let waitResult {
+                                    group.cancelAll()
+                                    return waitResult
+                                }
+                            }
+                            return RESTContainerWait(statusCode: 0)
+                        }
                     }
-
-                    if let data = try? JSONEncoder().encode(result) {
-                        var buf = sharedAllocator.buffer(capacity: data.count)
-                        buf.writeBytes(data)
-                        _ = writer.write(.buffer(buf))
-                    }
+                } catch {
+                    result = RESTContainerWait(statusCode: 0)
                 }
-            }
+
+                if let data = try? JSONEncoder().encode(result) {
+                    var buf = sharedAllocator.buffer(capacity: data.count)
+                    buf.writeBytes(data)
+                    _ = try? await writer.write(.buffer(buf))
+                }
+                _ = try? await writer.write(.end)
+            })
 
             return Response(status: .ok, headers: headers, body: body)
         }
