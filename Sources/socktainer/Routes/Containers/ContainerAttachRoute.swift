@@ -23,6 +23,10 @@ struct ContainerAttachRoute: RouteCollection {
 }
 
 extension ContainerAttachRoute {
+    /// Grace period between closing pipe write ends and unblocking /wait.
+    /// Lets pipe readers flush buffered output before Docker CLI closes the connection.
+    static let outputFlushGraceNs: UInt64 = 200_000_000  // 200ms
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
@@ -87,10 +91,30 @@ extension ContainerAttachRoute {
 
         let isTTY = container.configuration.initProcess.terminal
 
-        // NOTE: When stdin is true, we will start the container before the client
-        //       this might be a workaround for the time being.
-        //       We are interested in having access to stdin file descriptor from the start
-        if stdin {
+        // For stopped containers (the `docker run` flow), bootstrap with pipes regardless
+        // of whether stdin is requested. The log-file polling path has a race condition
+        // for fast-exiting containers (#220): the container can produce output and exit
+        // before the polling loop finds the log file, silently dropping all output.
+        // Pipe-based bootstrapping captures output directly and eliminates the race.
+        if container.status == .stopped {
+            guard stdin else {
+                // Output-only attach (docker run / docker run -a STDOUT -a STDERR).
+                // Docker CLI sends Connection: Upgrade even without -i, so we accept the
+                // upgrade but return a Vapor streaming body — the same approach the original
+                // log-file path used. The key improvement is pipe-based bootstrapping which
+                // eliminates the race condition for fast-exiting containers (#220).
+                return try await attachStoppedOutputOnly(
+                    req: req,
+                    container: container,
+                    query: query,
+                    isTTY: isTTY,
+                    isUpgrade: isUpgrade,
+                    hasConnectionUpgrade: hasConnectionUpgrade
+                )
+            }
+            // stdin=true (docker run -it): full bidirectional pipe approach via TCP upgrade.
+            // Note: Docker CLI sends Connection: Upgrade even for non-stdin docker run, so
+            // we cannot rely on upgrade headers to distinguish interactive vs output-only.
             return try await handleAttachWithStdin(
                 req: req,
                 client: client,
@@ -207,6 +231,116 @@ extension ContainerAttachRoute {
             headers: headers,
             body: body
         )
+    }
+
+    // Output-only attach for stopped containers (docker run without -i, issue #220).
+    // Uses pipes instead of log-file polling to eliminate the race for fast-exiting containers.
+    private static func attachStoppedOutputOnly(
+        req: Request,
+        container: ContainerSnapshot,
+        query: ContainerAttachQuery,
+        isTTY: Bool,
+        isUpgrade: Bool,
+        hasConnectionUpgrade: Bool
+    ) async throws -> Response {
+        let attachStdout = query.stdout ?? true
+        let stderrOnly = (query.stderr ?? false) && !(query.stdout ?? false)
+
+        // Always create a stdin pipe even though no data will flow through it.
+        // Apple Container requires all three stdio handles to be non-nil to use
+        // pipe mode; passing nil for stdin causes it to fall back to log-file mode
+        // which has the race condition we are trying to fix.
+        let stdinPipe = Pipe()
+        let stdoutPipe = attachStdout ? Pipe() : nil
+        let stderrPipe = (!isTTY && (query.stderr ?? false)) ? Pipe() : nil
+
+        let stdio: [FileHandle?] = [
+            stdinPipe.fileHandleForReading,
+            stdoutPipe?.fileHandleForWriting,
+            stderrPipe?.fileHandleForWriting,
+        ]
+
+        // No data will be written to stdin for non-interactive containers — close
+        // the write end immediately so the container's stdin sees EOF.
+        try? stdinPipe.fileHandleForWriting.close()
+
+        await ContainerExitCodeStore.shared.remove(id: container.id)
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
+        } catch {
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
+            throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
+        }
+
+        do {
+            try await process.start()
+        } catch {
+            if !isBenignStartRace(error) {
+                await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
+                throw Abort(.internalServerError, reason: "Failed to start container: \(error.localizedDescription)")
+            }
+        }
+
+        let contentType =
+            isTTY
+            ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
+        var headers = HTTPHeaders()
+        headers.add(name: "Content-Type", value: contentType)
+        if isUpgrade && hasConnectionUpgrade {
+            headers.add(name: "Connection", value: "Upgrade")
+            headers.add(name: "Upgrade", value: "tcp")
+        }
+        let status: HTTPResponseStatus = (isUpgrade && hasConnectionUpgrade) ? .switchingProtocols : .ok
+
+        let body = Response.Body { writer in
+            Task.detached {
+                defer { _ = writer.write(.end) }
+                _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+
+                await withTaskGroup(of: Void.self) { group in
+                    // Close pipes → readers drain → grace period → unblock /wait.
+                    group.addTask {
+                        let code = (try? await process.wait()) ?? 0
+                        try? stdoutPipe?.fileHandleForWriting.close()
+                        try? stderrPipe?.fileHandleForWriting.close()
+                        try? stdinPipe.fileHandleForReading.close()
+                        try? await Task.sleep(nanoseconds: Self.outputFlushGraceNs)
+                        await ContainerExitCodeStore.shared.set(id: container.id, code: code)
+                    }
+
+                    // Stdout reader
+                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                        let frameType: DockerStreamFrame.StreamType = stderrOnly ? .stderr : .stdout
+                        group.addTask {
+                            defer { try? stdoutHandle.close() }
+                            while let data = try? stdoutHandle.read(upToCount: 8192), !data.isEmpty {
+                                var buf = sharedAllocator.buffer(capacity: data.count + (isTTY ? 0 : 8))
+                                buf.writeDockerFrame(streamType: frameType, data: data, ttyMode: isTTY)
+                                _ = try? await writer.write(.buffer(buf)).get()
+                            }
+                        }
+                    }
+
+                    // Stderr reader (separate stream when both stdout and stderr requested)
+                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                        group.addTask {
+                            defer { try? stderrHandle.close() }
+                            while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {
+                                var buf = sharedAllocator.buffer(capacity: data.count + 8)
+                                buf.writeDockerFrame(streamType: .stderr, data: data, ttyMode: false)
+                                _ = try? await writer.write(.buffer(buf)).get()
+                            }
+                        }
+                    }
+
+                    for await _ in group {}
+                }
+            }
+        }
+
+        return Response(status: status, headers: headers, body: body)
     }
 
     // ContainerClient surfaces a concurrent attach/start as a "booted" /
