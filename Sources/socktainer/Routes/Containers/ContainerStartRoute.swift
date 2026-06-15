@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Vapor
 
 struct ContainerStartRoute: RouteCollection {
@@ -24,8 +25,18 @@ extension ContainerStartRoute {
             let query = try req.query.decode(ContainerStartQuery.self)
             let detachKeys = query.detachKeys
 
+            let preStartSnapshot: ContainerSnapshot?
             do {
-                guard let container = try await client.getContainer(id: id) else {
+                preStartSnapshot = try await client.getContainer(id: id)
+            } catch ClientContainerError.notFound {
+                throw Abort(.notFound, reason: "No such container: \(id)")
+            } catch ClientContainerError.ambiguousId(let reference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+            }
+
+            do {
+                guard let container = preStartSnapshot else {
                     throw Abort(.notFound, reason: "No such container: \(id)")
                 }
 
@@ -85,7 +96,8 @@ extension ContainerStartRoute {
                 await healthManager.start(containerId: snapshot.id, config: healthcheck)
             }
 
-            if let snap = startedSnapshot {
+            let metadataSnapshot = startedSnapshot ?? preStartSnapshot
+            if let snap = metadataSnapshot {
                 await ContainerInfoCache.shared.set(
                     hexId: id,
                     nativeId: snap.id,
@@ -94,14 +106,16 @@ extension ContainerStartRoute {
                 )
             }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
+                return .noContent
+            }
             let event = DockerEvent.simpleEvent(
                 id: id,
                 type: "container",
                 status: "start",
-                image: startedSnapshot?.configuration.image.reference ?? "",
-                name: startedSnapshot?.id ?? id,
-                labels: LabelNormalization.restore(startedSnapshot?.configuration.labels ?? [:])
+                image: metadataSnapshot?.configuration.image.reference ?? "",
+                name: metadataSnapshot?.id ?? id,
+                labels: LabelNormalization.restore(metadataSnapshot?.configuration.labels ?? [:])
             )
             await broadcaster.broadcast(event)
 
