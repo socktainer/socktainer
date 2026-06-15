@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability?
+    url: https://github.com/socktainer/socktainer/security/policy
+    about: >
+      Do not report security vulnerabilities as public GitHub issues.
+      Follow responsible disclosure practices.
