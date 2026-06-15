@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationError
 import Foundation
 import NIOCore
 import NIOHTTP1
@@ -105,6 +106,7 @@ extension ContainerAttachRoute {
                 // eliminates the race condition for fast-exiting containers (#220).
                 return try await attachStoppedOutputOnly(
                     req: req,
+                    hexId: id,
                     container: container,
                     query: query,
                     isTTY: isTTY,
@@ -237,6 +239,7 @@ extension ContainerAttachRoute {
     // Uses pipes instead of log-file polling to eliminate the race for fast-exiting containers.
     private static func attachStoppedOutputOnly(
         req: Request,
+        hexId: String,
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         isTTY: Bool,
@@ -308,6 +311,36 @@ extension ContainerAttachRoute {
                         try? stdinPipe.fileHandleForReading.close()
                         try? await Task.sleep(nanoseconds: Self.outputFlushGraceNs)
                         await ContainerExitCodeStore.shared.set(id: container.id, code: code)
+                        await ContainerExitCodeStore.shared.set(id: hexId, code: code)
+
+                        // docker run --rm: Apple Container auto-removes the container so
+                        // DELETE never arrives and ContainerDeleteRoute never fires.
+                        // Detect auto-removal and emit the "remove" event here instead.
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                        let autoRemoved: Bool
+                        do {
+                            autoRemoved = try await ContainerClient().get(id: container.id) == nil
+                        } catch let error as ContainerizationError where error.code == .notFound {
+                            autoRemoved = true
+                        } catch {
+                            autoRemoved = false
+                        }
+                        if autoRemoved {
+                            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                                let cached = await ContainerInfoCache.shared.get(id: hexId)
+                                await broadcaster.broadcast(
+                                    DockerEvent.simpleEvent(
+                                        id: hexId,
+                                        type: "container",
+                                        status: "remove",
+                                        image: cached?.image ?? container.configuration.image.reference,
+                                        name: cached?.nativeId ?? container.id,
+                                        labels: cached?.labels
+                                            ?? LabelNormalization.restore(container.configuration.labels)
+                                    ))
+                                await ContainerInfoCache.shared.remove(id: hexId)
+                            }
+                        }
                     }
 
                     // Stdout reader

@@ -85,13 +85,26 @@ extension ContainerStartRoute {
                 await healthManager.start(containerId: snapshot.id, config: healthcheck)
             }
 
+            if let snap = startedSnapshot {
+                await ContainerInfoCache.shared.set(
+                    hexId: id,
+                    nativeId: snap.id,
+                    image: snap.configuration.image.reference,
+                    labels: LabelNormalization.restore(snap.configuration.labels)
+                )
+            }
+
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-
-            let event = DockerEvent.simpleEvent(id: id, type: "container", status: "start")
-
+            let event = DockerEvent.simpleEvent(
+                id: id,
+                type: "container",
+                status: "start",
+                image: startedSnapshot?.configuration.image.reference ?? "",
+                name: startedSnapshot?.id ?? id,
+                labels: LabelNormalization.restore(startedSnapshot?.configuration.labels ?? [:])
+            )
             await broadcaster.broadcast(event)
 
-            // should return 204 HTTP code
             return .noContent
         }
     }

@@ -4,15 +4,9 @@ struct EventBroadcasterKey: StorageKey {
     typealias Value = EventBroadcaster
 }
 
-struct ActorAttributes: Codable {
-    let containerExitCode: String
-    let image: String
-    let name: String
-}
-
 struct DockerActor: Codable {
     let ID: String
-    let Attributes: ActorAttributes
+    let Attributes: [String: String]
 }
 
 struct DockerEvent: Codable {
@@ -28,25 +22,28 @@ struct DockerEvent: Codable {
 }
 
 extension DockerEvent {
-    static func simpleEvent(id: String, type: String, status: String) -> DockerEvent {
+    static func simpleEvent(
+        id: String,
+        type: String,
+        status: String,
+        image: String = "",
+        name: String = "",
+        labels: [String: String] = [:]
+    ) -> DockerEvent {
         let now = Date()
         let timeSeconds = Int(now.timeIntervalSince1970)
         let timeNano = UInt64(now.timeIntervalSince1970 * 1_000_000_000)
 
-        let actorAttributes = ActorAttributes(
-            containerExitCode: "",  // empty if unknown
-            image: "",
-            name: id
-        )
-        let actor = DockerActor(
-            ID: id,
-            Attributes: actorAttributes
-        )
+        var attributes = labels
+        attributes["image"] = image
+        attributes["name"] = name.isEmpty ? id : name
+
+        let actor = DockerActor(ID: id, Attributes: attributes)
 
         return DockerEvent(
             status: status,
             id: id,
-            from: "",
+            from: image,
             Type: type,
             Action: status,
             Actor: actor,
