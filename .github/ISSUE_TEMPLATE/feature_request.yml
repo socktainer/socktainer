@@ -1,0 +1,47 @@
+name: Feature Request
+description: Propose a new feature or improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this solve? Why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Design
+      description: |
+        How should this work? Describe the system behavior, components involved, and user-facing interface changes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you evaluate? Why is the proposed design better?
+    validations:
+      required: false
+
+  - type: textarea
+    id: docker-api
+    attributes:
+      label: Docker API Reference
+      description: |
+        If this relates to Docker API compatibility, link to the relevant Docker Engine API endpoint or documentation.
+      placeholder: |
+        https://docs.docker.com/reference/api/engine/version/v1.51/
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true
