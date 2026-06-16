@@ -456,6 +456,10 @@ extension ContainerCreateRoute {
 
             containerConfiguration.mounts = resolvedMounts
 
+            if let memoryBytes = resolveMemoryInBytes(body.HostConfig?.Memory) {
+                containerConfiguration.resources.memoryInBytes = memoryBytes
+            }
+
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
             do {
@@ -546,4 +550,12 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
     }
 
     return publishedPorts
+}
+
+// Maps Docker HostConfig.Memory (bytes, 0 = no limit) to Apple Container memoryInBytes.
+// Returns nil when the value is absent, zero, or negative so the Apple Container
+// default (1 GiB) is preserved.
+func resolveMemoryInBytes(_ memory: Int?) -> UInt64? {
+    guard let memory, memory > 0 else { return nil }
+    return UInt64(memory)
 }
