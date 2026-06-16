@@ -751,8 +751,11 @@ extension ContainerAttachRoute {
                     try? stderrPipe?.fileHandleForWriting.close()
                     try? stdinPipe.fileHandleForWriting.close()
 
-                    // Close the channel gracefully
+                    // Close the channel gracefully only if still open.
+                    // Calling close() on an already-closed channel causes
+                    // EBADF which triggers a NIO precondition failure.
                     _ = channel.eventLoop.submit {
+                        guard channel.isActive else { return }
                         channel.close(promise: nil)
                     }
                 }
