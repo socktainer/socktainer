@@ -60,12 +60,35 @@ extension ContainerStartRoute {
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
                 let snapshot = startedSnapshot,
                 snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
-                let namesLabel = snapshot.configuration.labels["socktainer.dns.names"],
                 let firstAttachment = snapshot.networks.first
             {
                 let ip = firstAttachment.ipv4Address.address.description
-                for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                    dnsServer.register(hostname: name, ip: ip)
+
+                // Names stored at create time (Compose service aliases via socktainer.dns.names)
+                if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.register(hostname: name, ip: ip)
+                    }
+                }
+
+                // Register Docker Compose service names so that containers in the same
+                // project can resolve each other by service name (e.g. "db") or the
+                // project-qualified form (e.g. "db.myapp").
+                //
+                // The qualified form (service.project) matches Docker's own DNS behaviour
+                // and avoids collisions when multiple Compose projects run concurrently.
+                if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
+                    !serviceName.isEmpty
+                {
+                    dnsServer.register(hostname: serviceName, ip: ip)
+                    if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
+                        !projectName.isEmpty
+                    {
+                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                        req.logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
+                    } else {
+                        req.logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
+                    }
                 }
             }
 

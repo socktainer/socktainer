@@ -47,11 +47,34 @@ extension ContainerDeleteRoute {
                 }
 
                 if let container,
-                    let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
-                    let namesLabel = container.configuration.labels["socktainer.dns.names"]
+                    let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
                 {
-                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.unregister(hostname: name)
+                    let containerIP = container.networks.first?.ipv4Address.address.description
+
+                    // Only unregister an alias when this container still owns it — i.e. the
+                    // registered IP matches ours. If another container has since claimed the
+                    // same hostname (e.g. a second project with an identically-named service),
+                    // leave the entry intact so that surviving container keeps resolving.
+                    func unregisterIfOwned(_ hostname: String) {
+                        let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(hostname)]
+                        if let containerIP, registered != nil, registered != containerIP { return }
+                        dnsServer.unregister(hostname: hostname)
+                    }
+
+                    if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+                        for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                            unregisterIfOwned(name)
+                        }
+                    }
+                    if let serviceName = container.configuration.labels["com.docker.compose.service"],
+                        !serviceName.isEmpty
+                    {
+                        unregisterIfOwned(serviceName)
+                        if let projectName = container.configuration.labels["com.docker.compose.project"],
+                            !projectName.isEmpty
+                        {
+                            unregisterIfOwned("\(serviceName).\(projectName)")
+                        }
                     }
                 }
 
