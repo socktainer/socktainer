@@ -6,6 +6,6 @@ struct NetworkDisconnectRoute: RouteCollection {
     }
 
     static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/networks/{id}/disconnect", req.method.rawValue)
+        Response(status: .ok)
     }
 }

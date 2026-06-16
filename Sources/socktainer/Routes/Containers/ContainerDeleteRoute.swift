@@ -47,11 +47,22 @@ extension ContainerDeleteRoute {
                 }
 
                 if let container,
-                    let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
-                    let namesLabel = container.configuration.labels["socktainer.dns.names"]
+                    let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
                 {
-                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.unregister(hostname: name)
+                    if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+                        for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                            dnsServer.unregister(hostname: name)
+                        }
+                    }
+                    if let serviceName = container.configuration.labels["com.docker.compose.service"],
+                        !serviceName.isEmpty
+                    {
+                        dnsServer.unregister(hostname: serviceName)
+                        if let projectName = container.configuration.labels["com.docker.compose.project"],
+                            !projectName.isEmpty
+                        {
+                            dnsServer.unregister(hostname: "\(serviceName).\(projectName)")
+                        }
                     }
                 }
 

@@ -289,6 +289,37 @@ We welcome contributions!
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
 
+### Docker Compose — inter-service DNS
+
+Socktainer registers service names in its DNS server so Compose services can
+reach each other by name. Two aliases are created per service:
+
+| Alias | Example | Description |
+|---|---|---|
+| `service` | `db` | Short form — works within a single project |
+| `service.project` | `db.myapp` | Project-qualified — unique across concurrent projects |
+
+Set the project name explicitly via `name:` at the top of your Compose file
+(otherwise Docker Compose derives it from the directory name):
+
+```yaml
+name: myapp   # sets com.docker.compose.project=myapp
+
+services:
+  web:
+    image: nginx:alpine
+    # can reach the database as 'db' or 'db.myapp'
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: secret
+```
+
+> **Note:** Apple Container uses a single global hostname namespace. Two
+> Compose projects running simultaneously with identically-named services
+> (e.g. both have a `db` service) will share the short-form alias — last
+> started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
+
 ### Label key normalization
 
 Apple Container only accepts lowercase label keys matching `[a-z0-9](?:[a-z0-9\-\.\/]*[a-z0-9])?`. Docker allows mixed-case, underscores, and other characters. Socktainer automatically normalizes label keys at create time:
