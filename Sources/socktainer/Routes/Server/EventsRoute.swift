@@ -14,7 +14,9 @@ extension EventsRoute {
     static func handler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
+                throw Abort(.internalServerError, reason: "EventBroadcaster not configured")
+            }
             let stream = await broadcaster.stream()
 
             let response = Response(status: .ok)

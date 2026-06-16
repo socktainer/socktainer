@@ -27,13 +27,13 @@ extension ContainerDeleteRoute {
                 ?? cached?.labels ?? [:]
 
             func broadcastRemove() async {
-                let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+                await ContainerInfoCache.shared.remove(id: id)
+                guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
                         id: id, type: "container", status: "remove",
                         image: eventImage, name: eventName, labels: eventLabels
                     ))
-                await ContainerInfoCache.shared.remove(id: id)
             }
 
             do {
