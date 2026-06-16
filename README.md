@@ -23,6 +23,7 @@
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
     - [Volume sync mode](#volume-sync-mode)
+    - [VM memory](#vm-memory)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
     - [Build & Run](#build-run)
@@ -122,7 +123,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
 - Supports container lifecycle operations: inspect, stop, remove 🛠️
 - Supports image listing, pulling, deletion, logs, health checks, container stats. Exec without interactive mode 📄
-- `docker stats` reports memory against the Apple Container VM limit (default 1 GiB), not the host RAM
+- `docker stats` reports memory against the Apple Container VM limit (configurable via `--memory`, default 1 GiB per container), not the host RAM
 - Broadcasts container events for client liveness monitoring 📡
 
 ---
@@ -213,6 +214,36 @@ volumes:
 ```
 
 Valid modes: `nosync` · `fsync` · `full`
+
+### VM memory
+
+Each container runs in its own Apple Container VM with a fixed memory allocation.
+Socktainer honors Docker's `--memory` flag and `mem_limit:` / `deploy.resources.limits.memory:` in Compose files.
+
+```bash
+docker run --memory 2g postgres          # 2 GiB VM
+docker run --memory 512m redis           # 512 MiB VM
+docker run postgres                      # 1 GiB VM (Apple Container default)
+```
+
+> **Note:** Apple Container allocates VM RAM at creation time — this is not a cgroup
+> soft limit. Setting `--memory` too low will cause the process to OOM inside the VM.
+>
+> There is no "unlimited" mode: Docker's `--memory 0` (no limit) maps to the Apple
+> Container default of **1 GiB**, not host RAM. To give a container more than 1 GiB,
+> always pass an explicit `--memory` value.
+
+In Docker Compose:
+
+```yaml
+services:
+  kafka:
+    image: confluentinc/cp-kafka
+    mem_limit: 2g
+  redis:
+    image: redis:alpine
+    mem_limit: 256m
+```
 
 ---
 
