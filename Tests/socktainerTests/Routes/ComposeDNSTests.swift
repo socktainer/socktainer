@@ -120,6 +120,37 @@ struct ComposeDNSTests {
         #expect(dnsServer.listEntries()["web.shop"] == nil, "qualified alias must be unregistered on delete")
     }
 
+    @Test("Delete preserves alias when another container has taken ownership")
+    func deletePreservesAliasOwnedByAnotherContainer() async throws {
+        let snapshot = try makeSnapshot(
+            nativeId: "compose-web-old", ip: "192.168.65.30",
+            labels: [
+                "com.docker.compose.service": "web",
+                "com.docker.compose.project": "shop",
+            ])
+        let dnsServer = SocktainerDNSServer()
+        // Simulate a second container claiming the same aliases before the first is deleted
+        dnsServer.register(hostname: "web", ip: "192.168.65.31")
+        dnsServer.register(hostname: "web.shop", ip: "192.168.65.31")
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.DELETE, "/v1.51/containers/abc001") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries["web"] == "192.168.65.31", "alias owned by another container must be preserved")
+        #expect(entries["web.shop"] == "192.168.65.31", "qualified alias owned by another container must be preserved")
+    }
+
     // MARK: - Network connect/disconnect return 200
 
     @Test("POST /networks/{id}/connect returns 200")
