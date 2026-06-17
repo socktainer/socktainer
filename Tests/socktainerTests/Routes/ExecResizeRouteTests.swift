@@ -8,10 +8,9 @@ import VaporTesting
 
 /// Unit tests for POST /exec/{id}/resize.
 ///
-/// The process.resize() call requires a live Apple Container process and is
-/// validated via integration testing (POST .../resize?h=50&w=120 → 200 against
-/// a running container). These tests cover the parameter validation and exec-ID
-/// lookup that are unit-testable without infrastructure.
+/// The process.resize() call requires a live Apple Container process.
+/// These tests cover the parameter validation and exec-ID lookup that
+/// are unit-testable without infrastructure.
 @Suite("ExecResizeRoute")
 struct ExecResizeRouteTests {
 

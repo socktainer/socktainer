@@ -138,7 +138,8 @@ struct DockerContainerFilterUtility {
 // utility for parsing volume filters from query string
 struct DockerVolumeFilterUtility {
     static func parsePruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
-        let allowedKeys: Set<String> = ["label", "all"]
+        // "label!" is the key Docker CLI sends for --filter label!=key (negative match).
+        let allowedKeys: Set<String> = ["label", "label!", "all"]
         var filters: [String: Any] = [:]
         var parsedFilters: [String: [String]] = [:]
         if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {

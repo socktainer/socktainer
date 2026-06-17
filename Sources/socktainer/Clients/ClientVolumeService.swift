@@ -31,7 +31,9 @@ struct ClientVolumeService: ClientVolumeProtocol {
         let volumes = results.map { Self.convert($0) }
         var parsedFilters: [String: [String]] = [:]
         var labelDictFilter: [String: Any]? = nil
-        if let filters = filters, !filters.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, filters.trimmingCharacters(in: .whitespacesAndNewlines) != "{}" {
+        if let filters = filters, !filters.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            filters.trimmingCharacters(in: .whitespacesAndNewlines) != "{}"
+        {
             guard let data = filters.data(using: .utf8),
                 let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
             else {
@@ -52,11 +54,19 @@ struct ClientVolumeService: ClientVolumeProtocol {
                 }
             }
         }
-        if parsedFilters.isEmpty {
+        return Self.applyFilters(volumes, parsedFilters: parsedFilters, labelDictFilter: labelDictFilter)
+    }
+
+    /// Applies parsed volume filters to a list of volumes.
+    static func applyFilters(
+        _ volumes: [Volume],
+        parsedFilters: [String: [String]],
+        labelDictFilter: [String: Any]? = nil
+    ) -> [Volume] {
+        if parsedFilters.isEmpty && labelDictFilter == nil {
             return volumes
         }
-        // Filtering logic
-        let filteredVolumes = volumes.filter { volume in
+        return volumes.filter { volume in
             var matches = true
             if let names = parsedFilters["name"], !names.isEmpty {
                 matches = matches && names.contains(where: { volume.Name.contains($0) })
@@ -75,24 +85,33 @@ struct ClientVolumeService: ClientVolumeProtocol {
                 }
                 matches = matches && labelMatches
             }
+            // label! key = negative label filter (docker volume prune --filter label!=key)
+            if let negLabels = parsedFilters["label!"], !negLabels.isEmpty {
+                let volumeLabels = volume.Labels ?? [:]
+                let negMatches = negLabels.allSatisfy { labelFilter in
+                    guard let eqIdx = labelFilter.firstIndex(of: "=") else {
+                        return !LabelNormalization.filterContainsKey(labelFilter, in: volumeLabels)
+                    }
+                    let key = String(labelFilter[..<eqIdx])
+                    let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
+                    return LabelNormalization.filterValue(in: volumeLabels, forKey: key) != value
+                }
+                matches = matches && negMatches
+            }
             if let labelDict = labelDictFilter, let volumeLabels = volume.Labels {
                 let labelMatches = labelDict.allSatisfy { (key, value) in
                     if let volumeValue = volumeLabels[key] {
-                        // Compare as string
                         return String(describing: volumeValue) == String(describing: value)
                     }
                     return false
                 }
                 matches = matches && labelMatches
             }
-            // NOTE: we currently have no mechanism to correlate volumes
-            //       to containers.
+            // NOTE: we currently have no mechanism to correlate volumes to containers.
             // Filter by dangling (not referenced by any container)
-            // if let dangling = parsedFilters["dangling"], !dangling.isEmpty {
-            // }
+            // if let dangling = parsedFilters["dangling"], !dangling.isEmpty { }
             return matches
         }
-        return filteredVolumes
     }
 
     func inspect(name: String) async throws -> Volume {
