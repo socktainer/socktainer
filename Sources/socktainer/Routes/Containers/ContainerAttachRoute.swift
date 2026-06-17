@@ -286,6 +286,8 @@ extension ContainerAttachRoute {
             }
         }
 
+        await ProcessRegistry.shared.set(id: container.id, process: process)
+
         let contentType =
             isTTY
             ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
@@ -306,6 +308,7 @@ extension ContainerAttachRoute {
                     // Close pipes → readers drain → grace period → unblock /wait.
                     group.addTask {
                         let code = (try? await process.wait()) ?? 0
+                        await ProcessRegistry.shared.remove(id: container.id)
                         try? stdoutPipe?.fileHandleForWriting.close()
                         try? stderrPipe?.fileHandleForWriting.close()
                         try? stdinPipe.fileHandleForReading.close()
@@ -471,6 +474,8 @@ extension ContainerAttachRoute {
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
 
+        await ProcessRegistry.shared.set(id: container.id, process: process)
+
         guard shouldUpgrade else {
 
             return ConnectionHijackingMiddleware.createDockerStreamingResponse(
@@ -500,6 +505,7 @@ extension ContainerAttachRoute {
                             // /containers/{id}/wait can't block forever.
                             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                         }
+                        await ProcessRegistry.shared.remove(id: container.id)
                     }
 
                     if let stdoutHandle = stdoutPipe?.fileHandleForReading {
@@ -742,6 +748,7 @@ extension ContainerAttachRoute {
                         // /containers/{id}/wait can't block forever.
                         await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                     }
+                    await ProcessRegistry.shared.remove(id: container.id)
 
                     // Give a small delay for any final output to be processed
                     try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms

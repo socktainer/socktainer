@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationOS
 import Foundation
 import NIOCore
 import Vapor
@@ -100,6 +101,7 @@ struct ExecRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/exec", use: ExecRoute.createExec(client: client))
         try routes.registerVersionedRoute(.GET, pattern: "/exec/{id}/json", use: ExecRoute.inspectExec(client: client))
         try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/start", use: ExecRoute.startExec(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/resize", use: ExecRoute.resizeExec)
     }
 
     static func inspectExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
@@ -341,6 +343,8 @@ struct ExecRoute: RouteCollection {
                         throw error
                     }
 
+                    await ProcessRegistry.shared.set(id: execId, process: process)
+
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
                         if let stdoutHandle = stdoutPipe?.fileHandleForReading {
@@ -439,6 +443,7 @@ struct ExecRoute: RouteCollection {
                                 // code so the exec leaves the Running state.
                                 await ExecManager.shared.setExitCode(id: execId, code: -1)
                             }
+                            await ProcessRegistry.shared.remove(id: execId)
                         }
 
                         for await _ in group {}
@@ -495,6 +500,8 @@ struct ExecRoute: RouteCollection {
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }
+
+                await ProcessRegistry.shared.set(id: execId, process: process)
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
@@ -652,6 +659,7 @@ struct ExecRoute: RouteCollection {
                             // hanging there forever.
                             await ExecManager.shared.setExitCode(id: execId, code: -1)
                         }
+                        await ProcessRegistry.shared.remove(id: execId)
 
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
@@ -674,5 +682,31 @@ struct ExecRoute: RouteCollection {
                 // `GET /exec/{id}/json` can read the recorded exit code.
             }
         }
+    }
+
+    static let resizeExec: @Sendable (Request) async throws -> Response = { req in
+        guard let execId = req.parameters.get("id") else {
+            throw Abort(.badRequest, reason: "Missing exec ID")
+        }
+
+        guard let h = try? req.query.get(Int.self, at: "h"), h > 0 else {
+            throw Abort(.badRequest, reason: "Missing or invalid height parameter")
+        }
+
+        guard let w = try? req.query.get(Int.self, at: "w"), w > 0 else {
+            throw Abort(.badRequest, reason: "Missing or invalid width parameter")
+        }
+
+        // 404 if exec instance never existed; 200 (no-op) if it ran and already exited.
+        guard await ExecManager.shared.get(id: execId) != nil else {
+            throw Abort(.notFound, reason: "No such exec instance: \(execId)")
+        }
+
+        if let process = await ProcessRegistry.shared.get(id: execId) {
+            let size = Terminal.Size(width: UInt16(min(w, Int(UInt16.max))), height: UInt16(min(h, Int(UInt16.max))))
+            try? await process.resize(size)
+        }
+
+        return Response(status: .ok)
     }
 }
