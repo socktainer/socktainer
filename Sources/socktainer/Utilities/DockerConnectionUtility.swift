@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import NIOCore
 import NIOHTTP1
 import Vapor
@@ -80,59 +81,124 @@ private struct DockerTCPProtocolUpgrader: HTTPServerProtocolUpgrader {
 
         let channel = context.channel
         let eventLoop = context.eventLoop
+        let pipeline = context.pipeline
 
-        return context.pipeline.addHandler(tcpHandler).flatMap { _ in
-            _ = Task.detached { [streamHandler] in
-                do {
-                    try await streamHandler(channel, tcpHandler)
-                } catch {
-                    eventLoop.execute {
-                        channel.close(promise: nil)
+        // Allow the remote peer to half-close its write side (stdin EOF) without
+        // tearing down the whole channel. Without this, Docker CLI piping stdin
+        // (echo "hi" | docker run -i ...) closes the write half after sending data,
+        // which NIO interprets as a full close — the channel goes away before
+        // stdout can be sent back. With this option NIO fires .inputClosed instead.
+        return channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
+            pipeline.addHandler(tcpHandler).flatMap { _ in
+                _ = Task.detached { [streamHandler] in
+                    do {
+                        try await streamHandler(channel, tcpHandler)
+                    } catch {
+                        eventLoop.execute {
+                            channel.close(promise: nil)
+                        }
                     }
                 }
-            }
 
-            return eventLoop.makeSucceededVoidFuture()
+                return eventLoop.makeSucceededVoidFuture()
+            }
         }
     }
 }
 
-/// Channel handler that manages raw TCP communication after HTTP upgrade
+/// Channel handler that manages raw TCP communication after HTTP upgrade.
+///
+/// All writes to the stdin file descriptor are serialized through `writeQueue`,
+/// a private serial DispatchQueue. This guarantees FIFO ordering and prevents
+/// byte-interleaving between concurrent callers (channelRead on the NIO event
+/// loop, setStdinWriter from a detached Swift Task).
+///
+/// The NSLock protects the mutable flags and stdinWriter pointer across threads.
+/// The writeQueue serializes the actual fd writes independently of the lock, so
+/// writes never hold the lock while potentially blocking on a full pipe.
 public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable {
     public typealias InboundIn = ByteBuffer
 
     let execId: String
     let ttyEnabled: Bool
+    private let lock = NSLock()
+    private static let logger = Logger(label: "DockerTCPHandler")
+    // Serial queue — all fd writes and closes go through here.
+    // Guarantees: (1) FIFO across concurrent callers, (2) no byte-interleaving
+    // for writes > PIPE_BUF, (3) close always follows all pending writes.
+    private let writeQueue = DispatchQueue(label: "DockerTCPHandler.stdin", qos: .userInteractive)
     private var stdinWriter: FileHandle?
+    // Buffers stdin bytes arriving before setStdinWriter is called.
+    // Capped at 1 MiB to prevent unbounded growth if setup is delayed.
+    private var pendingData: [Data] = []
+    private var pendingDataSize: Int = 0
+    private static let pendingDataMaxBytes = 1 * 1024 * 1024  // 1 MiB
+    private var didReceiveInputClosed = false
+    private var isChannelInactive = false
 
     init(execId: String, ttyEnabled: Bool) {
         self.execId = execId
         self.ttyEnabled = ttyEnabled
     }
 
-    public func channelActive(context: ChannelHandlerContext) {
+    deinit {
+        // Defensive cleanup for exceptional teardown paths where channelInactive
+        // never fires. deinit only runs when the stream handler Task has released
+        // its reference, so writeQueue is idle — direct close is safe.
+        lock.lock()
+        let writer = stdinWriter
+        stdinWriter = nil
+        lock.unlock()
+        try? writer?.close()
     }
+
+    public func channelActive(context: ChannelHandlerContext) {}
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let buffer = unwrapInboundIn(data)
+        guard let data = buffer.getData(at: 0, length: buffer.readableBytes) else { return }
+        writeToStdin(data)
+    }
 
-        // Handle raw TCP input from client (stdin)
-        // This data should be forwarded to the process stdin
-        if let stdinWriter = self.stdinWriter {
-            if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
-                do {
-                    try stdinWriter.write(contentsOf: data)
-
-                    // Force flush the data to ensure it reaches the process
-                    try stdinWriter.synchronize()
-                } catch {
-                    // Failed to write to stdin
-                }
+    /// Core write path — buffers when no writer is set yet; dispatches to
+    /// writeQueue otherwise. Called by channelRead and exposed for unit tests.
+    func writeToStdin(_ data: Data) {
+        lock.lock()
+        let writer = stdinWriter
+        if writer == nil {
+            if pendingDataSize + data.count <= Self.pendingDataMaxBytes {
+                pendingData.append(data)
+                pendingDataSize += data.count
             } else {
-                // No buffer data available
+                Self.logger.warning(
+                    "[\(execId)] stdin buffer full (\(Self.pendingDataMaxBytes) B) — discarding \(data.count) B"
+                )
+            }
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        writeQueue.async { [execId] in
+            do { try writer!.write(contentsOf: data) } catch { Self.logger.error("[\(execId)] stdin write failed: \(error)") }
+        }
+    }
+
+    // Fired when Docker CLI half-closes its write side (stdin EOF).
+    // Dispatching the close through writeQueue ensures it runs after all
+    // previously queued writes, so the process sees EOF only after all data.
+    public func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if (event as? ChannelEvent) == .inputClosed {
+            lock.lock()
+            didReceiveInputClosed = true
+            let writer = stdinWriter
+            stdinWriter = nil
+            lock.unlock()
+            if let writer {
+                writeQueue.async { try? writer.close() }
             }
         } else {
-            // No stdin writer available
+            context.fireUserInboundEventTriggered(event)
         }
     }
 
@@ -141,12 +207,78 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
-        try? stdinWriter?.close()
+        lock.lock()
+        isChannelInactive = true
+        let writer = stdinWriter
+        stdinWriter = nil
+        lock.unlock()
+        if let writer {
+            writeQueue.async { try? writer.close() }
+        }
     }
 
-    // Method to set the stdin writer from the stream handler
+    /// Set the stdin writer. Publishes the writer and enqueues the buffered-data
+    /// flush atomically under the lock, so any concurrent writeToStdin that
+    /// observes the new writer (and enqueues its write after our unlock) is
+    /// guaranteed to be ordered after the flush — true FIFO preserved.
+    /// writeQueue.async is non-blocking so enqueuing under the lock is safe.
     public func setStdinWriter(_ writer: FileHandle?) {
-        self.stdinWriter = writer
+        lock.lock()
+        let buffered = pendingData
+        pendingData = []
+        pendingDataSize = 0
+        let shouldClose = didReceiveInputClosed || isChannelInactive
+        if let writer {
+            if !shouldClose { stdinWriter = writer }
+            writeQueue.async { [execId] in
+                for data in buffered {
+                    do { try writer.write(contentsOf: data) } catch {
+                        Self.logger.error("[\(execId)] stdin flush failed: \(error)")
+                    }
+                }
+                if shouldClose { try? writer.close() }
+            }
+        }
+        lock.unlock()
+    }
+
+    // MARK: - Test helpers
+
+    /// Returns the total bytes currently buffered in pendingData.
+    var pendingDataSizeForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingDataSize
+    }
+
+    /// Blocks until all pending writeQueue work completes. Call before reading
+    /// pipe state in tests that write asynchronously through writeQueue.
+    func drainForTesting() {
+        writeQueue.sync {}
+    }
+
+    /// Simulates channelInactive without a NIO context (tests only).
+    func simulateChannelInactive() {
+        lock.lock()
+        isChannelInactive = true
+        let writer = stdinWriter
+        stdinWriter = nil
+        lock.unlock()
+        if let writer {
+            writeQueue.async { try? writer.close() }
+        }
+    }
+
+    /// Simulates .inputClosed without a NIO context (tests only).
+    func simulateInputClosed() {
+        lock.lock()
+        didReceiveInputClosed = true
+        let writer = stdinWriter
+        stdinWriter = nil
+        lock.unlock()
+        if let writer {
+            writeQueue.async { try? writer.close() }
+        }
     }
 }
 
