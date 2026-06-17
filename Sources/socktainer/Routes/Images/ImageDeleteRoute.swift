@@ -32,7 +32,7 @@ extension ImageDeleteRoute {
 
             // Optional: broadcast event
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-            let event = DockerEvent.simpleEvent(id: imageRef, type: "image", status: "remove")
+            let event = DockerEvent.simpleEvent(id: imageRef, type: "image", status: "remove", image: imageRef)
             await broadcaster.broadcast(event)
 
             let deleteResponse = [
