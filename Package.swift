@@ -42,6 +42,9 @@ let package = Package(
                 .product(name: "DataCompression", package: "DataCompression"),
                 "BuildInfo",
             ],
+            resources: [
+                .copy("Resources/socktainer-dns-embedded.tar.gz")
+            ]
         ),
         .testTarget(
             name: "socktainerTests",

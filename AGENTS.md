@@ -65,6 +65,16 @@ Agent skills live in `.agents/skills/`. Each skill has a `SKILL.md` file describ
 | `make fmt` | Format Swift source code |
 | `make test` | Run the unit test suite |
 | `make release` | Build in release mode |
+| `make build-dns` | Rebuild embedded DNS forwarder binary + OCI tarball |
+
+### Embedded DNS forwarder
+
+The inter-container DNS sidecar uses a minimal Go UDP proxy bundled directly in the socktainer binary (no DockerHub pull). Two pre-built artefacts are committed to the repository:
+
+- `Sources/dns-forwarder/dns-forwarder` — static Linux arm64 binary (~2 MB)
+- `Sources/socktainer/Resources/socktainer-dns-embedded.tar.gz` — OCI image tarball (~900 KB)
+
+**These files only need to be rebuilt when `Sources/dns-forwarder/main.go` changes.** Rebuild with `make build-dns`, which requires Go and a running Docker daemon (Colima or Docker Desktop). Commit both files after rebuilding. The `make build` / CI pipeline does not require Go — the pre-built artefacts are used as-is.
 
 Tests are in `Tests/socktainerTests/`. The PR CI (`pr-check.yaml`) runs: format check, unit tests, release build, installer build, and integration tests.
 

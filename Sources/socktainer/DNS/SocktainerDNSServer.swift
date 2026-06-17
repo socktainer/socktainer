@@ -44,7 +44,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
     /// Tries to bind to `preferredPort`, then `preferredPort+1`, `+2`, up to `maxAttempts`.
     /// Returns the port that was successfully bound, or nil if all attempts failed.
-    /// The resolved port must be passed to NetworkDNSManager so Corefiles reference the right one.
+    /// The resolved port is passed to NetworkDNSManager so the DNS container uses the right upstream.
     @discardableResult
     func start(preferredPort: Int = 2054, maxAttempts: Int = 10) -> Int? {
         for offset in 0..<maxAttempts {
