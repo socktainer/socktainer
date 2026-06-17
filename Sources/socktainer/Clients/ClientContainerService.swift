@@ -51,21 +51,31 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = try await containerClient.list()
-        var containers = allContainers
-        if !showAll {
-            containers = containers.filter { $0.status == .running }
-        }
+        let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
+        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+    }
+
+    /// Applies parsed Docker container filters to a snapshot list.
+    /// `allContainers` is the unfiltered set used by `before`/`since` for
+    /// relative ordering; defaults to `containers` when not available.
+    static func applyFilters(
+        _ containers: [ContainerSnapshot],
+        filters: [String: [String]],
+        allContainers: [ContainerSnapshot] = []
+    ) -> [ContainerSnapshot] {
+        let referencePool = allContainers.isEmpty ? containers : allContainers
+        var result = containers
         for (key, values) in filters {
             switch key {
             case "status":
-                containers = containers.filter { values.contains($0.status.mobyState) }
+                result = result.filter { values.contains($0.status.mobyState) }
             case "exited":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     guard container.status == .stopped else { return false }
                     return values.contains("0") || values.isEmpty
                 }
             case "label":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let labels = container.configuration.labels
                     return values.allSatisfy { labelFilter in
                         guard let eqIdx = labelFilter.firstIndex(of: "=") else {
@@ -77,19 +87,22 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                containers = containers.filter { values.contains($0.id) }
+                result = result.filter { values.contains($0.id) }
             case "id":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     values.contains { value in
                         container.id == value || DockerContainerID.hexId(for: container).hasPrefix(value)
                     }
                 }
             case "ancestor":
-                containers = containers.filter { values.contains($0.configuration.image.reference) }
+                result = result.filter { values.contains($0.configuration.image.reference) }
             case "before":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     for beforeId in values {
-                        if let beforeContainer = allContainers.first(where: { $0.id == beforeId || $0.id.hasPrefix(beforeId) }) {
+                        if let beforeContainer = referencePool.first(where: {
+                            $0.id == beforeId || $0.id.hasPrefix(beforeId)
+                                || DockerContainerID.hexId(for: $0).hasPrefix(beforeId)
+                        }) {
                             if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
@@ -101,9 +114,12 @@ struct ClientContainerService: ClientContainerProtocol {
                     return false
                 }
             case "since":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     for sinceId in values {
-                        if let sinceContainer = allContainers.first(where: { $0.id == sinceId || $0.id.hasPrefix(sinceId) }) {
+                        if let sinceContainer = referencePool.first(where: {
+                            $0.id == sinceId || $0.id.hasPrefix(sinceId)
+                                || DockerContainerID.hexId(for: $0).hasPrefix(sinceId)
+                        }) {
                             if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
@@ -120,45 +136,37 @@ struct ClientContainerService: ClientContainerProtocol {
                 // so we skip it here to avoid a stale heuristic.
                 break
             case "volume":
-                containers = containers.filter { container in
-                    values.contains("volume-filter-not-implemented")
-                }
+                result = result.filter { _ in false }
             case "expose":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let exposedPorts = container.configuration.publishedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" }
-                    return values.allSatisfy { port in
-                        exposedPorts.contains { $0.contains(port) }
-                    }
+                    return values.allSatisfy { port in exposedPorts.contains { $0.contains(port) } }
                 }
             case "isolation":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let isolation = container.configuration.platform.os == "linux" ? "process" : "hyperv"
                     return values.contains(isolation)
                 }
             case "is-task":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let isTask = container.configuration.labels["com.docker.swarm.task.id"] != nil
                     return values.contains(isTask ? "true" : "false")
                 }
             case "network":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let networkNames = container.networks.map { $0.network }
-                    return values.allSatisfy { networkName in
-                        networkNames.contains(networkName)
-                    }
+                    return values.allSatisfy { networkNames.contains($0) }
                 }
             case "publish":
-                containers = containers.filter { container in
+                result = result.filter { container in
                     let publishedPorts = container.configuration.publishedPorts.map { "\($0.hostPort):\($0.containerPort)" }
-                    return values.allSatisfy { portMapping in
-                        publishedPorts.contains { $0.contains(portMapping) }
-                    }
+                    return values.allSatisfy { portMapping in publishedPorts.contains { $0.contains(portMapping) } }
                 }
             default:
                 continue
             }
         }
-        return containers
+        return result
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
