@@ -1,4 +1,6 @@
 import ContainerAPIClient
+import ContainerPersistence
+import ContainerizationError
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -11,14 +13,25 @@ func configure(_ app: Application) async throws {
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
 
+    let systemConfig: ContainerSystemConfig
+    do {
+        systemConfig = try await ConfigurationLoader.load()
+    } catch let err as ContainerizationError {
+        app.logger.error("System config is malformed — falling back to defaults. Fix your config.toml: \(err)")
+        systemConfig = ContainerSystemConfig()
+    } catch {
+        app.logger.warning("Failed to load system config at startup, using defaults: \(error)")
+        systemConfig = ContainerSystemConfig()
+    }
+
     let containerClient = ClientContainerService()
-    let imageClient = ClientImageService()
+    let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
-    let volumeClinet = ClientVolumeService()
+    let volumeClient = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl)
+    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -29,7 +42,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
 
     // /info
-    try app.register(collection: InfoRoute())
+    try app.register(collection: InfoRoute(imageClient: imageClient))
 
     // /events
     try app.register(collection: EventsRoute(client: healthCheckClient))
@@ -42,7 +55,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerAttachRoute(client: containerClient))
     try app.register(collection: ContainerAttachWSRoute())
     try app.register(collection: ContainerChangesRoute())
-    try app.register(collection: ContainerCreateRoute(client: containerClient))
+    try app.register(collection: ContainerCreateRoute(client: containerClient, systemConfig: systemConfig))
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute())
     try app.register(collection: ContainerInspectRoute(client: containerClient))
@@ -64,23 +77,23 @@ func configure(_ app: Application) async throws {
 
     // /images
     try app.register(collection: ImageDeleteRoute(client: imageClient))
-    try app.register(collection: ImageHistoryRoute(client: imageClient))
+    try app.register(collection: ImageHistoryRoute(systemConfig: systemConfig))
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
     try app.register(collection: ImageCreateRoute(client: imageClient))
     try app.register(collection: ImagePushRoute(client: imageClient))
     try app.register(collection: ImageSearchRoute())
-    try app.register(collection: ImageInspectRoute(client: imageClient))
-    try app.register(collection: ImageTagRoute())
+    try app.register(collection: ImageInspectRoute(systemConfig: systemConfig))
+    try app.register(collection: ImageTagRoute(systemConfig: systemConfig))
     try app.register(collection: ImagesGetRoute(client: imageClient))
     try app.register(collection: ImagesLoadRoute(client: imageClient))
 
     // /volumes
-    try app.register(collection: VolumeCreateRoute(client: volumeClinet))
-    try app.register(collection: VolumeDeleteRoute(client: volumeClinet))
-    try app.register(collection: VolumeInspectRoute(client: volumeClinet))
-    try app.register(collection: VolumeListRoute(client: volumeClinet))
-    try app.register(collection: VolumePruneRoute(client: volumeClinet))
+    try app.register(collection: VolumeCreateRoute(client: volumeClient))
+    try app.register(collection: VolumeDeleteRoute(client: volumeClient))
+    try app.register(collection: VolumeInspectRoute(client: volumeClient))
+    try app.register(collection: VolumeListRoute(client: volumeClient))
+    try app.register(collection: VolumePruneRoute(client: volumeClient))
 
     // /swarm
     try app.register(collection: SwarmInitRoute())
@@ -102,7 +115,7 @@ func configure(_ app: Application) async throws {
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
-    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient))
+    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig))
     try app.register(collection: DistributionJsonRoute())
 
     // --- plugin routes ---
@@ -153,7 +166,7 @@ func configure(_ app: Application) async throws {
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: CommitRoute())
-    try app.register(collection: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClinet, builderClient: builderClient))
+    try app.register(collection: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient))
     try app.register(collection: VersionRoute())
 
     // Initialize broadcaster
@@ -181,7 +194,7 @@ func configure(_ app: Application) async throws {
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
     app.storage[SocktainerDNSServerKey.self] = dnsServer
 
-    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort)
+    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
     app.storage[NetworkDNSManagerKey.self] = dnsManager
 
     // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and

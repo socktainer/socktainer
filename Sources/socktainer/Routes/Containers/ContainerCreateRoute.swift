@@ -10,8 +10,10 @@ import Vapor
 
 struct ContainerCreateRoute: RouteCollection {
     let client: ClientContainerProtocol
+    let systemConfig: ContainerSystemConfig
+
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/create", use: ContainerCreateRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/create", use: ContainerCreateRoute.handler(client: client, systemConfig: systemConfig))
     }
 
 }
@@ -52,7 +54,7 @@ struct CreateContainerRequest: Content {
 }
 
 extension ContainerCreateRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerCreate {
+    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> RESTContainerCreate {
         { req in
             let query = try req.query.decode(ContainerCreateQuery.self)
 
@@ -75,7 +77,7 @@ extension ContainerCreateRoute {
 
             // Check if image exists locally
             do {
-                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: ContainerSystemConfig())
+                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: systemConfig)
             } catch {
                 throw Abort(.notFound, reason: "No such image: \(body.Image)")
             }
@@ -90,7 +92,7 @@ extension ContainerCreateRoute {
                 img = try await ClientImage.fetch(
                     reference: body.Image,
                     platform: requestedPlatform,
-                    containerSystemConfig: ContainerSystemConfig()
+                    containerSystemConfig: systemConfig
                 )
                 // Case 2: image exists locally but may have been pulled as amd64
                 if requestedPlatform.architecture == "arm64",
@@ -110,7 +112,7 @@ extension ContainerCreateRoute {
                 img = try await ClientImage.fetch(
                     reference: body.Image,
                     platform: amd64,
-                    containerSystemConfig: ContainerSystemConfig()
+                    containerSystemConfig: systemConfig
                 )
                 requestedPlatform = amd64
             }
@@ -123,8 +125,8 @@ extension ContainerCreateRoute {
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
             let initImage = try await ClientImage.fetch(
-                reference: ContainerSystemConfig().vminit.image, platform: .current,
-                containerSystemConfig: ContainerSystemConfig()
+                reference: systemConfig.vminit.image, platform: .current,
+                containerSystemConfig: systemConfig
             )
 
             _ = try await initImage.getCreateSnapshot(

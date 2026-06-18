@@ -9,10 +9,10 @@ struct RESTImageHistoryQuery: Vapor.Content {
 }
 
 struct ImageHistoryRoute: RouteCollection {
-    let client: ClientImageProtocol
+    let systemConfig: ContainerSystemConfig
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/history", use: ImageHistoryRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/history", use: ImageHistoryRoute.handler(systemConfig: systemConfig))
     }
 }
 
@@ -119,7 +119,7 @@ extension ImageHistoryRoute {
         throw Abort(.notFound, reason: "Image '\(requestedName)' not found")
     }
 
-    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageHistoryResponseItem] {
+    static func handler(systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> [RESTImageHistoryResponseItem] {
         { req in
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
@@ -133,11 +133,9 @@ extension ImageHistoryRoute {
                 preferredPlatform = nil
             }
 
-            _ = client
-
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: ContainerSystemConfig())
+                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }

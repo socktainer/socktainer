@@ -3,8 +3,12 @@ import ContainerPersistence
 import Vapor
 
 struct ImageTagRoute: RouteCollection {
+    let systemConfig: ContainerSystemConfig
+
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag", use: ImageTagRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag") { [systemConfig] req in
+            try await ImageTagRoute.handler(req, systemConfig: systemConfig)
+        }
     }
 }
 
@@ -14,7 +18,7 @@ struct RESTImageTagQuery: Vapor.Content {
 }
 
 extension ImageTagRoute {
-    static func handler(_ req: Request) async throws -> Response {
+    static func handler(_ req: Request, systemConfig: ContainerSystemConfig) async throws -> Response {
         guard let sourceImageName = req.parameters.get("name") else {
             throw Abort(.badRequest, reason: "Missing image name parameter")
         }
@@ -25,17 +29,16 @@ extension ImageTagRoute {
             throw Abort(.badRequest, reason: "repo parameter is required")
         }
 
-        let containerSystemConfig = ContainerSystemConfig()
         let targetReference = try {
             if let tag = query.tag, !tag.isEmpty {
-                return try ClientImage.normalizeReference("\(repo):\(tag)", containerSystemConfig: containerSystemConfig)
+                return try ClientImage.normalizeReference("\(repo):\(tag)", containerSystemConfig: systemConfig)
             }
-            return try ClientImage.normalizeReference(repo, containerSystemConfig: containerSystemConfig)
+            return try ClientImage.normalizeReference(repo, containerSystemConfig: systemConfig)
         }()
 
         let sourceImage: ClientImage
         do {
-            sourceImage = try await ClientImage.get(reference: sourceImageName, containerSystemConfig: containerSystemConfig)
+            sourceImage = try await ClientImage.get(reference: sourceImageName, containerSystemConfig: systemConfig)
         } catch {
             throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
         }

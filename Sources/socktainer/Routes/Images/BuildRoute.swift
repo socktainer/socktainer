@@ -16,14 +16,16 @@ struct BuildRoute: RouteCollection {
 
     let client: ClientContainerProtocol
     let builderClient: ClientBuilderProtocol
+    let systemConfig: ContainerSystemConfig
 
-    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) {
+    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) {
         self.client = client
         self.builderClient = builderClient
+        self.systemConfig = systemConfig
     }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient))
+        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient, systemConfig: systemConfig))
 
     }
 
@@ -104,7 +106,8 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
-    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
+    {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
 
@@ -262,6 +265,7 @@ extension BuildRoute {
                             memory: memory,
                             quiet: quiet,
                             builderClient: builderClient,
+                            systemConfig: systemConfig,
                             writer: writer,
                             logger: req.logger
                         )
@@ -337,6 +341,7 @@ extension BuildRoute {
         memory: Int,
         quiet: Bool,
         builderClient: ClientBuilderProtocol,
+        systemConfig: ContainerSystemConfig,
         writer: BodyStreamWriter,
         logger: Logger
     ) async throws {
@@ -453,7 +458,7 @@ extension BuildRoute {
             cacheIn: [],
             cacheOut: [],
             pull: pull,
-            containerSystemConfig: ContainerSystemConfig()
+            containerSystemConfig: systemConfig
         )
 
         sendStreamMessage(" ---> Starting build process")

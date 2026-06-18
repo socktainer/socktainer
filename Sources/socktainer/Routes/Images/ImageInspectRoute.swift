@@ -10,10 +10,10 @@ struct RESTImageInspectQuery: Vapor.Content {
 }
 
 struct ImageInspectRoute: RouteCollection {
-    let client: ClientImageProtocol
+    let systemConfig: ContainerSystemConfig
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json", use: ImageInspectRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json", use: ImageInspectRoute.handler(systemConfig: systemConfig))
     }
 }
 
@@ -124,7 +124,7 @@ extension ImageInspectRoute {
         return try platformOrThrow(platformString)
     }
 
-    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> RESTImageInspect {
+    static func handler(systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> RESTImageInspect {
         { req in
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
@@ -136,11 +136,9 @@ extension ImageInspectRoute {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
 
-            _ = client
-
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: ContainerSystemConfig())
+                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }

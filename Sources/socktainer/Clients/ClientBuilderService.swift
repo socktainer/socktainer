@@ -52,19 +52,22 @@ struct ClientBuilderService: ClientBuilderProtocol {
     private let builderCPUs: Int64
     private let builderMemory: String
     private let appSupportURL: URL
+    private let containerSystemConfig: ContainerSystemConfig
 
     init(
         builderContainerId: String = "buildkit",
         builderPort: UInt32 = 8088,
         builderCPUs: Int64 = 2,
         builderMemory: String = "2048MB",
-        appSupportURL: URL
+        appSupportURL: URL,
+        containerSystemConfig: ContainerSystemConfig
     ) {
         self.builderContainerId = builderContainerId
         self.builderPort = builderPort
         self.builderCPUs = builderCPUs
         self.builderMemory = builderMemory
         self.appSupportURL = appSupportURL
+        self.containerSystemConfig = containerSystemConfig
     }
 
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
@@ -205,11 +208,11 @@ struct ClientBuilderService: ClientBuilderProtocol {
             try FileManager.default.createDirectory(at: exportsMount, withIntermediateDirectories: true)
         }
 
-        let builderImage = BuildConfig.defaultImage
+        let builderImage = containerSystemConfig.build.image
         let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
-        let useRosetta = BuildConfig.defaultRosetta
+        let useRosetta = containerSystemConfig.build.rosetta
 
-        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform, containerSystemConfig: ContainerSystemConfig())
+        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform, containerSystemConfig: containerSystemConfig)
         _ = try await image.getCreateSnapshot(platform: builderPlatform)
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
