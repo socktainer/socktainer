@@ -30,13 +30,15 @@ actor NetworkDNSManager {
 
     private let appSupportURL: URL
     private let dnsPort: Int
+    private let containerSystemConfig: ContainerSystemConfig
     private var containerIPs: [String: String] = [:]  // networkId → CoreDNS container IP
     private var pendingCreation: [String: Task<String, Error>] = [:]
     private var log = Logger(label: "socktainer.dns.manager")
 
-    init(appSupportURL: URL, dnsPort: Int = 2054) {
+    init(appSupportURL: URL, dnsPort: Int = 2054, containerSystemConfig: ContainerSystemConfig) {
         self.appSupportURL = appSupportURL
         self.dnsPort = dnsPort
+        self.containerSystemConfig = containerSystemConfig
     }
 
     // MARK: - Public API
@@ -57,8 +59,9 @@ actor NetworkDNSManager {
         log.info("[dns-manager] creating CoreDNS container for network \(networkId)")
         let appSupportURL = self.appSupportURL
         let dnsPort = self.dnsPort
+        let containerSystemConfig = self.containerSystemConfig
         let task = Task<String, Error> {
-            try await Self.createDNSContainerWork(networkId: networkId, appSupportURL: appSupportURL, dnsPort: dnsPort)
+            try await Self.createDNSContainerWork(networkId: networkId, appSupportURL: appSupportURL, dnsPort: dnsPort, containerSystemConfig: containerSystemConfig)
         }
         pendingCreation[networkId] = task
 
@@ -126,7 +129,7 @@ actor NetworkDNSManager {
     // MARK: - Private implementation
 
     /// Runs outside the actor's executor to avoid deadlock with the Task created in ensureDNSContainer.
-    private static func createDNSContainerWork(networkId: String, appSupportURL: URL, dnsPort: Int) async throws -> String {
+    private static func createDNSContainerWork(networkId: String, appSupportURL: URL, dnsPort: Int, containerSystemConfig: ContainerSystemConfig) async throws -> String {
         let containerClient = ContainerClient()
         // Sanitize to respect Apple Container's 64-char container ID limit
         let containerId = ContainerNameUtility.sanitize(containerPrefix + networkId)
@@ -157,7 +160,6 @@ actor NetworkDNSManager {
         try corefile.write(to: corefileURL, atomically: true, encoding: .utf8)
 
         // Pull CoreDNS image — arm64 native, no Rosetta needed
-        let containerSystemConfig = ContainerSystemConfig()
         let imageRef = try ClientImage.normalizeReference("docker.io/coredns/coredns:latest", containerSystemConfig: containerSystemConfig)
         let platform = Platform.current
         let image = try await ClientImage.fetch(reference: imageRef, platform: platform, containerSystemConfig: containerSystemConfig)

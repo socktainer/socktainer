@@ -31,7 +31,11 @@ enum ClientImageError: Error {
 }
 
 struct ClientImageService: ClientImageProtocol {
-    private let containerSystemConfig = ContainerSystemConfig()
+    private let containerSystemConfig: ContainerSystemConfig
+
+    init(containerSystemConfig: ContainerSystemConfig) {
+        self.containerSystemConfig = containerSystemConfig
+    }
 
     // Workaround for narrowing an unspecified push from all platforms to a single platform available.
     // This avoids container push failures caused by missing blobs for non local platforms.
@@ -79,7 +83,7 @@ struct ClientImageService: ClientImageProtocol {
         let filteredImages = allImages.filter { img in
             let ref = img.reference.trimmingCharacters(in: .whitespacesAndNewlines)
             let isDigest = ref.contains("@sha256:")
-            let isInfra = Utility.isInfraImage(name: ref, builderImage: BuildConfig.defaultImage, initImage: VminitConfig.defaultImage)
+            let isInfra = Utility.isInfraImage(name: ref, builderImage: containerSystemConfig.build.image, initImage: containerSystemConfig.vminit.image)
             return isDigest || !isInfra
         }
         return filteredImages
