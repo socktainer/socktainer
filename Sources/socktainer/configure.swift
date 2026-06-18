@@ -42,7 +42,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
 
     // /info
-    try app.register(collection: InfoRoute(imageClient: imageClient))
+    try app.register(collection: InfoRoute(containerClient: containerClient, imageClient: imageClient))
 
     // /events
     try app.register(collection: EventsRoute(client: healthCheckClient))
