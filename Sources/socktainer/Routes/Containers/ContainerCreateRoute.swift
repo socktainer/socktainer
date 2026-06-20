@@ -424,7 +424,6 @@ extension ContainerCreateRoute {
 
                     let volume: ContainerResource.VolumeConfiguration
                     if let existing = existingVolume {
-                        // Volume exists, use it
                         volume = existing
                     } else {
                         // Volume doesn't exist, create it automatically (Docker behavior)
@@ -436,6 +435,20 @@ extension ContainerCreateRoute {
                             driverOpts: [:],
                             labels: [:]
                         )
+                    }
+
+                    // Strip /lost+found when PGDATA matches this volume's destination.
+                    // Every official Postgres image sets PGDATA as a Docker ENV, so
+                    // this reliably targets the exact volume that initdb will reject.
+                    let pgdata =
+                        mergedEnv
+                        .first(where: { $0.hasPrefix("PGDATA=") })
+                        .map { String($0.dropFirst("PGDATA=".count)) }
+                    if let pgdata, parsed.destination == pgdata,
+                        volume.format == "ext4",
+                        VolumeImageCleaner.isEnabled(labels: volume.labels)
+                    {
+                        VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
                     }
 
                     // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
