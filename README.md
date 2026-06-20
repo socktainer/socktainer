@@ -24,6 +24,7 @@
   - [Usage 🚀](#usage-🚀)
     - [Volume sync mode](#volume-sync-mode)
     - [VM memory](#vm-memory)
+    - [Volume compatibility — Postgres](#volume-compatibility--postgres)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
     - [Build & Run](#build-run)
@@ -244,6 +245,16 @@ services:
     image: redis:alpine
     mem_limit: 256m
 ```
+
+### Volume compatibility — Postgres
+
+Apple Container's EXT4 volumes always contain `/lost+found`, which causes
+`initdb` to fail with "directory exists but is not empty". Socktainer
+automatically removes it when a Postgres container is created, before
+`initdb` runs.
+
+**Opt out** — set `SOCKTAINER_CLEAN_VOLUMES=false` globally, or label a
+specific volume with `socktainer.clean-volumes=false`.
 
 ---
 
