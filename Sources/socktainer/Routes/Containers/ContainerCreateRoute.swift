@@ -437,14 +437,10 @@ extension ContainerCreateRoute {
                         )
                     }
 
-                    // Strip /lost+found when PGDATA matches this volume's destination.
-                    // Every official Postgres image sets PGDATA as a Docker ENV, so
-                    // this reliably targets the exact volume that initdb will reject.
-                    let pgdata =
-                        mergedEnv
-                        .first(where: { $0.hasPrefix("PGDATA=") })
-                        .map { String($0.dropFirst("PGDATA=".count)) }
-                    if let pgdata, parsed.destination == pgdata,
+                    // Strip /lost+found when PGDATA is set (any value) — that
+                    // reliably signals a Postgres container, and named volumes are
+                    // always mounted at their root so /lost+found is always reachable.
+                    if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
                         volume.format == "ext4",
                         VolumeImageCleaner.isEnabled(labels: volume.labels)
                     {
