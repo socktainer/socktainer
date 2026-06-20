@@ -5,14 +5,23 @@ import SystemPackage
 
 /// Removes `/lost+found` from the EXT4 image backing a named volume.
 ///
-/// Apple Container always creates `/lost+found` at the volume root; Postgres's
-/// `initdb` rejects a non-empty data directory. Triggered only when `PGDATA`
-/// matches the volume's mount destination — that is the reliable signal that
-/// `initdb` will run here. Idempotent: no-op when `/lost+found` is absent.
+/// Apple Container always creates `/lost+found` at the volume root, which
+/// causes Postgres's `initdb` to reject the directory as non-empty. Named
+/// volumes are always mounted at their root, so `/lost+found` is always at
+/// the top of every mount — the EXT4 reformat is idempotent (no-op when
+/// already absent) and safe for all images.
 /// Best-effort: failures are logged and never propagate to the caller.
 enum VolumeImageCleaner {
     static let optOutLabel = "socktainer.clean-volumes"
     static let optOutEnvVar = "SOCKTAINER_CLEAN_VOLUMES"
+
+    /// Returns true when `PGDATA` is set in `mergedEnv` (any value), which
+    /// reliably identifies a Postgres container regardless of the actual path.
+    /// Named volumes are always mounted at their root, so any EXT4 named volume
+    /// used by a Postgres container may contain `/lost+found` at the mount root.
+    static func isPostgresDataVolume(mergedEnv: [String]) -> Bool {
+        mergedEnv.contains(where: { $0.hasPrefix("PGDATA=") })
+    }
 
     /// Returns false when opted out via `SOCKTAINER_CLEAN_VOLUMES=false` or
     /// the `socktainer.clean-volumes=false` volume label.
@@ -39,9 +48,9 @@ enum VolumeImageCleaner {
 
         // Use the real file size, not the optional volume metadata.
         guard let attributes = try? fm.attributesOfItem(atPath: imagePath),
-            let size = (attributes[.size] as? NSNumber)?.uint64Value, size >= 256 * 1024
+            let size = (attributes[.size] as? NSNumber)?.uint64Value, size >= 4 * 1024 * 1024
         else {
-            logger.warning("[volume-clean] skip: cannot determine a valid size for \(imagePath)")
+            logger.warning("[volume-clean] skip: image too small to be a valid EXT4 filesystem: \(imagePath)")
             return
         }
 

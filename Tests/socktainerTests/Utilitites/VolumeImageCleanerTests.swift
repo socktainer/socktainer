@@ -7,13 +7,17 @@ import Testing
 @testable import socktainer
 
 /// Tests for VolumeImageCleaner — removing `/lost+found` from fresh EXT4 volumes.
-struct VolumeImageCleanerTests {
+final class VolumeImageCleanerTests {
     let tempDir: URL
     let logger = Logger(label: "test.volume-clean")
 
     init() {
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("vol-clean-tests-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: tempDir)
     }
 
     /// Formats a fresh EXT4 image the way Apple Container does — which always
@@ -73,6 +77,35 @@ struct VolumeImageCleanerTests {
         let editor = try EXT4Editor(devicePath: FilePath(img.path))
         #expect(editor.exists(path: "/") == true)
         #expect(editor.exists(path: "/lost+found") == false)
+    }
+
+    @Test("User files written after the initial clean are preserved on subsequent calls")
+    func userFilesPreservedOnSubsequentCalls() throws {
+        // Safety guarantee: once /lost+found is gone the cleaner is a no-op,
+        // so data written after the first clean (e.g. by initdb) is never wiped.
+        let img = try freshExt4Image()
+        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+
+        let editor = try EXT4Editor(devicePath: FilePath(img.path))
+        try editor.createDirectory(path: "/userdata", uid: 0, gid: 0)
+        try editor.sync()
+
+        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)  // must be no-op
+
+        let verifier = try EXT4Editor(devicePath: FilePath(img.path))
+        #expect(verifier.exists(path: "/userdata") == true)
+        #expect(verifier.exists(path: "/lost+found") == false)
+    }
+
+    @Test("isPostgresDataVolume detects PGDATA regardless of its value")
+    func isPostgresDataVolume() {
+        // Any PGDATA value (postgres:16 path, postgres:18 path, custom) signals Postgres.
+        #expect(VolumeImageCleaner.isPostgresDataVolume(mergedEnv: ["PGDATA=/var/lib/postgresql/data", "PATH=/usr/bin"]) == true)
+        #expect(VolumeImageCleaner.isPostgresDataVolume(mergedEnv: ["PGDATA=/var/lib/postgresql/18/docker"]) == true)
+        #expect(VolumeImageCleaner.isPostgresDataVolume(mergedEnv: ["PGDATA=/custom/path"]) == true)
+        // No PGDATA → not a Postgres container (MySQL, MongoDB, alpine, …)
+        #expect(VolumeImageCleaner.isPostgresDataVolume(mergedEnv: ["PATH=/usr/bin", "MYSQL_ROOT_PASSWORD=x"]) == false)
+        #expect(VolumeImageCleaner.isPostgresDataVolume(mergedEnv: []) == false)
     }
 
     @Test("Opt-out via env var and per-volume label")
