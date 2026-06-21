@@ -1,11 +1,293 @@
+import ContainerAPIClient
+import ContainerResource
+import ContainerizationError
+import Foundation
 import Vapor
 
+private struct ContainerAttachWSQuery: Content {
+    let logs: Bool?
+    let stream: Bool?
+    let stdin: Bool?
+    let stdout: Bool?
+    let stderr: Bool?
+    let detachKeys: String?
+}
+
 struct ContainerAttachWSRoute: RouteCollection {
+    let client: ClientContainerProtocol
+
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/attach/ws", use: ContainerAttachWSRoute.handler)
+        try routes.registerVersionedRoute(
+            .GET, pattern: "/containers/{id}/attach/ws",
+            use: ContainerAttachWSRoute.handler(client: client))
+    }
+}
+
+extension ContainerAttachWSRoute {
+
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+        { req in
+            guard let id = req.parameters.get("id") else {
+                throw Abort(.badRequest, reason: "Missing container ID")
+            }
+            let query = try req.query.decode(ContainerAttachWSQuery.self)
+            guard let container = try await client.getContainer(id: id) else {
+                throw Abort(.notFound, reason: "No such container: \(id)")
+            }
+
+            // moby: MuxStreams=false — WebSocket is the mux; raw binary frames,
+            // no stdcopy header, matches moby's wsContainersAttach behaviour.
+            return req.webSocket { req, ws in
+                Task {
+                    if container.status == .stopped {
+                        await handleStopped(
+                            ws: ws, req: req, hexId: id, container: container, query: query)
+                    } else {
+                        await handleRunning(ws: ws, req: req, container: container, query: query)
+                    }
+                }
+            }
+        }
     }
 
-    static func handler(_ req: Request) async throws -> Response {
-        NotImplemented.respond("/containers/{id}/attach/ws", req.method.rawValue)
+    // MARK: - Stopped container (bootstrap with pipes — same lifecycle as HTTP attach)
+
+    private static func handleStopped(
+        ws: WebSocket,
+        req: Request,
+        hexId: String,
+        container: ContainerSnapshot,
+        query: ContainerAttachWSQuery
+    ) async {
+        let stdin = query.stdin ?? false
+        let stdout = query.stdout ?? true
+        let stderr = query.stderr ?? true
+        let isTTY = container.configuration.initProcess.terminal
+
+        let stdinPipe = Pipe()
+        let stdoutPipe: Pipe? = stdout ? Pipe() : nil
+        let stderrPipe: Pipe? = (stderr && !isTTY) ? Pipe() : nil
+
+        let stdio: [FileHandle?] = [
+            stdinPipe.fileHandleForReading,
+            stdoutPipe?.fileHandleForWriting,
+            stderrPipe?.fileHandleForWriting,
+        ]
+
+        // Close the write end immediately when not interactive so the container
+        // sees EOF on its stdin without waiting for a client signal.
+        if !stdin {
+            try? stdinPipe.fileHandleForWriting.close()
+        }
+
+        // Wire client disconnect → stdin EOF before bootstrap, so an early
+        // disconnect still signals the container cleanly.
+        // ws.onClose is the ONLY cleanup path for the stdin write end;
+        // the process monitor task owns all other teardown to avoid double-close.
+        ws.onClose.whenComplete { _ in
+            try? stdinPipe.fileHandleForWriting.close()
+        }
+
+        await ContainerExitCodeStore.shared.remove(id: container.id)
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
+        } catch {
+            // Fix: close all pipe handles before returning to avoid fd leaks.
+            try? stdinPipe.fileHandleForReading.close()
+            try? stdoutPipe?.fileHandleForWriting.close()
+            try? stderrPipe?.fileHandleForWriting.close()
+            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
+            await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
+            try? await ws.close(code: .unexpectedServerError)
+            return
+        }
+
+        do {
+            try await process.start()
+        } catch {
+            if !isBenignStartRace(error) {
+                try? stdinPipe.fileHandleForReading.close()
+                try? stdoutPipe?.fileHandleForWriting.close()
+                try? stderrPipe?.fileHandleForWriting.close()
+                await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
+                await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
+                try? await ws.close(code: .unexpectedServerError)
+                return
+            }
+        }
+
+        await ProcessRegistry.shared.set(id: container.id, process: process)
+
+        // Wire WS → stdin. Guard ws.isClosed so a late-arriving frame after
+        // teardown doesn't write to a closed fd.
+        if stdin {
+            let stdinWriter = stdinPipe.fileHandleForWriting
+            ws.onBinary { ws, buf in
+                guard !ws.isClosed else { return }
+                var b = buf
+                if let data = b.readBytes(length: b.readableBytes) {
+                    try? stdinWriter.write(contentsOf: data)
+                }
+            }
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            // Process monitor — sole owner of teardown (no double-close with ws.onClose
+            // because ws.onClose only closes the stdin write end, not the read ends).
+            group.addTask {
+                // Fix: record -1 on wait failure so /wait doesn't lie to callers.
+                let code: Int32
+                do { code = try await process.wait() } catch { code = -1 }
+
+                await ProcessRegistry.shared.remove(id: container.id)
+
+                // Close pipe write ends → readers drain → break their loops.
+                try? stdoutPipe?.fileHandleForWriting.close()
+                try? stderrPipe?.fileHandleForWriting.close()
+                try? stdinPipe.fileHandleForReading.close()
+
+                try? await Task.sleep(nanoseconds: ContainerAttachRoute.outputFlushGraceNs)
+                // Extra probe delay matching HTTP attach — lets Apple Container finish
+                // internal teardown before we poll for auto-removal.
+                try? await Task.sleep(nanoseconds: 100_000_000)
+
+                let autoRemoved: Bool
+                do {
+                    autoRemoved = try await ContainerClient().get(id: container.id) == nil
+                } catch let e as ContainerizationError where e.code == .notFound {
+                    autoRemoved = true
+                } catch {
+                    autoRemoved = false
+                }
+                if autoRemoved, let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                    let cached = await ContainerInfoCache.shared.get(id: hexId)
+                    await broadcaster.broadcast(
+                        DockerEvent.simpleEvent(
+                            id: hexId, type: "container", status: "remove",
+                            image: cached?.image ?? container.configuration.image.reference,
+                            name: cached?.nativeId ?? container.id,
+                            labels: cached?.labels
+                                ?? LabelNormalization.restore(container.configuration.labels)
+                        ))
+                    await ContainerInfoCache.shared.remove(id: hexId)
+                }
+
+                await ContainerExitCodeStore.shared.set(id: container.id, code: code)
+                await ContainerExitCodeStore.shared.set(id: hexId, code: code)
+                try? await ws.close()
+            }
+
+            // Stdout → WS binary frames. Break on send error (client disconnected).
+            if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                group.addTask {
+                    defer { try? stdoutHandle.close() }
+                    while let data = try? stdoutHandle.read(upToCount: 8192), !data.isEmpty {
+                        do {
+                            try await ws.send(raw: data, opcode: .binary)
+                        } catch {
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Stderr → WS binary frames (non-TTY + both streams requested).
+            if let stderrHandle = stderrPipe?.fileHandleForReading {
+                group.addTask {
+                    defer { try? stderrHandle.close() }
+                    while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {
+                        do {
+                            try await ws.send(raw: data, opcode: .binary)
+                        } catch {
+                            break
+                        }
+                    }
+                }
+            }
+
+            for await _ in group {}
+        }
     }
+
+    // MARK: - Running container (stream log output)
+
+    private static func handleRunning(
+        ws: WebSocket,
+        req: Request,
+        container: ContainerSnapshot,
+        query: ContainerAttachWSQuery
+    ) async {
+        let stream = query.stream ?? false
+        let logs = query.logs ?? false
+
+        // Fix: reject degenerate requests with neither stream nor logs, matching
+        // the HTTP attach guard (ContainerAttachRoute line 76-78).
+        guard stream || logs else {
+            try? await ws.close()
+            return
+        }
+
+        // Wait for the log file, escaping when the WS closes or after ~10s.
+        // The timeout guards against an indefinite poll when a container is
+        // removed via another API call while the WS is still open.
+        var logHandle: FileHandle? = nil
+        var attempts = 0
+        let maxAttempts = 200  // 200 × 50 ms = 10 s
+        while logHandle == nil {
+            guard !ws.isClosed, attempts < maxAttempts else {
+                try? await ws.close()
+                return
+            }
+            attempts += 1
+            if let fhs = try? await ContainerClient().logs(id: container.id), !fhs.isEmpty {
+                logHandle = fhs[0]
+                if fhs.count > 1 { try? fhs[1].close() }
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        guard let fileHandle = logHandle else {
+            try? await ws.close()
+            return
+        }
+        defer { try? fileHandle.close() }
+
+        let containerClient = ContainerClient()
+
+        // Drain buffered output, breaking on client disconnect.
+        while !ws.isClosed, let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
+            do {
+                try await ws.send(raw: data, opcode: .binary)
+            } catch {
+                try? await ws.close()
+                return
+            }
+        }
+
+        // Follow live output. Break on disconnect or container stop.
+        while stream, !ws.isClosed {
+            if let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
+                do {
+                    try await ws.send(raw: data, opcode: .binary)
+                } catch {
+                    break
+                }
+            } else {
+                let current = try? await containerClient.get(id: container.id)
+                if current == nil || current?.status != .running {
+                    if let flush = try? fileHandle.read(upToCount: 4096), !flush.isEmpty {
+                        try? await ws.send(raw: flush, opcode: .binary)
+                    }
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+        }
+
+        try? await ws.close()
+    }
+
 }

@@ -379,16 +379,6 @@ extension ContainerAttachRoute {
         return Response(status: status, headers: headers, body: body)
     }
 
-    // ContainerClient surfaces a concurrent attach/start as a "booted" /
-    // "expected to be in created state" error; ClientContainerService.start
-    // treats it as a benign race (another request already started the container).
-    // Don't record a synthetic exit code for it — the container may be running
-    // fine — so /wait isn't told the container exited.
-    private static func isBenignStartRace(_ error: Error) -> Bool {
-        let message = error.localizedDescription
-        return message.contains("booted") || message.contains("expected to be in created state")
-    }
-
     private static func handleAttachWithStdin(
         req: Request,
         client: ClientContainerProtocol,
