@@ -71,8 +71,16 @@ help:
 	@echo "  help             - Show this help message"
 
 .PHONY: test
-test:
+test: lint-pipes
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION)
+
+# Prevent Foundation's Pipe() from being used when passing fds to Apple Container
+# APIs (createProcess/bootstrap). Apple closes those fds immediately after duping
+# them into the container, causing Pipe.deinit to double-close a reused fd and
+# corrupt NIO's fd table (writev/kevent EBADF crash). Use StdioPipes instead.
+.PHONY: lint-pipes
+lint-pipes:
+	@bash scripts/lint-pipes.sh
 
 .PHONY: fmt
 fmt:	swift-fmt
