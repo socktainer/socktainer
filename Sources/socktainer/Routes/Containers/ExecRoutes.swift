@@ -267,7 +267,11 @@ struct ExecRoute: RouteCollection {
 
             let detach = startRequest.Detach ?? false
             let tty = startRequest.Tty ?? config.tty
-            let _ = startRequest.ConsoleSize
+            // Docker sends ConsoleSize as [height, width] for interactive (-it) exec.
+            // Apply it as the initial PTY winsize right after start so `stty size` and TUIs
+            // (vim/htop/less) work, rather than relying solely on the async /exec/{id}/resize
+            // call, which can race the process registration and be dropped.
+            let initialTerminalSize = ExecRoute.initialTerminalSize(tty: tty, consoleSize: startRequest.ConsoleSize)
 
             // Detached mode
             if detach {
@@ -344,6 +348,7 @@ struct ExecRoute: RouteCollection {
                     }
 
                     await ProcessRegistry.shared.set(id: execId, process: process)
+                    if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
@@ -502,6 +507,7 @@ struct ExecRoute: RouteCollection {
                 }
 
                 await ProcessRegistry.shared.set(id: execId, process: process)
+                if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
@@ -682,6 +688,19 @@ struct ExecRoute: RouteCollection {
                 // `GET /exec/{id}/json` can read the recorded exit code.
             }
         }
+    }
+
+    /// Maps Docker's exec-start `ConsoleSize` to an initial terminal size.
+    ///
+    /// Docker encodes `ConsoleSize` as `[height, width]` and only sends it for
+    /// interactive (`-it`) exec. Returns `nil` when there is no TTY or the value
+    /// is absent/malformed, so callers skip the initial resize.
+    static func initialTerminalSize(tty: Bool, consoleSize: [Int]?) -> ContainerizationOS.Terminal.Size? {
+        guard tty, let cs = consoleSize, cs.count == 2, cs[0] > 0, cs[1] > 0 else { return nil }
+        return ContainerizationOS.Terminal.Size(
+            width: UInt16(min(cs[1], Int(UInt16.max))),
+            height: UInt16(min(cs[0], Int(UInt16.max)))
+        )
     }
 
     static let resizeExec: @Sendable (Request) async throws -> Response = { req in
