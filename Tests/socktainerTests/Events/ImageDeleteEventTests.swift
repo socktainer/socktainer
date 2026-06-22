@@ -11,9 +11,12 @@ import VaporTesting
 @Suite("ImageDeleteRoute — event 'from' field")
 struct ImageDeleteEventTests {
 
-    @Test("image delete event carries image reference in 'from' field")
+    @Test("image delete event carries normalized reference, not raw user input")
     func imageDeleteEventPopulatesFromField() async throws {
-        let imageRef = "alpine:latest"
+        // Raw input "alpine:latest" — the mock returns the normalized form to simulate
+        // what ClientImageService.delete() does after the IMG-002 fix.
+        let rawRef = "alpine:latest"
+        let normalizedRef = "docker.io/library/alpine:latest"
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
 
@@ -27,16 +30,29 @@ struct ImageDeleteEventTests {
         try await withImageRouteApp(broadcaster: broadcaster) { app in
             try await app.testing().test(
                 .DELETE,
-                "/v1.51/images/\(imageRef)"
+                "/v1.51/images/\(rawRef)"
             ) { res async in
                 #expect(res.status == .ok)
             }
         }
 
-        captureTask.cancel()  // unblock the for-await if the event was never emitted
-        let event = await captureTask.value
-        #expect(event?.from == imageRef)
-        #expect(event?.Actor.Attributes["image"] == imageRef)
+        // Race captureTask against a 1-second timeout. Cancelling before awaiting the
+        // value can race with event delivery and produce a flaky nil result.
+        let event = await withTaskGroup(of: DockerEvent?.self) { group in
+            group.addTask { await captureTask.value }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        captureTask.cancel()
+        // Must use result.untagged (normalized) — not the raw imageRef from the request.
+        // If someone reverts the route to broadcast imageRef directly, this assertion fails.
+        #expect(event?.from == normalizedRef)
+        #expect(event?.Actor.Attributes["image"] == normalizedRef)
     }
 }
 
@@ -58,7 +74,11 @@ private func withImageRouteApp(
 
 private struct ImageDeleteMock: ClientImageProtocol {
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
-    func delete(id: String) async throws {}
+    func delete(id: String) async throws -> ImageDeletionResult {
+        // Simulate normalization: prepend registry+org so the returned ref differs from
+        // the raw input. The route must use result.untagged, not the original id parameter.
+        ImageDeletionResult(untagged: "docker.io/library/\(id)", deletedDigest: nil)
+    }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
         -> AsyncThrowingStream<String, Error>
     {
