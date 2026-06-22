@@ -199,7 +199,9 @@ jobs:
 
       - name: check container root
         run: |
-          sudo container image pull hello-world
+          # quay.io/podman/hello has no auth or rate-limit issues and is already
+          # used later in this workflow. Avoids Docker Hub / ECR Public flakiness.
+          sudo container image pull quay.io/podman/hello
           sudo container image ls
 
       - name: install docker cli
@@ -208,8 +210,8 @@ jobs:
 
       - name: check docker image with socktainer
         run: |
-          # expect that hello-world is present
-          sudo docker image ls | grep hello-world
+          # expect that the image pulled above is present
+          sudo docker image ls | grep 'podman/hello'
           # pull httpd image
           sudo docker image pull httpd:latest
           # list images
