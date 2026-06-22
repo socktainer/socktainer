@@ -140,27 +140,24 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ### Homebrew
 
-`socktainer` is shipped via a homebrew tap:
-
-```shell
-brew tap socktainer/tap
-```
-
-#### Stable Release
-
-Install the official release:
+`socktainer` is included in [Homebrew Formulae](https://formulae.brew.sh/formula/socktainer#default):
 
 ```shell
 brew install socktainer
 ```
 
-#### Pre Release
-
-Install development release:
+If you want to install the latest head version of socktainer:
 
 ```shell
-brew install socktainer-next
+brew install socktainer --HEAD
 ```
+
+> [!NOTE]
+> Formerly we have provided our own Homebrew tap. You may want to integrate it with the Homebrew official, and you can run the following command:
+> 
+> ```shell
+> brew untap socktainer/tap
+> ```
 
 ### GitHub Releases
 
