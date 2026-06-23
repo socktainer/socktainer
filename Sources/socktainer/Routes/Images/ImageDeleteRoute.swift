@@ -21,8 +21,9 @@ extension ImageDeleteRoute {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
+            let result: ImageDeletionResult
             do {
-                try await client.delete(id: imageRef)
+                result = try await client.delete(id: imageRef)
             } catch let error as ClientImageError {
                 switch error {
                 case .notFound(let id):
@@ -30,14 +31,20 @@ extension ImageDeleteRoute {
                 }
             }
 
-            // Optional: broadcast event
+            // Broadcast using the normalized reference so event consumers see the
+            // canonical form (matches Docker's own event emission).
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-            let event = DockerEvent.simpleEvent(id: imageRef, type: "image", status: "remove", image: imageRef)
+            let event = DockerEvent.simpleEvent(
+                id: result.untagged, type: "image", status: "remove", image: result.untagged)
             await broadcaster.broadcast(event)
 
-            let deleteResponse = [
-                ImageDeleteResponseItem(Deleted: imageRef, Untagged: nil)
-            ]
+            // Build response matching Docker Engine API:
+            //   {Untagged} for the tag that was removed
+            //   {Deleted}  for the image layers freed (only when the last reference was removed)
+            var deleteResponse = [ImageDeleteResponseItem(Deleted: nil, Untagged: result.untagged)]
+            if let digest = result.deletedDigest {
+                deleteResponse.append(ImageDeleteResponseItem(Deleted: digest, Untagged: nil))
+            }
 
             return try await deleteResponse.encodeResponse(status: .ok, for: req)
 

@@ -6,9 +6,18 @@ import Foundation
 import Logging
 import TerminalProgress
 
+/// What was removed when deleting an image reference.
+/// Mirrors Docker Engine's `ImageDeleteResponseItem` semantics:
+///   - `untagged` — the tag that was removed (always present)
+///   - `deletedDigest` — the sha256 of image layers freed (only when the last tag was removed)
+struct ImageDeletionResult {
+    let untagged: String  // normalized tag that was untagged
+    let deletedDigest: String?  // sha256 if the image layers were garbage-collected
+}
+
 protocol ClientImageProtocol: Sendable {
     func list(includeSystemImages: Bool) async throws -> [ClientImage]
-    func delete(id: String) async throws
+    func delete(id: String) async throws -> ImageDeletionResult
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
@@ -28,6 +37,46 @@ extension ClientImageProtocol {
 
 enum ClientImageError: Error {
     case notFound(id: String)
+}
+
+/// Seam that abstracts the static `ClientImage` API for testing.
+/// The real implementation delegates to Apple Container; tests inject a fake.
+protocol ImageDeletionStore: Sendable {
+    /// Return the (normalizedReference, digest) for the image matching `id`.
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String)
+    /// Return all normalized references that share the same digest.
+    /// Call this AFTER delete() to determine whether the deletion freed the image layers.
+    func refsForDigest(_ digest: String) async throws -> [String]
+    /// Delete the image with the exact (normalized) reference from the store.
+    func delete(reference: String) async throws
+    /// Free orphaned blobs and snapshots no longer referenced by any image.
+    /// Returns bytes reclaimed. Mirrors what Apple Container's own CLI does after
+    /// every image delete or prune to actually reclaim disk space.
+    func cleanUpOrphanedBlobs() async throws -> UInt64
+}
+
+/// Production implementation — delegates straight to Apple Container.
+struct LiveImageDeletionStore: ImageDeletionStore {
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
+        let image = try await ClientImage.get(reference: id, containerSystemConfig: config)
+        return (image.reference, image.digest)
+    }
+
+    func refsForDigest(_ digest: String) async throws -> [String] {
+        let all = try await ClientImage.list()
+        return all.filter { $0.digest == digest }.map { $0.reference }
+    }
+
+    func delete(reference: String) async throws {
+        // garbageCollect: false — Apple Container's own CLI always uses false here.
+        // Orphaned blobs are freed separately via cleanUpOrphanedBlobs().
+        try await ClientImage.delete(reference: reference, garbageCollect: false)
+    }
+
+    func cleanUpOrphanedBlobs() async throws -> UInt64 {
+        let (_, freed) = try await ClientImage.cleanUpOrphanedBlobs()
+        return freed
+    }
 }
 
 struct ClientImageService: ClientImageProtocol {
@@ -89,14 +138,53 @@ struct ClientImageService: ClientImageProtocol {
         return filteredImages
     }
 
-    func delete(id: String) async throws {
+    func delete(id: String) async throws -> ImageDeletionResult {
+        try await Self.delete(
+            id: id,
+            containerSystemConfig: containerSystemConfig
+        )
+    }
+
+    /// Deletes an image by reference, normalizing the key via `imageStore`.
+    ///
+    /// The `imageStore` parameter is a test seam that defaults to the real
+    /// `ClientImage` implementation. Inject a custom store in tests to verify
+    /// that the delete call uses the normalized reference (not the raw user input).
+    ///
+    /// **Bug fixed**: the pre-fix implementation passed the raw user-supplied `id`
+    /// directly to the store's delete method. Because tags are stored under their
+    /// normalized form (e.g. `"docker.io/library/test:latest"`), a short tag like
+    /// `"test:latest"` would silently miss — the delete was a no-op.
+    static func delete(
+        id: String,
+        containerSystemConfig: ContainerSystemConfig,
+        imageStore: ImageDeletionStore = LiveImageDeletionStore()
+    ) async throws -> ImageDeletionResult {
+        let normalizedRef: String
+        let digest: String
         do {
-            _ = try await ClientImage.get(reference: id, containerSystemConfig: containerSystemConfig)
+            (normalizedRef, digest) = try await imageStore.normalizedReference(for: id, config: containerSystemConfig)
         } catch {
-            // Handle specific error if needed
             throw ClientImageError.notFound(id: id)
         }
-        try await ClientImage.delete(reference: id, garbageCollect: false)
+        try await imageStore.delete(reference: normalizedRef)
+
+        // Free orphaned blobs — mirrors Apple Container's own `container image rm`.
+        // Use try? so a GC failure does not fail the delete: the tag is already gone
+        // and returning an error here would cause the client to retry a completed operation.
+        _ = try? await imageStore.cleanUpOrphanedBlobs()
+
+        // Check remaining refs AFTER deletion to avoid a TOCTOU race: two concurrent
+        // deletes checking before either delete would both see isLastRef=false and
+        // neither would GC. Checking post-delete gives the accurate remaining count.
+        // Use try? — if the list call fails the tag is still gone; assume last-ref=false.
+        let remainingRefs = (try? await imageStore.refsForDigest(digest)) ?? []
+        let wasLastRef = remainingRefs.isEmpty
+
+        return ImageDeletionResult(
+            untagged: normalizedRef,
+            deletedDigest: wasLastRef ? digest : nil
+        )
     }
 
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
@@ -430,7 +518,7 @@ struct ClientImageService: ClientImageProtocol {
                     }
                 }
 
-                try await delete(id: reference)
+                _ = try await delete(id: reference)
                 deletedImages.append(reference)
             } catch {
                 logger.warning("Failed to delete image \(image.reference): \(error)")
