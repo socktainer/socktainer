@@ -319,6 +319,41 @@ We welcome contributions!
   - `Utilities/` — Helper utilities 🧰
 - Document any public API or CLI changes in this README 📝
 
+#### Piping I/O to container processes
+
+When passing I/O to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`, **do not use Foundation's `Pipe()`**. Use `StdioPipes` from `Sources/socktainer/Utilities/DockerConnectionUtility.swift` instead.
+
+**Background**: on Unix, every open file/socket/pipe is identified by a small integer called a *file descriptor* (fd). Apple's APIs dup the fds you pass into the container and then **immediately close your originals**. Foundation's `Pipe` doesn't know this happened — when it's eventually garbage-collected, it tries to `close()` the same fd number again. By then, that number may have been recycled for a NIO HTTP socket, so the double-close silently kills an active connection, corrupting the event loop and causing hard-to-reproduce crashes under concurrent load (issue [#107](https://github.com/socktainer/socktainer/issues/107)).
+
+`StdioPipes` centralises allocation, EMFILE validation, and cleanup:
+
+```swift
+guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else { // or make(.all)
+    throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
+}
+let process: ClientProcess
+do {
+    process = try await ContainerClient().createProcess(..., stdio: pipes.stdioArray)
+} catch {
+    pipes.closeAll()          // Apple never received the fds — close all 6
+    throw error
+}
+do {
+    try await process.start()
+} catch {
+    pipes.closeAfterHandoff() // Apple owns stdin.read, stdout.write, stderr.write
+    throw error
+}
+// Use pipes.stdout?.read, pipes.stderr?.read, pipes.stdin?.write in tasks
+```
+
+Ownership rules:
+- **stdout/stderr**: Apple closes `.write`. You close `.read` when the reader task ends.
+- **stdin**: Apple closes `.read`. You close `.write` when done sending input.
+- `StdioPipes.make()` closes any partial pipes on EMFILE and returns `nil` — always `guard let`.
+
+`make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in any source file other than the one legitimate exception (`ClientRegistryService.swift`, which uses Foundation's own `Process`, not Apple Container APIs).
+
 ---
 
 ## Security & Limitations ⚠️

@@ -347,7 +347,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // cannot mask the existence checks.
         processConfig.user = .id(uid: 0, gid: 0)
 
-        let stderrPipe = Pipe()
+        guard let pipes = StdioPipes.make([.stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create stderr pipe")
+        }
 
         let process: ClientProcess
         do {
@@ -355,20 +357,23 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 containerId: container.id,
                 processId: UUID().uuidString.lowercased(),
                 configuration: processConfig,
-                stdio: [nil, nil, stderrPipe.fileHandleForWriting]
+                stdio: pipes.stdioArray
             )
+        } catch {
+            pipes.closeAll()
+            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+        do {
             try await process.start()
         } catch {
-            try? stderrPipe.fileHandleForReading.close()
-            try? stderrPipe.fileHandleForWriting.close()
+            pipes.closeAfterHandoff()
             throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
         }
 
-        // Close our copy of the remote end so EOF propagates once the guest
-        // process exits (the daemon holds its own duplicate).
-        try? stderrPipe.fileHandleForWriting.close()
-
-        let stderrReader = stderrPipe.fileHandleForReading
+        // Drain stderr concurrently (capped at 16 KiB) while waiting.
+        // collectOutput() is not used here because it reads unboundedly via
+        // readDataToEndOfFile(); this capped reader prevents runaway memory growth.
+        let stderrReader = pipes.stderr!.read
         let stderrTask = Task.detached { () -> Data in
             defer { try? stderrReader.close() }
             var collected = Data()
@@ -384,6 +389,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         do {
             exitCode = try await process.wait()
         } catch {
+            // Concurrent close(2) + read(2) on the same fd is unsafe (NSException risk).
+            // Rethrow immediately; stderrTask exits naturally when the process terminates
+            // and Apple closes the write end.
             throw ClientArchiveError.operationFailed(message: "Failed waiting for validation in running container: \(error.localizedDescription)")
         }
 

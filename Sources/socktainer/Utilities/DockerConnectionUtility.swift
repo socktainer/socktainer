@@ -32,6 +32,195 @@ public final class DockerConnectionState: @unchecked Sendable {
 /// Shared allocator for memory efficiency across Docker operations
 public let sharedAllocator = ByteBufferAllocator()
 
+/// Low-level pipe pair created via pipe(2) with closeOnDealloc:false.
+///
+/// **Prefer `StdioPipes`** for all container stdio wiring — it handles EMFILE
+/// validation and provides `closeAll()` / `closeAfterHandoff()` so every error
+/// path is covered without manual per-fd calls. `ProcessPipe` is an
+/// implementation detail exposed only for testing the raw fd ownership contract.
+///
+/// Ownership model:
+///   - stdout/stderr: pass `.write` to createProcess/bootstrap; Apple owns that close.
+///     Caller explicitly closes `.read` when the reader task finishes.
+///   - stdin: pass `.read` to createProcess/bootstrap; Apple owns that close.
+///     Caller explicitly closes `.write` when done writing.
+struct ProcessPipe: @unchecked Sendable {
+    let read: FileHandle
+    let write: FileHandle
+
+    static func make() -> ProcessPipe? {
+        var fds: [Int32] = [0, 0]
+        guard Darwin.pipe(&fds) == 0 else { return nil }
+        return ProcessPipe(
+            read: FileHandle(fileDescriptor: fds[0], closeOnDealloc: false),
+            write: FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
+        )
+    }
+}
+
+/// Collects the three stdio pipe pairs for a container process, with centralised
+/// allocation, validation, and cleanup that eliminates per-call-site boilerplate
+/// and prevents fd leaks on every error path.
+///
+/// Ownership after `createProcess(stdio:)` / `bootstrap(id:stdio:)`:
+///   - Apple owns and will close: `stdin?.read`, `stdout?.write`, `stderr?.write`
+///   - Caller owns and must close: `stdin?.write`, `stdout?.read`, `stderr?.read`
+///
+/// Usage pattern:
+/// ```swift
+/// guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else {
+///     throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
+/// }
+/// let process: ClientProcess
+/// do {
+///     process = try await ContainerClient().createProcess(..., stdio: pipes.stdioArray)
+/// } catch {
+///     pipes.closeAll()   // Apple never took ownership
+///     throw error
+/// }
+/// do {
+///     try await process.start()
+/// } catch {
+///     pipes.closeAfterHandoff()   // Apple owns the passed ends
+///     throw error
+/// }
+/// ```
+struct StdioPipes: @unchecked Sendable {
+
+    /// Which stdio channels to allocate. Use as an OptionSet:
+    ///   `StdioPipes.make([.stdout, .stderr])`  or  `StdioPipes.make(.all)`
+    struct Channels: OptionSet {
+        let rawValue: UInt8
+        static let stdin = Channels(rawValue: 1 << 0)
+        static let stdout = Channels(rawValue: 1 << 1)
+        static let stderr = Channels(rawValue: 1 << 2)
+        static let all: Channels = [.stdin, .stdout, .stderr]
+    }
+
+    let stdin: ProcessPipe?
+    let stdout: ProcessPipe?
+    let stderr: ProcessPipe?
+
+    /// `[stdin.read, stdout.write, stderr.write]` — the array to pass to createProcess/bootstrap.
+    var stdioArray: [FileHandle?] { [stdin?.read, stdout?.write, stderr?.write] }
+
+    /// Allocates pipes for the requested channels. Returns `nil` (and closes any
+    /// partially-allocated pipes) if any required pipe cannot be created (EMFILE).
+    ///
+    /// Prefer the OptionSet overload for static channel selection:
+    ///   `StdioPipes.make([.stdout, .stderr])`  or  `StdioPipes.make(.all)`
+    /// Use the Bool overload (`make(stdin:stdout:stderr:)`) when channels are
+    /// computed dynamically from config flags.
+    ///
+    /// The `makePipe` parameter defaults to `ProcessPipe.make` and exists solely
+    /// as a test seam — inject a custom factory to exercise the partial-allocation
+    /// cleanup path without exhausting process-wide file descriptors.
+    static func make(_ channels: Channels, makePipe: () -> ProcessPipe? = ProcessPipe.make) -> StdioPipes? {
+        let stdinPipe = channels.contains(.stdin) ? makePipe() : nil
+        let stdoutPipe = channels.contains(.stdout) ? makePipe() : nil
+        let stderrPipe = channels.contains(.stderr) ? makePipe() : nil
+
+        let allOk =
+            (!channels.contains(.stdin) || stdinPipe != nil)
+            && (!channels.contains(.stdout) || stdoutPipe != nil)
+            && (!channels.contains(.stderr) || stderrPipe != nil)
+
+        guard allOk else {
+            try? stdinPipe?.read.close()
+            try? stdinPipe?.write.close()
+            try? stdoutPipe?.read.close()
+            try? stdoutPipe?.write.close()
+            try? stderrPipe?.read.close()
+            try? stderrPipe?.write.close()
+            return nil
+        }
+        return StdioPipes(stdin: stdinPipe, stdout: stdoutPipe, stderr: stderrPipe)
+    }
+
+    /// Convenience overload for dynamic channel selection from boolean config flags.
+    /// Use the OptionSet overload for static cases: `make([.stdout, .stderr])`.
+    static func make(stdin: Bool, stdout: Bool, stderr: Bool) -> StdioPipes? {
+        var channels: Channels = []
+        if stdin { channels.insert(.stdin) }
+        if stdout { channels.insert(.stdout) }
+        if stderr { channels.insert(.stderr) }
+        return make(channels)
+    }
+
+    /// Close all six fds. Use when createProcess/bootstrap has NOT yet taken ownership
+    /// (e.g. the call threw before completing the dup).
+    func closeAll() {
+        try? stdin?.read.close()
+        try? stdin?.write.close()
+        try? stdout?.read.close()
+        try? stdout?.write.close()
+        try? stderr?.read.close()
+        try? stderr?.write.close()
+    }
+
+    /// Close the fds we retain after createProcess/bootstrap has taken ownership:
+    /// `stdin?.write`, `stdout?.read`, `stderr?.read`.
+    ///
+    /// Safe to call even when `stdin?.write` was already closed (e.g. pre-closed
+    /// for non-interactive attach) — `FileHandle.close()` is idempotent on the
+    /// same object.
+    func closeAfterHandoff() {
+        try? stdin?.write.close()
+        try? stdout?.read.close()
+        try? stderr?.read.close()
+    }
+
+    /// Collect stdout and stderr as `Data` while concurrently waiting for the
+    /// process via `wait`. Draining must happen before waiting: if the child
+    /// writes more than the pipe buffer holds it blocks on write, so calling
+    /// `wait` first would deadlock.
+    ///
+    /// On error the wait closure's error is rethrown immediately. The drain
+    /// tasks continue in the background and exit naturally when the process
+    /// exits and Apple closes the write ends.
+    ///
+    /// - Parameter wait: async closure that waits for the process and returns
+    ///   its exit code (e.g. `{ try await process.wait() }`).
+    func collectOutput(waiting wait: () async throws -> Int32) async throws -> (
+        exitCode: Int32, stdout: Data, stderr: Data
+    ) {
+        let stdoutReader = stdout?.read
+        let stderrReader = stderr?.read
+
+        // `read(upToCount:)` loop is used instead of `readDataToEndOfFile()` /
+        // `readToEnd()`. Both of those can raise NSException when the fd is
+        // closed from the error path below. `read(upToCount:)` returns nil on
+        // EBADF (swallowed by `try?`), which cleanly breaks the loop.
+        let stdoutTask = Task.detached { () -> Data in
+            defer { try? stdoutReader?.close() }
+            var data = Data()
+            while let chunk = try? stdoutReader?.read(upToCount: 65_536), !chunk.isEmpty {
+                data.append(chunk)
+            }
+            return data
+        }
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader?.close() }
+            var data = Data()
+            while let chunk = try? stderrReader?.read(upToCount: 65_536), !chunk.isEmpty {
+                data.append(chunk)
+            }
+            return data
+        }
+
+        do {
+            let code = try await wait()
+            return (code, await stdoutTask.value, await stderrTask.value)
+        } catch {
+            // Do NOT close read ends here — concurrent close(2) + read(2) on the same
+            // fd is unsafe and can raise NSException. The drain tasks will exit on
+            // their own once the process fully exits and Apple closes the write ends.
+            // We rethrow immediately rather than awaiting them.
+            throw error
+        }
+    }
+}
+
 /// This provides TCP connection hijacking for Docker exec endpoints
 public struct DockerTCPUpgrader: Upgrader, Sendable {
     let execId: String

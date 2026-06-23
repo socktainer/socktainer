@@ -276,23 +276,30 @@ struct ClientBuilderService: ClientBuilderProtocol {
         processConfig.arguments = command.arguments
         processConfig.terminal = false
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let process = try await containerClient.createProcess(
-            containerId: container.id,
-            processId: UUID().uuidString.lowercased(),
-            configuration: processConfig,
-            stdio: [nil, stdoutPipe.fileHandleForWriting, stderrPipe.fileHandleForWriting]
-        )
-
-        try await process.start()
-        let exitCode = try await process.wait()
-
-        try? stdoutPipe.fileHandleForWriting.close()
-        try? stderrPipe.fileHandleForWriting.close()
-
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let pipes = StdioPipes.make([.stdout, .stderr]) else {
+            throw ContainerizationError(.internalError, message: "Failed to create I/O pipes")
+        }
+        let process: ClientProcess
+        do {
+            process = try await containerClient.createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: pipes.stdioArray
+            )
+        } catch {
+            pipes.closeAll()
+            throw error
+        }
+        do {
+            try await process.start()
+        } catch {
+            pipes.closeAfterHandoff()
+            throw error
+        }
+        let (exitCode, stdoutData, stderrData) = try await pipes.collectOutput {
+            try await process.wait()
+        }
         let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
         let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
 

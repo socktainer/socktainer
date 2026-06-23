@@ -253,26 +253,27 @@ extension ContainerAttachRoute {
         // Apple Container requires all three stdio handles to be non-nil to use
         // pipe mode; passing nil for stdin causes it to fall back to log-file mode
         // which has the race condition we are trying to fix.
-        let stdinPipe = Pipe()
-        let stdoutPipe = attachStdout ? Pipe() : nil
-        let stderrPipe = (!isTTY && (query.stderr ?? false)) ? Pipe() : nil
-
-        let stdio: [FileHandle?] = [
-            stdinPipe.fileHandleForReading,
-            stdoutPipe?.fileHandleForWriting,
-            stderrPipe?.fileHandleForWriting,
-        ]
+        guard
+            let pipes = StdioPipes.make(
+                stdin: true,
+                stdout: attachStdout,
+                stderr: !isTTY && (query.stderr ?? false)
+            )
+        else {
+            throw Abort(.internalServerError, reason: "Failed to create stdio pipes")
+        }
 
         // No data will be written to stdin for non-interactive containers — close
-        // the write end immediately so the container's stdin sees EOF.
-        try? stdinPipe.fileHandleForWriting.close()
+        // our write end immediately so the container's stdin sees EOF.
+        try? pipes.stdin?.write.close()
 
         await ContainerExitCodeStore.shared.remove(id: container.id)
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
         } catch {
+            pipes.closeAll()
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
@@ -281,6 +282,7 @@ extension ContainerAttachRoute {
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
+                pipes.closeAfterHandoff()
                 await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                 throw Abort(.internalServerError, reason: "Failed to start container: \(error.localizedDescription)")
             }
@@ -305,13 +307,10 @@ extension ContainerAttachRoute {
                 _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
                 await withTaskGroup(of: Void.self) { group in
-                    // Close pipes → readers drain → grace period → unblock /wait.
+                    // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
                     group.addTask {
                         let code = (try? await process.wait()) ?? 0
                         await ProcessRegistry.shared.remove(id: container.id)
-                        try? stdoutPipe?.fileHandleForWriting.close()
-                        try? stderrPipe?.fileHandleForWriting.close()
-                        try? stdinPipe.fileHandleForReading.close()
                         try? await Task.sleep(nanoseconds: Self.outputFlushGraceNs)
                         await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                         await ContainerExitCodeStore.shared.set(id: hexId, code: code)
@@ -347,7 +346,7 @@ extension ContainerAttachRoute {
                     }
 
                     // Stdout reader
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    if let stdoutHandle = pipes.stdout?.read {
                         let frameType: DockerStreamFrame.StreamType = stderrOnly ? .stderr : .stdout
                         group.addTask {
                             defer { try? stdoutHandle.close() }
@@ -360,7 +359,7 @@ extension ContainerAttachRoute {
                     }
 
                     // Stderr reader (separate stream when both stdout and stderr requested)
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                    if let stderrHandle = pipes.stderr?.read {
                         group.addTask {
                             defer { try? stderrHandle.close() }
                             while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {
@@ -427,15 +426,15 @@ extension ContainerAttachRoute {
         let attachStderr = query.stderr ?? !isTTY
 
         // Create pipes for bidirectional communication with the main process
-        let stdinPipe: Pipe = Pipe()
-        let stdoutPipe: Pipe? = attachStdout ? Pipe() : nil
-        let stderrPipe: Pipe? = (attachStderr && !isTTY) ? Pipe() : nil
-
-        let stdio = [
-            stdinPipe.fileHandleForReading,
-            stdoutPipe?.fileHandleForWriting,
-            stderrPipe?.fileHandleForWriting,
-        ]
+        guard
+            let pipes = StdioPipes.make(
+                stdin: true,
+                stdout: attachStdout,
+                stderr: attachStderr && !isTTY
+            )
+        else {
+            throw Abort(.internalServerError, reason: "Failed to create stdio pipes")
+        }
 
         // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
         // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
@@ -445,8 +444,9 @@ extension ContainerAttachRoute {
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
         } catch {
+            pipes.closeAll()
             if isBenignStartRace(error) {
                 throw Abort(.conflict, reason: "Container is already starting")
             }
@@ -457,6 +457,7 @@ extension ContainerAttachRoute {
         do {
             try await process.start()
         } catch {
+            pipes.closeAfterHandoff()
             if isBenignStartRace(error) {
                 throw Abort(.conflict, reason: "Container is already starting")
             }
@@ -477,12 +478,9 @@ extension ContainerAttachRoute {
                     // Process monitor - when process exits, close pipes and finish stream
                     group.addTask {
                         defer {
-                            // Close pipes to break the reader loops
-                            try? stdoutPipe?.fileHandleForWriting.close()
-                            try? stderrPipe?.fileHandleForWriting.close()
-                            try? stdinPipe.fileHandleForWriting.close()
-
-                            // Close stream
+                            // stdout/stderr write ends are Apple-owned — do not close them.
+                            // stdin write end is owned by the stdin-writer task below; closing
+                            // it here too would be a double-close on the same fd.
                             streamContinuation.finish()
                         }
 
@@ -498,7 +496,7 @@ extension ContainerAttachRoute {
                         await ProcessRegistry.shared.remove(id: container.id)
                     }
 
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    if let stdoutHandle = pipes.stdout?.read {
                         group.addTask {
                             defer {
                                 try? stdoutHandle.close()
@@ -525,7 +523,7 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                    if let stderrHandle = pipes.stderr?.read {
                         group.addTask {
                             defer {
                                 try? stderrHandle.close()
@@ -552,7 +550,7 @@ extension ContainerAttachRoute {
                         }
                     }
 
-                    let stdinWriter = stdinPipe.fileHandleForWriting
+                    let stdinWriter = pipes.stdin!.write
                     group.addTask {
                         defer {
                             try? stdinWriter.close()
@@ -579,17 +577,21 @@ extension ContainerAttachRoute {
             ttyEnabled: isTTY
         ) { channel, tcpHandler in
 
-            tcpHandler.setStdinWriter(stdinPipe.fileHandleForWriting)
+            tcpHandler.setStdinWriter(pipes.stdin!.write)
 
             await withTaskGroup(of: Void.self) { group in
-                if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                if let stdoutHandle = pipes.stdout?.read {
                     group.addTask {
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
+                            ) { _ in
+                                // Close in the cleanup handler — DispatchIO relinquishes
+                                // the fd here, so it's safe to close without risk of
+                                // closing a recycled descriptor.
+                                try? stdoutHandle.close()
                                 continuation.resume()
                             }
 
@@ -646,19 +648,18 @@ extension ContainerAttachRoute {
 
                             readNextChunk()
                         }
-
-                        try? stdoutHandle.close()
                     }
                 }
 
-                if let stderrHandle = stderrPipe?.fileHandleForReading {
+                if let stderrHandle = pipes.stderr?.read {
                     group.addTask {
                         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
+                            ) { _ in
+                                try? stderrHandle.close()
                                 continuation.resume()
                             }
 
@@ -715,8 +716,6 @@ extension ContainerAttachRoute {
 
                             readNextChunk()
                         }
-
-                        try? stderrHandle.close()
                     }
                 }
 
@@ -743,10 +742,10 @@ extension ContainerAttachRoute {
                     // Give a small delay for any final output to be processed
                     try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
 
-                    // Close all pipes to signal EOF to readers
-                    try? stdoutPipe?.fileHandleForWriting.close()
-                    try? stderrPipe?.fileHandleForWriting.close()
-                    try? stdinPipe.fileHandleForWriting.close()
+                    // DockerTCPHandler owns pipes.stdin!.write after setStdinWriter(); it closes
+                    // it via writeQueue on channelInactive / inputClosed. Closing it here too
+                    // would be a double-close that can kill a reused fd.
+                    // stdout/stderr write ends are Apple-owned — also do not close them.
 
                     // Close the channel gracefully only if still open.
                     // Calling close() on an already-closed channel causes

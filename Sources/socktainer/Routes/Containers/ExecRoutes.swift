@@ -83,17 +83,6 @@ struct CreateExecResponse: Content {
     let Id: String
 }
 
-// Helper to convert pipes to stdio array
-struct Stdio {
-    let stdin: FileHandle?
-    let stdout: FileHandle?
-    let stderr: FileHandle?
-
-    var asArray: [FileHandle?] {
-        [stdin, stdout, stderr]
-    }
-}
-
 struct ExecRoute: RouteCollection {
     let client: ClientContainerProtocol
 
@@ -313,16 +302,16 @@ struct ExecRoute: RouteCollection {
                     ttyEnabled: tty
                 ) { streamContinuation in
 
-                    // Setup pipes
-                    let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-                    let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-                    let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
-
-                    let stdio = Stdio(
-                        stdin: stdinPipe?.fileHandleForReading,
-                        stdout: stdoutPipe?.fileHandleForWriting,
-                        stderr: stderrPipe?.fileHandleForWriting
-                    )
+                    guard
+                        let pipes = StdioPipes.make(
+                            stdin: config.attachStdin,
+                            stdout: config.attachStdout,
+                            stderr: config.attachStderr && !tty
+                        )
+                    else {
+                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
+                    }
 
                     let executable = config.cmd.first!
                     let arguments = Array(config.cmd.dropFirst())
@@ -331,18 +320,24 @@ struct ExecRoute: RouteCollection {
                     processConfig.arguments = arguments
                     processConfig.terminal = tty
 
-                    let process = try await ContainerClient().createProcess(
-                        containerId: container.id,
-                        processId: UUID().uuidString.lowercased(),
-                        configuration: processConfig,
-                        stdio: stdio.asArray
-                    )
+                    let process: ClientProcess
+                    do {
+                        process = try await ContainerClient().createProcess(
+                            containerId: container.id,
+                            processId: UUID().uuidString.lowercased(),
+                            configuration: processConfig,
+                            stdio: pipes.stdioArray
+                        )
+                    } catch {
+                        pipes.closeAll()
+                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        throw error
+                    }
 
                     do {
                         try await process.start()
                     } catch {
-                        // Record an exit code so a failed start doesn't leave
-                        // the exec stuck reporting Running forever.
+                        pipes.closeAfterHandoff()
                         await ExecManager.shared.setExitCode(id: execId, code: -1)
                         throw error
                     }
@@ -352,100 +347,65 @@ struct ExecRoute: RouteCollection {
 
                     await withTaskGroup(of: Void.self) { group in
                         // stdout handler
-                        if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                        if let stdoutRead = pipes.stdout?.read {
                             group.addTask {
-                                defer {
-                                    try? stdoutHandle.close()
-                                }
-
-                                let state = DockerConnectionState()
-
-                                while !state.shouldStop() {
+                                defer { try? stdoutRead.close() }
+                                while true {
                                     do {
                                         // A blocking pipe read returns empty Data only at EOF —
                                         // the process exited and its stdout writer was closed.
-                                        // Break so the task group can finish and the response
-                                        // stream is closed; sleeping/continuing here spins forever
-                                        // and the Docker client hangs waiting for the stream to end.
-                                        guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
+                                        guard let data = try stdoutRead.read(upToCount: 8192), !data.isEmpty else {
                                             break
                                         }
-
                                         let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
                                         var buffer = sharedAllocator.buffer(capacity: bufferSize)
                                         buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: tty)
                                         streamContinuation.yield(buffer)
-                                    } catch {
-                                        break
-                                    }
+                                    } catch { break }
                                 }
                             }
                         }
 
                         // stderr handler
-                        if let stderrHandle = stderrPipe?.fileHandleForReading {
+                        if let stderrRead = pipes.stderr?.read {
                             group.addTask {
-                                defer {
-                                    try? stderrHandle.close()
-                                }
-
-                                let state = DockerConnectionState()
-
-                                while !state.shouldStop() {
+                                defer { try? stderrRead.close() }
+                                while true {
                                     do {
                                         // A blocking pipe read returns empty Data only at EOF —
                                         // the process exited and its stderr writer was closed.
-                                        // Break so the task group can finish and the response
-                                        // stream is closed; sleeping/continuing here spins forever
-                                        // and the Docker client hangs waiting for the stream to end.
-                                        guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
+                                        guard let data = try stderrRead.read(upToCount: 8192), !data.isEmpty else {
                                             break
                                         }
-
                                         let bufferSize = min(data.count + 8, 65536)
                                         var buffer = sharedAllocator.buffer(capacity: bufferSize)
                                         buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: tty)
                                         streamContinuation.yield(buffer)
-                                    } catch {
-                                        break
-                                    }
+                                    } catch { break }
                                 }
                             }
                         }
 
                         // stdin handler for HTTP mode
-                        if let stdinWriter = stdinPipe?.fileHandleForWriting {
+                        if let stdinWrite = pipes.stdin?.write {
                             group.addTask {
-                                defer {
-                                    try? stdinWriter.close()
-                                }
-
+                                defer { try? stdinWrite.close() }
                                 do {
                                     for try await var buf in req.body {
                                         if let data = buf.readData(length: buf.readableBytes) {
-                                            try stdinWriter.write(contentsOf: data)
+                                            try stdinWrite.write(contentsOf: data)
                                         }
                                     }
-                                } catch {
-                                }
+                                } catch {}
                             }
                         }
 
                         // Process monitor
                         group.addTask {
-                            defer {
-                                // Close all write ends to signal EOF
-                                try? stdoutPipe?.fileHandleForWriting.close()
-                                try? stderrPipe?.fileHandleForWriting.close()
-                                try? stdinPipe?.fileHandleForWriting.close()
-                            }
-
                             do {
                                 let exitCode = try await process.wait()
                                 await ExecManager.shared.setExitCode(id: execId, code: exitCode)
                             } catch {
-                                // process.wait() failed — record a synthetic exit
-                                // code so the exec leaves the Running state.
                                 await ExecManager.shared.setExitCode(id: execId, code: -1)
                             }
                             await ProcessRegistry.shared.remove(id: execId)
@@ -466,20 +426,15 @@ struct ExecRoute: RouteCollection {
                 ttyEnabled: tty
             ) { channel, tcpHandler in
 
-                // Setup pipes with detailed logging
-                let stdinPipe: Pipe? = config.attachStdin ? Pipe() : nil
-                let stdoutPipe: Pipe? = config.attachStdout ? Pipe() : nil
-                let stderrPipe: Pipe? = (config.attachStderr && !tty) ? Pipe() : nil
-
-                let stdio = Stdio(
-                    stdin: stdinPipe?.fileHandleForReading,
-                    stdout: stdoutPipe?.fileHandleForWriting,
-                    stderr: stderrPipe?.fileHandleForWriting
-                )
-
-                // Connect TCP handler to stdin writer for bidirectional communication
-                if let stdinWriter = stdinPipe?.fileHandleForWriting {
-                    tcpHandler.setStdinWriter(stdinWriter)
+                guard
+                    let pipes = StdioPipes.make(
+                        stdin: config.attachStdin,
+                        stdout: config.attachStdout,
+                        stderr: config.attachStderr && !tty
+                    )
+                else {
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
                 }
 
                 let executable = config.cmd.first!
@@ -490,20 +445,30 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
-                let process = try await ContainerClient().createProcess(
-                    containerId: container.id,
-                    processId: UUID().uuidString.lowercased(),
-                    configuration: processConfig,
-                    stdio: stdio.asArray
-                )
-
+                let process: ClientProcess
+                do {
+                    process = try await ContainerClient().createProcess(
+                        containerId: container.id,
+                        processId: UUID().uuidString.lowercased(),
+                        configuration: processConfig,
+                        stdio: pipes.stdioArray
+                    )
+                } catch {
+                    pipes.closeAll()
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    throw error
+                }
                 do {
                     try await process.start()
                 } catch {
-                    // Record an exit code so a failed start doesn't leave the
-                    // exec stuck reporting Running forever.
+                    pipes.closeAfterHandoff()
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
+                }
+                // Wire stdin only after start() succeeds so closeAfterHandoff()
+                // remains the sole owner on any failure path before this point.
+                if let stdinWrite = pipes.stdin?.write {
+                    tcpHandler.setStdinWriter(stdinWrite)
                 }
 
                 await ProcessRegistry.shared.set(id: execId, process: process)
@@ -512,17 +477,16 @@ struct ExecRoute: RouteCollection {
                 // Setup bidirectional communication for interactive sessions
                 await withTaskGroup(of: Void.self) { group in
                     // stdout/stderr -> channel (container output to client)
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    if let stdoutHandle = pipes.stdout?.read {
                         group.addTask {
-                            defer {
-                                try? stdoutHandle.close()
-                            }
-
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stdoutHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
+                            ) { _ in
+                                // DispatchIO relinquishes the fd in its cleanup handler.
+                                // Close here to avoid closing a potentially recycled fd.
+                                try? stdoutHandle.close()
                             }
 
                             defer {
@@ -580,18 +544,14 @@ struct ExecRoute: RouteCollection {
                         }
                     }
 
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
+                    if let stderrHandle = pipes.stderr?.read {
                         group.addTask {
-                            defer {
-                                try? stderrHandle.close()
-                            }
-
                             let dispatchIO = DispatchIO(
                                 type: .stream,
                                 fileDescriptor: stderrHandle.fileDescriptor,
                                 queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
-                                // Cleanup handled automatically
+                            ) { _ in
+                                try? stderrHandle.close()
                             }
 
                             defer {
@@ -670,10 +630,10 @@ struct ExecRoute: RouteCollection {
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
 
-                        // Close all pipes to signal EOF to readers
-                        try? stdoutPipe?.fileHandleForWriting.close()
-                        try? stderrPipe?.fileHandleForWriting.close()
-                        try? stdinPipe?.fileHandleForWriting.close()
+                        // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
+                        // it via writeQueue on channelInactive / inputClosed. Closing it here too
+                        // would be a double-close that can kill a reused fd.
+                        // stdout/stderr write ends are Apple-owned — also do not close them.
 
                         // Close the channel gracefully
                         _ = channel.eventLoop.submit {

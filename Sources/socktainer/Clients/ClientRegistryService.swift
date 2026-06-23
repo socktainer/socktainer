@@ -164,13 +164,32 @@ struct ClientRegistryService: ClientRegistryProtocol {
         }
         try stdinPipe.fileHandleForWriting.close()
 
+        // Drain stdout and stderr concurrently while the process runs.
+        // Calling waitUntilExit() before draining would deadlock if the process
+        // writes more than the pipe buffer holds (it blocks on write).
+        // group.wait() is the happens-before barrier; nonisolated(unsafe) tells
+        // the compiler we own the synchronisation.
+        nonisolated(unsafe) var stdoutData = Data()
+        nonisolated(unsafe) var stderrData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
         process.waitUntilExit()
+        group.wait()
 
         let stdout =
-            String(data: try stdoutPipe.fileHandleForReading.readToEnd() ?? Data(), encoding: .utf8)?
+            String(data: stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let stderr =
-            String(data: try stderrPipe.fileHandleForReading.readToEnd() ?? Data(), encoding: .utf8)?
+            String(data: stderrData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard process.terminationStatus == 0 else {

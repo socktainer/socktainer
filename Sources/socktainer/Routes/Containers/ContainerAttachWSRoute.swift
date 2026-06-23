@@ -64,40 +64,32 @@ extension ContainerAttachWSRoute {
         let stderr = query.stderr ?? true
         let isTTY = container.configuration.initProcess.terminal
 
-        let stdinPipe = Pipe()
-        let stdoutPipe: Pipe? = stdout ? Pipe() : nil
-        let stderrPipe: Pipe? = (stderr && !isTTY) ? Pipe() : nil
-
-        let stdio: [FileHandle?] = [
-            stdinPipe.fileHandleForReading,
-            stdoutPipe?.fileHandleForWriting,
-            stderrPipe?.fileHandleForWriting,
-        ]
-
-        // Close the write end immediately when not interactive so the container
-        // sees EOF on its stdin without waiting for a client signal.
-        if !stdin {
-            try? stdinPipe.fileHandleForWriting.close()
+        guard let pipes = StdioPipes.make(stdin: true, stdout: stdout, stderr: stderr && !isTTY) else {
+            try? await ws.close(code: .unexpectedServerError)
+            return
         }
 
-        // Wire client disconnect → stdin EOF before bootstrap, so an early
-        // disconnect still signals the container cleanly.
-        // ws.onClose is the ONLY cleanup path for the stdin write end;
-        // the process monitor task owns all other teardown to avoid double-close.
+        // For non-interactive containers, pre-close the write end so the container
+        // sees immediate stdin EOF. ws.onClose (registered below) calls close() on
+        // the same FileHandle object — Foundation makes that second call a no-op.
+        if !stdin {
+            try? pipes.stdin?.write.close()
+        }
+
+        // ws.onClose is the sole owner for the interactive stdin write end.
+        // For non-interactive, the pre-close above already happened — this is a
+        // safe no-op second call on the same FileHandle object.
         ws.onClose.whenComplete { _ in
-            try? stdinPipe.fileHandleForWriting.close()
+            try? pipes.stdin?.write.close()
         }
 
         await ContainerExitCodeStore.shared.remove(id: container.id)
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: stdio)
+            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
         } catch {
-            // Fix: close all pipe handles before returning to avoid fd leaks.
-            try? stdinPipe.fileHandleForReading.close()
-            try? stdoutPipe?.fileHandleForWriting.close()
-            try? stderrPipe?.fileHandleForWriting.close()
+            pipes.closeAll()
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
             try? await ws.close(code: .unexpectedServerError)
@@ -108,9 +100,7 @@ extension ContainerAttachWSRoute {
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
-                try? stdinPipe.fileHandleForReading.close()
-                try? stdoutPipe?.fileHandleForWriting.close()
-                try? stderrPipe?.fileHandleForWriting.close()
+                pipes.closeAfterHandoff()
                 await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
                 await ContainerExitCodeStore.shared.set(id: hexId, code: -1)
                 try? await ws.close(code: .unexpectedServerError)
@@ -123,7 +113,7 @@ extension ContainerAttachWSRoute {
         // Wire WS → stdin. Guard ws.isClosed so a late-arriving frame after
         // teardown doesn't write to a closed fd.
         if stdin {
-            let stdinWriter = stdinPipe.fileHandleForWriting
+            let stdinWriter = pipes.stdin!.write
             ws.onBinary { ws, buf in
                 guard !ws.isClosed else { return }
                 var b = buf
@@ -143,10 +133,9 @@ extension ContainerAttachWSRoute {
 
                 await ProcessRegistry.shared.remove(id: container.id)
 
-                // Close pipe write ends → readers drain → break their loops.
-                try? stdoutPipe?.fileHandleForWriting.close()
-                try? stderrPipe?.fileHandleForWriting.close()
-                try? stdinPipe.fileHandleForReading.close()
+                // stdout/stderr write ends and stdin read end are Apple-owned —
+                // do not close them here (double-close causes fd-reuse crashes).
+                // ws.onClose owns the stdin write end; readers own their read ends.
 
                 try? await Task.sleep(nanoseconds: ContainerAttachRoute.outputFlushGraceNs)
                 // Extra probe delay matching HTTP attach — lets Apple Container finish
@@ -180,7 +169,7 @@ extension ContainerAttachWSRoute {
             }
 
             // Stdout → WS binary frames. Break on send error (client disconnected).
-            if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+            if let stdoutHandle = pipes.stdout?.read {
                 group.addTask {
                     defer { try? stdoutHandle.close() }
                     while let data = try? stdoutHandle.read(upToCount: 8192), !data.isEmpty {
@@ -194,7 +183,7 @@ extension ContainerAttachWSRoute {
             }
 
             // Stderr → WS binary frames (non-TTY + both streams requested).
-            if let stderrHandle = stderrPipe?.fileHandleForReading {
+            if let stderrHandle = pipes.stderr?.read {
                 group.addTask {
                     defer { try? stderrHandle.close() }
                     while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {

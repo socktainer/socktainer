@@ -97,6 +97,42 @@ Tests are in `Tests/socktainerTests/`. The PR CI (`pr-check.yaml`) runs: format 
 - PRs must follow the conventional commit format for titles, include a summary and testing info. See `.github/PULL_REQUEST_TEMPLATE.md`.
 - Skills that create issues or PRs (`create-github-issue`, `create-github-pr`) produce output conforming to these templates.
 
+## Apple Container stdio fd Ownership
+
+**Never use Foundation's `Pipe()` when passing fds to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`.**
+
+These APIs dup the passed fds into the container and then **immediately close the parent copies**. `Pipe()` does not know about this external close — its `deinit` later calls `close()` again on the same fd, which may now be a recycled NIO socket. The double-close corrupts NIO's fd table, causing `writev`/`kevent` EBADF crashes under concurrent load (issue #107).
+
+**Use `StdioPipes`** (centralized allocation and cleanup, `Sources/socktainer/Utilities/DockerConnectionUtility.swift`):
+
+```swift
+guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else {  // or make(.all)
+    throw Abort(.internalServerError, reason: "Failed to create I/O pipes")
+}
+let process: ClientProcess
+do {
+    process = try await ContainerClient().createProcess(..., stdio: pipes.stdioArray)
+} catch {
+    pipes.closeAll()           // Apple never took ownership — close all 6 fds
+    throw error
+}
+do {
+    try await process.start()
+} catch {
+    pipes.closeAfterHandoff()  // Apple owns stdin.read, stdout.write, stderr.write
+    throw error
+}
+// Success — use pipes.stdout?.read, pipes.stderr?.read, pipes.stdin?.write in tasks
+```
+
+`StdioPipes.make()` handles EMFILE internally (closes any partially-allocated pipes and returns `nil`). `closeAll()` is for createProcess-failure; `closeAfterHandoff()` is for start-failure. `ProcessPipe` (the single-pipe primitive) exists for unusual cases requiring finer control.
+
+Ownership contract:
+- **stdout/stderr**: pass `.write` via `StdioPipes.stdioArray` — Apple closes it. Caller closes `.read`.
+- **stdin**: pass `.read` via `StdioPipes.stdioArray` — Apple closes it. Caller closes `.write`.
+- Always use `StdioPipes.make()` with `guard let` — pipe exhaustion returns nil and yields a clean HTTP error.
+- `make test` runs `make lint-pipes` which rejects `= Pipe()` in non-registry source files.
+
 ## Security
 
 - Never commit secrets, API keys, or credentials. Do not stage files that look like they contain secrets (`.env`, `credentials.json`, etc.).
