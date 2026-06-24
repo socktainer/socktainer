@@ -40,6 +40,13 @@ struct VolumePruneRoute: RouteCollection {
                 logger.warning("Failed to delete volume \(volume.Name): \(error)")
             }
         }
+        if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+            // Docker prune events carry an empty Actor.ID and only the bytes reclaimed.
+            await broadcaster.broadcast(
+                DockerEvent.make(
+                    type: "volume", action: "prune", actorID: "",
+                    attributes: ["reclaimed": String(spaceReclaimed)]))
+        }
         return PruneResponse(VolumesDeleted: volumesDeleted, SpaceReclaimed: spaceReclaimed)
     }
 }

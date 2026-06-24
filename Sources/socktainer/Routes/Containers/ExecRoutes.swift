@@ -196,6 +196,20 @@ struct ExecRoute: RouteCollection {
             )
 
             let id = await ExecManager.shared.create(config: config)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                var attrs = LabelNormalization.restore(container.configuration.labels)
+                attrs["execID"] = id
+                // Docker formats the action as "exec_create: <command>" (action + ": " + cmd).
+                let event = DockerEvent.simpleEvent(
+                    id: DockerContainerID.hexId(for: container),
+                    type: "container",
+                    status: "exec_create: \(config.cmd.joined(separator: " "))",
+                    image: container.configuration.image.reference,
+                    name: container.id,
+                    labels: attrs
+                )
+                await broadcaster.broadcast(event)
+            }
             return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
         }
     }
@@ -254,6 +268,29 @@ struct ExecRoute: RouteCollection {
 
             let startRequest = try req.content.decode(StartExecRequest.self)
 
+            // Capture values for exec_start / exec_die events — must happen before any
+            // streaming closure so they're available deep inside task groups without
+            // capturing `req`. exec_start fires only once the process actually starts
+            // (after process.start() succeeds), so a failed exec emits no started event.
+            let execBroadcaster = req.application.storage[EventBroadcasterKey.self]
+            let execEventHexId = DockerContainerID.hexId(for: container)
+            let execEventImage = container.configuration.image.reference
+            let execEventName = container.id
+            let execEventLabels = LabelNormalization.restore(container.configuration.labels)
+            // Docker formats the action as "exec_start: <command>" (action + ": " + cmd).
+            let execStartAction = "exec_start: \(config.cmd.joined(separator: " "))"
+
+            @Sendable func broadcastExecEvent(_ status: String, exitCode: Int32? = nil) async {
+                guard let broadcaster = execBroadcaster else { return }
+                var attrs = execEventLabels
+                attrs["execID"] = execId
+                if let exitCode { attrs["exitCode"] = String(exitCode) }
+                let event = DockerEvent.simpleEvent(
+                    id: execEventHexId, type: "container", status: status,
+                    image: execEventImage, name: execEventName, labels: attrs)
+                await broadcaster.broadcast(event)
+            }
+
             let detach = startRequest.Detach ?? false
             let tty = startRequest.Tty ?? config.tty
             // Docker sends ConsoleSize as [height, width] for interactive (-it) exec.
@@ -271,8 +308,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
+                let process: ClientProcess
                 do {
-                    let process = try await ContainerClient().createProcess(
+                    process = try await ContainerClient().createProcess(
                         containerId: container.id,
                         processId: UUID().uuidString.lowercased(),
                         configuration: processConfig,
@@ -286,7 +324,17 @@ struct ExecRoute: RouteCollection {
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }
-                await ExecManager.shared.remove(id: execId)
+                await broadcastExecEvent(execStartAction)
+                // Observe the detached process so docker exec -d still reports completion
+                // (exit code + exec_die), mirroring the container.die observer. Keep the
+                // ExecManager entry afterwards — the recorded exit code must remain readable
+                // via GET /exec/{id}/json (matching the attached HTTP/TCP paths).
+                Task.detached {
+                    let code: Int32
+                    do { code = try await process.wait() } catch { code = -1 }
+                    await ExecManager.shared.setExitCode(id: execId, code: code)
+                    await broadcastExecEvent("exec_die", exitCode: code)
+                }
                 return Response(status: .ok)
             }
 
@@ -341,6 +389,7 @@ struct ExecRoute: RouteCollection {
                         await ExecManager.shared.setExitCode(id: execId, code: -1)
                         throw error
                     }
+                    await broadcastExecEvent(execStartAction)
 
                     await ProcessRegistry.shared.set(id: execId, process: process)
                     if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
@@ -402,13 +451,17 @@ struct ExecRoute: RouteCollection {
 
                         // Process monitor
                         group.addTask {
+                            let code: Int32
                             do {
-                                let exitCode = try await process.wait()
-                                await ExecManager.shared.setExitCode(id: execId, code: exitCode)
+                                code = try await process.wait()
                             } catch {
-                                await ExecManager.shared.setExitCode(id: execId, code: -1)
+                                // process.wait() failed — record a synthetic exit
+                                // code so the exec leaves the Running state.
+                                code = -1
                             }
+                            await ExecManager.shared.setExitCode(id: execId, code: code)
                             await ProcessRegistry.shared.remove(id: execId)
+                            await broadcastExecEvent("exec_die", exitCode: code)
                         }
 
                         for await _ in group {}
@@ -465,6 +518,7 @@ struct ExecRoute: RouteCollection {
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }
+                await broadcastExecEvent(execStartAction)
                 // Wire stdin only after start() succeeds so closeAfterHandoff()
                 // remains the sole owner on any failure path before this point.
                 if let stdinWrite = pipes.stdin?.write {
@@ -616,16 +670,18 @@ struct ExecRoute: RouteCollection {
 
                     // Process monitor with proper cleanup
                     group.addTask {
+                        let code: Int32
                         do {
-                            let exitCode = try await process.wait()
-                            await ExecManager.shared.setExitCode(id: execId, code: exitCode)
+                            code = try await process.wait()
                         } catch {
                             // process.wait() failed — record a synthetic exit code
                             // so the exec leaves the Running state instead of
                             // hanging there forever.
-                            await ExecManager.shared.setExitCode(id: execId, code: -1)
+                            code = -1
                         }
+                        await ExecManager.shared.setExitCode(id: execId, code: code)
                         await ProcessRegistry.shared.remove(id: execId)
+                        await broadcastExecEvent("exec_die", exitCode: code)
 
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms

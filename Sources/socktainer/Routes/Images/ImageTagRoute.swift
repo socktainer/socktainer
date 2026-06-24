@@ -45,6 +45,14 @@ extension ImageTagRoute {
 
         do {
             _ = try await sourceImage.tag(new: targetReference)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // moby's tag event uses the image digest as Actor.ID and the new
+                // reference as the `name` attribute.
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "image", action: "tag", actorID: sourceImage.digest,
+                        attributes: ["name": targetReference]))
+            }
             return Response(status: .created)
         } catch {
             req.logger.error("Failed to tag image: \(error)")

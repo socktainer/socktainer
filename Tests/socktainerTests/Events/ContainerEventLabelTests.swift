@@ -87,7 +87,7 @@ struct ContainerRestartEventLabelTests {
 @Suite("ContainerDeleteRoute — event label forwarding")
 struct ContainerDeleteEventLabelTests {
 
-    @Test("Remove event carries labels from snapshot when container exists")
+    @Test("Destroy event carries labels from snapshot when container exists")
     func removeEventFromSnapshot() async throws {
         let id = "del-ctr-hex"
         let nativeId = "del-native"
@@ -95,7 +95,7 @@ struct ContainerDeleteEventLabelTests {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
         let captureTask = Task<DockerEvent?, Never> {
-            for await event in stream where event.Action == "remove" { return event }
+            for await event in stream where event.Action == "destroy" { return event }
             return nil
         }
 
@@ -116,9 +116,13 @@ struct ContainerDeleteEventLabelTests {
         #expect(event?.Actor.Attributes["db"] == "main")
         #expect(event?.Actor.Attributes["image"] == "postgres:17")
         #expect(event?.Actor.Attributes["name"] == nativeId)
+        // Actor.ID must be the canonical hex ID derived from the snapshot, not the raw
+        // request reference — matching create/start/die/kill.
+        #expect(event?.Actor.ID == DockerContainerID.hexId(for: snapshot))
+        #expect(event?.Actor.ID != id, "destroy event must not use the raw request id")
     }
 
-    @Test("Remove event uses ContainerInfoCache when container is already gone (docker run --rm)")
+    @Test("Destroy event uses ContainerInfoCache when container is already gone (docker run --rm)")
     func removeEventFromCacheWhenNotFound() async throws {
         let hexId = "rm-ctr-hex"
         let nativeId = "rm-native"
@@ -132,7 +136,7 @@ struct ContainerDeleteEventLabelTests {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
         let captureTask = Task<DockerEvent?, Never> {
-            for await event in stream where event.Action == "remove" { return event }
+            for await event in stream where event.Action == "destroy" { return event }
             return nil
         }
 
@@ -156,6 +160,26 @@ struct ContainerDeleteEventLabelTests {
         #expect(event?.Actor.Attributes["name"] == nativeId)
         // Cache must be cleared after the event.
         #expect(await ContainerInfoCache.shared.get(id: hexId) == nil)
+    }
+}
+
+@Suite("ContainerCreateRoute — create event")
+struct ContainerCreateEventTests {
+
+    @Test("create event carries canonical hex ID and image/name/label attributes")
+    func createEventShape() async throws {
+        let snapshot = makeSnapshot(nativeId: "create-native", image: "redis:7", labels: ["app": "cache"])
+        let event = ContainerCreateRoute.makeCreateEvent(for: snapshot)
+
+        #expect(event.Type == "container")
+        #expect(event.Action == "create")
+        // Actor.ID must be the canonical 64-char hex ID derived from the snapshot,
+        // matching start/die/destroy.
+        #expect(event.Actor.ID == DockerContainerID.hexId(for: snapshot))
+        #expect(event.Actor.ID != "create-native", "must not use the native name as Actor.ID")
+        #expect(event.Actor.Attributes["image"] == "redis:7")
+        #expect(event.Actor.Attributes["name"] == "create-native")
+        #expect(event.Actor.Attributes["app"] == "cache")
     }
 }
 

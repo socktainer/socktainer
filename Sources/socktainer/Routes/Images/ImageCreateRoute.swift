@@ -48,6 +48,10 @@ extension ImageCreateRoute {
             let progressStream = try await client.pull(
                 image: image, tag: decodedTag, platform: platform, logger: req.logger)
 
+            let app = req.application
+            // Use decodedTag (the value actually pulled) so a percent-encoded tag
+            // does not produce a mismatched reference in the "pull" event.
+            let pulledRef = "\(image)\(decodedTag.isEmpty ? "" : ":\(decodedTag)")"
             response.body = .init(stream: { writer in
                 Task {
                     do {
@@ -56,6 +60,14 @@ extension ImageCreateRoute {
                             _ = writer.write(.buffer(ByteBuffer(string: json + "\n")))
                         }
                         _ = writer.write(.end)
+                        if let broadcaster = app.storage[EventBroadcasterKey.self] {
+                            // moby's pull event uses the reference as Actor.ID and the
+                            // image name as the `name` attribute (no `image` key).
+                            await broadcaster.broadcast(
+                                DockerEvent.make(
+                                    type: "image", action: "pull", actorID: pulledRef,
+                                    attributes: ["name": image]))
+                        }
                     } catch {
                         _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
                         _ = writer.write(.error(error))

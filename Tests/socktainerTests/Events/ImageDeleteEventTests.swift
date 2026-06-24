@@ -11,23 +11,25 @@ import VaporTesting
 @Suite("ImageDeleteRoute — event 'from' field")
 struct ImageDeleteEventTests {
 
-    @Test("image delete event carries normalized reference, not raw user input")
+    @Test("image untag event uses the digest as Actor.ID and the normalized ref as name (moby shape)")
     func imageDeleteEventPopulatesFromField() async throws {
-        // Raw input "alpine:latest" — the mock returns the normalized form to simulate
-        // what ClientImageService.delete() does after the IMG-002 fix.
+        // Raw input "alpine:latest"; the mock returns the normalized ref + a known digest,
+        // simulating ClientImageService.delete(). moby's untag event sets Actor.ID to the
+        // image digest with the reference in the `name` attribute and no `image` key.
         let rawRef = "alpine:latest"
         let normalizedRef = "docker.io/library/alpine:latest"
+        let digest = "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
 
         let captureTask = Task<DockerEvent?, Never> {
-            for await event in stream where event.Action == "remove" && event.Type == "image" {
+            for await event in stream where event.Action == "untag" && event.Type == "image" {
                 return event
             }
             return nil
         }
 
-        try await withImageRouteApp(broadcaster: broadcaster) { app in
+        try await withImageRouteApp(broadcaster: broadcaster, digest: digest) { app in
             try await app.testing().test(
                 .DELETE,
                 "/v1.51/images/\(rawRef)"
@@ -36,23 +38,19 @@ struct ImageDeleteEventTests {
             }
         }
 
-        // Race captureTask against a 1-second timeout. Cancelling before awaiting the
-        // value can race with event delivery and produce a flaky nil result.
-        let event = await withTaskGroup(of: DockerEvent?.self) { group in
-            group.addTask { await captureTask.value }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+        // Bound the wait with a timeout that cancels the capture task so its for-await
+        // loop exits cleanly even if the event never arrives.
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
         }
-        captureTask.cancel()
-        // Must use result.untagged (normalized) — not the raw imageRef from the request.
-        // If someone reverts the route to broadcast imageRef directly, this assertion fails.
-        #expect(event?.from == normalizedRef)
-        #expect(event?.Actor.Attributes["image"] == normalizedRef)
+        let event = await captureTask.value
+        timeout.cancel()
+
+        #expect(event?.Actor.ID == digest)
+        #expect(event?.Actor.Attributes["name"] == normalizedRef)
+        #expect(event?.Actor.Attributes["image"] == nil, "moby image events carry no 'image' attribute")
+        #expect(event?.from == "")
     }
 }
 
@@ -60,6 +58,7 @@ struct ImageDeleteEventTests {
 
 private func withImageRouteApp(
     broadcaster: EventBroadcaster,
+    digest: String = "sha256:abc",
     test: @escaping (Application) async throws -> Void
 ) async throws {
     try await withApp(configure: { _ in }) { app in
@@ -67,17 +66,18 @@ private func withImageRouteApp(
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
         app.storage[EventBroadcasterKey.self] = broadcaster
-        try app.register(collection: ImageDeleteRoute(client: ImageDeleteMock()))
+        try app.register(collection: ImageDeleteRoute(client: ImageDeleteMock(digest: digest)))
         try await test(app)
     }
 }
 
 private struct ImageDeleteMock: ClientImageProtocol {
+    var digest: String = "sha256:abc"
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
     func delete(id: String) async throws -> ImageDeletionResult {
         // Simulate normalization: prepend registry+org so the returned ref differs from
         // the raw input. The route must use result.untagged, not the original id parameter.
-        ImageDeletionResult(untagged: "docker.io/library/\(id)", deletedDigest: nil)
+        ImageDeletionResult(untagged: "docker.io/library/\(id)", digest: digest, deletedDigest: nil)
     }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
         -> AsyncThrowingStream<String, Error>

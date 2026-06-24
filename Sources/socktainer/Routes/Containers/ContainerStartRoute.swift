@@ -144,8 +144,19 @@ extension ContainerStartRoute {
             guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
                 return .noContent
             }
+            // Use the canonical 64-char Docker ID (derived from the snapshot) so every
+            // lifecycle event for a container carries the same id as the create event,
+            // regardless of whether the client started it by name or short ID.
+            let eventId = metadataSnapshot.map { DockerContainerID.hexId(for: $0) } ?? id
+
+            // Emit "start" on every successful /start. We intentionally do NOT gate this on
+            // "did this call transition the container to running": for a foreground `docker run`,
+            // the attach route bootstraps and starts the container BEFORE /start is invoked, so
+            // /start sees it already running — indistinguishable from a redundant `docker start`.
+            // Gating dropped the start (and die) events for the common `docker run` case, so we
+            // accept a possible extra event on the rare redundant `docker start` instead.
             let event = DockerEvent.simpleEvent(
-                id: id,
+                id: eventId,
                 type: "container",
                 status: "start",
                 image: metadataSnapshot?.configuration.image.reference ?? "",
@@ -153,6 +164,29 @@ extension ContainerStartRoute {
                 labels: LabelNormalization.restore(metadataSnapshot?.configuration.labels ?? [:])
             )
             await broadcaster.broadcast(event)
+
+            // Observe the container process exit to fire the "die" event.
+            // Runs as a detached background task — the start route returns immediately.
+            if let snap = metadataSnapshot {
+                let nativeId = snap.id
+                let dieImage = snap.configuration.image.reference
+                let dieName = snap.id
+                let dieLabels = LabelNormalization.restore(snap.configuration.labels)
+                Task.detached {
+                    // Await the authoritative exit code recorded by the start() background
+                    // waiter once the init process exits. Using the store's continuation-based
+                    // wait (rather than client.wait's timed grace-poll) means the die event
+                    // always carries the real code, even under load — no `?? 0` fallback race.
+                    let code = await ContainerExitCodeStore.shared.waitForCode(id: nativeId)
+                    var attrs = dieLabels
+                    attrs["exitCode"] = String(code)
+                    let dieEvent = DockerEvent.simpleEvent(
+                        id: eventId, type: "container", status: "die",
+                        image: dieImage, name: dieName, labels: attrs
+                    )
+                    await broadcaster.broadcast(dieEvent)
+                }
+            }
 
             return .noContent
         }

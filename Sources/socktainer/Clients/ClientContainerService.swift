@@ -11,9 +11,15 @@ actor ContainerExitCodeStore {
     static let shared = ContainerExitCodeStore()
 
     private var codes: [String: Int32] = [:]
+    private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
     func set(id: String, code: Int32) {
         codes[id] = code
+        // Resume anyone awaiting this container's exit code (e.g. the die-event observer),
+        // delivering the authoritative recorded value rather than a timed-poll fallback.
+        if let pending = waiters.removeValue(forKey: id) {
+            for continuation in pending { continuation.resume(returning: code) }
+        }
     }
 
     func get(id: String) -> Int32? {
@@ -22,6 +28,17 @@ actor ContainerExitCodeStore {
 
     func remove(id: String) {
         codes.removeValue(forKey: id)
+    }
+
+    /// Suspends until the exit code for `id` is recorded, returning the exact recorded value.
+    /// If a code is already present it returns immediately. This avoids the grace-poll/`?? 0`
+    /// race that `wait(condition:)` is subject to under load — the recorder calls `set(id:)`
+    /// with the real code once the init process exits, which resumes the waiter deterministically.
+    func waitForCode(id: String) async -> Int32 {
+        if let code = codes[id] { return code }
+        return await withCheckedContinuation { continuation in
+            waiters[id, default: []].append(continuation)
+        }
     }
 }
 

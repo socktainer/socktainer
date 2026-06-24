@@ -116,7 +116,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: NetworkInspectRoute(client: networkClient))
     try app.register(collection: NetworkListRoute())
     try app.register(collection: NetworkPruneRoute(client: networkClient))
-    try app.register(collection: NetworkDeletetRoute(client: networkClient))
+    try app.register(collection: NetworkDeleteRoute(client: networkClient))
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))

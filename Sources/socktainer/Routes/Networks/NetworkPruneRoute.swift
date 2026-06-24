@@ -43,6 +43,14 @@ struct NetworkPruneRoute: RouteCollection {
                 "Errors": errors,
             ]
             let responseData = try JSONSerialization.data(withJSONObject: responseBody, options: [])
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // Docker prune events carry an empty Actor.ID and only a reclaimed attribute;
+                // moby always reports reclaimed="0" for networks.
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "network", action: "prune", actorID: "",
+                        attributes: ["reclaimed": "0"]))
+            }
             return Response(status: .ok, body: .init(data: responseData))
         } catch {
             return Response(status: .internalServerError, body: .init(string: "Failed to prune networks: \(error)"))

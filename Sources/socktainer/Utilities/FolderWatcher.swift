@@ -166,7 +166,7 @@ final class FolderWatcher: @unchecked Sendable {
         containerDebounceSource?.setEventHandler { [weak self] in
             guard let self = self, self.isActive else { return }
 
-            let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "container", status: "remove")
+            let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "container", status: "destroy")
             Task {
                 await self.broadcaster.broadcast(event)
                 // print("[FolderWatcher] Broadcasted container event")
@@ -183,7 +183,9 @@ final class FolderWatcher: @unchecked Sendable {
         imageDebounceSource?.setEventHandler { [weak self] in
             guard let self = self, self.isActive else { return }
 
-            let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "image", status: "remove")
+            // Image events carry no container-only image/name attributes — use make().
+            let event = DockerEvent.make(
+                type: "image", action: "delete", actorID: UUID().uuidString, attributes: [:])
             Task {
                 await self.broadcaster.broadcast(event)
                 // print("[FolderWatcher] Broadcasted image event")

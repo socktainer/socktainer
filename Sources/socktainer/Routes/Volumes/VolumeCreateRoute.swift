@@ -43,8 +43,10 @@ struct VolumeCreateRoute: RouteCollection {
         )
         // Docker Engine API: POST /volumes/create returns 201 Created.
         let volume: Volume
+        let created: Bool
         do {
             volume = try await client.create(request: restRequest)
+            created = true
         } catch {
             // Docker's `volume create` is idempotent: creating a volume that
             // already exists returns the existing one rather than erroring.
@@ -55,6 +57,16 @@ struct VolumeCreateRoute: RouteCollection {
             // real error and must propagate.
             guard "\(error)".lowercased().contains("already exists") else { throw error }
             volume = try await client.inspect(name: resolvedName)
+            created = false
+        }
+        // Only emit "create" for a genuinely new volume — moby logs the create event
+        // only when the store actually created one, not on the idempotent return path.
+        if created, let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+            // moby volume events carry {driver} with the volume name as Actor.ID.
+            await broadcaster.broadcast(
+                DockerEvent.make(
+                    type: "volume", action: "create", actorID: volume.Name,
+                    attributes: ["driver": volume.Driver]))
         }
         let httpResponse = try await volume.encodeResponse(for: req)
         httpResponse.status = .created

@@ -36,6 +36,13 @@ extension ImagePruneRoute {
                 RESTImageDeletedItem(Deleted: imageRef, Untagged: nil)
             }
 
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // Docker prune events carry an empty Actor.ID and only the bytes reclaimed.
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "image", action: "prune", actorID: "",
+                        attributes: ["reclaimed": String(result.spaceReclaimed)]))
+            }
             return RESTImagePruneResponse(
                 ImagesDeleted: imagesDeleted.isEmpty ? nil : imagesDeleted,
                 SpaceReclaimed: result.spaceReclaimed

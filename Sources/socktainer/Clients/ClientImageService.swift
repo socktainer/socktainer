@@ -9,9 +9,12 @@ import TerminalProgress
 /// What was removed when deleting an image reference.
 /// Mirrors Docker Engine's `ImageDeleteResponseItem` semantics:
 ///   - `untagged` — the tag that was removed (always present)
+///   - `digest` — the sha256 of the image the tag pointed at (always present); Docker uses
+///     this as the `Actor.ID` for `untag`/`delete` events
 ///   - `deletedDigest` — the sha256 of image layers freed (only when the last tag was removed)
 struct ImageDeletionResult {
     let untagged: String  // normalized tag that was untagged
+    let digest: String  // sha256 of the image the removed tag referenced
     let deletedDigest: String?  // sha256 if the image layers were garbage-collected
 }
 
@@ -183,6 +186,7 @@ struct ClientImageService: ClientImageProtocol {
 
         return ImageDeletionResult(
             untagged: normalizedRef,
+            digest: digest,
             deletedDigest: wasLastRef ? digest : nil
         )
     }

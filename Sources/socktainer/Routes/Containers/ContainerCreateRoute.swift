@@ -501,15 +501,31 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
             }
 
+            let hexId = DockerContainerID.hexId(for: container)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
+            }
             // Docker Engine API: POST /containers/create returns 201 Created.
-            let createResponse = RESTContainerCreate(
-                Id: DockerContainerID.hexId(for: container),
-                Warnings: []
-            )
+            let createResponse = RESTContainerCreate(Id: hexId, Warnings: [])
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
         }
+    }
+
+    /// Builds the `container create` event from the created container snapshot.
+    /// Extracted from the handler (which drives Apple Container directly and can't be
+    /// unit-tested without the runtime) so the event contract — Type, Action, canonical
+    /// Actor.ID, and image/name/label attributes — can be asserted in isolation.
+    static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {
+        DockerEvent.simpleEvent(
+            id: DockerContainerID.hexId(for: container),
+            type: "container",
+            status: "create",
+            image: container.configuration.image.reference,
+            name: container.id,
+            labels: LabelNormalization.restore(container.configuration.labels)
+        )
     }
 }
 // Function to convert PortBindings from HostConfig to PublishedPorts

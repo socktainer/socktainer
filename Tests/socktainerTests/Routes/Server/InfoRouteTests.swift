@@ -51,7 +51,7 @@ private struct EmptyContainerClient: ClientContainerProtocol {
 
 private struct StubImageClient: ClientImageProtocol {
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
-    func delete(id: String) async throws -> ImageDeletionResult { ImageDeletionResult(untagged: id, deletedDigest: nil) }
+    func delete(id: String) async throws -> ImageDeletionResult { ImageDeletionResult(untagged: id, digest: "sha256:abc", deletedDigest: nil) }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
     }
