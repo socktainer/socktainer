@@ -147,18 +147,26 @@ extension ContainerAttachWSRoute {
 
                 // docker run --rm over WS: emit the single post-exit "destroy" (consumeAutoRemove
                 // gates on the --rm flag and dedups against the detached die observer).
-                if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId),
-                    let broadcaster = req.application.storage[EventBroadcasterKey.self]
-                {
+                if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
+                    // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
+                    if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
+                        let cachedIP = await ContainerInfoCache.shared.get(id: hexId)?.ip
+                        let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(container.id)]
+                        if cachedIP == nil || registered == nil || registered == cachedIP {
+                            dnsServer.unregister(hostname: container.id)
+                        }
+                    }
                     let cached = await ContainerInfoCache.shared.get(id: hexId)
-                    await broadcaster.broadcast(
-                        ContainerAttachRoute.makeAutoRemoveEvent(
-                            id: hexId,
-                            image: cached?.image ?? container.configuration.image.reference,
-                            name: cached?.nativeId ?? container.id,
-                            labels: cached?.labels
-                                ?? LabelNormalization.restore(container.configuration.labels)
-                        ))
+                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                        await broadcaster.broadcast(
+                            ContainerAttachRoute.makeAutoRemoveEvent(
+                                id: hexId,
+                                image: cached?.image ?? container.configuration.image.reference,
+                                name: cached?.nativeId ?? container.id,
+                                labels: cached?.labels
+                                    ?? LabelNormalization.restore(container.configuration.labels)
+                            ))
+                    }
                     await ContainerInfoCache.shared.remove(id: hexId)
                 }
 

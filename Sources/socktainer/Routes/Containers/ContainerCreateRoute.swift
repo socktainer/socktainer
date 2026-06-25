@@ -332,24 +332,32 @@ extension ContainerCreateRoute {
 
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+            }
 
-                // Ensure a CoreDNS container for the first network and point this
-                // container's DNS at it so service names resolve inside the VM.
-                if let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
-                    let firstNetwork = body.NetworkingConfig?.EndpointsConfig?.keys.first
-                {
-                    do {
-                        let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
-                        let existing = containerConfiguration.dns
-                        containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
-                            nameservers: [dnsIP],
-                            domain: existing?.domain ?? nil,
-                            searchDomains: existing?.searchDomains ?? [],
-                            options: existing?.options ?? []
-                        )
-                    } catch {
-                        req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
-                    }
+            // Ensure a DNS forwarder container for any named (non-default) network.
+            // This covers both Docker Compose (EndpointsConfig.Aliases) and plain
+            // `docker run --network <name>` (HostConfig.NetworkMode) — both need
+            // DNS forwarder configured as the container's nameserver so container names
+            // resolve inside the VM via SocktainerDNSServer.
+            let endpointsKeys = body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? []
+            let firstNamedNetwork = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: endpointsKeys,
+                networkMode: body.HostConfig?.NetworkMode
+            )
+            if let firstNetwork = firstNamedNetwork,
+                let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
+            {
+                do {
+                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                    let existing = containerConfiguration.dns
+                    containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                        nameservers: [dnsIP],
+                        domain: existing?.domain,
+                        searchDomains: existing?.searchDomains ?? [],
+                        options: existing?.options ?? []
+                    )
+                } catch {
+                    req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
                 }
             }
             containerConfiguration.labels = containerLabels
@@ -523,6 +531,27 @@ extension ContainerCreateRoute {
     /// Extracted from the handler (which drives Apple Container directly and can't be
     /// unit-tested without the runtime) so the event contract — Type, Action, canonical
     /// Actor.ID, and image/name/label attributes — can be asserted in isolation.
+    /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
+    /// container uses the default (non-named) network and no DNS setup is needed.
+    ///
+    /// Covers both Compose (`EndpointsConfig`) and plain `docker run --network <name>`
+    /// (`HostConfig.NetworkMode`). Reserved non-routable modes — "default", "bridge",
+    /// "host", "none" — are excluded because they either don't support user-defined name
+    /// resolution or are handled by the host's own DNS.
+    ///
+    /// Extracted so the selection logic can be asserted in unit tests independently of
+    /// the full handler, which drives Apple Container APIs.
+    /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
+    /// container uses the default (non-named) network and no DNS setup is needed.
+    ///
+    /// Pass `endpointsConfigKeys` as `Array(body.NetworkingConfig?.EndpointsConfig?.keys ?? [])`.
+    static func firstNamedNetwork(endpointsConfigKeys: [String], networkMode: String?) -> String? {
+        let reservedModes: Set<String> = ["default", "bridge", "host", "none"]
+        if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
+        if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
+        return nil
+    }
+
     static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {
         DockerEvent.simpleEvent(
             id: DockerContainerID.hexId(for: container),

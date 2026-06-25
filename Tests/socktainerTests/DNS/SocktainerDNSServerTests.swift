@@ -206,3 +206,85 @@ private actor ActorCounter {
     private(set) var value = 0
     func increment() { value += 1 }
 }
+
+// MARK: - firstNamedNetwork (plain docker run --network parity)
+
+@Suite("ContainerCreateRoute.firstNamedNetwork")
+struct FirstNamedNetworkTests {
+
+    @Test("Compose EndpointsConfig key is returned when present")
+    func composePath() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["myapp_default"],
+            networkMode: nil
+        )
+        #expect(result == "myapp_default")
+    }
+
+    @Test("HostConfig.NetworkMode is returned when EndpointsConfig is absent")
+    func networkModePath() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: "user-net"
+        )
+        #expect(result == "user-net")
+    }
+
+    @Test("EndpointsConfig takes precedence over NetworkMode")
+    func endpointsConfigWins() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["compose-net"],
+            networkMode: "mode-net"
+        )
+        #expect(result == "compose-net")
+    }
+
+    @Test("Reserved modes return nil")
+    func reservedModesReturnNil() {
+        for mode in ["default", "bridge", "host", "none"] {
+            let result = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: [],
+                networkMode: mode
+            )
+            #expect(result == nil, "mode '\(mode)' must not trigger DNS setup")
+        }
+    }
+
+    @Test("Empty networkMode returns nil")
+    func emptyNetworkModeReturnsNil() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: ""
+        )
+        #expect(result == nil)
+    }
+
+    @Test("No config at all returns nil")
+    func noConfigReturnsNil() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: nil
+        )
+        #expect(result == nil)
+    }
+
+    @Test("Reserved names in EndpointsConfig return nil")
+    func reservedEndpointsConfigKeysReturnNil() {
+        for mode in ["default", "bridge", "host", "none"] {
+            let result = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: [mode],
+                networkMode: nil
+            )
+            #expect(result == nil, "EndpointsConfig key '\(mode)' must not trigger DNS setup")
+        }
+    }
+
+    @Test("EndpointsConfig skips reserved and returns first valid key")
+    func endpointsConfigSkipsReserved() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["default", "user-net"],
+            networkMode: nil
+        )
+        #expect(result == "user-net", "must skip 'default' and return the first non-reserved key")
+    }
+}

@@ -8,6 +8,9 @@ actor ContainerInfoCache {
         let nativeId: String
         let image: String
         let labels: [String: String]
+        /// IP on the container's primary network, stored at /start so DNS cleanup in the
+        /// --rm paths can perform the same ownership check as ContainerDeleteRoute.
+        let ip: String?
     }
 
     private var store: [String: Info] = [:]
@@ -18,8 +21,8 @@ actor ContainerInfoCache {
     /// depend on a `store` entry existing at consume time.
     private var autoRemoveSibling: [String: String] = [:]
 
-    func set(hexId: String, nativeId: String, image: String, labels: [String: String]) {
-        let info = Info(hexId: hexId, nativeId: nativeId, image: image, labels: labels)
+    func set(hexId: String, nativeId: String, image: String, labels: [String: String], ip: String? = nil) {
+        let info = Info(hexId: hexId, nativeId: nativeId, image: image, labels: labels, ip: ip)
         store[hexId] = info
         store[nativeId] = info
     }

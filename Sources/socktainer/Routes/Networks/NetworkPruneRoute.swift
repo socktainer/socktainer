@@ -27,7 +27,7 @@ struct NetworkPruneRoute: RouteCollection {
                     continue
                 }
                 do {
-                    // Clean up CoreDNS sidecar before deleting the network
+                    // Clean up DNS forwarder sidecar before deleting the network
                     if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                         await dnsManager.cleanupDNSContainer(networkId: network.Id)
                     }

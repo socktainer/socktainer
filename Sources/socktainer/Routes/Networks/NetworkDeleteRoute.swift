@@ -21,7 +21,7 @@ struct NetworkDeleteRoute: RouteCollection {
             let summary = try? await client.getNetwork(id: id, logger: logger)
             let resolvedId = summary?.Id ?? id
 
-            // Remove the CoreDNS sidecar BEFORE deleting the network —
+            // Remove the DNS forwarder sidecar BEFORE deleting the network —
             // the network can't be deleted while the DNS container is still attached.
             if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                 await dnsManager.cleanupDNSContainer(networkId: resolvedId)
