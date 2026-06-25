@@ -75,6 +75,18 @@ extension ContainerStartRoute {
             {
                 let ip = firstAttachment.ipv4Address.address.description
 
+                // Register the container's own name. Docker's embedded DNS resolves a
+                // container by its name on every network it is attached to — not only by
+                // Compose aliases. Tools that address peers by container name get NXDOMAIN
+                // without this, because the name never appears in `socktainer.dns.names`
+                // or the compose labels handled below. Supabase is the motivating case:
+                // its services dial the database at its container name (e.g.
+                // `supabase_db_<project>`), which is otherwise unresolvable.
+                if !snapshot.id.isEmpty {
+                    dnsServer.register(hostname: snapshot.id, ip: ip)
+                    req.logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                }
+
                 // Names stored at create time (Compose service aliases via socktainer.dns.names)
                 if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
                     for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {

@@ -68,8 +68,8 @@ struct ComposeDNSTests {
             "no qualified alias without project label")
     }
 
-    @Test("Start does not register compose DNS for non-compose containers")
-    func startSkipsComposeDNSWithoutLabels() async throws {
+    @Test("Start registers only the container name (no compose aliases) when compose labels are absent")
+    func startRegistersContainerNameWithoutLabels() async throws {
         let snapshot = try makeSnapshot(nativeId: "plain-container", ip: "192.168.65.22", labels: [:])
         let dnsServer = SocktainerDNSServer()
 
@@ -84,7 +84,40 @@ struct ComposeDNSTests {
             try await app.testing().test(.POST, "/v1.51/containers/abc789/start") { _ async in }
         }
 
-        #expect(dnsServer.listEntries().isEmpty, "no DNS entries for non-compose container")
+        // Docker resolves a container by its name regardless of Compose; the name is
+        // registered, but no compose-style aliases are invented.
+        let entries = dnsServer.listEntries()
+        #expect(entries == ["plain-container": "192.168.65.22"], "only the container name is registered")
+    }
+
+    @Test("Start registers the container's own name alongside socktainer.dns.names aliases")
+    func startRegistersContainerNameWithDNSNames() async throws {
+        // Mirrors Supabase: services dial the database by its container name
+        // (`supabase_db_<project>`), while only short aliases land in socktainer.dns.names.
+        let nativeId = "supabase_db_proj"
+        let ip = "192.168.65.21"
+        let snapshot = try makeSnapshot(
+            nativeId: nativeId, ip: ip,
+            labels: ["socktainer.dns.names": "db,db.supabase.internal"])
+        let dnsServer = SocktainerDNSServer()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.POST, "/v1.51/containers/abc790/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries[nativeId] == ip, "the container name must be resolvable (the bug this fixes)")
+        #expect(entries["db"] == ip, "short alias from socktainer.dns.names is still registered")
+        #expect(entries["db.supabase.internal"] == ip, "qualified alias from socktainer.dns.names is still registered")
     }
 
     // MARK: - Delete route unregisters compose DNS aliases
@@ -149,6 +182,35 @@ struct ComposeDNSTests {
         let entries = dnsServer.listEntries()
         #expect(entries["web"] == "192.168.65.31", "alias owned by another container must be preserved")
         #expect(entries["web.shop"] == "192.168.65.31", "qualified alias owned by another container must be preserved")
+    }
+
+    @Test("Delete unregisters the container's own name")
+    func deleteUnregistersContainerName() async throws {
+        let nativeId = "supabase_db_proj"
+        let ip = "192.168.65.21"
+        let snapshot = try makeSnapshot(
+            nativeId: nativeId, ip: ip,
+            labels: ["socktainer.dns.names": "db"])
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: nativeId, ip: ip)
+        dnsServer.register(hostname: "db", ip: ip)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.DELETE, "/v1.51/containers/abc002") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries[nativeId] == nil, "container name must be unregistered on delete")
+        #expect(entries["db"] == nil, "alias must be unregistered on delete")
     }
 
     // MARK: - Network connect/disconnect return 200
