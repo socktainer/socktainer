@@ -36,7 +36,21 @@ struct NetworkCreateRoute: RouteCollection {
         if let mapping = LabelNormalization.buildMapping(originalLabels) {
             labels[LabelNormalization.mappingKey] = mapping
         }
-        let response = try await client.create(name: query.Name, labels: labels, logger: logger)
+        let response: RESTNetworkCreate
+        do {
+            response = try await client.create(name: query.Name, labels: labels, logger: logger)
+        } catch {
+            // Docker's `network create` is effectively create-to-ensure for tools
+            // (e.g. the Supabase CLI) that may issue it more than once during a
+            // single bring-up; socktainer's create throws "already exists", which
+            // those tools treat as a fatal "failed to create docker network".
+            // Only treat that specific conflict as idempotent — return the
+            // existing network; any other failure is a real error and propagates.
+            // (Mirrors VolumeCreateRoute's idempotent create.)
+            guard "\(error)".lowercased().contains("already exists") else { throw error }
+            guard let existing = try await client.getNetwork(id: query.Name, logger: logger) else { throw error }
+            response = RESTNetworkCreate(Id: existing.Id, Warning: "")
+        }
         return try await response.encodeResponse(for: req)
     }
 }
