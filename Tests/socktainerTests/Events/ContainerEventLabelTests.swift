@@ -183,6 +183,30 @@ struct ContainerCreateEventTests {
     }
 }
 
+@Suite("ContainerAttachRoute — docker run --rm auto-remove event")
+struct ContainerAutoRemoveEventTests {
+
+    // The action MUST be "destroy", matching ContainerDeleteRoute: `--rm` auto-removal is the
+    // same removal operation. A regression to "remove" (the original value) would make this fail.
+    @Test("auto-remove event uses the 'destroy' action and carries image/name/labels")
+    func autoRemoveEventShape() async throws {
+        let event = ContainerAttachRoute.makeAutoRemoveEvent(
+            id: "autorm-hex",
+            image: "postgres:16-alpine",
+            name: "autorm-native",
+            labels: ["app": "autorm"]
+        )
+
+        #expect(event.Type == "container")
+        #expect(event.Action == "destroy")
+        #expect(event.Action != "remove", "auto-remove must emit 'destroy', not the old 'remove'")
+        #expect(event.Actor.ID == "autorm-hex")
+        #expect(event.Actor.Attributes["image"] == "postgres:16-alpine")
+        #expect(event.Actor.Attributes["name"] == "autorm-native")
+        #expect(event.Actor.Attributes["app"] == "autorm")
+    }
+}
+
 // MARK: - Shared helpers
 
 private func makeSnapshot(nativeId: String, image: String, labels: [String: String]) -> ContainerSnapshot {

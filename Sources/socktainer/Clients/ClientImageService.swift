@@ -27,7 +27,7 @@ protocol ClientImageProtocol: Sendable {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64)
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
 }
@@ -364,7 +364,7 @@ struct ClientImageService: ClientImageProtocol {
         }
     }
 
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64) {
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         let allImages = try await list()
         var imagesToDelete: [ClientImage] = []
 
@@ -492,7 +492,7 @@ struct ClientImageService: ClientImageProtocol {
             }
         }
 
-        var deletedImages: [String] = []
+        var results: [ImageDeletionResult] = []
         var spaceReclaimed: Int64 = 0
 
         for image in imagesToDelete {
@@ -522,14 +522,18 @@ struct ClientImageService: ClientImageProtocol {
                     }
                 }
 
-                _ = try await delete(id: reference)
-                deletedImages.append(reference)
+                // Capture the per-image untag/delete result (instead of discarding it) so the
+                // route can emit moby-faithful per-image events. moby's image prune emits an
+                // `untag` per removed reference and a `delete` per freed digest — never an
+                // aggregate "prune" event.
+                let result = try await delete(id: reference)
+                results.append(result)
             } catch {
                 logger.warning("Failed to delete image \(image.reference): \(error)")
             }
         }
 
-        return (deletedImages, spaceReclaimed)
+        return (results, spaceReclaimed)
     }
 
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {

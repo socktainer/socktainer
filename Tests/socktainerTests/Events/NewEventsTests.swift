@@ -125,13 +125,24 @@ struct NewEventsTests {
 
     // MARK: - image.prune
 
-    @Test("image prune route broadcasts Type=image Action=prune event")
+    // moby's image prune emits per-image `untag`/`delete` events — NOT an aggregate "prune"
+    // event (that exists for containers/networks/volumes, but not images). Verified against
+    // moby v28.5.2 daemon/containerd/image_prune.go.
+    @Test("image prune route emits per-image untag/delete, never an aggregate 'prune'")
     func imagePruneEventBroadcast() async throws {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
-        let captureTask = Task<DockerEvent?, Never> {
-            for await event in stream where event.Action == "prune" && event.Type == "image" { return event }
-            return nil
+        let captureTask = Task<[DockerEvent], Never> {
+            var collected: [DockerEvent] = []
+            for await event in stream where event.Type == "image" {
+                collected.append(event)
+                if collected.contains(where: { $0.Action == "untag" })
+                    && collected.contains(where: { $0.Action == "delete" })
+                {
+                    return collected
+                }
+            }
+            return collected
         }
 
         try await withApp(configure: { _ in }) { app in
@@ -146,15 +157,24 @@ struct NewEventsTests {
             }
         }
 
-        let event = await withTimeout(captureTask)
-        captureTask.cancel()
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
+        }
+        let events = await captureTask.value
+        timeout.cancel()
 
-        #expect(event?.Type == "image")
-        #expect(event?.Action == "prune")
-        #expect(event?.Actor.ID == "")
-        #expect(event?.Actor.Attributes["reclaimed"] == "5000000")
-        #expect(event?.Actor.Attributes["name"] == nil)
-        #expect(event?.Actor.Attributes["image"] == nil)
+        // untag: Actor.ID = digest, name = the removed reference.
+        let untag = events.first { $0.Action == "untag" }
+        #expect(untag?.Type == "image")
+        #expect(untag?.Actor.ID == "sha256:abc123")
+        #expect(untag?.Actor.Attributes["name"] == "docker.io/library/alpine:latest")
+        // delete: Actor.ID = freed digest.
+        let del = events.first { $0.Action == "delete" }
+        #expect(del?.Type == "image")
+        #expect(del?.Actor.ID == "sha256:abc123")
+        // The spurious aggregate prune event must be gone.
+        #expect(!events.contains { $0.Action == "prune" }, "image prune must not emit an aggregate 'prune' event")
     }
 
     // MARK: - container.die
@@ -318,8 +338,11 @@ private struct StubImageClient: ClientImageProtocol {
     {
         AsyncThrowingStream { $0.finish() }
     }
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64) {
-        (["docker.io/library/alpine:latest"], 5_000_000)
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
+        (
+            [ImageDeletionResult(untagged: "docker.io/library/alpine:latest", digest: "sha256:abc123", deletedDigest: "sha256:abc123")],
+            5_000_000
+        )
     }
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {

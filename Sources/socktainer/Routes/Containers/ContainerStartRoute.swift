@@ -185,6 +185,17 @@ extension ContainerStartRoute {
                         image: dieImage, name: dieName, labels: attrs
                     )
                     await broadcaster.broadcast(dieEvent)
+
+                    // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
+                    // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
+                    // gates on the --rm flag and dedups against the foreground attach path, so a
+                    // container attached in the foreground does not get a second destroy.
+                    if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
+                        await broadcaster.broadcast(
+                            ContainerAttachRoute.makeAutoRemoveEvent(
+                                id: eventId, image: dieImage, name: dieName, labels: dieLabels))
+                        await ContainerInfoCache.shared.remove(id: nativeId)
+                    }
                 }
             }
 

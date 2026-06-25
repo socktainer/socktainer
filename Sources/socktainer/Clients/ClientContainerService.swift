@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationError
 import Foundation
+import Logging
 
 // Stores the exit code for each container's init process once it terminates.
 // Both ClientContainerService.start() and the stdin-attach bootstrap path
@@ -38,6 +39,38 @@ actor ContainerExitCodeStore {
         if let code = codes[id] { return code }
         return await withCheckedContinuation { continuation in
             waiters[id, default: []].append(continuation)
+        }
+    }
+
+    /// Sentinel recorded when the init process's exit code could not be obtained after retries.
+    /// Distinguishes "wait failed" from a genuine exit code of 0.
+    static let waitFailureSentinel: Int32 = -1
+
+    /// Resolves a process's exit code with bounded retry before it is recorded.
+    ///
+    /// `ClientProcess.wait()` is an XPC round-trip to the Apple Container daemon; under
+    /// concurrent load (many containers exiting at once) that round-trip can throw a transient
+    /// connection error. The previous recorder collapsed any such throw into `?? 0`, recording
+    /// a fake exit code of 0 that then surfaced in the container `die` event (issue #90 / EVT-008:
+    /// expected 7, observed 0). Retrying the wait yields the authoritative code; a process that
+    /// has already exited answers the re-issued wait immediately. After `maxAttempts` failures we
+    /// record `waitFailureSentinel` so observers can tell a failed wait from a real exit-0.
+    static func resolveExitCode(
+        maxAttempts: Int = 5,
+        retryDelayNs: UInt64 = 100_000_000,
+        logger: Logger? = nil,
+        wait: () async throws -> Int32
+    ) async -> Int32 {
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                return try await wait()
+            } catch {
+                logger?.warning("exit-code wait() threw on attempt \(attempt)/\(maxAttempts): \(error)")
+                if attempt >= maxAttempts { return waitFailureSentinel }
+                if retryDelayNs > 0 { try? await Task.sleep(nanoseconds: retryDelayNs) }
+            }
         }
     }
 }
@@ -238,8 +271,11 @@ struct ClientContainerService: ClientContainerProtocol {
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.
             let containerId = container.id
+            let exitLogger = Logger(label: "socktainer.exitcode")
             Task.detached {
-                let code = (try? await process.wait()) ?? 0
+                let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
+                    try await process.wait()
+                }
                 await ContainerExitCodeStore.shared.set(id: containerId, code: code)
             }
         } catch {

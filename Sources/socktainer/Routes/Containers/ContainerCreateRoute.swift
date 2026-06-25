@@ -502,6 +502,12 @@ extension ContainerCreateRoute {
             }
 
             let hexId = DockerContainerID.hexId(for: container)
+            // Record --rm intent so the post-exit `destroy` event fires (and fires exactly once):
+            // Apple Container reaps the container itself, so no DELETE arrives. The flag is consumed
+            // by whichever path observes the exit — foreground attach or the detached die observer.
+            if options.autoRemove {
+                await ContainerInfoCache.shared.markAutoRemove(hexId: hexId, nativeId: container.id)
+            }
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
             }

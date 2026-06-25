@@ -179,12 +179,6 @@ func configure(_ app: Application) async throws {
     app.storage[EventBroadcasterKey.self] = broadcaster
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
-    let watcher = FolderWatcher(parentFolderURL: appleContainerAppSupportUrl, broadcaster: broadcaster)
-    app.storage[FolderWatcherKey.self] = watcher
-
-    // Await starting watching
-    watcher.startWatching()
-
     // Initialize inter-container DNS infrastructure.
     // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
     // is taken, Socktainer auto-increments until a free port is found.

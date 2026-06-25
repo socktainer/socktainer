@@ -138,23 +138,22 @@ extension ContainerAttachWSRoute {
                 // ws.onClose owns the stdin write end; readers own their read ends.
 
                 try? await Task.sleep(nanoseconds: ContainerAttachRoute.outputFlushGraceNs)
-                // Extra probe delay matching HTTP attach — lets Apple Container finish
-                // internal teardown before we poll for auto-removal.
-                try? await Task.sleep(nanoseconds: 100_000_000)
 
-                let autoRemoved: Bool
-                do {
-                    autoRemoved = try await ContainerClient().get(id: container.id) == nil
-                } catch let e as ContainerizationError where e.code == .notFound {
-                    autoRemoved = true
-                } catch {
-                    autoRemoved = false
-                }
-                if autoRemoved, let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // Record the exit code FIRST: this unblocks the /start die observer's
+                // waitForCode so its `die` event is emitted before the `destroy` below,
+                // preserving moby's die→destroy order for foreground `docker run --rm` over WS.
+                await ContainerExitCodeStore.shared.set(id: container.id, code: code)
+                await ContainerExitCodeStore.shared.set(id: hexId, code: code)
+
+                // docker run --rm over WS: emit the single post-exit "destroy" (consumeAutoRemove
+                // gates on the --rm flag and dedups against the detached die observer).
+                if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId),
+                    let broadcaster = req.application.storage[EventBroadcasterKey.self]
+                {
                     let cached = await ContainerInfoCache.shared.get(id: hexId)
                     await broadcaster.broadcast(
-                        DockerEvent.simpleEvent(
-                            id: hexId, type: "container", status: "remove",
+                        ContainerAttachRoute.makeAutoRemoveEvent(
+                            id: hexId,
                             image: cached?.image ?? container.configuration.image.reference,
                             name: cached?.nativeId ?? container.id,
                             labels: cached?.labels
@@ -163,8 +162,6 @@ extension ContainerAttachWSRoute {
                     await ContainerInfoCache.shared.remove(id: hexId)
                 }
 
-                await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                await ContainerExitCodeStore.shared.set(id: hexId, code: code)
                 try? await ws.close()
             }
 

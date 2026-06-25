@@ -90,7 +90,7 @@ private struct ImageDeleteMock: ClientImageProtocol {
         AsyncThrowingStream { $0.finish() }
     }
     func prune(filters: [String: [String]], logger: Logger) async throws -> (
-        deletedImages: [String], spaceReclaimed: Int64
+        results: [ImageDeletionResult], spaceReclaimed: Int64
     ) { ([], 0) }
     func load(
         tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger
