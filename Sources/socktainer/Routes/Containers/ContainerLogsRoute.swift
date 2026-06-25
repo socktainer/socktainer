@@ -21,6 +21,12 @@ extension ContainerLogsRoute {
                 throw Abort(.notFound, reason: "Container not found")
             }
 
+            // Containers started with a TTY produce a raw, unmultiplexed log
+            // stream; non-TTY containers use Docker's 8-byte stdcopy framing.
+            // The docker CLI decides how to read the stream from the container's
+            // Tty setting, so the framing here must match it.
+            let isTTY = container.configuration.initProcess.terminal
+
             // always use the container's log, not the boot of the container
             let boot = false
             let fhs = try await ContainerClient().logs(id: container.id)
@@ -41,7 +47,7 @@ extension ContainerLogsRoute {
                             buffer.append(data)
 
                             // Process complete frames from buffer
-                            buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
+                            buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY) { outputBuffer in
                                 _ = writer.write(.buffer(outputBuffer))
                             }
                         }
@@ -71,7 +77,7 @@ extension ContainerLogsRoute {
                             while let data = try fileHandle.read(upToCount: 4096), !data.isEmpty {
                                 gotData = true
                                 buffer.append(data)
-                                buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer) { outputBuffer in
+                                buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY) { outputBuffer in
                                     frames.append(outputBuffer)
                                 }
                             }
@@ -107,30 +113,18 @@ extension ContainerLogsRoute {
         }
     }
 
-    private static func processDockerLogFrames(from buffer: Data, writeOutput: (ByteBuffer) -> Void) throws -> Data {
-        // Since the buffer contains raw log data, we need to format it as Docker log frames
-        // with stdout stream type (0x01)
+    static func processDockerLogFrames(from buffer: Data, ttyMode: Bool, writeOutput: (ByteBuffer) -> Void) throws -> Data {
         guard !buffer.isEmpty else {
             return buffer
         }
 
-        // Create a Docker log frame with stdout stream type
-        let streamType: UInt8 = 0x01  // stdout
-        let frameSize = UInt32(buffer.count)
-
-        // Create the 8-byte header: [stream_type, 0, 0, 0, size_bytes...]
-        var frame = Data(capacity: 8 + buffer.count)
-        frame.append(streamType)
-        frame.append(contentsOf: [0, 0, 0])  // padding
-        frame.append(contentsOf: withUnsafeBytes(of: frameSize.bigEndian) { Data($0) })
-        frame.append(buffer)
-
-        // Write the complete frame
-        var outputBuffer = ByteBufferAllocator().buffer(capacity: frame.count)
-        outputBuffer.writeBytes(frame)
+        // Match the container's TTY mode: a TTY produces a raw, unmultiplexed
+        // stream, while non-TTY logs use Docker's 8-byte stdcopy framing. Shared
+        // with the attach/exec routes via writeDockerFrame so the wire format is
+        // defined in exactly one place.
+        var outputBuffer = ByteBufferAllocator().buffer(capacity: buffer.count + (ttyMode ? 0 : 8))
+        outputBuffer.writeDockerFrame(streamType: .stdout, data: buffer, ttyMode: ttyMode)
         writeOutput(outputBuffer)
-
-        // Return empty data since we've processed all the buffer
         return Data()
     }
 }
