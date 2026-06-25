@@ -63,8 +63,26 @@ extension ContainerCreateRoute {
             // use platform "" if not provided
             let containerPlatform = (query.platform?.isEmpty == false) ? query.platform! : "linux/\(Arch.hostArchitecture().rawValue)"
 
-            let bodyData = try await req.body.collect().get()!
-            let body = try JSONDecoder().decode(CreateContainerRequest.self, from: bodyData.getData(at: 0, length: bodyData.readableBytes)!)
+            // `collect()` with no max silently caps at Vapor's 1<<14 (16 KB)
+            // default — `defaultMaxBodySize` is only consulted by Vapor's
+            // registered-route collection, which the RegexRouter bypasses. A
+            // container-create payload (e.g. Supabase's edge-runtime / storage
+            // services carry large env + config) exceeds 16 KB and would 413
+            // "Payload Too Large". Honor the configured cap explicitly.
+            guard let bodyData = try await req.body.collect(max: req.application.routes.defaultMaxBodySize.value).get(),
+                let data = bodyData.getData(at: 0, length: bodyData.readableBytes), !data.isEmpty
+            else {
+                // No body (e.g. an empty POST) — return 400 rather than trapping
+                // on a force-unwrap.
+                throw Abort(.badRequest, reason: "Request body is required")
+            }
+            let body: CreateContainerRequest
+            do {
+                body = try JSONDecoder().decode(CreateContainerRequest.self, from: data)
+            } catch {
+                // Malformed JSON is bad client input, not a server fault — 400, not 500.
+                throw Abort(.badRequest, reason: "Invalid JSON request body")
+            }
 
             req.logger.info("Creating container for image: \(body.Image)")
 
