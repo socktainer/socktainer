@@ -221,6 +221,36 @@ struct ComposeDNSTests {
         #expect(entries["db"] == nil, "alias must be unregistered on delete")
     }
 
+    @Test("Delete preserves the container's own name when another container has taken ownership")
+    func deletePreservesNativeNameOwnedByAnotherContainer() async throws {
+        let nativeId = "supabase_db_proj"
+        let snapshot = try makeSnapshot(
+            nativeId: nativeId, ip: "192.168.65.21",
+            labels: ["socktainer.dns.names": "db"])
+        let dnsServer = SocktainerDNSServer()
+        // A replacement container has claimed the same native name (and alias) before
+        // this one is deleted — the ownership check must leave both entries intact.
+        dnsServer.register(hostname: nativeId, ip: "192.168.65.99")
+        dnsServer.register(hostname: "db", ip: "192.168.65.99")
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.DELETE, "/v1.51/containers/abc003") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries[nativeId] == "192.168.65.99", "container name owned by another container must be preserved")
+        #expect(entries["db"] == "192.168.65.99", "alias owned by another container must be preserved")
+    }
+
     // MARK: - Network connect/disconnect return 200
 
     @Test("POST /networks/{id}/connect returns 200")
