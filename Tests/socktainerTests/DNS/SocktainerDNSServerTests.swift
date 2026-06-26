@@ -1,4 +1,6 @@
 import Darwin
+import Foundation
+import SocktainerDNSImage
 import Testing
 
 @testable import socktainer
@@ -129,4 +131,78 @@ struct SocktainerDNSServerTests {
         server.register(hostname: "db", ip: "10.0.0.99")
         #expect(server.listEntries()["db"] == "10.0.0.99")
     }
+}
+
+// MARK: - EmbeddedDNSImage / SocktainerDNSImage SwiftPM resource
+
+@Suite("EmbeddedDNSImage — SwiftPM resource")
+struct EmbeddedDNSImageTests {
+
+    @Test("SocktainerDNSImage.archiveURL resolves to an existing file")
+    func archiveURLResolvesToExistingFile() {
+        let url = SocktainerDNSImage.archiveURL
+        #expect(url.lastPathComponent == "socktainer-dns.tar.gz")
+        #expect(FileManager.default.fileExists(atPath: url.path), "tarball must be present in SwiftPM resource bundle")
+    }
+
+    @Test("EmbeddedDNSImage.tag matches SocktainerDNSImage.reference")
+    func tagMatchesPackageReference() {
+        #expect(EmbeddedDNSImage.tag == SocktainerDNSImage.reference)
+        #expect(EmbeddedDNSImage.tag == "socktainer-dns:embedded", "image tag must match what NetworkDNSManager registers")
+    }
+
+    // Regression for the permanent-failure-caching bug (CodeRabbit review): a transient
+    // error in perform() must not poison every future call. After a failure the gate resets
+    // so the next caller can retry — without this, DNS sidecar creation never recovers
+    // from a momentary resource error without a process restart.
+    @Test("ImportGate.ensureOnce resets after failure so the next caller can retry")
+    func importGateResetsAfterFailure() async throws {
+        struct ImportError: Error {}
+        let gate = EmbeddedDNSImage.ImportGate()
+
+        // First call: fails.
+        await #expect(throws: ImportError.self) {
+            try await gate.ensureOnce { throw ImportError() }
+        }
+
+        // Second call: must succeed — gate must have cleared the failed task.
+        let retryCount = ActorCounter()
+        try await gate.ensureOnce { await retryCount.increment() }
+        #expect(await retryCount.value == 1, "gate must allow retry after a prior failure")
+    }
+
+    // Regression for the concurrent first-use race (Finding #1 in CodeRabbit review):
+    // without ImportGate, two networks starting simultaneously both missed the
+    // ClientImage.get check and both called load(), nondeterministic on a fresh store.
+    // This test proves that ImportGate.ensureOnce coalesces concurrent callers so the
+    // perform closure executes exactly once even when two tasks race through it.
+    @Test("ImportGate.ensureOnce executes perform exactly once under concurrent callers")
+    func importGateCoalescesConcurrentCallers() async throws {
+        let gate = EmbeddedDNSImage.ImportGate()
+        let callCount = ActorCounter()
+
+        // Start two tasks concurrently; both will race into ensureOnce.
+        async let t1: Void = gate.ensureOnce {
+            await callCount.increment()
+            // Brief yield so the second task has a chance to arrive while the first is
+            // in-flight, proving the "in-flight task" branch of ensureOnce is exercised.
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        async let t2: Void = gate.ensureOnce {
+            await callCount.increment()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try await t1
+        try await t2
+
+        let count = await callCount.value
+        #expect(count == 1, "perform must execute exactly once — concurrent callers must coalesce, not each run the body")
+    }
+}
+
+// MARK: - Helpers
+
+private actor ActorCounter {
+    private(set) var value = 0
+    func increment() { value += 1 }
 }

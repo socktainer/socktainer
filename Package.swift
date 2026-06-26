@@ -22,6 +22,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
+        .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.1.0"),
     ],
     targets: [
         .executableTarget(
@@ -40,14 +41,16 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "DataCompression", package: "DataCompression"),
+                .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 "BuildInfo",
-            ],
+            ]
         ),
         .testTarget(
             name: "socktainerTests",
             dependencies: [
                 .target(name: "socktainer"),
                 .product(name: "ContainerAPIClient", package: "container"),
+                .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 .product(name: "VaporTesting", package: "vapor"),
             ],
         ),

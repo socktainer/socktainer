@@ -12,12 +12,12 @@ struct NetworkDNSManagerKey: StorageKey {
     typealias Value = NetworkDNSManager
 }
 
-/// Manages one CoreDNS sidecar container per user-created network.
+/// Manages one DNS forwarder sidecar container per user-created network.
 ///
-/// Each CoreDNS container is configured to forward all DNS queries to
-/// SocktainerDNSServer running on the host (reachable at the network's
-/// gateway IP on port 2054). SocktainerDNSServer resolves container
-/// service names and forwards unknown queries upstream to 1.1.1.1.
+/// Each forwarder is the embedded `socktainer-dns` binary (static Rust, ~388 KB,
+/// bundled as a Swift Package resource). It proxies DNS queries from containers
+/// to SocktainerDNSServer on the macOS host via the network gateway, without
+/// pulling anything from the internet at runtime.
 ///
 /// DNS containers are identified by the label `socktainer.role=dns` and
 /// named `socktainer-dns-{networkId}`.
@@ -31,7 +31,7 @@ actor NetworkDNSManager {
     private let appSupportURL: URL
     private let dnsPort: Int
     private let containerSystemConfig: ContainerSystemConfig
-    private var containerIPs: [String: String] = [:]  // networkId → CoreDNS container IP
+    private var containerIPs: [String: String] = [:]  // networkId → DNS forwarder container IP
     private var pendingCreation: [String: Task<String, Error>] = [:]
     private var log = Logger(label: "socktainer.dns.manager")
 
@@ -43,20 +43,20 @@ actor NetworkDNSManager {
 
     // MARK: - Public API
 
-    /// Returns the IP of the CoreDNS container for `networkId`, creating it lazily.
+    /// Returns the IP of the DNS forwarder container for `networkId`, creating it lazily.
     /// Concurrent callers for the same network are coalesced — only one container is created.
     func ensureDNSContainer(networkId: String) async throws -> String {
         if let ip = containerIPs[networkId] {
-            log.info("[dns-manager] reusing cached CoreDNS at \(ip) for network \(networkId)")
+            log.info("[dns-manager] reusing cached DNS forwarder at \(ip) for network \(networkId)")
             return ip
         }
 
         if let pending = pendingCreation[networkId] {
-            log.info("[dns-manager] waiting for in-flight CoreDNS creation for network \(networkId)")
+            log.info("[dns-manager] waiting for in-flight DNS forwarder creation for network \(networkId)")
             return try await pending.value
         }
 
-        log.info("[dns-manager] creating CoreDNS container for network \(networkId)")
+        log.info("[dns-manager] creating DNS forwarder container for network \(networkId)")
         let appSupportURL = self.appSupportURL
         let dnsPort = self.dnsPort
         let containerSystemConfig = self.containerSystemConfig
@@ -69,7 +69,7 @@ actor NetworkDNSManager {
             let ip = try await task.value
             containerIPs[networkId] = ip
             pendingCreation.removeValue(forKey: networkId)
-            log.info("[dns-manager] CoreDNS running at \(ip) for network \(networkId)")
+            log.info("[dns-manager] DNS forwarder running at \(ip) for network \(networkId)")
             return ip
         } catch {
             pendingCreation.removeValue(forKey: networkId)
@@ -77,7 +77,7 @@ actor NetworkDNSManager {
         }
     }
 
-    /// Removes the CoreDNS container for `networkId` and clears its cached IP.
+    /// Removes the DNS forwarder container for `networkId` and clears its cached IP.
     /// Called when a user network is deleted.
     func cleanupDNSContainer(networkId: String) async {
         containerIPs.removeValue(forKey: networkId)
@@ -142,33 +142,28 @@ actor NetworkDNSManager {
             return attachment.ipv4Address.address.description
         }
 
-        // Get the network's gateway IP — needed for the CoreDNS Corefile
+        // Get the network's gateway IP — passed to the forwarder as DNS_UPSTREAM
         let networkResource = try await NetworkClient().get(id: networkId)
         let gatewayIP = networkResource.status.ipv4Gateway.description
 
-        // Write Corefile to a host directory that will be virtiofs-mounted
-        let corefileDir = appSupportURL.appendingPathComponent("dns/\(networkId)")
-        try FileManager.default.createDirectory(at: corefileDir, withIntermediateDirectories: true)
-        let corefileURL = corefileDir.appendingPathComponent("Corefile")
-        let corefile = """
-            . {
-                forward . \(gatewayIP):\(dnsPort)
-                cache 10
-                errors
-            }
-            """
-        try corefile.write(to: corefileURL, atomically: true, encoding: .utf8)
+        // Ensure the embedded DNS forwarder image is available (imports from bundle on first use)
+        try await EmbeddedDNSImage.ensure(
+            containerSystemConfig: containerSystemConfig,
+            appSupportURL: appSupportURL
+        )
 
-        // Pull CoreDNS image — arm64 native, no Rosetta needed
-        let imageRef = try ClientImage.normalizeReference("docker.io/coredns/coredns:latest", containerSystemConfig: containerSystemConfig)
         let platform = Platform.current
-        let image = try await ClientImage.fetch(reference: imageRef, platform: platform, containerSystemConfig: containerSystemConfig)
+        let image = try await ClientImage.fetch(
+            reference: EmbeddedDNSImage.tag,
+            platform: platform,
+            containerSystemConfig: containerSystemConfig
+        )
         _ = try await image.getCreateSnapshot(platform: platform)
 
         let processConfig = ProcessConfiguration(
-            executable: "/coredns",
-            arguments: ["-conf", "/etc/coredns/Corefile"],
-            environment: [],
+            executable: "/dns-forwarder",
+            arguments: [],
+            environment: ["DNS_UPSTREAM=\(gatewayIP):\(dnsPort)"],
             workingDirectory: "/",
             terminal: false,
             user: .id(uid: 0, gid: 0)
@@ -179,16 +174,13 @@ actor NetworkDNSManager {
             roleLabel: dnsRole,
             networkLabel: networkId,
         ]
-        config.mounts = [
-            Filesystem.virtiofs(source: corefileDir.path, destination: "/etc/coredns", options: [])
-        ]
         config.networks = [
             AttachmentConfiguration(
                 network: networkId,
                 options: AttachmentOptions(hostname: ContainerNameUtility.sanitize(containerPrefix + networkId))
             )
         ]
-        // Point CoreDNS to the vmnet gateway for upstream resolution
+        // Point DNS forwarder to the vmnet gateway for upstream resolution
         config.dns = ContainerConfiguration.DNSConfiguration(
             nameservers: [gatewayIP],
             domain: nil,
