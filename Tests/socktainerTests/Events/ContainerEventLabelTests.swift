@@ -107,7 +107,7 @@ struct ContainerDeleteEventLabelTests {
             try app.register(collection: ContainerDeleteRoute(client: EventMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/\(id)") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 

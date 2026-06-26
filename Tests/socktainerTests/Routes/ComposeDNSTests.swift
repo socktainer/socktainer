@@ -152,7 +152,7 @@ struct ComposeDNSTests {
             try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/abc000") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 
@@ -183,7 +183,7 @@ struct ComposeDNSTests {
             try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/abc001") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 
@@ -212,7 +212,7 @@ struct ComposeDNSTests {
             try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/abc002") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 
@@ -242,7 +242,7 @@ struct ComposeDNSTests {
             try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/abc003") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 
