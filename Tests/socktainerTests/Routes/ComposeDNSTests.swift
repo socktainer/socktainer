@@ -153,6 +153,8 @@ struct ComposeDNSTests {
 
             try await app.testing().test(.DELETE, "/v1.51/containers/abc000") { res async in
                 #expect(res.status == .noContent)
+                // 204 No Content must carry an empty body.
+                #expect(res.body.readableBytes == 0)
             }
         }
 
