@@ -51,6 +51,9 @@ struct NetworkCreateRoute: RouteCollection {
             guard let existing = try await client.getNetwork(id: query.Name, logger: logger) else { throw error }
             response = RESTNetworkCreate(Id: existing.Id, Warning: "")
         }
-        return try await response.encodeResponse(for: req)
+        // Docker Engine API: POST /networks/create returns 201 Created.
+        let httpResponse = try await response.encodeResponse(for: req)
+        httpResponse.status = .created
+        return httpResponse
     }
 }

@@ -18,7 +18,7 @@ import VaporTesting
 @Suite("NetworkCreateRoute — idempotent create")
 struct NetworkCreateRouteTests {
 
-    @Test("first create returns 200 with the created network")
+    @Test("first create returns 201 with the created network")
     func firstCreateSucceeds() async throws {
         let client = FakeNetworkClient()
         try await withNetworkRouteApp(client: client) { app in
@@ -27,7 +27,7 @@ struct NetworkCreateRouteTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Name":"net-a"}"#)
             ) { res async throws in
-                #expect(res.status == .ok)
+                #expect(res.status == .created)
                 let created = try res.content.decode(RESTNetworkCreate.self)
                 #expect(created.Id == "net-a")
             }
@@ -46,7 +46,7 @@ struct NetworkCreateRouteTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Name":"net-a"}"#)
             ) { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .created)
             }
             // Second create for the same name — must NOT be fatal.
             try await app.testing().test(
@@ -54,7 +54,7 @@ struct NetworkCreateRouteTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Name":"net-a"}"#)
             ) { res async throws in
-                #expect(res.status == .ok)
+                #expect(res.status == .created)
                 let body = try res.content.decode(RESTNetworkCreate.self)
                 #expect(body.Id == "net-a")
             }
@@ -90,7 +90,7 @@ struct NetworkCreateRouteTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Name":"net-a"}"#)
             ) { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .created)
             }
             // Simulate the network being deleted between the failed create and the
             // lookup — the route must not return a bogus 200, it rethrows.
