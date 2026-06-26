@@ -13,7 +13,8 @@ struct VolumeDeleteRoute: RouteCollection {
         }
         do {
             try await client.delete(name: name)
-            return Response(status: .ok, body: .init(string: "{}"))
+            // Docker Engine API: DELETE /volumes/{name} returns 204 No Content.
+            return Response(status: .noContent)
         } catch {
             if let abortError = error as? AbortError {
                 throw abortError
