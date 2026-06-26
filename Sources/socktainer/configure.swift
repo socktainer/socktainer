@@ -9,6 +9,11 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
 
 func configure(_ app: Application) async throws {
 
+    // Docker container-create payloads (large env / config — e.g. Supabase's
+    // edge-runtime + storage-api) exceed Vapor's 16 KB default collected-body
+    // cap, yielding 413 "Payload Too Large". Raise it well above any real request.
+    app.routes.defaultMaxBodySize = "64mb"
+
     // Define app support path early since it's needed by multiple services
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)

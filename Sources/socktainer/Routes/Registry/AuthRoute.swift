@@ -10,18 +10,25 @@ struct AuthRoute: RouteCollection {
 extension AuthRoute {
     static func handler(client: ClientRegistryService) -> @Sendable (Request) async throws -> Response {
         { req in
-            // Collect the body for large requests
-            let collectedBuffer = try await req.body.collect().get()
+            // Collect the body for large requests. `collect()` with no max
+            // silently caps at Vapor's 1<<14 (16 KB) default; the RegexRouter
+            // bypasses Vapor's registered-route collection, so honor the
+            // configured `defaultMaxBodySize` cap explicitly instead.
+            guard let buffer = try await req.body.collect(max: req.application.routes.defaultMaxBodySize.value).get(),
+                buffer.readableBytes > 0
+            else {
+                // Empty POST /auth — bad client input; return 400 rather than
+                // falling through to req.content.decode below and surfacing a 500.
+                let response = Response(status: .badRequest, body: .init(string: #"{"message": "Request body is required"}"#))
+                response.headers.add(name: .contentType, value: "application/json")
+                return response
+            }
 
-            if let buffer = collectedBuffer {
-                _ = buffer.getString(at: 0, length: buffer.readableBytes)
-
-                if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
-                    do {
-                        _ = try JSONDecoder().decode(AuthConfig.self, from: data)
-                    } catch {
-                        req.logger.error("Failed to decode content from buffer: \(error)")
-                    }
+            if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
+                do {
+                    _ = try JSONDecoder().decode(AuthConfig.self, from: data)
+                } catch {
+                    req.logger.error("Failed to decode content from buffer: \(error)")
                 }
             }
 
