@@ -67,7 +67,20 @@ extension ContainerStartRoute {
             // Names were stored in the label at create time (Compose service aliases).
             // Resolve through getContainer: clients commonly start containers by
             // the hex ID returned from create, which the native lookup rejects.
-            let startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+            // Retry up to 5 times (500 ms total): Apple Container may return the container
+            // before the vmnet IP is assigned, leaving networks[] empty on the first fetch.
+            var startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+            if startedSnapshot?.networks.isEmpty == true {
+                for _ in 0..<5 {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    if let refreshed = try? await client.getContainer(id: id),
+                        !refreshed.networks.isEmpty
+                    {
+                        startedSnapshot = refreshed
+                        break
+                    }
+                }
+            }
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
                 let snapshot = startedSnapshot,
                 snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,

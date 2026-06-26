@@ -94,6 +94,87 @@ struct ContainerCreateRouteTests {
     }
 }
 
+// MARK: - Env-var rewrite helpers
+
+@Suite("ContainerCreateRoute — 127.0.0.1 gateway rewrite")
+struct LoopbackGatewayRewriteTests {
+
+    @Test("URL @-form connection string is rewritten")
+    func atFormIsRewritten() {
+        let env = ["DB=postgresql://user:pass@127.0.0.1:5432/postgres"]
+        let result = ContainerCreateRoute.rewriteLoopbackToGateway(env, gatewayIP: "192.168.67.1")
+        #expect(result == ["DB=postgresql://user:pass@192.168.67.1:5432/postgres"])
+    }
+
+    @Test("URL ://-form without credentials is rewritten")
+    func schemeFormIsRewritten() {
+        let env = ["REDIS_URL=redis://127.0.0.1:6379"]
+        let result = ContainerCreateRoute.rewriteLoopbackToGateway(env, gatewayIP: "10.0.0.1")
+        #expect(result == ["REDIS_URL=redis://10.0.0.1:6379"])
+    }
+
+    @Test("Bind-address var is left unchanged")
+    func bindAddressUnchanged() {
+        let env = ["LISTEN=127.0.0.1:8080"]
+        let result = ContainerCreateRoute.rewriteLoopbackToGateway(env, gatewayIP: "192.168.67.1")
+        #expect(result == env)
+    }
+
+    @Test("Multiple env vars — only URL-form rewritten")
+    func multipleVarsMixed() {
+        let env = [
+            "DB=postgresql://user@127.0.0.1:5432/db",
+            "BIND=127.0.0.1:80",
+            "CACHE=redis://127.0.0.1:6379",
+        ]
+        let result = ContainerCreateRoute.rewriteLoopbackToGateway(env, gatewayIP: "10.1.2.3")
+        #expect(result[0] == "DB=postgresql://user@10.1.2.3:5432/db")
+        #expect(result[1] == "BIND=127.0.0.1:80")  // unchanged
+        #expect(result[2] == "CACHE=redis://10.1.2.3:6379")
+    }
+}
+
+@Suite("ContainerCreateRoute — peer hostname rewrite")
+struct PeerHostnameRewriteTests {
+
+    private let peers = ["supabase_db_supabase": "192.168.67.3", "db": "192.168.67.3"]
+
+    @Test("@hostname:port form is rewritten")
+    func atFormIsRewritten() {
+        let env = ["URL=postgresql://user@supabase_db_supabase:5432/postgres"]
+        let result = ContainerCreateRoute.rewritePeerHostnames(env, peers: peers)
+        #expect(result == ["URL=postgresql://user@192.168.67.3:5432/postgres"])
+    }
+
+    @Test("host=hostname key-value form is rewritten")
+    func hostKeyValueIsRewritten() {
+        let env = ["GOTRUE_DB_DSN=host=supabase_db_supabase user=admin dbname=postgres"]
+        let result = ContainerCreateRoute.rewritePeerHostnames(env, peers: peers)
+        #expect(result == ["GOTRUE_DB_DSN=host=192.168.67.3 user=admin dbname=postgres"])
+    }
+
+    @Test("Unknown hostname is left unchanged")
+    func unknownHostnameUnchanged() {
+        let env = ["URL=postgresql://user@other_service:5432/db"]
+        let result = ContainerCreateRoute.rewritePeerHostnames(env, peers: peers)
+        #expect(result == env)
+    }
+
+    @Test("Short alias is also rewritten")
+    func shortAliasRewritten() {
+        let env = ["DB_HOST=host=db port=5432"]
+        let result = ContainerCreateRoute.rewritePeerHostnames(env, peers: peers)
+        #expect(result == ["DB_HOST=host=192.168.67.3 port=5432"])
+    }
+
+    @Test("Empty peers list leaves env unchanged")
+    func emptyPeersNoChange() {
+        let env = ["URL=postgresql://user@supabase_db_supabase:5432/db"]
+        let result = ContainerCreateRoute.rewritePeerHostnames(env, peers: [:])
+        #expect(result == env)
+    }
+}
+
 // MARK: - Helpers
 
 private func withCreateRouteApp(

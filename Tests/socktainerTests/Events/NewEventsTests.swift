@@ -38,7 +38,7 @@ struct NewEventsTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Name":"my-net"}"#)
             ) { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .created)
             }
         }
 
