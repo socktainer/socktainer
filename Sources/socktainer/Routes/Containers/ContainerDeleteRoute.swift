@@ -61,6 +61,10 @@ extension ContainerDeleteRoute {
                         dnsServer.unregister(hostname: hostname)
                     }
 
+                    // Mirror of the container-name registration in the start route.
+                    if !container.id.isEmpty {
+                        unregisterIfOwned(container.id)
+                    }
                     if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
                         for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
                             unregisterIfOwned(name)
