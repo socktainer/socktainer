@@ -32,6 +32,18 @@ struct ContainerLogsFramingTests {
         #expect(remainder.isEmpty)
     }
 
+    @Test("non-TTY length field uses all four big-endian header bytes (payload > 255B)")
+    func nonTTYLengthUsesAllHeaderBytes() throws {
+        let payload = Data(repeating: 0x61, count: 300)  // 300 = 0x0000012C
+        let (bytes, remainder) = try collect(payload, ttyMode: false)
+
+        // The sibling test covers the header shape for a small payload; this one
+        // exists to verify the upper length bytes, so it asserts all four.
+        #expect(Array(bytes[4...7]) == [0, 0, 1, 44])  // 300 big-endian = 0x00 0x00 0x01 0x2C
+        #expect(Array(bytes[8...]) == Array(payload))
+        #expect(remainder.isEmpty)
+    }
+
     @Test("TTY logs are passed through raw, without any framing header")
     func ttyIsRaw() throws {
         let payload = Data("hello".utf8)
