@@ -12,7 +12,7 @@ struct VolumeCreateRoute: RouteCollection {
 
     /// Creates a volume, returning the existing volume when one with the same
     /// name already exists (idempotent, matching Docker's `POST /volumes/create`).
-    func handler(_ req: Request) async throws -> Volume {
+    func handler(_ req: Request) async throws -> Response {
         let createRequest = try req.content.decode(VolumeRequest.self)
         let resolvedName = (createRequest.Name?.isEmpty == false) ? createRequest.Name! : "volume-\(UUID().uuidString)"
 
@@ -41,8 +41,10 @@ struct VolumeCreateRoute: RouteCollection {
             Options: driverOpts,
             Labels: labels
         )
+        // Docker Engine API: POST /volumes/create returns 201 Created.
+        let volume: Volume
         do {
-            return try await client.create(request: restRequest)
+            volume = try await client.create(request: restRequest)
         } catch {
             // Docker's `volume create` is idempotent: creating a volume that
             // already exists returns the existing one rather than erroring.
@@ -52,7 +54,10 @@ struct VolumeCreateRoute: RouteCollection {
             // idempotent — return the existing volume; any other failure is a
             // real error and must propagate.
             guard "\(error)".lowercased().contains("already exists") else { throw error }
-            return try await client.inspect(name: resolvedName)
+            volume = try await client.inspect(name: resolvedName)
         }
+        let httpResponse = try await volume.encodeResponse(for: req)
+        httpResponse.status = .created
+        return httpResponse
     }
 }
