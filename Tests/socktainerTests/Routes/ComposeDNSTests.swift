@@ -41,6 +41,7 @@ struct ComposeDNSTests {
         let entries = dnsServer.listEntries()
         #expect(entries["db"] == ip, "short service name must be registered with correct IP")
         #expect(entries["db.myapp"] == ip, "qualified service.project alias must be registered")
+        #expect(entries[nativeId] == ip, "the container's own name must register in the compose-label path too")
     }
 
     @Test("Start registers only service alias when project label is absent")
@@ -122,17 +123,23 @@ struct ComposeDNSTests {
 
     // MARK: - Delete route unregisters compose DNS aliases
 
-    @Test("Delete unregisters both service and service.project aliases")
+    @Test("Delete unregisters the container name plus service and service.project aliases")
     func deleteUnregistersComposeDNSAliases() async throws {
+        let nativeId = "compose-web"
+        let ip = "192.168.65.30"
         let snapshot = try makeSnapshot(
-            nativeId: "compose-web", ip: "192.168.65.30",
+            nativeId: nativeId, ip: ip,
             labels: [
                 "com.docker.compose.service": "web",
                 "com.docker.compose.project": "shop",
             ])
         let dnsServer = SocktainerDNSServer()
-        dnsServer.register(hostname: "web", ip: "192.168.65.30")
-        dnsServer.register(hostname: "web.shop", ip: "192.168.65.30")
+        // The start route registers all three (container name + both aliases);
+        // delete must remove all three together.
+        dnsServer.register(hostname: nativeId, ip: ip)
+        dnsServer.register(hostname: "web", ip: ip)
+        dnsServer.register(hostname: "web.shop", ip: ip)
+        #expect(dnsServer.listEntries()[nativeId] != nil)
         #expect(dnsServer.listEntries()["web"] != nil)
         #expect(dnsServer.listEntries()["web.shop"] != nil)
 
@@ -149,6 +156,7 @@ struct ComposeDNSTests {
             }
         }
 
+        #expect(dnsServer.listEntries()[nativeId] == nil, "container name must be unregistered on delete")
         #expect(dnsServer.listEntries()["web"] == nil, "service alias must be unregistered on delete")
         #expect(dnsServer.listEntries()["web.shop"] == nil, "qualified alias must be unregistered on delete")
     }
