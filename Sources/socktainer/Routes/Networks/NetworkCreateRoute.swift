@@ -39,6 +39,14 @@ struct NetworkCreateRoute: RouteCollection {
         let response: RESTNetworkCreate
         do {
             response = try await client.create(name: query.Name, labels: labels, logger: logger)
+            // moby network events carry {name, type} where type is the driver.
+            // Only broadcast on actual creation — not on the idempotent "already exists" path.
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "network", action: "create", actorID: response.Id,
+                        attributes: ["name": query.Name, "type": "nat"]))
+            }
         } catch {
             // Docker's `network create` is effectively create-to-ensure for tools
             // (e.g. the Supabase CLI) that may issue it more than once during a

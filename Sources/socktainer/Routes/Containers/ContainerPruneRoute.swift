@@ -26,6 +26,13 @@ extension ContainerPruneRoute {
 
         do {
             let result = try await client.prune(filters: parsedFilters)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // Docker prune events carry an empty Actor.ID and only the bytes reclaimed.
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "container", action: "prune", actorID: "",
+                        attributes: ["reclaimed": String(result.spaceReclaimed)]))
+            }
             return RESTContainerPruneResponse(
                 ContainersDeleted: result.deletedContainers,
                 SpaceReclaimed: result.spaceReclaimed

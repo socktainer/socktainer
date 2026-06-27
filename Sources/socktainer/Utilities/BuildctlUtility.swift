@@ -170,7 +170,7 @@ enum BuildctlUtility {
     }
 
     static func duCommand() -> Command {
-        var arguments = [
+        let arguments = [
             "--addr", "unix:///run/buildkit/buildkitd.sock",
             "du",
             "--format=json",

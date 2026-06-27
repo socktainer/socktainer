@@ -56,4 +56,37 @@ struct ContainerInfoCacheTests {
 
         #expect(await cache.get(id: "hex123") != nil)
     }
+
+    // --rm destroy gate + dedup: exactly one of the foreground attach path and the detached
+    // die observer may emit the destroy event for an auto-removed container.
+
+    @Test("consumeAutoRemove returns false for a container not marked --rm")
+    func consumeNotMarked() async {
+        let cache = ContainerInfoCache()
+        #expect(await cache.consumeAutoRemove(id: "hex123") == false)
+    }
+
+    @Test("consumeAutoRemove returns true exactly once, then false (dedup)")
+    func consumeOnce() async {
+        let cache = ContainerInfoCache()
+        await cache.set(hexId: "hex123", nativeId: "native-name", image: "alpine", labels: [:])
+        await cache.markAutoRemove(hexId: "hex123", nativeId: "native-name")
+
+        #expect(await cache.consumeAutoRemove(id: "hex123") == true)
+        // Second claim — by EITHER id — must be false so only one destroy fires.
+        #expect(await cache.consumeAutoRemove(id: "hex123") == false)
+        #expect(await cache.consumeAutoRemove(id: "native-name") == false)
+    }
+
+    @Test("consumeAutoRemove via native id clears the hex claim too")
+    func consumeByNativeClearsHex() async {
+        let cache = ContainerInfoCache()
+        await cache.set(hexId: "hex123", nativeId: "native-name", image: "alpine", labels: [:])
+        await cache.markAutoRemove(hexId: "hex123", nativeId: "native-name")
+
+        // The detached die observer claims by native id; the foreground attach path (hex) must
+        // then see it already consumed.
+        #expect(await cache.consumeAutoRemove(id: "native-name") == true)
+        #expect(await cache.consumeAutoRemove(id: "hex123") == false)
+    }
 }

@@ -67,7 +67,20 @@ extension ContainerStartRoute {
             // Names were stored in the label at create time (Compose service aliases).
             // Resolve through getContainer: clients commonly start containers by
             // the hex ID returned from create, which the native lookup rejects.
-            let startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+            // Retry up to 5 times (500 ms total): Apple Container may return the container
+            // before the vmnet IP is assigned, leaving networks[] empty on the first fetch.
+            var startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+            if startedSnapshot?.networks.isEmpty == true {
+                for _ in 0..<5 {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    if let refreshed = try? await client.getContainer(id: id),
+                        !refreshed.networks.isEmpty
+                    {
+                        startedSnapshot = refreshed
+                        break
+                    }
+                }
+            }
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
                 let snapshot = startedSnapshot,
                 snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
@@ -75,14 +88,12 @@ extension ContainerStartRoute {
             {
                 let ip = firstAttachment.ipv4Address.address.description
 
-                // Register the container's own name. Docker's embedded DNS resolves a
-                // container by its name on every network it is attached to — not only by
-                // Compose aliases. Tools that address peers by container name get NXDOMAIN
-                // without this, because the name never appears in `socktainer.dns.names`
-                // or the compose labels handled below. Supabase is the motivating case:
-                // its services dial the database at its container name (e.g.
-                // `supabase_db_<project>`), which is otherwise unresolvable.
-                if !snapshot.id.isEmpty {
+                // Register the container's own name only on networks that have a DNS forwarder
+                // sidecar — same reserved set as firstNamedNetwork. On reserved networks
+                // (default/bridge/host/none) there is no forwarder so the registration would
+                // be unreachable and is skipped entirely.
+                let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
+                if !snapshot.id.isEmpty && !reservedNetworks.contains(firstAttachment.network) {
                     dnsServer.register(hostname: snapshot.id, ip: ip)
                     req.logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
                 }
@@ -113,6 +124,7 @@ extension ContainerStartRoute {
                         req.logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
                     }
                 }
+
             }
 
             // Kick off the healthcheck probe loop if a healthcheck label is set.
@@ -132,20 +144,34 @@ extension ContainerStartRoute {
             }
 
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
+            // Derive the canonical 64-char Docker ID once here so the cache and all
+            // lifecycle events use the same stable id the create event returned.
+            let eventId = metadataSnapshot.map { DockerContainerID.hexId(for: $0) } ?? id
             if let snap = metadataSnapshot {
+                // Store under canonical hexId so later lookups by the Docker hex ID always
+                // hit, regardless of whether /start was called by name or short ID.
+                let containerIP = startedSnapshot?.networks.first?.ipv4Address.address.description
                 await ContainerInfoCache.shared.set(
-                    hexId: id,
+                    hexId: eventId,
                     nativeId: snap.id,
                     image: snap.configuration.image.reference,
-                    labels: LabelNormalization.restore(snap.configuration.labels)
+                    labels: LabelNormalization.restore(snap.configuration.labels),
+                    ip: containerIP
                 )
             }
 
             guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
                 return .noContent
             }
+
+            // Emit "start" on every successful /start. We intentionally do NOT gate this on
+            // "did this call transition the container to running": for a foreground `docker run`,
+            // the attach route bootstraps and starts the container BEFORE /start is invoked, so
+            // /start sees it already running — indistinguishable from a redundant `docker start`.
+            // Gating dropped the start (and die) events for the common `docker run` case, so we
+            // accept a possible extra event on the rare redundant `docker start` instead.
             let event = DockerEvent.simpleEvent(
-                id: id,
+                id: eventId,
                 type: "container",
                 status: "start",
                 image: metadataSnapshot?.configuration.image.reference ?? "",
@@ -153,6 +179,50 @@ extension ContainerStartRoute {
                 labels: LabelNormalization.restore(metadataSnapshot?.configuration.labels ?? [:])
             )
             await broadcaster.broadcast(event)
+
+            // Observe the container process exit to fire the "die" event.
+            // Runs as a detached background task — the start route returns immediately.
+            if let snap = metadataSnapshot {
+                let nativeId = snap.id
+                let dieImage = snap.configuration.image.reference
+                let dieName = snap.id
+                let dieLabels = LabelNormalization.restore(snap.configuration.labels)
+                // Capture DNS server before the detached task so it can unregister on --rm reap.
+                let dnsServerForTask = req.application.storage[SocktainerDNSServerKey.self]
+                Task.detached {
+                    // Await the authoritative exit code recorded by the start() background
+                    // waiter once the init process exits. Using the store's continuation-based
+                    // wait (rather than client.wait's timed grace-poll) means the die event
+                    // always carries the real code, even under load — no `?? 0` fallback race.
+                    let code = await ContainerExitCodeStore.shared.waitForCode(id: nativeId)
+                    var attrs = dieLabels
+                    attrs["exitCode"] = String(code)
+                    let dieEvent = DockerEvent.simpleEvent(
+                        id: eventId, type: "container", status: "die",
+                        image: dieImage, name: dieName, labels: attrs
+                    )
+                    await broadcaster.broadcast(dieEvent)
+
+                    // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
+                    // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
+                    // gates on the --rm flag and dedups against the foreground attach path, so a
+                    // container attached in the foreground does not get a second destroy.
+                    if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
+                        // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
+                        if let dnsServer = dnsServerForTask {
+                            let cachedIP = await ContainerInfoCache.shared.get(id: nativeId)?.ip
+                            let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(nativeId)]
+                            if cachedIP == nil || registered == nil || registered == cachedIP {
+                                dnsServer.unregister(hostname: nativeId)
+                            }
+                        }
+                        await broadcaster.broadcast(
+                            ContainerAttachRoute.makeAutoRemoveEvent(
+                                id: eventId, image: dieImage, name: dieName, labels: dieLabels))
+                        await ContainerInfoCache.shared.remove(id: nativeId)
+                    }
+                }
+            }
 
             return .noContent
         }

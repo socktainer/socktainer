@@ -25,13 +25,17 @@ extension ContainerDeleteRoute {
             let eventLabels =
                 snapshot.map { LabelNormalization.restore($0.configuration.labels) }
                 ?? cached?.labels ?? [:]
+            // Use the canonical 64-char Docker ID so the destroy event matches the id
+            // carried by create/start/die — derived from the snapshot, then the cache,
+            // falling back to the request reference only when neither is available.
+            let eventId = snapshot.map { DockerContainerID.hexId(for: $0) } ?? cached?.hexId ?? id
 
             func broadcastRemove() async {
                 await ContainerInfoCache.shared.remove(id: id)
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
-                        id: id, type: "container", status: "remove",
+                        id: eventId, type: "container", status: "destroy",
                         image: eventImage, name: eventName, labels: eventLabels
                     ))
             }

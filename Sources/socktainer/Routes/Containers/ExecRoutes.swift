@@ -196,6 +196,20 @@ struct ExecRoute: RouteCollection {
             )
 
             let id = await ExecManager.shared.create(config: config)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                var attrs = LabelNormalization.restore(container.configuration.labels)
+                attrs["execID"] = id
+                // Docker formats the action as "exec_create: <command>" (action + ": " + cmd).
+                let event = DockerEvent.simpleEvent(
+                    id: DockerContainerID.hexId(for: container),
+                    type: "container",
+                    status: "exec_create: \(config.cmd.joined(separator: " "))",
+                    image: container.configuration.image.reference,
+                    name: container.id,
+                    labels: attrs
+                )
+                await broadcaster.broadcast(event)
+            }
             return Response(status: .created, body: .init(data: try JSONEncoder().encode(CreateExecResponse(Id: id))))
         }
     }
@@ -254,6 +268,29 @@ struct ExecRoute: RouteCollection {
 
             let startRequest = try req.content.decode(StartExecRequest.self)
 
+            // Capture values for exec_start / exec_die events — must happen before any
+            // streaming closure so they're available deep inside task groups without
+            // capturing `req`. exec_start fires only once the process actually starts
+            // (after process.start() succeeds), so a failed exec emits no started event.
+            let execBroadcaster = req.application.storage[EventBroadcasterKey.self]
+            let execEventHexId = DockerContainerID.hexId(for: container)
+            let execEventImage = container.configuration.image.reference
+            let execEventName = container.id
+            let execEventLabels = LabelNormalization.restore(container.configuration.labels)
+            // Docker formats the action as "exec_start: <command>" (action + ": " + cmd).
+            let execStartAction = "exec_start: \(config.cmd.joined(separator: " "))"
+
+            @Sendable func broadcastExecEvent(_ status: String, exitCode: Int32? = nil) async {
+                guard let broadcaster = execBroadcaster else { return }
+                var attrs = execEventLabels
+                attrs["execID"] = execId
+                if let exitCode { attrs["exitCode"] = String(exitCode) }
+                let event = DockerEvent.simpleEvent(
+                    id: execEventHexId, type: "container", status: status,
+                    image: execEventImage, name: execEventName, labels: attrs)
+                await broadcaster.broadcast(event)
+            }
+
             let detach = startRequest.Detach ?? false
             let tty = startRequest.Tty ?? config.tty
             // Docker sends ConsoleSize as [height, width] for interactive (-it) exec.
@@ -271,8 +308,9 @@ struct ExecRoute: RouteCollection {
                 processConfig.arguments = arguments
                 processConfig.terminal = tty
 
+                let process: ClientProcess
                 do {
-                    let process = try await ContainerClient().createProcess(
+                    process = try await ContainerClient().createProcess(
                         containerId: container.id,
                         processId: UUID().uuidString.lowercased(),
                         configuration: processConfig,
@@ -286,7 +324,30 @@ struct ExecRoute: RouteCollection {
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }
-                await ExecManager.shared.remove(id: execId)
+                await broadcastExecEvent(execStartAction)
+                // Observe the detached process so docker exec -d still reports completion
+                // (exit code + exec_die), mirroring the container.die observer. Keep the
+                // ExecManager entry afterwards — the recorded exit code must remain readable
+                // via GET /exec/{id}/json (matching the attached HTTP/TCP paths).
+                Task.detached {
+                    // Same timeout as the HTTP streaming path: Apple Container's XPC
+                    // sometimes does not acknowledge exec process exit, leaving
+                    // process.wait() hanging. Without the timeout, ExecManager would
+                    // never record the exit code and GET /exec/{id}/json would return
+                    // Running: true forever, blocking the caller indefinitely.
+                    let code: Int32 = await withTaskGroup(of: Int32.self) { g in
+                        g.addTask { (try? await process.wait()) ?? -1 }
+                        g.addTask {
+                            try? await Task.sleep(nanoseconds: 60_000_000_000)
+                            return -1
+                        }
+                        let result = await g.next() ?? -1
+                        g.cancelAll()
+                        return result
+                    }
+                    await ExecManager.shared.setExitCode(id: execId, code: code)
+                    await broadcastExecEvent("exec_die", exitCode: code)
+                }
                 return Response(status: .ok)
             }
 
@@ -341,19 +402,51 @@ struct ExecRoute: RouteCollection {
                         await ExecManager.shared.setExitCode(id: execId, code: -1)
                         throw error
                     }
+                    await broadcastExecEvent(execStartAction)
 
                     await ProcessRegistry.shared.set(id: execId, process: process)
                     if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
-                    await withTaskGroup(of: Void.self) { group in
-                        // stdout handler
+                    // Decouple exit-code recording from stream lifecycle.
+                    // Apple Container's XPC sometimes does not acknowledge exec
+                    // process exit, leaving process.wait() hanging. Tying the HTTP
+                    // stream to process.wait() therefore blocks the caller forever.
+                    //
+                    // Correct design: the stream closes when I/O is exhausted (pipe
+                    // EOF = process exited). process.wait() runs independently to
+                    // obtain the numeric exit code; if it hangs we fall back to -1
+                    // after 10 s. The stream is never blocked by exit-code retrieval.
+                    Task.detached {
+                        let code: Int32 = await withTaskGroup(of: Int32.self) { g in
+                            g.addTask { (try? await process.wait()) ?? -1 }
+                            g.addTask {
+                                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                                return -1
+                            }
+                            let result = await g.next() ?? -1
+                            g.cancelAll()
+                            return result
+                        }
+                        await ExecManager.shared.setExitCode(id: execId, code: code)
+                        await ProcessRegistry.shared.remove(id: execId)
+                        await broadcastExecEvent("exec_die", exitCode: code)
+                    }
+
+                    // Task group: only I/O tasks. Stdout and stderr complete at pipe
+                    // EOF (Apple Container closes the container-side write ends when
+                    // the exec process exits). Stdin is cancelled by cancelAll() once
+                    // both output pipes are drained. The group finishes promptly and
+                    // streamContinuation.finish() is called without waiting for XPC.
+                    await withTaskGroup(of: Bool.self) { group in
+                        var outputTaskCount = 0
+
+                        // stdout handler — completion returns true
                         if let stdoutRead = pipes.stdout?.read {
+                            outputTaskCount += 1
                             group.addTask {
                                 defer { try? stdoutRead.close() }
                                 while true {
                                     do {
-                                        // A blocking pipe read returns empty Data only at EOF —
-                                        // the process exited and its stdout writer was closed.
                                         guard let data = try stdoutRead.read(upToCount: 8192), !data.isEmpty else {
                                             break
                                         }
@@ -363,17 +456,17 @@ struct ExecRoute: RouteCollection {
                                         streamContinuation.yield(buffer)
                                     } catch { break }
                                 }
+                                return true  // output pipe drained
                             }
                         }
 
-                        // stderr handler
+                        // stderr handler — completion returns true
                         if let stderrRead = pipes.stderr?.read {
+                            outputTaskCount += 1
                             group.addTask {
                                 defer { try? stderrRead.close() }
                                 while true {
                                     do {
-                                        // A blocking pipe read returns empty Data only at EOF —
-                                        // the process exited and its stderr writer was closed.
                                         guard let data = try stderrRead.read(upToCount: 8192), !data.isEmpty else {
                                             break
                                         }
@@ -383,10 +476,11 @@ struct ExecRoute: RouteCollection {
                                         streamContinuation.yield(buffer)
                                     } catch { break }
                                 }
+                                return true  // output pipe drained
                             }
                         }
 
-                        // stdin handler for HTTP mode
+                        // stdin handler — runs until cancelled, returns false
                         if let stdinWrite = pipes.stdin?.write {
                             group.addTask {
                                 defer { try? stdinWrite.close() }
@@ -397,21 +491,24 @@ struct ExecRoute: RouteCollection {
                                         }
                                     }
                                 } catch {}
+                                return false  // stdin closed (by client or cancellation)
                             }
                         }
 
-                        // Process monitor
-                        group.addTask {
-                            do {
-                                let exitCode = try await process.wait()
-                                await ExecManager.shared.setExitCode(id: execId, code: exitCode)
-                            } catch {
-                                await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        // Drive the group: cancel everything once both output pipes
+                        // are drained. Stdin is cancelled by cancelAll so it does not
+                        // block the group after the process has exited.
+                        var drained = 0
+                        for await isOutput in group {
+                            if isOutput {
+                                drained += 1
+                                if drained >= outputTaskCount {
+                                    group.cancelAll()
+                                    break
+                                }
                             }
-                            await ProcessRegistry.shared.remove(id: execId)
                         }
 
-                        for await _ in group {}
                     }
 
                     // Keep the exec entry so the client's follow-up
@@ -465,6 +562,7 @@ struct ExecRoute: RouteCollection {
                     await ExecManager.shared.setExitCode(id: execId, code: -1)
                     throw error
                 }
+                await broadcastExecEvent(execStartAction)
                 // Wire stdin only after start() succeeds so closeAfterHandoff()
                 // remains the sole owner on any failure path before this point.
                 if let stdinWrite = pipes.stdin?.write {
@@ -616,16 +714,18 @@ struct ExecRoute: RouteCollection {
 
                     // Process monitor with proper cleanup
                     group.addTask {
+                        let code: Int32
                         do {
-                            let exitCode = try await process.wait()
-                            await ExecManager.shared.setExitCode(id: execId, code: exitCode)
+                            code = try await process.wait()
                         } catch {
                             // process.wait() failed — record a synthetic exit code
                             // so the exec leaves the Running state instead of
                             // hanging there forever.
-                            await ExecManager.shared.setExitCode(id: execId, code: -1)
+                            code = -1
                         }
+                        await ExecManager.shared.setExitCode(id: execId, code: code)
                         await ProcessRegistry.shared.remove(id: execId)
+                        await broadcastExecEvent("exec_die", exitCode: code)
 
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms

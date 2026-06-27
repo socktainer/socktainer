@@ -31,12 +31,29 @@ extension ImageDeleteRoute {
                 }
             }
 
-            // Broadcast using the normalized reference so event consumers see the
-            // canonical form (matches Docker's own event emission).
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-            let event = DockerEvent.simpleEvent(
-                id: result.untagged, type: "image", status: "remove", image: result.untagged)
-            await broadcaster.broadcast(event)
+            // Docker fires "untag" when a tag is removed, "delete" when the last
+            // reference to a digest is removed and the image layers are freed.
+            // Both carry the image digest as Actor.ID with the reference in `name`
+            // (matches moby's logImageEvent / LogImageEvent shape).
+            //
+            // moby's imageDeleteHelper (daemon/containerd/image_delete.go) gates "untag" on
+            // `!isDanglingImage(img)` — dangling images have no real tag to untag, so only
+            // "delete" is emitted for them. Verified against moby v28.5.2 source.
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                let isDangling = result.untagged.contains("<none>")
+                if !isDangling {
+                    await broadcaster.broadcast(
+                        DockerEvent.make(
+                            type: "image", action: "untag", actorID: result.digest,
+                            attributes: ["name": result.untagged]))
+                }
+                if let digest = result.deletedDigest {
+                    await broadcaster.broadcast(
+                        DockerEvent.make(
+                            type: "image", action: "delete", actorID: digest,
+                            attributes: ["name": digest]))
+                }
+            }
 
             // Build response matching Docker Engine API:
             //   {Untagged} for the tag that was removed

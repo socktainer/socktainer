@@ -288,7 +288,10 @@ struct ComposeDNSTests {
 
 /// Constructs a ContainerSnapshot with a real Attachment (decoded from JSON) so that
 /// DNS registration code can extract the IP from networks.first.ipv4Address.
-private func makeSnapshot(nativeId: String, ip: String, labels: [String: String]) throws -> ContainerSnapshot {
+/// `network` defaults to `"myapp_default"` — a named Compose network — because registration
+/// is suppressed on reserved networks (default/bridge/host/none) where no DNS forwarder sidecar
+/// exists. Real Compose containers always run on project networks, never on "default".
+private func makeSnapshot(nativeId: String, ip: String, labels: [String: String], network: String = "myapp_default") throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
         workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
@@ -307,7 +310,7 @@ private func makeSnapshot(nativeId: String, ip: String, labels: [String: String]
     // CIDRv4 and IPv4Address are single-value string types: "192.168.x.x/24" and "192.168.x.x".
     let attachmentJSON = """
         {
-            "network": "default",
+            "network": "\(network)",
             "hostname": "\(nativeId)",
             "ipv4Address": "\(ip)/24",
             "ipv4Gateway": "192.168.65.1",

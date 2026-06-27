@@ -166,6 +166,47 @@ extension ContainerCreateRoute {
             // merge environment variables, with request taking precedence
             let mergedEnv = try Parser.allEnv(imageEnvs: imageConfigEnvironment, envFiles: [], envs: requestedEnvironment)
 
+            // Inside a VM 127.0.0.1 is the container's own loopback, not the host. Rewrite
+            // URL-form connection strings to the vmnet gateway. host-mode containers are
+            // excluded — they stay on "default" with loopback DNS so NPM imports fail fast.
+            var finalEnv = mergedEnv
+            let envNetworkKeys = body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? []
+            let isHostMode = body.HostConfig?.NetworkMode == "host"
+            // Compute once; both rewrite blocks share the same named-network context.
+            let namedNet = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: envNetworkKeys,
+                networkMode: body.HostConfig?.NetworkMode
+            )
+            if let firstNet = namedNet,
+                let networkResource = try? await NetworkClient().get(id: firstNet)
+            {
+                let gatewayIP = networkResource.status.ipv4Gateway.description
+                if !gatewayIP.isEmpty && gatewayIP != "0.0.0.0" {
+                    let rewritten = ContainerCreateRoute.rewriteLoopbackToGateway(mergedEnv, gatewayIP: gatewayIP)
+                    if rewritten != mergedEnv {
+                        req.logger.info("[network] rewrote 127.0.0.1→\(gatewayIP) in env vars for \(firstNet)")
+                        finalEnv = rewritten
+                    }
+                }
+            }
+
+            // Also rewrite peer container hostnames to IPs in connection strings so inter-container
+            // connections bypass DNS entirely, avoiding sidecar reliability issues at startup.
+            // Note: IPs are snapshot at create time; if a peer restarts and gets a new IP the
+            // baked address becomes stale. DNS remains the primary resolution path for runtime use.
+            if !isHostMode, namedNet != nil,
+                let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
+            {
+                let peers = dnsServer.listEntries()
+                if !peers.isEmpty {
+                    let hostRewrote = ContainerCreateRoute.rewritePeerHostnames(finalEnv, peers: peers)
+                    if hostRewrote != finalEnv {
+                        req.logger.info("[network] rewrote container hostnames→IPs in env vars")
+                        finalEnv = hostRewrote
+                    }
+                }
+            }
+
             let publishedPorts: [PublishPort]
             do {
                 publishedPorts = try convertPortBindings(
@@ -233,7 +274,7 @@ extension ContainerCreateRoute {
             let processConfig = ProcessConfiguration(
                 executable: executable,
                 arguments: commandLine.dropFirst().map { String($0) },
-                environment: mergedEnv,
+                environment: finalEnv,
                 workingDirectory: finalWorkingDirectory,
                 terminal: body.Tty ?? false,
                 user: finalUser,
@@ -275,8 +316,28 @@ extension ContainerCreateRoute {
                 let networkMode = hostConfig.NetworkMode,
                 !networkMode.isEmpty
             {
-                // Use NetworkMode from HostConfig
-                containerConfiguration.networks = [AttachmentConfiguration(network: networkMode, options: AttachmentOptions(hostname: hostname))]
+                // Apple Container is VM-based and does not support Linux-only network modes.
+                // "host" and "none" have no equivalent; "bridge" is Docker's default bridge
+                // which maps to Apple Container's "default". All three are silently remapped
+                // to "default" so containers start instead of failing with "no network for id".
+                let resolvedMode: String
+                switch networkMode {
+                case "host", "none", "bridge":
+                    // Apple Container is VM-based: host/none/bridge have no equivalent.
+                    // All remap to "default". host-mode containers rely on fast DNS failure
+                    // (127.0.0.1 nameserver, see below) to avoid hanging on package downloads.
+                    if networkMode != "bridge" {
+                        req.logger.warning(
+                            "network_mode '\(networkMode)' is not supported by Apple Container — remapping to 'default'"
+                        )
+                    }
+                    resolvedMode = "default"
+                default:
+                    resolvedMode = networkMode
+                }
+                containerConfiguration.networks = [
+                    AttachmentConfiguration(network: resolvedMode, options: AttachmentOptions(hostname: hostname))
+                ]
             } else {
                 // Fall back to default network if no networking config provided
                 containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
@@ -332,24 +393,45 @@ extension ContainerCreateRoute {
 
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
+            }
 
-                // Ensure a CoreDNS container for the first network and point this
-                // container's DNS at it so service names resolve inside the VM.
-                if let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
-                    let firstNetwork = body.NetworkingConfig?.EndpointsConfig?.keys.first
-                {
-                    do {
-                        let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
-                        let existing = containerConfiguration.dns
-                        containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
-                            nameservers: [dnsIP],
-                            domain: existing?.domain ?? nil,
-                            searchDomains: existing?.searchDomains ?? [],
-                            options: existing?.options ?? []
-                        )
-                    } catch {
-                        req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
-                    }
+            // Ensure a DNS forwarder container for any named (non-default) network.
+            // This covers both Docker Compose (EndpointsConfig.Aliases) and plain
+            // `docker run --network <name>` (HostConfig.NetworkMode) — both need
+            // DNS forwarder configured as the container's nameserver so container names
+            // resolve inside the VM via SocktainerDNSServer.
+            let endpointsKeys = body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? []
+            let firstNamedNetwork = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: endpointsKeys,
+                networkMode: body.HostConfig?.NetworkMode
+            )
+            if isHostMode {
+                // host-mode containers get loopback (127.0.0.1) as their only nameserver.
+                // Any external DNS lookup (e.g. Deno resolving registry.npmjs.org for an
+                // `npm:` import) hits nothing on loopback and gets ECONNREFUSED in < 1 ms,
+                // causing the process to fail immediately rather than hanging for minutes
+                // on a SYN to an internet host that is unreachable from vmnet containers.
+                let existing = containerConfiguration.dns
+                containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                    nameservers: ["127.0.0.1"],
+                    domain: existing?.domain,
+                    searchDomains: existing?.searchDomains ?? [],
+                    options: existing?.options ?? []
+                )
+            } else if let firstNetwork = firstNamedNetwork,
+                let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
+            {
+                do {
+                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                    let existing = containerConfiguration.dns
+                    containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
+                        nameservers: [dnsIP],
+                        domain: existing?.domain,
+                        searchDomains: existing?.searchDomains ?? [],
+                        options: existing?.options ?? []
+                    )
+                } catch {
+                    req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
                 }
             }
             containerConfiguration.labels = containerLabels
@@ -359,26 +441,39 @@ extension ContainerCreateRoute {
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
             // must create missing directories BEFORE parsing, not after.
+            // Socket files (.sock) are skipped: Apple Container uses virtiofs which shares
+            // directories, not individual files or Unix domain sockets. Mounting a socket
+            // would cause "operation not supported" at bootstrap time.
+            let isSocketPath: (String) -> Bool = { $0.hasSuffix(".sock") || $0.hasSuffix(".socket") }
             if let binds = body.HostConfig?.Binds {
                 for bind in binds {
                     let parts = bind.split(separator: ":").map(String.init)
-                    if let source = parts.first, source.hasPrefix("/") {
+                    if let source = parts.first, source.hasPrefix("/"), !isSocketPath(source) {
                         try? FileManager.default.createDirectory(
                             atPath: source, withIntermediateDirectories: true)
                     }
                 }
             }
             if let mounts = body.HostConfig?.Mounts {
-                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty {
+                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty && !isSocketPath(mount.Source) {
                     try? FileManager.default.createDirectory(
                         atPath: mount.Source, withIntermediateDirectories: true)
                 }
             }
 
-            // Process bind mounts from HostConfig.Binds
+            // Process bind mounts from HostConfig.Binds — filter out socket files which
+            // cannot be shared via virtiofs (Apple Container is VM-based).
+            let filteredBinds = (body.HostConfig?.Binds ?? []).filter { bind in
+                let source = bind.split(separator: ":").first.map(String.init) ?? ""
+                if isSocketPath(source) {
+                    req.logger.warning("bind mount '\(source)' is a Unix socket — skipped (not supported in Apple Container VMs)")
+                    return false
+                }
+                return true
+            }
             var volumesOrFs: [VolumeOrFilesystem] = []
-            if let binds = body.HostConfig?.Binds, !binds.isEmpty {
-                volumesOrFs = try Parser.volumes(binds)
+            if !filteredBinds.isEmpty {
+                volumesOrFs = try Parser.volumes(filteredBinds)
             }
 
             // Process mounts from HostConfig.Mounts
@@ -386,7 +481,7 @@ extension ContainerCreateRoute {
             if let mounts = body.HostConfig?.Mounts, !mounts.isEmpty {
                 // Separate volume mounts from other mount types
                 let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
-                let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" }
+                let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }
 
                 // Handle volume mounts using the volume format (source:destination)
                 if !volumeMounts.isEmpty {
@@ -501,15 +596,93 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
             }
 
+            let hexId = DockerContainerID.hexId(for: container)
+            // Record --rm intent so the post-exit `destroy` event fires (and fires exactly once):
+            // Apple Container reaps the container itself, so no DELETE arrives. The flag is consumed
+            // by whichever path observes the exit — foreground attach or the detached die observer.
+            if options.autoRemove {
+                await ContainerInfoCache.shared.markAutoRemove(hexId: hexId, nativeId: container.id)
+            }
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
+            }
             // Docker Engine API: POST /containers/create returns 201 Created.
-            let createResponse = RESTContainerCreate(
-                Id: DockerContainerID.hexId(for: container),
-                Warnings: []
-            )
+            let createResponse = RESTContainerCreate(Id: hexId, Warnings: [])
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
         }
+    }
+
+    /// Builds the `container create` event from the created container snapshot.
+    /// Extracted from the handler (which drives Apple Container directly and can't be
+    /// unit-tested without the runtime) so the event contract — Type, Action, canonical
+    /// Actor.ID, and image/name/label attributes — can be asserted in isolation.
+    /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
+    /// container uses the default (non-named) network and no DNS setup is needed.
+    ///
+    /// Covers both Compose (`EndpointsConfig`) and plain `docker run --network <name>`
+    /// (`HostConfig.NetworkMode`). Reserved non-routable modes — "default", "bridge",
+    /// "host", "none" — are excluded because they either don't support user-defined name
+    /// resolution or are handled by the host's own DNS.
+    ///
+    /// Extracted so the selection logic can be asserted in unit tests independently of
+    /// the full handler, which drives Apple Container APIs.
+    /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
+    /// container uses the default (non-named) network and no DNS setup is needed.
+    ///
+    /// Pass `endpointsConfigKeys` as `Array(body.NetworkingConfig?.EndpointsConfig?.keys ?? [])`.
+    static func firstNamedNetwork(endpointsConfigKeys: [String], networkMode: String?) -> String? {
+        let reservedModes: Set<String> = ["default", "bridge", "host", "none"]
+        if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
+        if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
+        return nil
+    }
+
+    /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).
+    /// Bind-address vars like `LISTEN=127.0.0.1:80` are left unchanged.
+    static func rewriteLoopbackToGateway(_ envVars: [String], gatewayIP: String) -> [String] {
+        envVars.map {
+            $0.replacingOccurrences(
+                of: #"(@|://)127\.0\.0\.1:(\d+)"#,
+                with: "$1\(gatewayIP):$2",
+                options: .regularExpression
+            )
+        }
+    }
+
+    /// Rewrite known container hostnames to their IPs in `@hostname:port` and `host=hostname`
+    /// connection-string positions. Bypasses DNS for inter-container connections at startup.
+    static func rewritePeerHostnames(_ envVars: [String], peers: [String: String]) -> [String] {
+        envVars.map { env in
+            var result = env
+            for (rawName, ip) in peers {
+                let escaped = NSRegularExpression.escapedPattern(for: rawName)
+                // URL form: @hostname:port or ://hostname:port
+                result = result.replacingOccurrences(
+                    of: "(@|://)\(escaped):(\\d+)", with: "$1\(ip):$2", options: .regularExpression)
+                // PostgreSQL key-value form: `host=hostname` followed by a DSN separator
+                // (space, end-of-string, & or ?) — prevents a short name like "db" from
+                // matching inside "olddb" or "database".
+                result = result.replacingOccurrences(
+                    of: "host=\(escaped)(?=[\\s?&]|$)",
+                    with: "host=\(ip)",
+                    options: .regularExpression
+                )
+            }
+            return result
+        }
+    }
+
+    static func makeCreateEvent(for container: ContainerSnapshot) -> DockerEvent {
+        DockerEvent.simpleEvent(
+            id: DockerContainerID.hexId(for: container),
+            type: "container",
+            status: "create",
+            image: container.configuration.image.reference,
+            name: container.id,
+            labels: LabelNormalization.restore(container.configuration.labels)
+        )
     }
 }
 // Function to convert PortBindings from HostConfig to PublishedPorts
