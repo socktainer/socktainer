@@ -74,10 +74,13 @@ struct ClientVolumeService: ClientVolumeProtocol {
             if let drivers = parsedFilters["driver"], !drivers.isEmpty {
                 matches = matches && drivers.contains(volume.Driver)
             }
-            if let labels = parsedFilters["label"], !labels.isEmpty, let volumeLabels = volume.Labels {
+            if let labels = parsedFilters["label"], !labels.isEmpty {
                 // Docker treats multiple `--filter label=...` as AND: a volume must
-                // match every label filter, not just one. (The negative `label!`
-                // and dict paths below already use allSatisfy.)
+                // match every label filter, not just one. A volume with no labels
+                // matches none of them, so treat a missing label set as empty —
+                // consistent with the negative `label!` path below (without this,
+                // an unlabeled volume would skip the block and wrongly pass).
+                let volumeLabels = volume.Labels ?? [:]
                 let labelMatches = labels.allSatisfy { labelFilter in
                     guard let eqIdx = labelFilter.firstIndex(of: "=") else {
                         return LabelNormalization.filterContainsKey(labelFilter, in: volumeLabels)

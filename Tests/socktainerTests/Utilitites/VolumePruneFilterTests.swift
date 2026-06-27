@@ -100,6 +100,17 @@ struct VolumePruneFilterTests {
         let result = ClientVolumeService.applyFilters(volumes, parsedFilters: ["label": ["env=dev"]])
         #expect(result.map(\.Name) == ["vol-dev"])
     }
+
+    @Test("a volume with no labels is excluded by a positive label filter")
+    func unlabeledVolumeExcludedByPositiveLabel() {
+        let volumes = [
+            makeVolume(name: "vol-dev", labels: ["env": "dev"]),
+            makeVolume(name: "vol-none"),  // Labels: nil
+        ]
+        let result = ClientVolumeService.applyFilters(volumes, parsedFilters: ["label": ["env=dev"]])
+        // Docker excludes label-less volumes when a positive label filter is set.
+        #expect(result.map(\.Name) == ["vol-dev"])
+    }
 }
 
 // MARK: - Helpers
