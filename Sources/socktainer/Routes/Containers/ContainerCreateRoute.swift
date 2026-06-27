@@ -190,10 +190,12 @@ extension ContainerCreateRoute {
                 }
             }
 
-            // Also rewrite peer container hostnames to IPs in connection strings so inter-container
-            // connections bypass DNS entirely, avoiding sidecar reliability issues at startup.
-            // Note: IPs are snapshot at create time; if a peer restarts and gets a new IP the
-            // baked address becomes stale. DNS remains the primary resolution path for runtime use.
+            // Also rewrite peer container hostnames → IPs in connection strings for named-network
+            // containers. This bypasses the Rust DNS sidecar for inter-container DB connections:
+            // under concurrent startup load the sidecar can drop responses causing auth/realtime/
+            // storage to time out on DNS. Only @hostname:port and host=hostname DSN positions are
+            // rewritten; IPs are a point-in-time snapshot so DNS remains the runtime path.
+            // host-mode containers are excluded (they already get loopback DNS for fast-fail).
             if !isHostMode, namedNet != nil,
                 let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
             {
@@ -201,7 +203,7 @@ extension ContainerCreateRoute {
                 if !peers.isEmpty {
                     let hostRewrote = ContainerCreateRoute.rewritePeerHostnames(finalEnv, peers: peers)
                     if hostRewrote != finalEnv {
-                        req.logger.info("[network] rewrote container hostnames→IPs in env vars")
+                        req.logger.info("[network] rewrote peer hostnames→IPs in env vars")
                         finalEnv = hostRewrote
                     }
                 }
@@ -614,10 +616,6 @@ extension ContainerCreateRoute {
         }
     }
 
-    /// Builds the `container create` event from the created container snapshot.
-    /// Extracted from the handler (which drives Apple Container directly and can't be
-    /// unit-tested without the runtime) so the event contract — Type, Action, canonical
-    /// Actor.ID, and image/name/label attributes — can be asserted in isolation.
     /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
     /// container uses the default (non-named) network and no DNS setup is needed.
     ///
@@ -628,8 +626,6 @@ extension ContainerCreateRoute {
     ///
     /// Extracted so the selection logic can be asserted in unit tests independently of
     /// the full handler, which drives Apple Container APIs.
-    /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
-    /// container uses the default (non-named) network and no DNS setup is needed.
     ///
     /// Pass `endpointsConfigKeys` as `Array(body.NetworkingConfig?.EndpointsConfig?.keys ?? [])`.
     static func firstNamedNetwork(endpointsConfigKeys: [String], networkMode: String?) -> String? {

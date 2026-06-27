@@ -250,4 +250,10 @@ func configure(_ app: Application) async throws {
     // Clean up any CoreDNS containers left from a previous run
     await dnsManager.cleanupStaleDNSContainers()
 
+    // Reap networks orphaned by a previous run (containers removed, network left behind).
+    // Apple Container's vmnet state degrades as stale networks accumulate and eventually
+    // breaks container-to-container routing (EHOSTUNREACH); runs after the DNS-sidecar
+    // cleanup so a network whose only member was its sidecar now appears empty.
+    await OrphanedNetworkReaper.reap(networkClient: networkClient, logger: app.logger)
+
 }
