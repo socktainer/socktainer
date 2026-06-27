@@ -394,6 +394,10 @@ services:
 > (e.g. both have a `db` service) will share the short-form alias — last
 > started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
 
+### Container-to-container connections fail with `EHOSTUNREACH`
+
+If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
+
 ### Label key normalization
 
 Apple Container only accepts lowercase label keys matching `[a-z0-9](?:[a-z0-9\-\.\/]*[a-z0-9])?`. Docker allows mixed-case, underscores, and other characters. Socktainer automatically normalizes label keys at create time:
