@@ -51,7 +51,7 @@ struct ContainerDeleteHealthcheckTests {
 
             // DELETE with a hex id that resolves to nil — fallback path exercises the warning log
             try await app.testing().test(.DELETE, "/v1.51/containers/\(hexId)") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
             }
         }
 
@@ -105,7 +105,9 @@ struct ContainerDeleteHealthcheckTests {
             try app.register(collection: ContainerDeleteRoute(client: KnownContainerDeleteMock(snapshot: snapshot)))
 
             try await app.testing().test(.DELETE, "/v1.51/containers/\(nativeId)") { res async in
-                #expect(res.status == .ok)
+                #expect(res.status == .noContent)
+                // 204 No Content must carry an empty body.
+                #expect(res.body.readableBytes == 0)
             }
         }
 

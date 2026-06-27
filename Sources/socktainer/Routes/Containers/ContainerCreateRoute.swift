@@ -54,7 +54,7 @@ struct CreateContainerRequest: Content {
 }
 
 extension ContainerCreateRoute {
-    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> RESTContainerCreate {
+    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response {
         { req in
             let query = try req.query.decode(ContainerCreateQuery.self)
 
@@ -501,10 +501,14 @@ extension ContainerCreateRoute {
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
             }
 
-            return RESTContainerCreate(
+            // Docker Engine API: POST /containers/create returns 201 Created.
+            let createResponse = RESTContainerCreate(
                 Id: DockerContainerID.hexId(for: container),
                 Warnings: []
             )
+            let httpResponse = try await createResponse.encodeResponse(for: req)
+            httpResponse.status = .created
+            return httpResponse
         }
     }
 }

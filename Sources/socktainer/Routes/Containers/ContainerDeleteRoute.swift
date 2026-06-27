@@ -97,7 +97,8 @@ extension ContainerDeleteRoute {
             }
 
             await broadcastRemove()
-            return .ok
+            // Docker Engine API: DELETE /containers/{id} returns 204 No Content.
+            return .noContent
         }
     }
 }
