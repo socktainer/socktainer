@@ -37,8 +37,14 @@ struct ContainerStopEventLabelTests {
             }
         }
 
-        captureTask.cancel()
+        // Await the event first (bounded), then cancel as cleanup — cancelling before
+        // reading can race the listener and drop a yielded-but-not-yet-consumed event.
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
+        }
         let event = await captureTask.value
+        timeout.cancel()
         #expect(event?.Actor.Attributes["svc"] == "cache")
         #expect(event?.Actor.Attributes["image"] == "redis:7")
         #expect(event?.Actor.Attributes["name"] == nativeId)
@@ -74,8 +80,14 @@ struct ContainerRestartEventLabelTests {
             }
         }
 
-        captureTask.cancel()
+        // Await the event first (bounded), then cancel as cleanup — cancelling before
+        // reading can race the listener and drop a yielded-but-not-yet-consumed event.
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
+        }
         let event = await captureTask.value
+        timeout.cancel()
         #expect(event?.Actor.Attributes["role"] == "proxy")
         #expect(event?.Actor.Attributes["image"] == "nginx:latest")
         #expect(event?.Actor.Attributes["name"] == nativeId)
@@ -111,8 +123,14 @@ struct ContainerDeleteEventLabelTests {
             }
         }
 
-        captureTask.cancel()
+        // Await the event first (bounded), then cancel as cleanup — cancelling before
+        // reading can race the listener and drop a yielded-but-not-yet-consumed event.
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
+        }
         let event = await captureTask.value
+        timeout.cancel()
         #expect(event?.Actor.Attributes["db"] == "main")
         #expect(event?.Actor.Attributes["image"] == "postgres:17")
         #expect(event?.Actor.Attributes["name"] == nativeId)
@@ -153,8 +171,14 @@ struct ContainerDeleteEventLabelTests {
             }
         }
 
-        captureTask.cancel()
+        // Await the event first (bounded), then cancel as cleanup — cancelling before
+        // reading can race the listener and drop a yielded-but-not-yet-consumed event.
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            captureTask.cancel()
+        }
         let event = await captureTask.value
+        timeout.cancel()
         #expect(event?.Actor.Attributes["app"] == "ephemeral")
         #expect(event?.Actor.Attributes["image"] == "alpine:latest")
         #expect(event?.Actor.Attributes["name"] == nativeId)

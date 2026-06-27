@@ -330,23 +330,36 @@ struct ExecRoute: RouteCollection {
                 // ExecManager entry afterwards — the recorded exit code must remain readable
                 // via GET /exec/{id}/json (matching the attached HTTP/TCP paths).
                 Task.detached {
-                    // Same timeout as the HTTP streaming path: Apple Container's XPC
-                    // sometimes does not acknowledge exec process exit, leaving
-                    // process.wait() hanging. Without the timeout, ExecManager would
-                    // never record the exit code and GET /exec/{id}/json would return
-                    // Running: true forever, blocking the caller indefinitely.
-                    let code: Int32 = await withTaskGroup(of: Int32.self) { g in
-                        g.addTask { (try? await process.wait()) ?? -1 }
+                    // moby emits `exec_die` only when the process is observed to actually
+                    // exit. Race the real exit against a 60-second XPC-stall fallback (no
+                    // client is blocked on the detach result): on an observed exit, record
+                    // the code and broadcast exec_die; if the wait stalls or errors without
+                    // an observed exit, record a sentinel so GET /exec/{id}/json stops
+                    // reporting Running: true, but broadcast no exec_die.
+                    enum ExecExit {
+                        case observed(Int32)
+                        case unresolved
+                    }
+                    let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
+                        g.addTask {
+                            if let code = try? await process.wait() { return .observed(code) }
+                            return .unresolved
+                        }
                         g.addTask {
                             try? await Task.sleep(nanoseconds: 60_000_000_000)
-                            return -1
+                            return .unresolved
                         }
-                        let result = await g.next() ?? -1
+                        let result = await g.next() ?? .unresolved
                         g.cancelAll()
                         return result
                     }
-                    await ExecManager.shared.setExitCode(id: execId, code: code)
-                    await broadcastExecEvent("exec_die", exitCode: code)
+                    switch outcome {
+                    case .observed(let code):
+                        await ExecManager.shared.setExitCode(id: execId, code: code)
+                        await broadcastExecEvent("exec_die", exitCode: code)
+                    case .unresolved:
+                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    }
                 }
                 return Response(status: .ok)
             }
@@ -417,19 +430,36 @@ struct ExecRoute: RouteCollection {
                     // obtain the numeric exit code; if it hangs we fall back to -1
                     // after 10 s. The stream is never blocked by exit-code retrieval.
                     Task.detached {
-                        let code: Int32 = await withTaskGroup(of: Int32.self) { g in
-                            g.addTask { (try? await process.wait()) ?? -1 }
+                        // moby emits `exec_die` only on an observed real exit. Race the exit
+                        // against a 10s XPC-stall fallback: on an observed exit, record the code
+                        // and broadcast exec_die; if it stalls/errors with no observed exit,
+                        // record a sentinel so GET /exec/{id}/json leaves Running, but emit no
+                        // exec_die (no death was observed).
+                        enum ExecExit {
+                            case observed(Int32)
+                            case unresolved
+                        }
+                        let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
+                            g.addTask {
+                                if let code = try? await process.wait() { return .observed(code) }
+                                return .unresolved
+                            }
                             g.addTask {
                                 try? await Task.sleep(nanoseconds: 10_000_000_000)
-                                return -1
+                                return .unresolved
                             }
-                            let result = await g.next() ?? -1
+                            let result = await g.next() ?? .unresolved
                             g.cancelAll()
                             return result
                         }
-                        await ExecManager.shared.setExitCode(id: execId, code: code)
                         await ProcessRegistry.shared.remove(id: execId)
-                        await broadcastExecEvent("exec_die", exitCode: code)
+                        switch outcome {
+                        case .observed(let code):
+                            await ExecManager.shared.setExitCode(id: execId, code: code)
+                            await broadcastExecEvent("exec_die", exitCode: code)
+                        case .unresolved:
+                            await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        }
                     }
 
                     // Task group: only I/O tasks. Stdout and stderr complete at pipe
@@ -714,18 +744,16 @@ struct ExecRoute: RouteCollection {
 
                     // Process monitor with proper cleanup
                     group.addTask {
-                        let code: Int32
-                        do {
-                            code = try await process.wait()
-                        } catch {
-                            // process.wait() failed — record a synthetic exit code
-                            // so the exec leaves the Running state instead of
-                            // hanging there forever.
-                            code = -1
-                        }
-                        await ExecManager.shared.setExitCode(id: execId, code: code)
+                        // moby emits `exec_die` only on an observed real exit. If wait()
+                        // throws, record a synthetic exit code so the exec leaves the
+                        // Running state (GET /exec/{id}/json), but broadcast no exec_die —
+                        // no clean exit was observed.
+                        let observedCode: Int32? = try? await process.wait()
+                        await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
                         await ProcessRegistry.shared.remove(id: execId)
-                        await broadcastExecEvent("exec_die", exitCode: code)
+                        if let observedCode {
+                            await broadcastExecEvent("exec_die", exitCode: observedCode)
+                        }
 
                         // Give a small delay for any final output to be processed
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms

@@ -33,6 +33,13 @@ struct NetworkPruneRoute: RouteCollection {
                     }
                     try await networkClient.delete(id: network.Id, logger: req.logger)
                     deletedNetworks.append(network.Id)
+                    // moby fires a `destroy` per removed network before the aggregate prune.
+                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                        await broadcaster.broadcast(
+                            DockerEvent.make(
+                                type: "network", action: "destroy", actorID: network.Id,
+                                attributes: ["name": network.Name, "type": network.Driver]))
+                    }
                 } catch {
                     errors[network.Id] = String(describing: error)
                     req.logger.error("Failed to delete network \(network.Id): \(error)")

@@ -52,18 +52,22 @@ extension DockerEvent {
 
     /// Container-shaped event: moby's `LogContainerEventWithAttributes` always injects
     /// `image` and `name` attributes alongside the container labels. Keep using this for
-    /// `Type: "container"` events only.
+    /// `Type: "container"` events only. `extraAttributes` carries action-specific keys moby
+    /// adds on top (e.g. `signal` on `kill`, `exitCode` on `die`/`exec_die`); they override
+    /// any same-named label.
     static func simpleEvent(
         id: String,
         type: String,
         status: String,
         image: String = "",
         name: String = "",
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        extraAttributes: [String: String] = [:]
     ) -> DockerEvent {
         var attributes = labels
         attributes["image"] = image
         attributes["name"] = name.isEmpty ? id : name
+        for (key, value) in extraAttributes { attributes[key] = value }
         return make(type: type, action: status, actorID: id, attributes: attributes)
     }
 }

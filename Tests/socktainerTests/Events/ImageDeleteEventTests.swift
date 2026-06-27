@@ -19,14 +19,15 @@ struct ImageDeleteEventTests {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
 
-        var collected: [DockerEvent] = []
         let captureTask = Task<[DockerEvent], Never> {
+            var collected: [DockerEvent] = []
+            // Collect every image event until the timeout cancels this task (cancellation
+            // makes the stream's next() return nil, ending the loop). Breaking after the
+            // first event would let a regression that emits `delete` then a late `untag`
+            // slip past the negative assertion below.
             for await event in stream where event.Type == "image" {
                 collected.append(event)
-                // Collect for 300ms then return
-                if collected.count >= 1 { break }
             }
-            try? await Task.sleep(nanoseconds: 300_000_000)
             return collected
         }
 
@@ -95,8 +96,9 @@ struct ImageDeleteEventTests {
 
         #expect(event?.Actor.ID == digest)
         #expect(event?.Actor.Attributes["name"] == normalizedRef)
-        #expect(event?.Actor.Attributes["image"] == nil, "moby image events carry no 'image' attribute")
-        #expect(event?.from == "")
+        // moby image events carry only `name` — no `image` key, so the legacy `from` is empty.
+        #expect(event?.Actor.Attributes["image"] == nil, "moby image events set no 'image' attribute")
+        #expect(event?.from == "", "image events leave the legacy 'from' field empty")
     }
 }
 

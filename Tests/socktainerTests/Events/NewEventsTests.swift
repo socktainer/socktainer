@@ -10,8 +10,9 @@ import VaporTesting
 @testable import socktainer
 
 /// Tests for new Docker events added for issue #90 parity.
-/// Routes that store concrete service types (kill, volume) are covered by
-/// integration tests; these cover routes that accept a protocol.
+/// Routes that store concrete service types (volume/network prune build their
+/// service internally) are covered by integration tests; these cover routes
+/// that accept a protocol.
 @Suite("New events — issue #90 parity")
 struct NewEventsTests {
 
@@ -121,6 +122,107 @@ struct NewEventsTests {
         #expect(event?.Actor.Attributes["reclaimed"] == "1024")
         #expect(event?.Actor.Attributes["name"] == nil, "prune events carry no 'name' attribute")
         #expect(event?.Actor.Attributes["image"] == nil, "prune events carry no 'image' attribute")
+    }
+
+    @Test("container prune emits a per-container 'destroy' before the aggregate prune")
+    func containerPruneEmitsPerContainerDestroy() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        // Collect both the destroy and the aggregate prune to assert ordering/coexistence.
+        let captureTask = Task<[DockerEvent], Never> {
+            var collected: [DockerEvent] = []
+            for await event in stream where event.Type == "container" {
+                collected.append(event)
+                if event.Action == "prune" { break }
+            }
+            return collected
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerPruneRoute(client: StubContainerClient()))
+
+            try await app.testing().test(.POST, "/v1.51/containers/prune") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let events = await withTimeout(captureTask)
+        captureTask.cancel()
+
+        let destroy = events.first { $0.Action == "destroy" }
+        let prune = events.first { $0.Action == "prune" }
+        // moby fires a `destroy` per removed container (StubContainerClient prunes "my-container")…
+        #expect(destroy != nil, "container prune must emit a per-container destroy")
+        #expect(destroy?.Actor.ID == "my-container")
+        // …then the aggregate prune, and the destroy must precede it.
+        #expect(prune != nil)
+        if let di = events.firstIndex(where: { $0.Action == "destroy" }),
+            let pi = events.firstIndex(where: { $0.Action == "prune" })
+        {
+            #expect(di < pi, "destroy must precede the aggregate prune")
+        }
+    }
+
+    // MARK: - container.kill
+
+    @Test("kill route broadcasts a 'kill' event carrying the numeric signal attribute")
+    func killEventCarriesSignal() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "kill" && event.Type == "container" { return event }
+            return nil
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerKillRoute(client: StubContainerClient()))
+
+            try await app.testing().test(.POST, "/v1.51/containers/my-container/kill?signal=SIGTERM") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let event = await withTimeout(captureTask)
+        captureTask.cancel()
+
+        #expect(event?.Action == "kill")
+        // moby's kill event carries the numeric signal (SIGTERM == 15).
+        #expect(event?.Actor.Attributes["signal"] == String(SIGTERM))
+    }
+
+    @Test("kill route defaults the signal attribute to SIGKILL when none is given")
+    func killEventDefaultsToSigkill() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "kill" && event.Type == "container" { return event }
+            return nil
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerKillRoute(client: StubContainerClient()))
+
+            try await app.testing().test(.POST, "/v1.51/containers/my-container/kill") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let event = await withTimeout(captureTask)
+        captureTask.cancel()
+
+        #expect(event?.Actor.Attributes["signal"] == String(SIGKILL), "Docker defaults kill to SIGKILL")
     }
 
     // MARK: - image.prune
@@ -251,6 +353,11 @@ struct NewEventsTests {
 
         #expect(event?.Action == "start")
         #expect(event?.Actor.Attributes["app"] == "fg")
+
+        // Release the detached die observer /start spawned for this snapshot (it awaits
+        // ContainerExitCodeStore for nativeId); otherwise a waiter/task leaks into later tests.
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: 0)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 }
 
@@ -260,14 +367,14 @@ struct NewEventsTests {
 /// capture task is cancelled so its `for await` loop exits and returns nil — this
 /// is essential for negative tests (expecting no event), where the event never
 /// arrives and awaiting the task directly would block forever.
-private func withTimeout(_ task: Task<DockerEvent?, Never>) async -> DockerEvent? {
+private func withTimeout<T>(_ task: Task<T, Never>) async -> T {
     let timeout = Task {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         task.cancel()
     }
-    let event = await task.value
+    let value = await task.value
     timeout.cancel()
-    return event
+    return value
 }
 
 private func makeContainerSnapshot(

@@ -33,9 +33,9 @@ extension ImagePruneRoute {
             let result = try await client.prune(filters: parsedFilters, logger: logger)
 
             // moby emits per-image `untag`/`delete` events for prune (NOT an aggregate "prune"
-            // event — that exists for containers/networks/volumes but not images). Mirror the
-            // exact emission of ImageDeleteRoute: untag per removed reference (Actor.ID = digest),
-            // delete per freed digest.
+            // event — that exists for containers/networks/volumes but not images): an `untag`
+            // per removed reference (Actor.ID = digest) and a `delete` per freed digest.
+            // Unlike ImageDeleteRoute, prune does not special-case dangling images here.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 for item in result.results {
                     await broadcaster.broadcast(
