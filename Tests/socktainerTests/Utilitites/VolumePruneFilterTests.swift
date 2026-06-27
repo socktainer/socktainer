@@ -3,7 +3,7 @@ import Testing
 
 @testable import socktainer
 
-@Suite("Volume prune — negative label filter")
+@Suite("Volume prune — label filters")
 struct VolumePruneFilterTests {
 
     private let logger = Logger(label: "test")
@@ -74,6 +74,42 @@ struct VolumePruneFilterTests {
         let volumes = [makeVolume(name: "vol-env", labels: ["env": "anything"])]
         let result = ClientVolumeService.applyFilters(volumes, parsedFilters: ["label!": ["env"]])
         #expect(result.isEmpty)
+    }
+
+    // MARK: - Positive label matching is AND across multiple filters
+
+    @Test("multiple label filters are ANDed: only a volume matching every label is kept")
+    func multipleLabelFiltersAreAnded() {
+        let volumes = [
+            makeVolume(name: "vol-both", labels: ["env": "dev", "team": "a"]),
+            makeVolume(name: "vol-env-only", labels: ["env": "dev", "team": "b"]),
+            makeVolume(name: "vol-team-only", labels: ["env": "prod", "team": "a"]),
+        ]
+        let result = ClientVolumeService.applyFilters(
+            volumes, parsedFilters: ["label": ["env=dev", "team=a"]])
+        // Docker semantics: env=dev AND team=a → only vol-both, not vol-env-only (OR would keep all three).
+        #expect(result.map(\.Name) == ["vol-both"])
+    }
+
+    @Test("single label filter still matches as before")
+    func singleLabelFilterMatches() {
+        let volumes = [
+            makeVolume(name: "vol-dev", labels: ["env": "dev"]),
+            makeVolume(name: "vol-prod", labels: ["env": "prod"]),
+        ]
+        let result = ClientVolumeService.applyFilters(volumes, parsedFilters: ["label": ["env=dev"]])
+        #expect(result.map(\.Name) == ["vol-dev"])
+    }
+
+    @Test("a volume with no labels is excluded by a positive label filter")
+    func unlabeledVolumeExcludedByPositiveLabel() {
+        let volumes = [
+            makeVolume(name: "vol-dev", labels: ["env": "dev"]),
+            makeVolume(name: "vol-none"),  // Labels: nil
+        ]
+        let result = ClientVolumeService.applyFilters(volumes, parsedFilters: ["label": ["env=dev"]])
+        // Docker excludes label-less volumes when a positive label filter is set.
+        #expect(result.map(\.Name) == ["vol-dev"])
     }
 }
 
