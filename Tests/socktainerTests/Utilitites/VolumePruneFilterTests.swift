@@ -3,7 +3,7 @@ import Testing
 
 @testable import socktainer
 
-@Suite("Volume prune — negative label filter")
+@Suite("Volume prune — label filters")
 struct VolumePruneFilterTests {
 
     private let logger = Logger(label: "test")
