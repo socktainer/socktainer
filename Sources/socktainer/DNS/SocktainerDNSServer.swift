@@ -108,9 +108,11 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
         var buf = [UInt8](repeating: 0, count: 512)
 
-        // Dispatch each query to a thread so the recvfrom loop is never blocked.
-        // forwardToUpstream() waits up to 2s for 1.1.1.1; without async dispatch
-        // every pending query times out while the loop is stuck on a slow upstream.
+        // Two-tier dispatch: local lookups (in-table A/AAAA/NODATA) are answered
+        // inline so the Rust DNS forwarder sidecar receives the response within
+        // microseconds — before any per-task scheduling latency. Upstream queries
+        // (external multi-label names that need 1.1.1.1) are still dispatched to
+        // avoid blocking the recvfrom loop for the 2-second socket timeout.
         while true {
             var clientAddr = sockaddr_in()
             var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -125,6 +127,20 @@ final class SocktainerDNSServer: @unchecked Sendable {
             let capturedAddr = clientAddr
             let capturedLen = clientLen
 
+            // Fast path: local resolution — answer inline without dispatch latency.
+            if let local = handleLocalQuery(packet) {
+                var addr = capturedAddr
+                _ = local.withUnsafeBytes { ptr in
+                    withUnsafePointer(to: &addr) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, ptr.baseAddress!, local.count, 0, $0, capturedLen)
+                        }
+                    }
+                }
+                continue
+            }
+
+            // Slow path: upstream query — dispatch so recvfrom stays responsive.
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let response = self.handleQuery(packet) else { return }
                 var addr = capturedAddr
@@ -137,6 +153,42 @@ final class SocktainerDNSServer: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Returns a local response without touching the network. Returns nil if the query
+    /// needs to be forwarded upstream, letting the caller fall through to the slow path.
+    private func handleLocalQuery(_ packet: [UInt8]) -> [UInt8]? {
+        guard packet.count >= 12 else { return nil }
+        let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
+        guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
+        guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else { return nil }
+        let normalized = Self.normalize(qname)
+        let isSingleLabel = !normalized.contains(".")
+        if qtype == 1 {
+            lock.lock()
+            let ip = entries[normalized]
+            lock.unlock()
+            if let ip {
+                log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
+                return buildAResponse(packet: packet, ip: ip)
+            }
+            if isSingleLabel {
+                log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
+                return buildNxdomainResponse(packet: packet)
+            }
+        } else if qtype == 28 {
+            if isSingleLabel { return buildNodataResponse(packet: packet) }
+            lock.lock()
+            let known = entries[normalized] != nil
+            lock.unlock()
+            if known { return buildNodataResponse(packet: packet) }
+        }
+        // Any other single-label query type (HTTPS/SVCB/SRV/TXT/…) is answered NODATA
+        // locally rather than forwarded: a single-label name has no public meaning, so
+        // forwarding it upstream only invites an authoritative NXDOMAIN that poisons the
+        // resolver's parallel A+AAAA lookups.
+        if isSingleLabel { return buildNodataResponse(packet: packet) }
+        return nil
     }
 
     private func handleQuery(_ packet: [UInt8]) -> [UInt8]? {
@@ -152,6 +204,10 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
         let normalized = Self.normalize(qname)
 
+        // Single-label names are container names, not real internet domains — never forward
+        // them to 1.1.1.1, whose authoritative NXDOMAIN can poison concurrent A+AAAA resolvers.
+        let isSingleLabel = !normalized.contains(".")
+
         if qtype == 1 {  // A record
             lock.lock()
             let ip = entries[normalized]
@@ -160,18 +216,20 @@ final class SocktainerDNSServer: @unchecked Sendable {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
                 return buildAResponse(packet: packet, ip: ip)
             }
-        } else if qtype == 28 {  // AAAA — return NODATA for known hosts (prevents musl NXDOMAIN bug)
+            if isSingleLabel {
+                log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
+                return buildNxdomainResponse(packet: packet)
+            }
+        } else if qtype == 28 {  // AAAA — container names are IPv4-only
+            // For single-label names return NODATA unconditionally; forwarding to 1.1.1.1
+            // would yield an authoritative NXDOMAIN that poisons concurrent A+AAAA resolvers.
+            if isSingleLabel { return buildNodataResponse(packet: packet) }
             lock.lock()
             let known = entries[normalized] != nil
             lock.unlock()
-            if known {
-                return buildNodataResponse(packet: packet)
-            }
+            if known { return buildNodataResponse(packet: packet) }
         }
 
-        if !normalized.contains(".") {
-            log.info("[dns] \(normalized) not in table, forwarding to 1.1.1.1")
-        }
         return forwardToUpstream(packet)
     }
 
@@ -220,6 +278,22 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var response = packet
         let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
         let rflags: UInt16 = 0x8400 | rd
+        response[2] = UInt8(rflags >> 8)
+        response[3] = UInt8(rflags & 0xFF)
+        response[6] = 0
+        response[7] = 0
+        response[8] = 0
+        response[9] = 0
+        response[10] = 0
+        response[11] = 0
+        return response
+    }
+
+    // Non-authoritative NXDOMAIN (no AA bit) so clients retry rather than cache permanently.
+    private func buildNxdomainResponse(packet: [UInt8]) -> [UInt8] {
+        var response = packet
+        let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
+        let rflags: UInt16 = 0x8003 | rd  // QR=1, Recursion Desired, RCODE=3
         response[2] = UInt8(rflags >> 8)
         response[3] = UInt8(rflags & 0xFF)
         response[6] = 0

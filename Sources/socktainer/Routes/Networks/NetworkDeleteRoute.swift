@@ -1,7 +1,7 @@
 import ContainerAPIClient
 import Vapor
 
-struct NetworkDeletetRoute: RouteCollection {
+struct NetworkDeleteRoute: RouteCollection {
     let client: ClientNetworkProtocol
 
     func boot(routes: RoutesBuilder) throws {
@@ -15,12 +15,24 @@ struct NetworkDeletetRoute: RouteCollection {
             throw Abort(.badRequest, reason: "Missing network id parameter")
         }
         do {
-            // Remove the CoreDNS sidecar BEFORE deleting the network —
+            // Resolve the network before deletion: getNetwork matches an exact Id or Name and
+            // returns the canonical Id, Name and Driver, so the request maps to the real network
+            // for DNS cleanup and the destroy event (moby network events include {name, type}).
+            let summary = try? await client.getNetwork(id: id, logger: logger)
+            let resolvedId = summary?.Id ?? id
+
+            // Remove the DNS forwarder sidecar BEFORE deleting the network —
             // the network can't be deleted while the DNS container is still attached.
             if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
-                await dnsManager.cleanupDNSContainer(networkId: id)
+                await dnsManager.cleanupDNSContainer(networkId: resolvedId)
             }
-            try await client.delete(id: id, logger: logger)
+            try await client.delete(id: resolvedId, logger: logger)
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "network", action: "destroy", actorID: resolvedId,
+                        attributes: ["name": summary?.Name ?? id, "type": summary?.Driver ?? "nat"]))
+            }
             return Response(status: .noContent)
         } catch {
             if error.localizedDescription.contains("not found") {

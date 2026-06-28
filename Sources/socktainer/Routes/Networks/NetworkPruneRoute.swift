@@ -27,12 +27,19 @@ struct NetworkPruneRoute: RouteCollection {
                     continue
                 }
                 do {
-                    // Clean up CoreDNS sidecar before deleting the network
+                    // Clean up DNS forwarder sidecar before deleting the network
                     if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                         await dnsManager.cleanupDNSContainer(networkId: network.Id)
                     }
                     try await networkClient.delete(id: network.Id, logger: req.logger)
                     deletedNetworks.append(network.Id)
+                    // moby fires a `destroy` per removed network before the aggregate prune.
+                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                        await broadcaster.broadcast(
+                            DockerEvent.make(
+                                type: "network", action: "destroy", actorID: network.Id,
+                                attributes: ["name": network.Name, "type": network.Driver]))
+                    }
                 } catch {
                     errors[network.Id] = String(describing: error)
                     req.logger.error("Failed to delete network \(network.Id): \(error)")
@@ -43,6 +50,14 @@ struct NetworkPruneRoute: RouteCollection {
                 "Errors": errors,
             ]
             let responseData = try JSONSerialization.data(withJSONObject: responseBody, options: [])
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                // Docker prune events carry an empty Actor.ID and only a reclaimed attribute;
+                // moby always reports reclaimed="0" for networks.
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "network", action: "prune", actorID: "",
+                        attributes: ["reclaimed": "0"]))
+            }
             return Response(status: .ok, body: .init(data: responseData))
         } catch {
             return Response(status: .internalServerError, body: .init(string: "Failed to prune networks: \(error)"))

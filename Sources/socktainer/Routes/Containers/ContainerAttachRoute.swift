@@ -28,6 +28,15 @@ extension ContainerAttachRoute {
     /// Lets pipe readers flush buffered output before Docker CLI closes the connection.
     static let outputFlushGraceNs: UInt64 = 200_000_000  // 200ms
 
+    /// Builds the container event emitted when `docker run --rm` triggers Apple Container's
+    /// auto-removal: no DELETE arrives, so ContainerDeleteRoute never fires and this path
+    /// substitutes for it. The action MUST be "destroy" — the same action ContainerDeleteRoute
+    /// emits — because `--rm` is the same removal operation. Shared by the HTTP and WS attach
+    /// routes so both stay consistent.
+    static func makeAutoRemoveEvent(id: String, image: String, name: String, labels: [String: String]) -> DockerEvent {
+        DockerEvent.simpleEvent(id: id, type: "container", status: "destroy", image: image, name: name, labels: labels)
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
@@ -309,32 +318,35 @@ extension ContainerAttachRoute {
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
                     group.addTask {
-                        let code = (try? await process.wait()) ?? 0
+                        // Retry the wait XPC round-trip rather than collapsing a transient
+                        // throw into a fake exit code of 0 (see ContainerExitCodeStore.resolveExitCode).
+                        let code = await ContainerExitCodeStore.resolveExitCode { try await process.wait() }
                         await ProcessRegistry.shared.remove(id: container.id)
                         try? await Task.sleep(nanoseconds: Self.outputFlushGraceNs)
                         await ContainerExitCodeStore.shared.set(id: container.id, code: code)
                         await ContainerExitCodeStore.shared.set(id: hexId, code: code)
 
-                        // docker run --rm: Apple Container auto-removes the container so
-                        // DELETE never arrives and ContainerDeleteRoute never fires.
-                        // Detect auto-removal and emit the "remove" event here instead.
-                        try? await Task.sleep(nanoseconds: 100_000_000)
-                        let autoRemoved: Bool
-                        do {
-                            autoRemoved = try await ContainerClient().get(id: container.id) == nil
-                        } catch let error as ContainerizationError where error.code == .notFound {
-                            autoRemoved = true
-                        } catch {
-                            autoRemoved = false
-                        }
-                        if autoRemoved {
+                        // docker run --rm: Apple Container auto-removes the container so DELETE
+                        // never arrives and ContainerDeleteRoute never fires. consumeAutoRemove
+                        // gates on the --rm flag (set at create) and dedups against the detached
+                        // die observer, so exactly one "destroy" fires — same action moby uses.
+                        if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
+                            // Clean up DNS entry registered at start — ContainerDeleteRoute
+                            // is never called for --rm containers (Apple Container reaps them).
+                            // Use the stored IP for the same ownership check ContainerDeleteRoute
+                            // uses: only unregister if this container still owns the entry.
+                            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
+                                let cachedIP = await ContainerInfoCache.shared.get(id: hexId)?.ip
+                                let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(container.id)]
+                                if cachedIP == nil || registered == nil || registered == cachedIP {
+                                    dnsServer.unregister(hostname: container.id)
+                                }
+                            }
                             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                                 let cached = await ContainerInfoCache.shared.get(id: hexId)
                                 await broadcaster.broadcast(
-                                    DockerEvent.simpleEvent(
+                                    Self.makeAutoRemoveEvent(
                                         id: hexId,
-                                        type: "container",
-                                        status: "remove",
                                         image: cached?.image ?? container.configuration.image.reference,
                                         name: cached?.nativeId ?? container.id,
                                         labels: cached?.labels

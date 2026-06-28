@@ -9,9 +9,12 @@ import TerminalProgress
 /// What was removed when deleting an image reference.
 /// Mirrors Docker Engine's `ImageDeleteResponseItem` semantics:
 ///   - `untagged` — the tag that was removed (always present)
+///   - `digest` — the sha256 of the image the tag pointed at (always present); Docker uses
+///     this as the `Actor.ID` for `untag`/`delete` events
 ///   - `deletedDigest` — the sha256 of image layers freed (only when the last tag was removed)
 struct ImageDeletionResult {
     let untagged: String  // normalized tag that was untagged
+    let digest: String  // sha256 of the image the removed tag referenced
     let deletedDigest: String?  // sha256 if the image layers were garbage-collected
 }
 
@@ -24,7 +27,7 @@ protocol ClientImageProtocol: Sendable {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64)
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64)
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
 }
@@ -183,6 +186,7 @@ struct ClientImageService: ClientImageProtocol {
 
         return ImageDeletionResult(
             untagged: normalizedRef,
+            digest: digest,
             deletedDigest: wasLastRef ? digest : nil
         )
     }
@@ -360,7 +364,7 @@ struct ClientImageService: ClientImageProtocol {
         }
     }
 
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (deletedImages: [String], spaceReclaimed: Int64) {
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         let allImages = try await list()
         var imagesToDelete: [ClientImage] = []
 
@@ -488,44 +492,46 @@ struct ClientImageService: ClientImageProtocol {
             }
         }
 
-        var deletedImages: [String] = []
+        var results: [ImageDeletionResult] = []
         var spaceReclaimed: Int64 = 0
 
         for image in imagesToDelete {
             do {
                 let reference = image.reference
 
+                // Calculate candidate size before deletion (manifest data unavailable after).
+                // Only credited to spaceReclaimed when delete confirms the layers were freed.
+                var candidateSize: Int64 = 0
                 let manifests = try await image.index().manifests
-
                 for descriptor in manifests {
                     if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
                         referenceType == "attestation-manifest"
                     {
                         continue
                     }
-
-                    guard let platform = descriptor.platform else {
-                        continue
-                    }
-
+                    guard let platform = descriptor.platform else { continue }
                     do {
                         let manifest = try await image.manifest(for: platform)
-                        // Calculate size: descriptor + config + all layers
-                        let imageSize = descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
-                        spaceReclaimed += imageSize
-                    } catch {
-                        continue
-                    }
+                        candidateSize += descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
+                    } catch { continue }
                 }
 
-                _ = try await delete(id: reference)
-                deletedImages.append(reference)
+                // Capture the per-image untag/delete result so the route can emit moby-faithful
+                // per-image events. moby's image prune emits an `untag` per removed reference and
+                // a `delete` per freed digest — never an aggregate "prune" event.
+                let result = try await delete(id: reference)
+                results.append(result)
+                // Only count reclaimed bytes when layers were actually garbage-collected
+                // (deletedDigest non-nil). An untag-only result frees no disk space.
+                if result.deletedDigest != nil {
+                    spaceReclaimed += candidateSize
+                }
             } catch {
                 logger.warning("Failed to delete image \(image.reference): \(error)")
             }
         }
 
-        return (deletedImages, spaceReclaimed)
+        return (results, spaceReclaimed)
     }
 
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {

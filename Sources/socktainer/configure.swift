@@ -116,7 +116,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: NetworkInspectRoute(client: networkClient))
     try app.register(collection: NetworkListRoute())
     try app.register(collection: NetworkPruneRoute(client: networkClient))
-    try app.register(collection: NetworkDeletetRoute(client: networkClient))
+    try app.register(collection: NetworkDeleteRoute(client: networkClient))
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
@@ -179,12 +179,6 @@ func configure(_ app: Application) async throws {
     app.storage[EventBroadcasterKey.self] = broadcaster
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
-    let watcher = FolderWatcher(parentFolderURL: appleContainerAppSupportUrl, broadcaster: broadcaster)
-    app.storage[FolderWatcherKey.self] = watcher
-
-    // Await starting watching
-    watcher.startWatching()
-
     // Initialize inter-container DNS infrastructure.
     // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
     // is taken, Socktainer auto-increments until a free port is found.
@@ -207,11 +201,43 @@ func configure(_ app: Application) async throws {
     let healthCheckManager = HealthCheckManager(broadcaster: broadcaster)
     app.storage[HealthCheckManagerKey.self] = healthCheckManager
 
-    // Resume healthcheck loops for any containers that were running when
-    // Socktainer last stopped — their socktainer.healthcheck label persists.
+    // Resume healthcheck loops and DNS registrations for any containers that were
+    // running when Socktainer last stopped. SocktainerDNSServer is in-memory so
+    // entries are lost on restart; without re-registration containers that are
+    // restarted (not re-created) via docker start cannot be resolved by peers.
     let resumeClient = ContainerClient()
     if let runningContainers = try? await resumeClient.list() {
+        let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
         for container in runningContainers where container.status == .running {
+            // Skip DNS-sidecar containers — they are internal infrastructure.
+            guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole
+            else { continue }
+
+            // Re-register DNS entries for containers on named networks.
+            if let firstAttachment = container.networks.first,
+                !reservedNetworks.contains(firstAttachment.network)
+            {
+                let ip = firstAttachment.ipv4Address.address.description
+                dnsServer.register(hostname: container.id, ip: ip)
+                if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.register(hostname: name, ip: ip)
+                    }
+                }
+                if let serviceName = container.configuration.labels["com.docker.compose.service"],
+                    !serviceName.isEmpty
+                {
+                    dnsServer.register(hostname: serviceName, ip: ip)
+                    if let projectName = container.configuration.labels["com.docker.compose.project"],
+                        !projectName.isEmpty
+                    {
+                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                    }
+                }
+                app.logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
+            }
+
+            // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
                 let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8)),
                 HealthCheckManager.parseTest(config.Test) != nil  // skip NONE / disabled checks
@@ -223,5 +249,11 @@ func configure(_ app: Application) async throws {
 
     // Clean up any CoreDNS containers left from a previous run
     await dnsManager.cleanupStaleDNSContainers()
+
+    // Reap networks orphaned by a previous run (containers removed, network left behind).
+    // Apple Container's vmnet state degrades as stale networks accumulate and eventually
+    // breaks container-to-container routing (EHOSTUNREACH); runs after the DNS-sidecar
+    // cleanup so a network whose only member was its sidecar now appears empty.
+    await OrphanedNetworkReaper.reap(networkClient: networkClient, logger: app.logger)
 
 }

@@ -133,6 +133,108 @@ struct SocktainerDNSServerTests {
     }
 }
 
+// MARK: - DNS query behaviour
+
+/// Sends a minimal DNS A or AAAA query via UDP and returns the RCODE from the response.
+/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
+/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
+private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x12, 0x34, 0x01, 0x00]  // ID + RD=1 query
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]  // QDCOUNT=1, rest 0
+    packet += qname
+    packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+
+    var dst = sockaddr_in()
+    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst.sin_family = sa_family_t(AF_INET)
+    dst.sin_port = in_port_t(port).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
+
+    for attempt in 0..<5 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { continue }
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let sent = packet.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &dst) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, ptr.baseAddress!, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent > 0 else { continue }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = recv(fd, &buf, buf.count, 0)
+        if n >= 4 { return buf[3] & 0x0F }
+    }
+    return nil
+}
+
+@Suite("SocktainerDNSServer — query behaviour")
+struct SocktainerDNSQueryTests {
+
+    @Test("A query for registered single-label name returns RCODE 0 (NOERROR)")
+    func aQueryKnownNameReturnsNoerror() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19700, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
+        let rcode = dnsRcode(type: 1, name: "supabase_db_supabase", port: port)
+        #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
+    }
+
+    @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")
+    func aQueryUnknownNameReturnsNxdomain() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19710, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
+        server.register(hostname: "_warmup", ip: "127.0.0.1")
+        let rcode = dnsRcode(type: 1, name: "no-such-container", port: port)
+        #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding to 1.1.1.1")
+    }
+
+    @Test("AAAA query for single-label name returns NODATA (RCODE 0, no answers)")
+    func aaaaQuerySingleLabelReturnsNodata() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19720, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "db", ip: "192.168.67.3")
+        // NODATA is RCODE=0 with zero answer records; the test checks RCODE only.
+        let rcode = dnsRcode(type: 28, name: "db", port: port)
+        #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not NXDOMAIN from 1.1.1.1")
+    }
+
+    @Test("AAAA query for unknown single-label name returns NODATA (RCODE 0)")
+    func aaaaQueryUnknownSingleLabelReturnsNodata() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19730, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "_warmup", ip: "127.0.0.1")
+        let rcode = dnsRcode(type: 28, name: "unknown-svc", port: port)
+        #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+    }
+}
+
 // MARK: - EmbeddedDNSImage / SocktainerDNSImage SwiftPM resource
 
 @Suite("EmbeddedDNSImage — SwiftPM resource")
@@ -205,4 +307,86 @@ struct EmbeddedDNSImageTests {
 private actor ActorCounter {
     private(set) var value = 0
     func increment() { value += 1 }
+}
+
+// MARK: - firstNamedNetwork (plain docker run --network parity)
+
+@Suite("ContainerCreateRoute.firstNamedNetwork")
+struct FirstNamedNetworkTests {
+
+    @Test("Compose EndpointsConfig key is returned when present")
+    func composePath() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["myapp_default"],
+            networkMode: nil
+        )
+        #expect(result == "myapp_default")
+    }
+
+    @Test("HostConfig.NetworkMode is returned when EndpointsConfig is absent")
+    func networkModePath() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: "user-net"
+        )
+        #expect(result == "user-net")
+    }
+
+    @Test("EndpointsConfig takes precedence over NetworkMode")
+    func endpointsConfigWins() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["compose-net"],
+            networkMode: "mode-net"
+        )
+        #expect(result == "compose-net")
+    }
+
+    @Test("Reserved modes return nil")
+    func reservedModesReturnNil() {
+        for mode in ["default", "bridge", "host", "none"] {
+            let result = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: [],
+                networkMode: mode
+            )
+            #expect(result == nil, "mode '\(mode)' must not trigger DNS setup")
+        }
+    }
+
+    @Test("Empty networkMode returns nil")
+    func emptyNetworkModeReturnsNil() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: ""
+        )
+        #expect(result == nil)
+    }
+
+    @Test("No config at all returns nil")
+    func noConfigReturnsNil() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: [],
+            networkMode: nil
+        )
+        #expect(result == nil)
+    }
+
+    @Test("Reserved names in EndpointsConfig return nil")
+    func reservedEndpointsConfigKeysReturnNil() {
+        for mode in ["default", "bridge", "host", "none"] {
+            let result = ContainerCreateRoute.firstNamedNetwork(
+                endpointsConfigKeys: [mode],
+                networkMode: nil
+            )
+            #expect(result == nil, "EndpointsConfig key '\(mode)' must not trigger DNS setup")
+        }
+    }
+
+    @Test("EndpointsConfig skips reserved and returns first valid key")
+    func endpointsConfigSkipsReserved() {
+        let result = ContainerCreateRoute.firstNamedNetwork(
+            endpointsConfigKeys: ["default", "user-net"],
+            networkMode: nil
+        )
+        #expect(result == "user-net", "must skip 'default' and return the first non-reserved key")
+    }
 }
