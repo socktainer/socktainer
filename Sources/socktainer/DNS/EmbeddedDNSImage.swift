@@ -62,12 +62,23 @@ enum EmbeddedDNSImage {
             let resourceURL = SocktainerDNSImage.archiveURL
             log.info("[dns-embedded] importing embedded DNS forwarder image")
             let imageClient = ClientImageService(containerSystemConfig: containerSystemConfig)
-            _ = try await imageClient.load(
+            let loaded = try await imageClient.load(
                 tarballPath: resourceURL,
                 platform: .current,
                 appleContainerAppSupportUrl: appSupportURL,
                 logger: log
             )
+
+            // The OCI archive carries no repo:tag, so the image lands in the store
+            // untagged and cannot be resolved as `socktainer-dns:embedded`. Tag the
+            // freshly-loaded image so the forwarder can reference it locally
+            // (otherwise creating the DNS container falls back to a registry pull).
+            if (try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig)) == nil,
+                let loadedRef = loaded.first
+            {
+                let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
+                _ = try await loadedImage.tag(new: tag)
+            }
             log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
         }
     }

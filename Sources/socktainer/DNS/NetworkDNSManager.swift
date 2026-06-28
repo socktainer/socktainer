@@ -153,9 +153,12 @@ actor NetworkDNSManager {
         )
 
         let platform = Platform.current
-        let image = try await ClientImage.fetch(
+        // The embedded DNS image was just imported into the local store by
+        // EmbeddedDNSImage.ensure(); look it up locally. Using ClientImage.fetch
+        // here would normalize "socktainer-dns:embedded" to a Docker Hub
+        // reference and try to pull it (401), since it is not a registry image.
+        let image = try await ClientImage.get(
             reference: EmbeddedDNSImage.tag,
-            platform: platform,
             containerSystemConfig: containerSystemConfig
         )
         _ = try await image.getCreateSnapshot(platform: platform)
