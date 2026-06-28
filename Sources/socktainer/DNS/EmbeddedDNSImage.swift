@@ -73,13 +73,19 @@ enum EmbeddedDNSImage {
             // untagged and cannot be resolved as `socktainer-dns:embedded`. Tag the
             // freshly-loaded image so the forwarder can reference it locally
             // (otherwise creating the DNS container falls back to a registry pull).
-            if (try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig)) == nil,
-                let loadedRef = loaded.first
-            {
-                let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
-                _ = try await loadedImage.tag(new: tag)
+            // Fail loudly if the import produced no image rather than reporting a
+            // readiness we cannot back.
+            guard let loadedRef = loaded.first else {
+                throw EmbeddedDNSError.importReturnedNoImage
             }
+            let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
+            _ = try await loadedImage.tag(new: tag)
             log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
         }
+    }
+
+    enum EmbeddedDNSError: Error {
+        /// The embedded archive was loaded but produced no image reference to tag.
+        case importReturnedNoImage
     }
 }
