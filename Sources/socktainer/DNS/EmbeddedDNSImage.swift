@@ -85,12 +85,17 @@ enum EmbeddedDNSImage {
             // `ClientImage.get(reference: tag)` reads can lag briefly. Confirm the tag
             // resolves before returning so the caller (NetworkDNSManager) can't miss it
             // and silently skip the DNS sidecar on the first `compose up`.
-            for _ in 0..<tagVisibilityMaxAttempts {
+            for attempt in 0..<tagVisibilityMaxAttempts {
+                // Sleep before every check except the first, so the final check happens
+                // after the last sleep — a tag that appears at the end of the budget is
+                // still caught rather than treated as a timeout.
+                if attempt > 0 {
+                    try await Task.sleep(for: tagVisibilityPollInterval)
+                }
                 if (try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig)) != nil {
                     log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
                     return
                 }
-                try await Task.sleep(for: tagVisibilityPollInterval)
             }
             // Tag write succeeded but the list still hasn't caught up within the budget.
             // Don't fail setup over it: return and let the caller proceed. Its lookup
