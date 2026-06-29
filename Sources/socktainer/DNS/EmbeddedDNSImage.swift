@@ -80,9 +80,36 @@ enum EmbeddedDNSImage {
             }
             let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
             _ = try await loadedImage.tag(new: tag)
-            log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
+
+            // The tag is written over XPC, but the image list a later
+            // `ClientImage.get(reference: tag)` reads can lag briefly. Confirm the tag
+            // resolves before returning so the caller (NetworkDNSManager) can't miss it
+            // and silently skip the DNS sidecar on the first `compose up`.
+            for attempt in 0..<tagVisibilityMaxAttempts {
+                // Sleep before every check except the first, so the final check happens
+                // after the last sleep — a tag that appears at the end of the budget is
+                // still caught rather than treated as a timeout.
+                if attempt > 0 {
+                    try await Task.sleep(for: tagVisibilityPollInterval)
+                }
+                if (try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig)) != nil {
+                    log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
+                    return
+                }
+            }
+            // Tag write succeeded but the list still hasn't caught up within the budget.
+            // Don't fail setup over it: return and let the caller proceed. Its lookup
+            // either now sees the tag (DNS set up) or falls back to starting the
+            // container without DNS — the same graceful degradation as before — and a
+            // later `compose up` resolves once the image list catches up.
+            log.warning("[dns-embedded] tag \(tag) not yet resolvable within budget; proceeding (DNS may be set up on a later run)")
         }
     }
+
+    // The embedded image tag is confirmed visible within this budget (~2s) before
+    // ensure() returns; see the poll loop above.
+    private static let tagVisibilityMaxAttempts = 100
+    private static let tagVisibilityPollInterval: Duration = .milliseconds(20)
 
     enum EmbeddedDNSError: Error {
         /// The embedded archive was loaded but produced no image reference to tag.
