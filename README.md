@@ -398,6 +398,14 @@ services:
 
 If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
 
+### Network subnets (IPAM)
+
+Socktainer pins a stable subnet on each network it creates so that inter-container DNS keeps working across a `container system` restart (an unpinned network's subnet is reassigned by `vmnet` on restart, which would leave containers' DNS nameservers pointing at a dead address). An explicit `--subnet` / Compose `ipam.config.subnet` is honored; otherwise a free `192.168.x.0/24` is chosen automatically.
+
+`IPAM.Config` fields other than `Subnet` — `Gateway`, `IPRange`, and `AuxiliaryAddresses` — are **not supported** by the Apple Container backend (the gateway is always the subnet's `.1` and addresses are allocated by `vmnet`). They are ignored, and a `WARNING` is logged when requested.
+
+> **Note:** networks created before this behavior shipped are not pinned retroactively — recreate them (`docker compose down && docker compose up`) to get a stable subnet.
+
 ### Label key normalization
 
 Apple Container only accepts lowercase label keys matching `[a-z0-9](?:[a-z0-9\-\.\/]*[a-z0-9])?`. Docker allows mixed-case, underscores, and other characters. Socktainer automatically normalizes label keys at create time:

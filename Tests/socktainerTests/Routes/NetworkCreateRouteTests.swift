@@ -136,6 +136,85 @@ struct NetworkCreateRouteTests {
         }
         #expect(client.lastSubnet == "192.168.55.0/24", "a client-requested subnet must be pinned as-is")
     }
+
+    @Test("auto-pick retries on a subnet conflict and pins the next free subnet")
+    func retriesOnSubnetConflict() async throws {
+        let client = FakeNetworkClient()
+        client.subnetConflictsBeforeSuccess = 1
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(client.createCalls == 2, "must retry once after the subnet conflict")
+        #expect(
+            client.triedSubnets == ["192.168.254.0/24", "192.168.253.0/24"],
+            "must exclude the conflicted subnet and pick the next free one")
+    }
+
+    @Test("auto-pick gives up after a bounded number of subnet conflicts and falls back to unpinned")
+    func retryIsBounded() async throws {
+        let client = FakeNetworkClient()
+        client.conflictAllPinned = true
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(
+            client.createCalls == NetworkCreateRoute.maxSubnetConflictRetries + 1,
+            "must cap pinned attempts and then make one unpinned fallback create")
+        #expect(client.lastSubnet == nil, "the final create must be the unpinned fallback")
+    }
+
+    @Test("an invalid explicit subnet returns 400, not 500, and never reaches the backend")
+    func invalidSubnetReturns400() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a","IPAM":{"Driver":"default","Config":[{"Subnet":"not-a-cidr"}]}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+        #expect(client.createCalls == 0, "an invalid subnet must be rejected before reaching the backend")
+    }
+
+    @Test("isSubnetConflict distinguishes subnet conflicts from name conflicts and unrelated errors")
+    func isSubnetConflictClassification() {
+        #expect(NetworkCreateRoute.isSubnetConflict(SubnetConflictError()) == true)
+        #expect(NetworkCreateRoute.isSubnetConflict(AlreadyExistsError(name: "net-a")) == false)
+        #expect(NetworkCreateRoute.isSubnetConflict(OtherError()) == false)
+    }
+
+    @Test("unsupportedIPAMFields reports only the set, unsupported fields")
+    func unsupportedIPAMFieldsDetection() {
+        #expect(NetworkCreateRoute.unsupportedIPAMFields(nil) == [])
+
+        let onlySubnet = NetworkIPAM(
+            Driver: "default",
+            Config: [NetworkIPAMConfig(Subnet: "192.168.5.0/24", IPRange: nil, Gateway: nil, AuxiliaryAddresses: nil)])
+        #expect(NetworkCreateRoute.unsupportedIPAMFields(onlySubnet) == [])
+
+        let withUnsupported = NetworkIPAM(
+            Driver: "default",
+            Config: [
+                NetworkIPAMConfig(
+                    Subnet: "192.168.5.0/24", IPRange: "192.168.5.128/25",
+                    Gateway: "192.168.5.254", AuxiliaryAddresses: ["host": "192.168.5.2"])
+            ])
+        #expect(NetworkCreateRoute.unsupportedIPAMFields(withUnsupported) == ["AuxiliaryAddresses", "Gateway", "IPRange"])
+    }
 }
 
 // MARK: - Helpers
@@ -164,6 +243,10 @@ private struct AlreadyExistsError: Error, CustomStringConvertible {
 
 private struct OtherError: Error, CustomStringConvertible {
     var description: String { "some unrelated failure" }
+}
+
+private struct SubnetConflictError: Error, CustomStringConvertible {
+    var description: String { "requested subnet is already in use" }
 }
 
 private func makeNetworkResource(name: String) throws -> NetworkResource {
@@ -195,6 +278,12 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     var getNetworkReturnsNil = false
     /// When true, `create` fails with a non-"already exists" error.
     var createThrowsOther = false
+    /// Number of leading `create` calls with a pinned subnet that fail with a subnet-conflict error.
+    var subnetConflictsBeforeSuccess = 0
+    /// When true, every `create` with a non-nil subnet fails with a subnet-conflict error.
+    var conflictAllPinned = false
+    /// Every subnet passed to `create`, in order — lets tests assert re-pick behavior.
+    private(set) var triedSubnets: [String?] = []
     private var existing: Set<String> = []
 
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] { [] }
@@ -210,7 +299,15 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
         createCalls += 1
         lastSubnet = ipv4Subnet
+        triedSubnets.append(ipv4Subnet)
         if createThrowsOther { throw OtherError() }
+        if ipv4Subnet != nil {
+            if conflictAllPinned { throw SubnetConflictError() }
+            if subnetConflictsBeforeSuccess > 0 {
+                subnetConflictsBeforeSuccess -= 1
+                throw SubnetConflictError()
+            }
+        }
         guard existing.insert(name).inserted else { throw AlreadyExistsError(name: name) }
         return RESTNetworkCreate(Id: name, Warning: "")
     }
