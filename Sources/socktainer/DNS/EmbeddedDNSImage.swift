@@ -92,7 +92,12 @@ enum EmbeddedDNSImage {
                 }
                 try await Task.sleep(for: tagVisibilityPollInterval)
             }
-            throw EmbeddedDNSError.tagNotVisibleAfterImport
+            // Tag write succeeded but the list still hasn't caught up within the budget.
+            // Don't fail setup over it: return and let the caller proceed. Its lookup
+            // either now sees the tag (DNS set up) or falls back to starting the
+            // container without DNS — the same graceful degradation as before — and a
+            // later `compose up` resolves once the image list catches up.
+            log.warning("[dns-embedded] tag \(tag) not yet resolvable within budget; proceeding (DNS may be set up on a later run)")
         }
     }
 
@@ -104,7 +109,5 @@ enum EmbeddedDNSImage {
     enum EmbeddedDNSError: Error {
         /// The embedded archive was loaded but produced no image reference to tag.
         case importReturnedNoImage
-        /// The image was tagged but the tag did not become resolvable in time.
-        case tagNotVisibleAfterImport
     }
 }
