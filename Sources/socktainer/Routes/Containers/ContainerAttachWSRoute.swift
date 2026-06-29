@@ -64,6 +64,8 @@ extension ContainerAttachWSRoute {
         let stderr = query.stderr ?? true
         let isTTY = container.configuration.initProcess.terminal
 
+        await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
+
         guard let pipes = StdioPipes.make(stdin: true, stdout: stdout, stderr: stderr && !isTTY) else {
             try? await ws.close(code: .unexpectedServerError)
             return
