@@ -80,12 +80,31 @@ enum EmbeddedDNSImage {
             }
             let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
             _ = try await loadedImage.tag(new: tag)
-            log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
+
+            // The tag is written over XPC, but the image list a later
+            // `ClientImage.get(reference: tag)` reads can lag briefly. Confirm the tag
+            // resolves before returning so the caller (NetworkDNSManager) can't miss it
+            // and silently skip the DNS sidecar on the first `compose up`.
+            for _ in 0..<tagVisibilityMaxAttempts {
+                if (try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig)) != nil {
+                    log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
+                    return
+                }
+                try await Task.sleep(for: tagVisibilityPollInterval)
+            }
+            throw EmbeddedDNSError.tagNotVisibleAfterImport
         }
     }
+
+    // The embedded image tag is confirmed visible within this budget (~2s) before
+    // ensure() returns; see the poll loop above.
+    private static let tagVisibilityMaxAttempts = 100
+    private static let tagVisibilityPollInterval: Duration = .milliseconds(20)
 
     enum EmbeddedDNSError: Error {
         /// The embedded archive was loaded but produced no image reference to tag.
         case importReturnedNoImage
+        /// The image was tagged but the tag did not become resolvable in time.
+        case tagNotVisibleAfterImport
     }
 }
