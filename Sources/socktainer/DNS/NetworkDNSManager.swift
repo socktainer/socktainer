@@ -31,7 +31,6 @@ actor NetworkDNSManager {
     private let appSupportURL: URL
     private let dnsPort: Int
     private let containerSystemConfig: ContainerSystemConfig
-    private var containerIPs: [String: String] = [:]  // networkId → DNS forwarder container IP
     private var pendingCreation: [String: Task<String, Error>] = [:]
     private var log = Logger(label: "socktainer.dns.manager")
 
@@ -43,20 +42,13 @@ actor NetworkDNSManager {
 
     // MARK: - Public API
 
-    /// Returns the IP of the DNS forwarder container for `networkId`, creating it lazily.
-    /// Concurrent callers for the same network are coalesced — only one container is created.
     func ensureDNSContainer(networkId: String) async throws -> String {
-        if let ip = containerIPs[networkId] {
-            log.info("[dns-manager] reusing cached DNS forwarder at \(ip) for network \(networkId)")
-            return ip
-        }
-
         if let pending = pendingCreation[networkId] {
             log.info("[dns-manager] waiting for in-flight DNS forwarder creation for network \(networkId)")
             return try await pending.value
         }
 
-        log.info("[dns-manager] creating DNS forwarder container for network \(networkId)")
+        log.info("[dns-manager] ensuring DNS forwarder container for network \(networkId)")
         let appSupportURL = self.appSupportURL
         let dnsPort = self.dnsPort
         let containerSystemConfig = self.containerSystemConfig
@@ -67,7 +59,6 @@ actor NetworkDNSManager {
 
         do {
             let ip = try await task.value
-            containerIPs[networkId] = ip
             pendingCreation.removeValue(forKey: networkId)
             log.info("[dns-manager] DNS forwarder running at \(ip) for network \(networkId)")
             return ip
@@ -77,10 +68,9 @@ actor NetworkDNSManager {
         }
     }
 
-    /// Removes the DNS forwarder container for `networkId` and clears its cached IP.
+    /// Removes the DNS forwarder container for `networkId`.
     /// Called when a user network is deleted.
     func cleanupDNSContainer(networkId: String) async {
-        containerIPs.removeValue(forKey: networkId)
         let containerId = ContainerNameUtility.sanitize(Self.containerPrefix + networkId)
         let client = ContainerClient()
         do {
@@ -123,7 +113,6 @@ actor NetworkDNSManager {
             if container.status == .running { try? await client.stop(id: container.id) }
             try? await client.delete(id: container.id)
         }
-        containerIPs.removeAll()
     }
 
     // MARK: - Private implementation
@@ -146,21 +135,12 @@ actor NetworkDNSManager {
         let networkResource = try await NetworkClient().get(id: networkId)
         let gatewayIP = networkResource.status.ipv4Gateway.description
 
-        // Ensure the embedded DNS forwarder image is available (imports from bundle on first use)
-        try await EmbeddedDNSImage.ensure(
+        let image = try await EmbeddedDNSImage.ensure(
             containerSystemConfig: containerSystemConfig,
             appSupportURL: appSupportURL
         )
 
         let platform = Platform.current
-        // The embedded DNS image was just imported into the local store by
-        // EmbeddedDNSImage.ensure(); look it up locally. Using ClientImage.fetch
-        // here would normalize "socktainer-dns:embedded" to a Docker Hub
-        // reference and try to pull it (401), since it is not a registry image.
-        let image = try await ClientImage.get(
-            reference: EmbeddedDNSImage.tag,
-            containerSystemConfig: containerSystemConfig
-        )
         _ = try await image.getCreateSnapshot(platform: platform)
 
         let processConfig = ProcessConfiguration(
