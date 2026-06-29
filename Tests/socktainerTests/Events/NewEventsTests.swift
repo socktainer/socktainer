@@ -466,7 +466,7 @@ private struct StubNetworkClient: ClientNetworkProtocol {
             IPAM: NetworkIPAM(Driver: "", Config: []), Options: [:], Containers: nil,
             ConfigFrom: nil, Labels: [:], Subnet: nil, Gateway: nil)
     }
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: "net-abc123", Warning: "")
     }
     func delete(id: String, logger: Logger) async throws {}

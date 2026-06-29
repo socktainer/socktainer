@@ -106,6 +106,36 @@ struct NetworkCreateRouteTests {
         #expect(client.createCalls == 2)
         #expect(client.getNetworkCalls == 1)
     }
+
+    @Test("create with no IPAM auto-pins a stable subnet from the allocator range")
+    func autoPinsSubnetWhenNoneRequested() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(client.lastSubnet == "192.168.254.0/24", "an unpinned create must pin the first free allocator subnet")
+    }
+
+    @Test("an explicit IPAM subnet is honored verbatim, not auto-picked")
+    func explicitIPAMSubnetHonored() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a","IPAM":{"Driver":"default","Config":[{"Subnet":"192.168.55.0/24"}]}}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(client.lastSubnet == "192.168.55.0/24", "a client-requested subnet must be pinned as-is")
+    }
 }
 
 // MARK: - Helpers
@@ -158,6 +188,8 @@ private func makeNetworkResource(name: String) throws -> NetworkResource {
 private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendable {
     private(set) var createCalls = 0
     private(set) var getNetworkCalls = 0
+    /// The subnet passed to the most recent `create` — lets tests assert pinning.
+    private(set) var lastSubnet: String?
     /// When true, `getNetwork` reports the network as absent (simulates a network
     /// deleted between the failed create and the lookup).
     var getNetworkReturnsNil = false
@@ -175,8 +207,9 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
 
     func delete(id: String, logger: Logger) async throws {}
 
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
         createCalls += 1
+        lastSubnet = ipv4Subnet
         if createThrowsOther { throw OtherError() }
         guard existing.insert(name).inserted else { throw AlreadyExistsError(name: name) }
         return RESTNetworkCreate(Id: name, Warning: "")

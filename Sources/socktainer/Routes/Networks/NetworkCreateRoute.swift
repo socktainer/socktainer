@@ -38,7 +38,8 @@ struct NetworkCreateRoute: RouteCollection {
         }
         let response: RESTNetworkCreate
         do {
-            response = try await client.create(name: query.Name, labels: labels, logger: logger)
+            response = try await NetworkCreateRoute.createPinned(
+                client: client, name: query.Name, labels: labels, ipam: query.IPAM, logger: logger)
             // moby network events carry {name, type} where type is the driver.
             // Only broadcast on actual creation — not on the idempotent "already exists" path.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -63,5 +64,36 @@ struct NetworkCreateRoute: RouteCollection {
         let httpResponse = try await response.encodeResponse(for: req)
         httpResponse.status = .created
         return httpResponse
+    }
+
+    static func createPinned(
+        client: ClientNetworkProtocol,
+        name: String,
+        labels: [String: String],
+        ipam: NetworkIPAM?,
+        logger: Logger
+    ) async throws -> RESTNetworkCreate {
+        if let requestedSubnet = ipam?.Config.first(where: { !($0.Subnet ?? "").isEmpty })?.Subnet {
+            return try await client.create(name: name, labels: labels, ipv4Subnet: requestedSubnet, logger: logger)
+        }
+
+        let usedSubnets = ((try? await client.list(filters: nil, logger: logger)) ?? []).compactMap { $0.Subnet }
+        var excludedOctets: Set<Int> = []
+        while let subnet = SubnetAllocator.nextFreeSubnet(usedSubnets: usedSubnets, excluded: excludedOctets) {
+            do {
+                return try await client.create(name: name, labels: labels, ipv4Subnet: subnet, logger: logger)
+            } catch {
+                guard isSubnetConflict(error) else { throw error }
+                if let octet = SubnetAllocator.thirdOctet(of: subnet) { excludedOctets.insert(octet) }
+            }
+        }
+        logger.warning("[networks] no free pinnable subnet for \(name); creating without a pinned subnet")
+        return try await client.create(name: name, labels: labels, ipv4Subnet: nil, logger: logger)
+    }
+
+    static func isSubnetConflict(_ error: Error) -> Bool {
+        let message = "\(error)".lowercased()
+        guard !message.contains("already exists") else { return false }
+        return message.contains("subnet") || message.contains("overlap") || message.contains("in use")
     }
 }
