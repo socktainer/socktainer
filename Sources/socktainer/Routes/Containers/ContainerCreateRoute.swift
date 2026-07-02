@@ -209,6 +209,39 @@ extension ContainerCreateRoute {
                 }
             }
 
+            // SSH agent forwarding: translate the Docker bind-mount idiom into
+            // Apple Container's native SSH relay (see SSHAgentForwarding). The
+            // matched mount is excluded from filesystem processing below and the
+            // host socket path travels to bootstrap via a label.
+            var sshAgentCandidates: [(source: String, target: String)] = []
+            for bind in body.HostConfig?.Binds ?? [] {
+                let parts = bind.split(separator: ":").map(String.init)
+                if parts.count >= 2 {
+                    sshAgentCandidates.append((source: parts[0], target: parts[1]))
+                }
+            }
+            for mount in body.HostConfig?.Mounts ?? [] where mount.MountType.lowercased() == "bind" {
+                sshAgentCandidates.append((source: mount.Source, target: mount.Target))
+            }
+            let sshAgentForward = SSHAgentForwarding.detect(candidates: sshAgentCandidates, containerEnv: finalEnv)
+            // The matched mount is consumed by the relay — downstream filesystem
+            // processing sees the request as if it wasn't there.
+            var hostBinds = body.HostConfig?.Binds
+            var hostMounts = body.HostConfig?.Mounts
+            if let sshAgentForward {
+                if let declaredTarget = sshAgentForward.declaredTarget {
+                    finalEnv = SSHAgentForwarding.rewriteEnv(finalEnv, declaredTarget: declaredTarget)
+                }
+                hostBinds = hostBinds?.filter {
+                    $0.split(separator: ":").first.map(String.init) != sshAgentForward.source
+                }
+                hostMounts = hostMounts?.filter {
+                    !($0.MountType.lowercased() == "bind" && $0.Source == sshAgentForward.source)
+                }
+                req.logger.info(
+                    "[ssh-agent] forwarding host agent socket \(sshAgentForward.hostPath) → \(SSHAgentForwarding.guestSocketPath)")
+            }
+
             let publishedPorts: [PublishPort]
             do {
                 publishedPorts = try convertPortBindings(
@@ -436,6 +469,10 @@ extension ContainerCreateRoute {
                     req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
                 }
             }
+            if let sshAgentForward {
+                containerLabels[SSHAgentForwarding.hostPathLabel] = sshAgentForward.hostPath
+                containerConfiguration.ssh = true
+            }
             containerConfiguration.labels = containerLabels
 
             var resolvedMounts: [Filesystem] = []
@@ -447,7 +484,7 @@ extension ContainerCreateRoute {
             // directories, not individual files or Unix domain sockets. Mounting a socket
             // would cause "operation not supported" at bootstrap time.
             let isSocketPath: (String) -> Bool = { $0.hasSuffix(".sock") || $0.hasSuffix(".socket") }
-            if let binds = body.HostConfig?.Binds {
+            if let binds = hostBinds {
                 for bind in binds {
                     let parts = bind.split(separator: ":").map(String.init)
                     if let source = parts.first, source.hasPrefix("/"), !isSocketPath(source) {
@@ -456,7 +493,7 @@ extension ContainerCreateRoute {
                     }
                 }
             }
-            if let mounts = body.HostConfig?.Mounts {
+            if let mounts = hostMounts {
                 for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty && !isSocketPath(mount.Source) {
                     try? FileManager.default.createDirectory(
                         atPath: mount.Source, withIntermediateDirectories: true)
@@ -465,7 +502,7 @@ extension ContainerCreateRoute {
 
             // Process bind mounts from HostConfig.Binds — filter out socket files which
             // cannot be shared via virtiofs (Apple Container is VM-based).
-            let filteredBinds = (body.HostConfig?.Binds ?? []).filter { bind in
+            let filteredBinds = (hostBinds ?? []).filter { bind in
                 let source = bind.split(separator: ":").first.map(String.init) ?? ""
                 if isSocketPath(source) {
                     req.logger.warning("bind mount '\(source)' is a Unix socket — skipped (not supported in Apple Container VMs)")
@@ -480,7 +517,7 @@ extension ContainerCreateRoute {
 
             // Process mounts from HostConfig.Mounts
             var mountsOrFs: [VolumeOrFilesystem] = []
-            if let mounts = body.HostConfig?.Mounts, !mounts.isEmpty {
+            if let mounts = hostMounts, !mounts.isEmpty {
                 // Separate volume mounts from other mount types
                 let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
                 let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }

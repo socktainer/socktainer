@@ -175,6 +175,152 @@ struct PeerHostnameRewriteTests {
     }
 }
 
+@Suite("ContainerCreateRoute — SSH agent forwarding")
+struct SSHAgentForwardingTests {
+
+    /// Creates a real Unix domain socket at a temp path so `stat` reports S_IFSOCK.
+    private func makeUnixSocket() throws -> (path: String, cleanup: () -> Void) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Keep the path short: sun_path is limited to ~104 bytes on Darwin.
+        let path = dir.appendingPathComponent("agent").path
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        #expect(fd >= 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            path.utf8CString.withUnsafeBytes { src in
+                raw.copyMemory(from: UnsafeRawBufferPointer(rebasing: src.prefix(raw.count - 1)))
+            }
+        }
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(bindResult == 0)
+        let cleanup = {
+            close(fd)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        return (path, cleanup)
+    }
+
+    @Test("Declared SSH_AUTH_SOCK env matching the mount target triggers forwarding")
+    func envDeclaredMatch() throws {
+        let (socketPath, cleanup) = try makeUnixSocket()
+        defer { cleanup() }
+
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: socketPath, target: "/ssh-agent")],
+            containerEnv: ["FOO=bar", "SSH_AUTH_SOCK=/ssh-agent"],
+            hostEnvironment: [:]
+        )
+        #expect(match == SSHAgentForwarding.Match(hostPath: socketPath, source: socketPath, declaredTarget: "/ssh-agent"))
+    }
+
+    @Test("A socket mount without any SSH_AUTH_SOCK declaration is not treated as an agent")
+    func unrelatedSocketDoesNotMatch() throws {
+        let (socketPath, cleanup) = try makeUnixSocket()
+        defer { cleanup() }
+
+        // e.g. a gpg-agent or docker.sock style mount — no SSH_AUTH_SOCK env.
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: socketPath, target: "/gpg-agent")],
+            containerEnv: ["GPG_TTY=/dev/tty"],
+            hostEnvironment: [:]
+        )
+        #expect(match == nil)
+    }
+
+    @Test("Declared env pointing elsewhere does not match the socket mount")
+    func declaredTargetMismatch() throws {
+        let (socketPath, cleanup) = try makeUnixSocket()
+        defer { cleanup() }
+
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: socketPath, target: "/gpg-agent")],
+            containerEnv: ["SSH_AUTH_SOCK=/somewhere-else"],
+            hostEnvironment: [:]
+        )
+        #expect(match == nil)
+    }
+
+    @Test("A non-socket source never matches even with a declared env")
+    func nonSocketSourceDoesNotMatch() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: dir.path, target: "/ssh-agent")],
+            containerEnv: ["SSH_AUTH_SOCK=/ssh-agent"],
+            hostEnvironment: [:]
+        )
+        #expect(match == nil)
+    }
+
+    @Test("Mounting the host's own $SSH_AUTH_SOCK matches without an env declaration")
+    func hostAgentSourceMatch() throws {
+        let (socketPath, cleanup) = try makeUnixSocket()
+        defer { cleanup() }
+
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: socketPath, target: "/ssh-agent")],
+            containerEnv: [],
+            hostEnvironment: ["SSH_AUTH_SOCK": socketPath]
+        )
+        #expect(match == SSHAgentForwarding.Match(hostPath: socketPath, source: socketPath, declaredTarget: nil))
+    }
+
+    @Test("Docker Desktop's well-known path is an alias for the host agent socket")
+    func dockerDesktopCompatibilityPath() throws {
+        let (socketPath, cleanup) = try makeUnixSocket()
+        defer { cleanup() }
+
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: SSHAgentForwarding.dockerDesktopSocketPath, target: "/ssh-agent")],
+            containerEnv: ["SSH_AUTH_SOCK=/ssh-agent"],
+            hostEnvironment: ["SSH_AUTH_SOCK": socketPath]
+        )
+        #expect(
+            match
+                == SSHAgentForwarding.Match(
+                    hostPath: socketPath,
+                    source: SSHAgentForwarding.dockerDesktopSocketPath,
+                    declaredTarget: "/ssh-agent"
+                ))
+    }
+
+    @Test("Docker Desktop path without a host agent available does not match")
+    func dockerDesktopPathWithoutHostAgent() {
+        let match = SSHAgentForwarding.detect(
+            candidates: [(source: SSHAgentForwarding.dockerDesktopSocketPath, target: "/ssh-agent")],
+            containerEnv: ["SSH_AUTH_SOCK=/ssh-agent"],
+            hostEnvironment: [:]
+        )
+        #expect(match == nil)
+    }
+
+    @Test("rewriteEnv replaces the declared target with the guest relay path")
+    func rewriteEnvReplacesDeclaredTarget() {
+        let rewritten = SSHAgentForwarding.rewriteEnv(
+            ["FOO=bar", "SSH_AUTH_SOCK=/ssh-agent", "BAZ=qux"],
+            declaredTarget: "/ssh-agent"
+        )
+        #expect(rewritten == ["FOO=bar", "SSH_AUTH_SOCK=\(SSHAgentForwarding.guestSocketPath)", "BAZ=qux"])
+    }
+
+    @Test("bootstrapDynamicEnv exposes the labeled host path")
+    func bootstrapDynamicEnvFromLabel() {
+        #expect(SSHAgentForwarding.bootstrapDynamicEnv(labels: [:]).isEmpty)
+        #expect(
+            SSHAgentForwarding.bootstrapDynamicEnv(labels: [SSHAgentForwarding.hostPathLabel: "/tmp/agent.sock"])
+                == ["SSH_AUTH_SOCK": "/tmp/agent.sock"])
+    }
+}
+
 // MARK: - Helpers
 
 private func withCreateRouteApp(

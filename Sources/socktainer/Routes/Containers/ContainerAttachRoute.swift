@@ -280,7 +280,11 @@ extension ContainerAttachRoute {
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
+            process = try await ContainerClient().bootstrap(
+                id: container.id,
+                stdio: pipes.stdioArray,
+                dynamicEnv: SSHAgentForwarding.bootstrapDynamicEnv(labels: container.configuration.labels)
+            )
         } catch {
             pipes.closeAll()
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
@@ -456,7 +460,11 @@ extension ContainerAttachRoute {
 
         let process: ClientProcess
         do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
+            process = try await ContainerClient().bootstrap(
+                id: container.id,
+                stdio: pipes.stdioArray,
+                dynamicEnv: SSHAgentForwarding.bootstrapDynamicEnv(labels: container.configuration.labels)
+            )
         } catch {
             pipes.closeAll()
             if isBenignStartRace(error) {

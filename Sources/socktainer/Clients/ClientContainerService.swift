@@ -262,7 +262,11 @@ struct ClientContainerService: ClientContainerProtocol {
         let stdio = [stdin, stdout, stderr]
 
         do {
-            let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
+            let process = try await containerClient.bootstrap(
+                id: container.id,
+                stdio: stdio,
+                dynamicEnv: SSHAgentForwarding.bootstrapDynamicEnv(labels: container.configuration.labels)
+            )
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
