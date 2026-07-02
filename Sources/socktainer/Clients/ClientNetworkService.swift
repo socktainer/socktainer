@@ -185,7 +185,10 @@ extension RESTNetworkSummary {
             Internal: false,
             Attachable: false,
             Ingress: false,  // Only applicable for Swarm
-            IPAM: NetworkIPAM(Driver: "", Config: []),  // Currently, there are no IPAM capabilities
+            IPAM: NetworkIPAM(
+                Driver: "default",
+                Config: subnet.isEmpty ? [] : [NetworkIPAMConfig(Subnet: subnet, IPRange: nil, Gateway: gateway, AuxiliaryAddresses: nil)]
+            ),
             Options: options,
             Containers: nil,
             ConfigFrom: nil,
