@@ -86,6 +86,11 @@ extension ContainerCreateRoute {
 
             req.logger.info("Creating container for image: \(body.Image)")
 
+            let requestedStopSignal = body.StopSignal.flatMap { $0.isEmpty ? nil : $0 }
+            if let requestedStopSignal, !DockerSignal.isValid(requestedStopSignal) {
+                throw Abort(.badRequest, reason: "invalid signal: \(requestedStopSignal)")
+            }
+
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
@@ -284,6 +289,7 @@ extension ContainerCreateRoute {
 
             var containerConfiguration = ContainerConfiguration(id: id, image: img.description, process: processConfig)
             containerConfiguration.platform = requestedPlatform
+            containerConfiguration.stopSignal = requestedStopSignal
 
             // Enable Rosetta when running amd64 images if on arm64 host
             if Platform.current.architecture == "arm64" && requestedPlatform.architecture == "amd64" {
