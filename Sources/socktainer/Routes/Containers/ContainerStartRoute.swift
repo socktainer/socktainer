@@ -40,6 +40,8 @@ extension ContainerStartRoute {
                     throw Abort(.notFound, reason: "No such container: \(id)")
                 }
 
+                await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
+
                 // If container is already running, return success (Docker CLI behavior)
                 if container.status == .running {
                     req.logger.debug("Container \(id) is already running")
@@ -226,5 +228,26 @@ extension ContainerStartRoute {
 
             return .noContent
         }
+    }
+
+    static func ensureDNSSidecarBeforeStart(for container: ContainerSnapshot, req: Request) async {
+        guard container.status != .running,
+            let dnsManager = req.application.storage[NetworkDNSManagerKey.self],
+            let network = sidecarNetwork(
+                configuredNetworks: container.configuration.networks.map { $0.network },
+                roleLabel: container.configuration.labels[NetworkDNSManager.roleLabel]
+            )
+        else { return }
+        do {
+            _ = try await dnsManager.ensureDNSContainer(networkId: network)
+        } catch {
+            req.logger.warning("Could not ensure DNS sidecar for \(network) on start: \(error)")
+        }
+    }
+
+    static func sidecarNetwork(configuredNetworks: [String], roleLabel: String?) -> String? {
+        if roleLabel == NetworkDNSManager.dnsRole { return nil }
+        let reserved: Set<String> = ["default", "bridge", "host", "none"]
+        return configuredNetworks.first { !$0.isEmpty && !reserved.contains($0) }
     }
 }

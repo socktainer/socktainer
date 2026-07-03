@@ -107,6 +107,7 @@ extension ContainerAttachRoute {
         // before the polling loop finds the log file, silently dropping all output.
         // Pipe-based bootstrapping captures output directly and eliminates the race.
         if container.status == .stopped {
+            await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
             guard stdin else {
                 // Output-only attach (docker run / docker run -a STDOUT -a STDERR).
                 // Docker CLI sends Connection: Upgrade even without -i, so we accept the

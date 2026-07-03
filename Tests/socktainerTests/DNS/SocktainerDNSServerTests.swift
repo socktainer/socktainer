@@ -1,3 +1,6 @@
+import ContainerAPIClient
+import ContainerResource
+import ContainerizationOCI
 import Darwin
 import Foundation
 import SocktainerDNSImage
@@ -269,8 +272,19 @@ struct EmbeddedDNSImageTests {
 
         // Second call: must succeed — gate must have cleared the failed task.
         let retryCount = ActorCounter()
-        try await gate.ensureOnce { await retryCount.increment() }
+        let image = try await gate.ensureOnce {
+            await retryCount.increment()
+            return makeTestImage()
+        }
         #expect(await retryCount.value == 1, "gate must allow retry after a prior failure")
+        #expect(image.reference == EmbeddedDNSImage.tag, "gate must return the image produced by the retried perform")
+    }
+
+    @Test("ImportGate.ensureOnce returns the image produced by perform")
+    func importGateReturnsPerformImage() async throws {
+        let gate = EmbeddedDNSImage.ImportGate()
+        let image = try await gate.ensureOnce { makeTestImage(reference: EmbeddedDNSImage.tag) }
+        #expect(image.reference == EmbeddedDNSImage.tag)
     }
 
     // Regression for the concurrent first-use race (Finding #1 in CodeRabbit review):
@@ -284,22 +298,38 @@ struct EmbeddedDNSImageTests {
         let callCount = ActorCounter()
 
         // Start two tasks concurrently; both will race into ensureOnce.
-        async let t1: Void = gate.ensureOnce {
+        async let t1: ClientImage = gate.ensureOnce {
             await callCount.increment()
             // Brief yield so the second task has a chance to arrive while the first is
             // in-flight, proving the "in-flight task" branch of ensureOnce is exercised.
             try await Task.sleep(nanoseconds: 10_000_000)
+            return makeTestImage()
         }
-        async let t2: Void = gate.ensureOnce {
+        async let t2: ClientImage = gate.ensureOnce {
             await callCount.increment()
             try await Task.sleep(nanoseconds: 10_000_000)
+            return makeTestImage()
         }
-        try await t1
-        try await t2
+        let r1 = try await t1
+        let r2 = try await t2
 
         let count = await callCount.value
         #expect(count == 1, "perform must execute exactly once — concurrent callers must coalesce, not each run the body")
+        #expect(r1.reference == r2.reference, "coalesced callers must all receive the single leader's image")
     }
+}
+
+private func makeTestImage(reference: String = EmbeddedDNSImage.tag) -> ClientImage {
+    ClientImage(
+        description: ImageDescription(
+            reference: reference,
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:" + String(repeating: "0", count: 64),
+                size: 0
+            )
+        )
+    )
 }
 
 // MARK: - Helpers
@@ -388,5 +418,50 @@ struct FirstNamedNetworkTests {
             networkMode: nil
         )
         #expect(result == "user-net", "must skip 'default' and return the first non-reserved key")
+    }
+}
+
+// MARK: - sidecarNetwork (DNS forwarder ensured on container start, not only create)
+
+@Suite("ContainerStartRoute.sidecarNetwork")
+struct SidecarNetworkTests {
+
+    @Test("Returns the first user-defined network the container is attached to")
+    func returnsNamedNetwork() {
+        let result = ContainerStartRoute.sidecarNetwork(configuredNetworks: ["stackdemo_default"], roleLabel: nil)
+        #expect(result == "stackdemo_default")
+    }
+
+    @Test("Reserved networks return nil")
+    func reservedNetworksReturnNil() {
+        for net in ["default", "bridge", "host", "none"] {
+            let result = ContainerStartRoute.sidecarNetwork(configuredNetworks: [net], roleLabel: nil)
+            #expect(result == nil, "network '\(net)' has no DNS forwarder and must not trigger ensure")
+        }
+    }
+
+    @Test("Skips reserved and returns the first user-defined network")
+    func skipsReserved() {
+        let result = ContainerStartRoute.sidecarNetwork(configuredNetworks: ["default", "user-net"], roleLabel: nil)
+        #expect(result == "user-net")
+    }
+
+    @Test("No networks returns nil")
+    func noNetworksReturnsNil() {
+        #expect(ContainerStartRoute.sidecarNetwork(configuredNetworks: [], roleLabel: nil) == nil)
+    }
+
+    @Test("Empty network names are skipped")
+    func emptyNamesSkipped() {
+        #expect(ContainerStartRoute.sidecarNetwork(configuredNetworks: [""], roleLabel: nil) == nil)
+    }
+
+    @Test("A DNS sidecar container returns nil even on a user network")
+    func dnsSidecarReturnsNil() {
+        let result = ContainerStartRoute.sidecarNetwork(
+            configuredNetworks: ["stackdemo_default"],
+            roleLabel: NetworkDNSManager.dnsRole
+        )
+        #expect(result == nil, "a DNS sidecar must not ensure another sidecar for its own network")
     }
 }

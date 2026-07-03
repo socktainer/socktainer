@@ -113,6 +113,23 @@ struct NetworkResourceMappingTests {
         let summary = RESTNetworkSummary(networkResource: resource)
         #expect(summary.Containers == nil)
     }
+
+    @Test("IPAM.Config carries the subnet and gateway (Docker-standard location)")
+    func ipamConfigCarriesSubnetAndGateway() throws {
+        let resource = try makeNetworkResource(configSubnet: "10.0.0.0/8", gateway: "10.0.0.1")
+        let summary = RESTNetworkSummary(networkResource: resource)
+        #expect(summary.IPAM.Driver == "default")
+        #expect(summary.IPAM.Config.count == 1)
+        #expect(summary.IPAM.Config.first?.Subnet == "10.0.0.0/8")
+        #expect(summary.IPAM.Config.first?.Gateway == "10.0.0.1")
+    }
+
+    @Test("IPAM.Config subnet falls back to status subnet when configuration.ipv4Subnet is nil")
+    func ipamConfigFallsBackToStatusSubnet() throws {
+        let resource = try makeNetworkResource(configSubnet: nil, statusSubnet: "172.20.0.0/16")
+        let summary = RESTNetworkSummary(networkResource: resource)
+        #expect(summary.IPAM.Config.first?.Subnet == "172.20.0.0/16")
+    }
 }
 
 // MARK: - AppleContainerTimestampResolver.networkCreationDate

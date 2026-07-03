@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerNetworkClient
 import ContainerResource
+import ContainerizationExtras
 import Foundation
 import Logging
 
@@ -8,7 +9,7 @@ protocol ClientNetworkProtocol: Sendable {
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary]
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary?
     func delete(id: String, logger: Logger) async throws
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
@@ -137,11 +138,13 @@ struct ClientNetworkService: ClientNetworkProtocol {
         logger.debug("Deleted network with id: \(id)")
     }
 
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
+        let pinnedSubnet = try ipv4Subnet.map { try CIDRv4($0) }
         let configuration = try NetworkConfiguration(
             name: name,
             mode: NetworkMode.nat,
+            ipv4Subnet: pinnedSubnet,
             labels: ResourceLabels(labels),
             plugin: "container-network-vmnet"
         )
@@ -182,7 +185,10 @@ extension RESTNetworkSummary {
             Internal: false,
             Attachable: false,
             Ingress: false,  // Only applicable for Swarm
-            IPAM: NetworkIPAM(Driver: "", Config: []),  // Currently, there are no IPAM capabilities
+            IPAM: NetworkIPAM(
+                Driver: "default",
+                Config: subnet.isEmpty ? [] : [NetworkIPAMConfig(Subnet: subnet, IPRange: nil, Gateway: gateway, AuxiliaryAddresses: nil)]
+            ),
             Options: options,
             Containers: nil,
             ConfigFrom: nil,

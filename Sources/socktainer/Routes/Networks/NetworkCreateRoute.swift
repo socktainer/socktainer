@@ -1,3 +1,4 @@
+import ContainerizationExtras
 import Vapor
 
 struct NetworksCreateQuery: Content {
@@ -38,7 +39,8 @@ struct NetworkCreateRoute: RouteCollection {
         }
         let response: RESTNetworkCreate
         do {
-            response = try await client.create(name: query.Name, labels: labels, logger: logger)
+            response = try await NetworkCreateRoute.createPinned(
+                client: client, name: query.Name, labels: labels, ipam: query.IPAM, logger: logger)
             // moby network events carry {name, type} where type is the driver.
             // Only broadcast on actual creation — not on the idempotent "already exists" path.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -63,5 +65,58 @@ struct NetworkCreateRoute: RouteCollection {
         let httpResponse = try await response.encodeResponse(for: req)
         httpResponse.status = .created
         return httpResponse
+    }
+
+    static func createPinned(
+        client: ClientNetworkProtocol,
+        name: String,
+        labels: [String: String],
+        ipam: NetworkIPAM?,
+        logger: Logger
+    ) async throws -> RESTNetworkCreate {
+        let unsupported = unsupportedIPAMFields(ipam)
+        if !unsupported.isEmpty {
+            logger.warning("[networks] ignoring IPAM fields unsupported by the Apple Container backend: \(unsupported.joined(separator: ", "))")
+        }
+
+        if let requestedSubnet = ipam?.Config.first(where: { !($0.Subnet ?? "").isEmpty })?.Subnet {
+            guard (try? CIDRv4(requestedSubnet)) != nil else {
+                throw Abort(.badRequest, reason: "invalid subnet '\(requestedSubnet)'")
+            }
+            return try await client.create(name: name, labels: labels, ipv4Subnet: requestedSubnet, logger: logger)
+        }
+
+        let usedSubnets = ((try? await client.list(filters: nil, logger: logger)) ?? []).compactMap { $0.Subnet }
+        var excludedOctets: Set<Int> = []
+        for _ in 0..<maxSubnetConflictRetries {
+            guard let subnet = SubnetAllocator.nextFreeSubnet(usedSubnets: usedSubnets, excluded: excludedOctets) else { break }
+            do {
+                return try await client.create(name: name, labels: labels, ipv4Subnet: subnet, logger: logger)
+            } catch {
+                guard isSubnetConflict(error) else { throw error }
+                if let octet = SubnetAllocator.thirdOctet(of: subnet) { excludedOctets.insert(octet) }
+            }
+        }
+        logger.warning("[networks] no free pinnable subnet for \(name); creating without a pinned subnet")
+        return try await client.create(name: name, labels: labels, ipv4Subnet: nil, logger: logger)
+    }
+
+    static let maxSubnetConflictRetries = 5
+
+    static func isSubnetConflict(_ error: Error) -> Bool {
+        let message = "\(error)".lowercased()
+        guard !message.contains("already exists") else { return false }
+        return message.contains("subnet") || message.contains("overlap") || message.contains("in use")
+    }
+
+    static func unsupportedIPAMFields(_ ipam: NetworkIPAM?) -> [String] {
+        guard let configs = ipam?.Config else { return [] }
+        var fields: Set<String> = []
+        for config in configs {
+            if !(config.Gateway ?? "").isEmpty { fields.insert("Gateway") }
+            if !(config.IPRange ?? "").isEmpty { fields.insert("IPRange") }
+            if !(config.AuxiliaryAddresses ?? [:]).isEmpty { fields.insert("AuxiliaryAddresses") }
+        }
+        return fields.sorted()
     }
 }
