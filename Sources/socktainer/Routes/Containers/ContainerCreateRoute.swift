@@ -95,6 +95,15 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "SHM size can not be less than 0")
             }
 
+            let normalizedCapabilities: (capAdd: [String], capDrop: [String])
+            do {
+                normalizedCapabilities = try Parser.capabilities(
+                    capAdd: body.HostConfig?.CapAdd ?? [],
+                    capDrop: body.HostConfig?.CapDrop ?? [])
+            } catch {
+                throw Abort(.badRequest, reason: "invalid capability: \(error)")
+            }
+
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
@@ -295,6 +304,11 @@ extension ContainerCreateRoute {
             containerConfiguration.platform = requestedPlatform
             containerConfiguration.stopSignal = requestedStopSignal
             containerConfiguration.shmSize = ContainerCreateRoute.shmSizeBytes(body.HostConfig?.ShmSize)
+            containerConfiguration.capAdd = normalizedCapabilities.capAdd
+            containerConfiguration.capDrop = normalizedCapabilities.capDrop
+            containerConfiguration.readOnly = body.HostConfig?.ReadonlyRootfs ?? false
+            containerConfiguration.useInit = body.HostConfig?.Init ?? false
+            containerConfiguration.sysctls = body.HostConfig?.Sysctls ?? [:]
 
             // Enable Rosetta when running amd64 images if on arm64 host
             if Platform.current.architecture == "arm64" && requestedPlatform.architecture == "amd64" {

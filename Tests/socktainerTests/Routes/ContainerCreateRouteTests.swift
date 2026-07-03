@@ -304,3 +304,34 @@ struct ShmSizeValidationTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute — capability validation")
+struct CapabilityValidationTests {
+
+    @Test("An unknown capability is rejected with 400 before any image work")
+    func unknownCapReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-cap",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"CapAdd":["NOTACAP"]}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("Known capabilities pass validation, failing later only at the image check")
+    func knownCapsPassValidation() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=good-cap",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"CapAdd":["NET_ADMIN"],"CapDrop":["MKNOD"]}}"#)
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+}
