@@ -91,6 +91,10 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "invalid signal: \(requestedStopSignal)")
             }
 
+            if let requestedShmSize = body.HostConfig?.ShmSize, requestedShmSize < 0 {
+                throw Abort(.badRequest, reason: "SHM size can not be less than 0")
+            }
+
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
@@ -290,6 +294,7 @@ extension ContainerCreateRoute {
             var containerConfiguration = ContainerConfiguration(id: id, image: img.description, process: processConfig)
             containerConfiguration.platform = requestedPlatform
             containerConfiguration.stopSignal = requestedStopSignal
+            containerConfiguration.shmSize = ContainerCreateRoute.shmSizeBytes(body.HostConfig?.ShmSize)
 
             // Enable Rosetta when running amd64 images if on arm64 host
             if Platform.current.architecture == "arm64" && requestedPlatform.architecture == "amd64" {
@@ -639,6 +644,15 @@ extension ContainerCreateRoute {
         if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
         if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
         return nil
+    }
+
+    /// Mirrors moby's ShmSize handling: a positive request is used verbatim; 0 or omitted
+    /// falls back to Docker's DefaultShmSize (64 MiB). Negative is rejected earlier with 400.
+    static let defaultShmSize: UInt64 = 64 * 1024 * 1024
+
+    static func shmSizeBytes(_ raw: Int?) -> UInt64 {
+        guard let raw, raw > 0 else { return defaultShmSize }
+        return UInt64(raw)
     }
 
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).
