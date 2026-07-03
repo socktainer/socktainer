@@ -72,7 +72,7 @@ extension ContainerInspectRoute {
                     let restored = LabelNormalization.restore(container.configuration.labels)
                     return restored.isEmpty ? nil : restored
                 }(),
-                StopSignal: nil,  // no mechanism to derive this value
+                StopSignal: container.configuration.stopSignal,
                 StopTimeout: nil,  // no mechanism to derive this value
                 Shell: nil  // no mechanism to derive this value
             )

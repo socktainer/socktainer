@@ -214,3 +214,59 @@ private struct NoopContainerClient: ClientContainerProtocol {
         ([], 0)
     }
 }
+
+@Suite("DockerSignal.isValid")
+struct DockerSignalTests {
+
+    @Test("Accepts signal names — SIG-prefixed, bare, and case-insensitive")
+    func acceptsNames() {
+        for signal in ["SIGTERM", "TERM", "sigterm", "SIGKILL", "KILL", "SIGSEGV", "SEGV", "SIGWINCH", "SIGPWR", "STKFLT"] {
+            #expect(DockerSignal.isValid(signal), "\(signal) should be valid")
+        }
+    }
+
+    @Test("Accepts real-time signals and non-zero integers")
+    func acceptsRealtimeAndNumbers() {
+        #expect(DockerSignal.isValid("SIGRTMIN+3"))
+        #expect(DockerSignal.isValid("RTMAX-1"))
+        #expect(DockerSignal.isValid("9"))
+        #expect(DockerSignal.isValid("-1"))
+    }
+
+    @Test("Rejects unknown names, signal 0, and malformed input")
+    func rejectsInvalid() {
+        for signal in ["", "0", "FOO", "SIG", "SIGFOO", "9x", "; rm", "SIGTERM ", "RTMIN+99"] {
+            #expect(!DockerSignal.isValid(signal), "\(signal) should be invalid")
+        }
+    }
+}
+
+@Suite("ContainerCreateRoute — StopSignal validation")
+struct StopSignalValidationTests {
+
+    @Test("An invalid StopSignal is rejected with 400 before any image work")
+    func invalidStopSignalReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-signal",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","StopSignal":"BOGUS"}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("A valid StopSignal passes validation, failing later only at the image check")
+    func validStopSignalPassesValidation() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=good-signal",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","StopSignal":"SIGWINCH"}"#)
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+}
