@@ -334,4 +334,17 @@ struct CapabilityValidationTests {
             }
         }
     }
+
+    @Test("The special ALL capability is accepted, matching moby's --cap-add=ALL")
+    func allCapabilityPassesValidation() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=all-cap",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"CapAdd":["ALL"]}}"#)
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
 }
