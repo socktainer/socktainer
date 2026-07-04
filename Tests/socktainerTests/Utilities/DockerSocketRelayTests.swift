@@ -51,6 +51,29 @@ struct DockerSocketRelayDetectionTests {
     }
 }
 
+@Suite("DockerSocketRelay.bindComponents")
+struct DockerSocketRelayBindComponentsTests {
+
+    @Test("Splits a source:target bind")
+    func splitsSourceAndTarget() {
+        let result = DockerSocketRelay.bindComponents("/var/run/docker.sock:/var/run/docker.sock")
+        #expect(result?.source == "/var/run/docker.sock")
+        #expect(result?.target == "/var/run/docker.sock")
+    }
+
+    @Test("Ignores a trailing mode like :ro")
+    func ignoresTrailingMode() {
+        let result = DockerSocketRelay.bindComponents("/var/run/docker.sock:/var/run/docker.sock:ro")
+        #expect(result?.source == "/var/run/docker.sock")
+        #expect(result?.target == "/var/run/docker.sock")
+    }
+
+    @Test("Returns nil for a bind with no target")
+    func nilForMissingTarget() {
+        #expect(DockerSocketRelay.bindComponents("/var/run/docker.sock") == nil)
+    }
+}
+
 @Suite("DockerSocketRelay.controlSocketPath")
 struct DockerSocketRelayControlSocketPathTests {
 

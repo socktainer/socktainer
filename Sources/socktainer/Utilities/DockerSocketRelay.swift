@@ -31,6 +31,13 @@ enum DockerSocketRelay {
         candidates.first { isDockerSocketPath($0.target) }.map { Match(guestPath: $0.target) }
     }
 
+    /// Splits a Docker `Binds` entry (`source:target[:mode]`) into its source and target.
+    static func bindComponents(_ bind: String) -> (source: String, target: String)? {
+        let parts = bind.split(separator: ":").map(String.init)
+        guard parts.count >= 2 else { return nil }
+        return (source: parts[0], target: parts[1])
+    }
+
     /// Mirrors the path `SocketUtility.prepareUnixSocket` binds the server to.
     static func controlSocketPath(homeDirectory: String?) -> String? {
         guard let homeDirectory else { return nil }

@@ -110,9 +110,8 @@ extension ContainerCreateRoute {
 
             var dockerSockCandidates: [(source: String, target: String)] = []
             for bind in body.HostConfig?.Binds ?? [] {
-                let parts = bind.split(separator: ":").map(String.init)
-                if parts.count >= 2 {
-                    dockerSockCandidates.append((source: parts[0], target: parts[1]))
+                if let components = DockerSocketRelay.bindComponents(bind) {
+                    dockerSockCandidates.append(components)
                 }
             }
             for mount in body.HostConfig?.Mounts ?? [] where mount.MountType.lowercased() == "bind" {
@@ -123,8 +122,7 @@ extension ContainerCreateRoute {
                 dockerSockRelay == nil
                 ? body.HostConfig?.Binds
                 : body.HostConfig?.Binds?.filter {
-                    let parts = $0.split(separator: ":").map(String.init)
-                    return !(parts.count >= 2 && DockerSocketRelay.isDockerSocketPath(parts[1]))
+                    !(DockerSocketRelay.bindComponents($0).map { DockerSocketRelay.isDockerSocketPath($0.target) } ?? false)
                 }
             let hostMounts =
                 dockerSockRelay == nil
@@ -132,8 +130,8 @@ extension ContainerCreateRoute {
                 : body.HostConfig?.Mounts?.filter {
                     !($0.MountType.lowercased() == "bind" && DockerSocketRelay.isDockerSocketPath($0.Target))
                 }
-            if dockerSockRelay != nil {
-                req.logger.info("[docker-sock] relaying \(DockerSocketRelay.hostDockerSocketPath) → socktainer's own API")
+            if let dockerSockRelay {
+                req.logger.info("[docker-sock] relaying \(dockerSockRelay.guestPath) → socktainer's own API")
             }
 
             let rawId = Utility.createContainerID(name: containerName)
@@ -641,10 +639,12 @@ extension ContainerCreateRoute {
                 }
             }
 
-            if let dockerSockRelay,
-                let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"])
-            {
-                resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
+            if let dockerSockRelay {
+                if let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"]) {
+                    resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
+                } else {
+                    req.logger.warning("[docker-sock] relay requested for \(dockerSockRelay.guestPath) but $HOME is unavailable — mount skipped")
+                }
             }
 
             containerConfiguration.mounts = resolvedMounts
