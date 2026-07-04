@@ -38,8 +38,11 @@ extension ContainerStopRoute {
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            // Carry the canonical 64-char Docker id, not the raw request
+            // reference (name or short id), so clients can correlate this
+            // event with start/kill/die (same pattern as those routes).
             let event = DockerEvent.simpleEvent(
-                id: id,
+                id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? id,
                 type: "container",
                 status: "stop",
                 image: snapshot?.configuration.image.reference ?? "",
