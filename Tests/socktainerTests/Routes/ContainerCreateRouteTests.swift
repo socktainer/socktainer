@@ -270,3 +270,37 @@ struct StopSignalValidationTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute.shmSizeBytes")
+struct ShmSizeBytesTests {
+
+    @Test("A positive byte count is used verbatim")
+    func positiveVerbatim() {
+        #expect(ContainerCreateRoute.shmSizeBytes(67_108_864) == 67_108_864)
+        #expect(ContainerCreateRoute.shmSizeBytes(1) == 1)
+    }
+
+    @Test("nil or zero falls back to Docker's 64 MiB default, matching moby")
+    func defaultsToDockerDefault() {
+        #expect(ContainerCreateRoute.defaultShmSize == 64 * 1024 * 1024)
+        #expect(ContainerCreateRoute.shmSizeBytes(nil) == ContainerCreateRoute.defaultShmSize)
+        #expect(ContainerCreateRoute.shmSizeBytes(0) == ContainerCreateRoute.defaultShmSize)
+    }
+}
+
+@Suite("ContainerCreateRoute — ShmSize validation")
+struct ShmSizeValidationTests {
+
+    @Test("A negative ShmSize is rejected with 400 before any image work")
+    func negativeShmSizeReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-shm",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"ShmSize":-1}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+}
