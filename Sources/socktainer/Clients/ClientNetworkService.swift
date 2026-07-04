@@ -70,6 +70,15 @@ struct ClientNetworkService: ClientNetworkProtocol {
             }
         }
 
+        return Self.applyFilters(allNetworks, filters: filters, logger: logger)
+    }
+
+    /// Applies Docker network list/prune filters. Multiple values for the same
+    /// key OR together (a network matches if it matches any value); different
+    /// keys AND together — the same OR/AND combination moby's filters.Args
+    /// implements. `label` is the exception: every label filter must match,
+    /// as in moby.
+    static func applyFilters(_ allNetworks: [RESTNetworkSummary], filters: String?, logger: Logger) -> [RESTNetworkSummary] {
         guard let filters = filters, let data = filters.data(using: .utf8) else { return allNetworks }
         guard let filtersDict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return allNetworks }
         // If filtersDict contains only unknown keys, return []
@@ -87,11 +96,15 @@ struct ClientNetworkService: ClientNetworkProtocol {
                     excludedReason = "dangling mismatch"
                 }
             }
-            if let driverArr = filtersDict["driver"], let driver = driverArr.first {
-                if network.Driver.caseInsensitiveCompare(driver) != ComparisonResult.orderedSame { excludedReason = "driver mismatch" }
+            if let driverArr = filtersDict["driver"], !driverArr.isEmpty {
+                if !driverArr.contains(where: { network.Driver.caseInsensitiveCompare($0) == .orderedSame }) {
+                    excludedReason = "driver mismatch"
+                }
             }
-            if let idArr = filtersDict["id"], let id = idArr.first {
-                if !network.Id.localizedCaseInsensitiveContains(id) { excludedReason = "id mismatch" }
+            if let idArr = filtersDict["id"], !idArr.isEmpty {
+                if !idArr.contains(where: { network.Id.localizedCaseInsensitiveContains($0) }) {
+                    excludedReason = "id mismatch"
+                }
             }
             if let labels = filtersDict["label"] {
                 for label in labels {
@@ -109,16 +122,21 @@ struct ClientNetworkService: ClientNetworkProtocol {
                     }
                 }
             }
-            if let nameArr = filtersDict["name"], let name = nameArr.first {
-                if !network.Name.localizedCaseInsensitiveContains(name) { excludedReason = "name mismatch" }
+            if let nameArr = filtersDict["name"], !nameArr.isEmpty {
+                if !nameArr.contains(where: { network.Name.localizedCaseInsensitiveContains($0) }) {
+                    excludedReason = "name mismatch"
+                }
             }
-            if let scopeArr = filtersDict["scope"], let scope = scopeArr.first {
-                if !network.Scope.localizedCaseInsensitiveContains(scope) { excludedReason = "scope mismatch" }
+            if let scopeArr = filtersDict["scope"], !scopeArr.isEmpty {
+                if !scopeArr.contains(where: { network.Scope.localizedCaseInsensitiveContains($0) }) {
+                    excludedReason = "scope mismatch"
+                }
             }
-            if let typeArr = filtersDict["type"], let type = typeArr.first {
+            if let typeArr = filtersDict["type"], !typeArr.isEmpty {
                 let isCustom = network.Driver != "bridge" && network.Driver != "host" && network.Driver != "null"
-                if type == "custom" && !isCustom { excludedReason = "type custom mismatch" }
-                if type == "builtin" && isCustom { excludedReason = "type builtin mismatch" }
+                if !typeArr.contains(where: { ($0 == "custom" && isCustom) || ($0 == "builtin" && !isCustom) }) {
+                    excludedReason = "type mismatch"
+                }
             }
             if let reason = excludedReason {
                 logger.debug("Excluding network \(network.Name) (ID: \(network.Id)) due to: \(reason)")
