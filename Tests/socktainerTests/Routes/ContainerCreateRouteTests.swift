@@ -463,3 +463,55 @@ struct CpuLimitRouteValidationTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute — docker.sock relay")
+struct DockerSocketRelayRouteTests {
+
+    @Test("A docker.sock bind via Binds doesn't break request handling, failing later only at the image check")
+    func dockerSockBindViaBindsPassesThrough() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=vector",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/var/run/docker.sock:/var/run/docker.sock:ro"]}}"#
+                )
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+
+    @Test("A docker.sock bind via Mounts doesn't break request handling, failing later only at the image check")
+    func dockerSockBindViaMountsPassesThrough() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=vector-mounts",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string:
+                        #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Mounts":[{"Type":"bind","Source":"/var/run/docker.sock","Target":"/var/run/docker.sock","ReadOnly":true}]}}"#
+                )
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+
+    @Test("A docker-context-aware client's bind (arbitrary source, canonical destination) doesn't break request handling")
+    func dockerContextAwareBindPassesThrough() async throws {
+        // Mirrors supabase-cli's actual bind (internal/start/start.go): active context's socket as source.
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=vector-context-aware",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string:
+                        #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/Users/test/.socktainer/container.sock:/var/run/docker.sock:ro"]}}"#
+                )
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+}

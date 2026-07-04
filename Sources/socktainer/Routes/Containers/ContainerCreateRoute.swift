@@ -108,6 +108,34 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: cpuValidationError)
             }
 
+            var dockerSockCandidates: [(source: String, target: String)] = []
+            for bind in body.HostConfig?.Binds ?? [] {
+                let parts = bind.split(separator: ":").map(String.init)
+                if parts.count >= 2 {
+                    dockerSockCandidates.append((source: parts[0], target: parts[1]))
+                }
+            }
+            for mount in body.HostConfig?.Mounts ?? [] where mount.MountType.lowercased() == "bind" {
+                dockerSockCandidates.append((source: mount.Source, target: mount.Target))
+            }
+            let dockerSockRelay = DockerSocketRelay.detect(candidates: dockerSockCandidates)
+            let hostBinds =
+                dockerSockRelay == nil
+                ? body.HostConfig?.Binds
+                : body.HostConfig?.Binds?.filter {
+                    let parts = $0.split(separator: ":").map(String.init)
+                    return !(parts.count >= 2 && DockerSocketRelay.isDockerSocketPath(parts[1]))
+                }
+            let hostMounts =
+                dockerSockRelay == nil
+                ? body.HostConfig?.Mounts
+                : body.HostConfig?.Mounts?.filter {
+                    !($0.MountType.lowercased() == "bind" && DockerSocketRelay.isDockerSocketPath($0.Target))
+                }
+            if dockerSockRelay != nil {
+                req.logger.info("[docker-sock] relaying \(DockerSocketRelay.hostDockerSocketPath) → socktainer's own API")
+            }
+
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
@@ -474,9 +502,13 @@ extension ContainerCreateRoute {
             // must create missing directories BEFORE parsing, not after.
             // Socket files (.sock) are skipped: Apple Container uses virtiofs which shares
             // directories, not individual files or Unix domain sockets. Mounting a socket
-            // would cause "operation not supported" at bootstrap time.
-            let isSocketPath: (String) -> Bool = { $0.hasSuffix(".sock") || $0.hasSuffix(".socket") }
-            if let binds = body.HostConfig?.Binds {
+            // would cause "operation not supported" at bootstrap time. Compared
+            // case-insensitively: macOS's default APFS volume is case-insensitive.
+            let isSocketPath: (String) -> Bool = {
+                let lowercased = $0.lowercased()
+                return lowercased.hasSuffix(".sock") || lowercased.hasSuffix(".socket")
+            }
+            if let binds = hostBinds {
                 for bind in binds {
                     let parts = bind.split(separator: ":").map(String.init)
                     if let source = parts.first, source.hasPrefix("/"), !isSocketPath(source) {
@@ -485,7 +517,7 @@ extension ContainerCreateRoute {
                     }
                 }
             }
-            if let mounts = body.HostConfig?.Mounts {
+            if let mounts = hostMounts {
                 for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty && !isSocketPath(mount.Source) {
                     try? FileManager.default.createDirectory(
                         atPath: mount.Source, withIntermediateDirectories: true)
@@ -494,7 +526,7 @@ extension ContainerCreateRoute {
 
             // Process bind mounts from HostConfig.Binds — filter out socket files which
             // cannot be shared via virtiofs (Apple Container is VM-based).
-            let filteredBinds = (body.HostConfig?.Binds ?? []).filter { bind in
+            let filteredBinds = (hostBinds ?? []).filter { bind in
                 let source = bind.split(separator: ":").first.map(String.init) ?? ""
                 if isSocketPath(source) {
                     req.logger.warning("bind mount '\(source)' is a Unix socket — skipped (not supported in Apple Container VMs)")
@@ -509,7 +541,7 @@ extension ContainerCreateRoute {
 
             // Process mounts from HostConfig.Mounts
             var mountsOrFs: [VolumeOrFilesystem] = []
-            if let mounts = body.HostConfig?.Mounts, !mounts.isEmpty {
+            if let mounts = hostMounts, !mounts.isEmpty {
                 // Separate volume mounts from other mount types
                 let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
                 let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }
@@ -607,6 +639,12 @@ extension ContainerCreateRoute {
                     )
                     resolvedMounts.append(volumeMount)
                 }
+            }
+
+            if let dockerSockRelay,
+                let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"])
+            {
+                resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
             }
 
             containerConfiguration.mounts = resolvedMounts
