@@ -363,6 +363,7 @@ Ownership rules:
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
 - `docker run --privileged` is **not supported** — Apple Container has no privileged mode. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) instead; `--privileged` is currently ignored rather than granting all capabilities.
+- `docker run --cpus` is honored, but Apple Container allocates a **whole vCPU count** to each container's VM rather than throttling a shared kernel's CFS quota. A fractional value is floored to the nearest whole core (minimum 1) — e.g. `--cpus=1.5` gets 1 vCPU, `--cpus=0.5` still gets 1. `--cpu-shares` (relative weighting) and `--cpu-period`/`--cpu-quota` have no equivalent and are not applied.
 
 ### Docker Compose — inter-service DNS
 

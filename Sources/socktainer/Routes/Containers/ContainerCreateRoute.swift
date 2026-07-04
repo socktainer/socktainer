@@ -104,6 +104,10 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "invalid capability: \(error)")
             }
 
+            if let cpuValidationError = ContainerCreateRoute.validateCpuLimits(hostConfig: body.HostConfig) {
+                throw Abort(.badRequest, reason: cpuValidationError)
+            }
+
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
             try Utility.validEntityName(id)
@@ -611,6 +615,10 @@ extension ContainerCreateRoute {
                 containerConfiguration.resources.memoryInBytes = memoryBytes
             }
 
+            if let nanoCpus = body.HostConfig?.NanoCpus, nanoCpus > 0 {
+                containerConfiguration.resources.cpus = ContainerCreateRoute.vCpus(fromNanoCpus: nanoCpus)
+            }
+
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
             do {
@@ -713,6 +721,42 @@ extension ContainerCreateRoute {
             name: container.id,
             labels: LabelNormalization.restore(container.configuration.labels)
         )
+    }
+
+    /// Mirrors moby's daemon_unix.go cpu subsystem checks (v28.5.2): NanoCpus and the CFS
+    /// period/quota knobs are mutually exclusive, NanoCpus must fall within the host's core
+    /// count, and CpuShares must be a positive weight. Returns the moby-verbatim error message
+    /// to send as a 400, or nil if the request is valid.
+    static func validateCpuLimits(hostConfig: HostConfig?) -> String? {
+        let nanoCpus = hostConfig?.NanoCpus ?? 0
+        let cpuPeriod = hostConfig?.CpuPeriod ?? 0
+        let cpuQuota = hostConfig?.CpuQuota ?? 0
+        let cpuShares = hostConfig?.CpuShares ?? 0
+
+        if nanoCpus > 0 && cpuPeriod > 0 {
+            return "Conflicting options: Nano CPUs and CPU Period cannot both be set"
+        }
+        if nanoCpus > 0 && cpuQuota > 0 {
+            return "Conflicting options: Nano CPUs and CPU Quota cannot both be set"
+        }
+        if nanoCpus != 0 {
+            let hostCores = ProcessInfo.processInfo.activeProcessorCount
+            if nanoCpus < 0 || nanoCpus > hostCores * 1_000_000_000 {
+                return "range of CPUs is from 0.01 to \(hostCores).00, as there are only \(hostCores) CPUs available"
+            }
+        }
+        if cpuShares < 0 {
+            return "invalid CPU shares (\(cpuShares)): value must be a positive integer"
+        }
+        return nil
+    }
+
+    /// Docker's `--cpus` (NanoCpus, billionths of a CPU) is a fractional CFS quota; Apple's
+    /// `resources.cpus` is a whole vCPU count provisioned to the container's VM. Floors rather
+    /// than rounds — `--cpus` is a cap, so flooring never grants more compute than requested
+    /// (a sub-1-core request like 0.5 still needs at least one whole vCPU to run at all).
+    static func vCpus(fromNanoCpus nanoCpus: Int) -> Int {
+        max(1, nanoCpus / 1_000_000_000)
     }
 }
 // Function to convert PortBindings from HostConfig to PublishedPorts
