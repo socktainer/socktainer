@@ -4,6 +4,7 @@ import Vapor
 
 struct ContainerListQuery: Content {
     var all: Bool?
+    var limit: Int?
     var filters: String?
 }
 
@@ -19,7 +20,11 @@ extension ContainerListRoute {
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> [RESTContainerSummary] {
         { req in
             let query = try req.query.decode(ContainerListQuery.self)
-            let showAll = query.all ?? false
+            let limit = query.limit ?? 0
+            // Docker Engine API: limit returns "this number of most recently
+            // created containers, including non-running ones", so a positive
+            // limit implies the all behavior.
+            let showAll = (query.all ?? false) || limit > 0
 
             let parsedFilters = try DockerContainerFilterUtility.parseContainerFilters(filtersParam: query.filters, logger: req.logger)
             let containers = try await client.list(showAll: showAll, filters: parsedFilters)
@@ -39,8 +44,20 @@ extension ContainerListRoute {
                 filteredContainers.append(container)
             }
 
+            // moby returns list responses newest-first regardless of limit.
+            // Creation dates are resolved once per container here (the resolver
+            // touches the filesystem) and reused for the summary's Created field.
+            var decorated = filteredContainers.map {
+                (container: $0, created: AppleContainerTimestampResolver.containerCreationDate($0))
+            }
+            decorated.sort { ($0.created ?? .distantPast) > ($1.created ?? .distantPast) }
+            // A positive limit keeps only the N most recently created containers.
+            if limit > 0 {
+                decorated = Array(decorated.prefix(limit))
+            }
+
             var summaries: [RESTContainerSummary] = []
-            for container in filteredContainers {
+            for (container, createdDate) in decorated {
                 let ports = container.configuration.publishedPorts.map { port in
                     ContainerPort(
                         IP: port.hostAddress.description,
@@ -112,9 +129,7 @@ extension ContainerListRoute {
                     )
                 }
 
-                let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(
-                    AppleContainerTimestampResolver.containerCreationDate(container)
-                )
+                let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(createdDate)
 
                 let mobyState = container.status.mobyState
                 // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
