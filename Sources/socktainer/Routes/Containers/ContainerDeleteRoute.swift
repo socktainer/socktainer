@@ -10,12 +10,18 @@ struct ContainerDeleteRoute: RouteCollection {
 
 }
 
+struct ContainerDeleteQuery: Content {
+    var force: Bool?
+}
+
 extension ContainerDeleteRoute {
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
+
+            let force = try req.query.decode(ContainerDeleteQuery.self).force ?? false
 
             let snapshot = try? await client.getContainer(id: id)
             let cached = await ContainerInfoCache.shared.get(id: id)
@@ -42,6 +48,16 @@ extension ContainerDeleteRoute {
 
             do {
                 let container = try await client.getContainer(id: id)
+
+                // Docker Engine API: removing a running container requires force=true.
+                // Checked before any side effect (healthcheck stop, DNS cleanup) so a
+                // rejected delete leaves the container fully intact. A container still
+                // shutting down (.stopping) counts as running, as it does in moby.
+                if let container, container.status == .running || container.status == .stopping, !force {
+                    throw Abort(
+                        .conflict,
+                        reason: "cannot remove container \"\(id)\": container is running: stop the container before removing or force remove")
+                }
 
                 if let healthManager = req.application.storage[HealthCheckManagerKey.self] {
                     if container == nil {
