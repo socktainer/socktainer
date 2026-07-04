@@ -14,7 +14,8 @@ struct VolumeCreateRoute: RouteCollection {
     /// name already exists (idempotent, matching Docker's `POST /volumes/create`).
     func handler(_ req: Request) async throws -> Response {
         let createRequest = try req.content.decode(VolumeRequest.self)
-        let resolvedName = (createRequest.Name?.isEmpty == false) ? createRequest.Name! : "volume-\(UUID().uuidString)"
+        let isAnonymous = createRequest.Name?.isEmpty != false
+        let resolvedName = isAnonymous ? "volume-\(UUID().uuidString)" : createRequest.Name!
 
         // Strip `sync` from DriverOpts (Apple Container ignores it, but it's
         // Socktainer-specific) and persist it as a label so ContainerCreateRoute
@@ -33,6 +34,13 @@ struct VolumeCreateRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Invalid sync mode '\(syncValue)'. Valid values: nosync, fsync, full")
             }
             labels[Filesystem.SyncMode.socktainerLabel] = syncValue
+        }
+        if isAnonymous {
+            // moby marks nameless creates anonymous so that volume prune
+            // (without all=true) targets only them. Also stamp Apple's own
+            // anonymous label so `container volume ls` agrees.
+            labels[ClientVolumeService.anonymousVolumeLabel] = ""
+            labels[VolumeConfiguration.anonymousLabel] = ""
         }
 
         let restRequest = RESTVolumeCreate(

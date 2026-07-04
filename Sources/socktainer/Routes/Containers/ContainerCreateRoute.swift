@@ -605,7 +605,12 @@ extension ContainerCreateRoute {
                             name: parsed.name,
                             driver: "local",
                             driverOpts: [:],
-                            labels: [:]
+                            // moby marks anonymous volumes with this label so that
+                            // volume prune (without all=true) targets only them.
+                            // Apple's own anonymous label keeps `container volume ls`
+                            // displaying it as anonymous too.
+                            labels: parsed.isAnonymous
+                                ? [ClientVolumeService.anonymousVolumeLabel: "", ContainerResource.VolumeConfiguration.anonymousLabel: ""] : [:]
                         )
                     }
 
