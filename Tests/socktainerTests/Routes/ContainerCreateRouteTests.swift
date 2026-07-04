@@ -374,40 +374,44 @@ struct VCpusConversionTests {
 @Suite("ContainerCreateRoute.validateCpuLimits")
 struct CpuLimitsValidationTests {
 
+    private func decodeHostConfig(_ json: String) -> HostConfig {
+        try! JSONDecoder().decode(HostConfig.self, from: Data(json.utf8))
+    }
+
     @Test("NanoCpus and CpuPeriod together are rejected, matching moby")
     func conflictingNanoCpusAndPeriod() {
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"NanoCpus":1000000000,"CpuPeriod":100000}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000,"CpuPeriod":100000}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "Conflicting options: Nano CPUs and CPU Period cannot both be set")
     }
 
     @Test("NanoCpus and CpuQuota together are rejected, matching moby")
     func conflictingNanoCpusAndQuota() {
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"NanoCpus":1000000000,"CpuQuota":50000}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000,"CpuQuota":50000}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "Conflicting options: Nano CPUs and CPU Quota cannot both be set")
     }
 
     @Test("A negative NanoCpus is rejected as out of range")
     func negativeNanoCpusRejected() {
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"NanoCpus":-1}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":-1}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) != nil)
     }
 
     @Test("A NanoCpus value beyond the host's core count is rejected as out of range")
     func excessiveNanoCpusRejected() {
         let hostCores = ProcessInfo.processInfo.activeProcessorCount
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"NanoCpus":\#((hostCores + 1) * 1_000_000_000)}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":\#((hostCores + 1) * 1_000_000_000)}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "range of CPUs is from 0.01 to \(hostCores).00, as there are only \(hostCores) CPUs available")
     }
 
     @Test("A NanoCpus value within the host's core count is accepted")
     func validNanoCpusAccepted() {
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"NanoCpus":1000000000}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == nil)
     }
 
     @Test("A negative CpuShares is rejected, matching moby")
     func negativeCpuSharesRejected() {
-        let hostConfig = try! JSONDecoder().decode(HostConfig.self, from: Data(#"{"CpuShares":-5}"#.utf8))
+        let hostConfig = decodeHostConfig(#"{"CpuShares":-5}"#)
         #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "invalid CPU shares (-5): value must be a positive integer")
     }
 
