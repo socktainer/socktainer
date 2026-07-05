@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import Logging
 import Vapor
 
 struct ContainerStartRoute: RouteCollection {
@@ -39,6 +40,10 @@ extension ContainerStartRoute {
                 guard let container = preStartSnapshot else {
                     throw Abort(.notFound, reason: "No such container: \(id)")
                 }
+
+                // A user-driven /start begins a fresh restart-policy lifecycle: clear any
+                // leftover "explicitly stopped" flag and retry count from a previous run.
+                await ContainerRestartState.shared.reset(id: container.id)
 
                 await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
 
@@ -185,48 +190,96 @@ extension ContainerStartRoute {
             // Observe the container process exit to fire the "die" event.
             // Runs as a detached background task — the start route returns immediately.
             if let snap = metadataSnapshot {
-                let nativeId = snap.id
-                let dieImage = snap.configuration.image.reference
-                let dieName = snap.id
-                let dieLabels = LabelNormalization.restore(snap.configuration.labels)
-                // Capture DNS server before the detached task so it can unregister on --rm reap.
-                let dnsServerForTask = req.application.storage[SocktainerDNSServerKey.self]
-                Task.detached {
-                    // Await the authoritative exit code recorded by the start() background
-                    // waiter once the init process exits. Using the store's continuation-based
-                    // wait (rather than client.wait's timed grace-poll) means the die event
-                    // always carries the real code, even under load — no `?? 0` fallback race.
-                    let code = await ContainerExitCodeStore.shared.waitForCode(id: nativeId)
-                    var attrs = dieLabels
-                    attrs["exitCode"] = String(code)
-                    let dieEvent = DockerEvent.simpleEvent(
-                        id: eventId, type: "container", status: "die",
-                        image: dieImage, name: dieName, labels: attrs
-                    )
-                    await broadcaster.broadcast(dieEvent)
-
-                    // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
-                    // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
-                    // gates on the --rm flag and dedups against the foreground attach path, so a
-                    // container attached in the foreground does not get a second destroy.
-                    if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
-                        // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
-                        if let dnsServer = dnsServerForTask {
-                            let cachedIP = await ContainerInfoCache.shared.get(id: nativeId)?.ip
-                            let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(nativeId)]
-                            if cachedIP == nil || registered == nil || registered == cachedIP {
-                                dnsServer.unregister(hostname: nativeId)
-                            }
-                        }
-                        await broadcaster.broadcast(
-                            ContainerAttachRoute.makeAutoRemoveEvent(
-                                id: eventId, image: dieImage, name: dieName, labels: dieLabels))
-                        await ContainerInfoCache.shared.remove(id: nativeId)
-                    }
-                }
+                let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
+                ContainerStartRoute.observeExit(
+                    nativeId: snap.id,
+                    eventId: eventId,
+                    image: snap.configuration.image.reference,
+                    name: snap.id,
+                    labels: LabelNormalization.restore(snap.configuration.labels),
+                    broadcaster: broadcaster,
+                    dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                    restartPolicy: restartPolicy,
+                    client: client,
+                    logger: req.logger
+                )
             }
 
             return .noContent
+        }
+    }
+
+    /// Awaits the container's init process exit, fires the "die" event, and — unless the
+    /// container was explicitly stopped/killed or was created with `--rm` — honors its
+    /// `HostConfig.RestartPolicy` by restarting it and re-arming this same observer for the
+    /// next lifecycle. Runs as a detached background task.
+    static func observeExit(
+        nativeId: String,
+        eventId: String,
+        image: String,
+        name: String,
+        labels: [String: String],
+        broadcaster: EventBroadcaster,
+        dnsServer: SocktainerDNSServer?,
+        restartPolicy: RestartPolicy?,
+        client: ClientContainerProtocol,
+        logger: Logger
+    ) {
+        Task.detached {
+            // Await the authoritative exit code recorded by the start() background waiter
+            // once the init process exits. Using the store's continuation-based wait (rather
+            // than client.wait's timed grace-poll) means the die event always carries the
+            // real code, even under load — no `?? 0` fallback race.
+            let code = await ContainerExitCodeStore.shared.waitForCode(id: nativeId)
+            var attrs = labels
+            attrs["exitCode"] = String(code)
+            let dieEvent = DockerEvent.simpleEvent(
+                id: eventId, type: "container", status: "die",
+                image: image, name: name, labels: attrs
+            )
+            await broadcaster.broadcast(dieEvent)
+
+            // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
+            // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
+            // gates on the --rm flag and dedups against the foreground attach path, so a
+            // container attached in the foreground does not get a second destroy.
+            if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
+                // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
+                if let dnsServer {
+                    let cachedIP = await ContainerInfoCache.shared.get(id: nativeId)?.ip
+                    let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(nativeId)]
+                    if cachedIP == nil || registered == nil || registered == cachedIP {
+                        dnsServer.unregister(hostname: nativeId)
+                    }
+                }
+                await broadcaster.broadcast(
+                    ContainerAttachRoute.makeAutoRemoveEvent(
+                        id: eventId, image: image, name: name, labels: labels))
+                await ContainerInfoCache.shared.remove(id: nativeId)
+                return
+            }
+
+            let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
+            guard !explicitlyStopped, let restartPolicy else { return }
+
+            let attempt = await ContainerRestartState.shared.nextAttempt(id: nativeId)
+            guard RestartPolicyManager.shouldRestart(policy: restartPolicy, exitCode: code, attempt: attempt) else { return }
+
+            try? await Task.sleep(nanoseconds: RestartPolicyManager.backoffDelayNanoseconds(attempt: attempt))
+            do {
+                try await client.start(id: nativeId, detachKeys: nil)
+            } catch {
+                logger.warning("restart-policy: failed to restart \(nativeId) (attempt \(attempt)): \(error)")
+                return
+            }
+            await broadcaster.broadcast(
+                DockerEvent.simpleEvent(id: eventId, type: "container", status: "start", image: image, name: name, labels: labels)
+            )
+            ContainerStartRoute.observeExit(
+                nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,
+                broadcaster: broadcaster, dnsServer: dnsServer, restartPolicy: restartPolicy,
+                client: client, logger: logger
+            )
         }
     }
 

@@ -448,6 +448,19 @@ extension ContainerCreateRoute {
                 }
             }
 
+            // Apple Container has no native restart-policy concept; persist the requested
+            // policy the same way as Healthcheck so the start route's die observer can honor it.
+            if let restartPolicy = body.HostConfig?.RestartPolicy, restartPolicy.Name != "", restartPolicy.Name != "no" {
+                do {
+                    let json = try JSONEncoder().encode(restartPolicy)
+                    if let jsonString = String(data: json, encoding: .utf8) {
+                        containerLabels[RestartPolicyManager.label] = jsonString
+                    }
+                } catch {
+                    req.logger.warning("Failed to encode restart policy: \(error) — restart policy will not be honored")
+                }
+            }
+
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
             }

@@ -256,4 +256,15 @@ func configure(_ app: Application) async throws {
     // cleanup so a network whose only member was its sidecar now appears empty.
     await OrphanedNetworkReaper.reap(networkClient: networkClient, logger: app.logger)
 
+    // Detect containers whose VM died without an exit event ever firing (see
+    // VMLivenessMonitor) so RestartPolicy can recover them instead of leaving them silently
+    // unreachable until something else happens to touch them.
+    let livenessMonitor = VMLivenessMonitor(client: containerClient, logger: app.logger)
+    await livenessMonitor.start()
+    app.storage[VMLivenessMonitorKey.self] = livenessMonitor
+
+}
+
+struct VMLivenessMonitorKey: StorageKey {
+    typealias Value = VMLivenessMonitor
 }
