@@ -362,6 +362,7 @@ Ownership rules:
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
+- `docker run --privileged` is **not supported** — Apple Container has no privileged mode. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) instead; `--privileged` is currently ignored rather than granting all capabilities.
 
 ### Docker Compose — inter-service DNS
 
