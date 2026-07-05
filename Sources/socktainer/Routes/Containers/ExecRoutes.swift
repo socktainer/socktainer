@@ -69,7 +69,9 @@ actor ExecManager {
 
 // Request & Response DTOs
 struct CreateExecRequest: Content {
-    let Cmd: [String]
+    // Optional so that a missing/null Cmd yields Docker's "No exec command
+    // specified" 400 rather than a generic decoding error.
+    let Cmd: [String]?
     let AttachStdin: Bool?
     let AttachStdout: Bool?
     let AttachStderr: Bool?
@@ -164,6 +166,15 @@ struct ExecRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
+            let body = try req.content.decode(CreateExecRequest.self)
+
+            // Docker rejects an exec with no command at create time, before even
+            // resolving the container. Without this guard the empty Cmd is stored
+            // and startExec's config.cmd.first! traps, taking down the whole daemon.
+            guard let cmd = body.Cmd, !cmd.isEmpty else {
+                throw Abort(.badRequest, reason: "No exec command specified")
+            }
+
             guard let container = try await client.getContainer(id: containerId) else {
                 throw Abort(.notFound, reason: "Container not found")
             }
@@ -174,8 +185,6 @@ struct ExecRoute: RouteCollection {
                 throw Abort(.conflict, reason: "Container is not running")
             }
 
-            let body = try req.content.decode(CreateExecRequest.self)
-
             // there is an error if we provides attachStderr with terminal true
             var attachStderr = body.AttachStderr ?? true
             if body.Tty ?? false {
@@ -184,7 +193,7 @@ struct ExecRoute: RouteCollection {
 
             let config = ExecManager.ExecConfig(
                 containerId: containerId,
-                cmd: body.Cmd,
+                cmd: cmd,
                 attachStdin: body.AttachStdin ?? false,
                 attachStdout: body.AttachStdout ?? true,
                 attachStderr: attachStderr,
