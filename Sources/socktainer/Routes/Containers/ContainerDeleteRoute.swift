@@ -114,6 +114,9 @@ extension ContainerDeleteRoute {
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+            } catch {
+                req.logger.error("Failed to delete container \(id): \(error)")
+                throw Abort(.internalServerError, reason: "Failed to delete container: \(error)")
             }
 
             await broadcastRemove()
