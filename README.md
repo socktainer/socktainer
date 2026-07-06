@@ -42,7 +42,7 @@ Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top 
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
-[**Podman Desktop Apple Container extension**](https://github.com/benoitf/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
+[**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
 
 ---
 
