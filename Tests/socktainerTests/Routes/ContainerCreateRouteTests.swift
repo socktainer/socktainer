@@ -348,3 +348,118 @@ struct CapabilityValidationTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute.vCpus")
+struct VCpusConversionTests {
+
+    @Test("A whole-core NanoCpus value converts verbatim")
+    func wholeCoreVerbatim() {
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 4_000_000_000) == 4)
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 1_000_000_000) == 1)
+    }
+
+    @Test("A fractional NanoCpus value floors, never rounding up past the requested cap")
+    func fractionalFloors() {
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 1_500_000_000) == 1)
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 2_900_000_000) == 2)
+    }
+
+    @Test("Sub-1-core values floor to the minimum of 1 vCPU")
+    func subOneFloorsToMinimumOne() {
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 500_000_000) == 1)
+        #expect(ContainerCreateRoute.vCpus(fromNanoCpus: 10_000_000) == 1)
+    }
+}
+
+@Suite("ContainerCreateRoute.validateCpuLimits")
+struct CpuLimitsValidationTests {
+
+    private func decodeHostConfig(_ json: String) -> HostConfig {
+        try! JSONDecoder().decode(HostConfig.self, from: Data(json.utf8))
+    }
+
+    @Test("NanoCpus and CpuPeriod together are rejected, matching moby")
+    func conflictingNanoCpusAndPeriod() {
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000,"CpuPeriod":100000}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "Conflicting options: Nano CPUs and CPU Period cannot both be set")
+    }
+
+    @Test("NanoCpus and CpuQuota together are rejected, matching moby")
+    func conflictingNanoCpusAndQuota() {
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000,"CpuQuota":50000}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "Conflicting options: Nano CPUs and CPU Quota cannot both be set")
+    }
+
+    @Test("A negative NanoCpus is rejected as out of range")
+    func negativeNanoCpusRejected() {
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":-1}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) != nil)
+    }
+
+    @Test("A NanoCpus value beyond the host's core count is rejected as out of range")
+    func excessiveNanoCpusRejected() {
+        let hostCores = ProcessInfo.processInfo.activeProcessorCount
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":\#((hostCores + 1) * 1_000_000_000)}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "range of CPUs is from 0.01 to \(hostCores).00, as there are only \(hostCores) CPUs available")
+    }
+
+    @Test("A NanoCpus value within the host's core count is accepted")
+    func validNanoCpusAccepted() {
+        let hostConfig = decodeHostConfig(#"{"NanoCpus":1000000000}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == nil)
+    }
+
+    @Test("A negative CpuShares is rejected, matching moby")
+    func negativeCpuSharesRejected() {
+        let hostConfig = decodeHostConfig(#"{"CpuShares":-5}"#)
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: hostConfig) == "invalid CPU shares (-5): value must be a positive integer")
+    }
+
+    @Test("No HostConfig is valid")
+    func nilHostConfigIsValid() {
+        #expect(ContainerCreateRoute.validateCpuLimits(hostConfig: nil) == nil)
+    }
+}
+
+@Suite("ContainerCreateRoute — CPU limit validation")
+struct CpuLimitRouteValidationTests {
+
+    @Test("Conflicting NanoCpus and CpuPeriod are rejected with 400 before any image work")
+    func conflictingCpuOptionsReturn400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-cpu",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"NanoCpus":1000000000,"CpuPeriod":100000}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("A negative CpuShares is rejected with 400 before any image work")
+    func negativeCpuSharesReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-shares",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"CpuShares":-1}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("A valid NanoCpus passes validation, failing later only at the image check")
+    func validNanoCpusPassesValidation() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=good-cpu",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"NanoCpus":1500000000}}"#)
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+}
