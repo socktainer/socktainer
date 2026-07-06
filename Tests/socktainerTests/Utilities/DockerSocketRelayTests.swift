@@ -44,10 +44,10 @@ struct DockerSocketRelayDetectionTests {
         #expect(DockerSocketRelay.detect(candidates: candidates) == DockerSocketRelay.Match(guestPath: "/var/run/docker.sock"))
     }
 
-    @Test("A differently-cased guest destination is still detected, matching macOS's case-insensitive default filesystem")
-    func detectsCaseInsensitively() {
+    @Test("A differently-cased guest destination is not detected — the guest Linux filesystem is case-sensitive")
+    func ignoresDifferentlyCasedDestination() {
         let candidates = [(source: "/var/run/docker.sock", target: "/VAR/RUN/Docker.Sock")]
-        #expect(DockerSocketRelay.detect(candidates: candidates) == DockerSocketRelay.Match(guestPath: "/VAR/RUN/Docker.Sock"))
+        #expect(DockerSocketRelay.detect(candidates: candidates) == nil)
     }
 }
 

@@ -21,10 +21,13 @@ enum DockerSocketRelay {
         let guestPath: String
     }
 
-    /// macOS's default APFS volume is case-insensitive, so a path naming the same
-    /// file on the host may not be byte-identical.
+    /// Exact match: this always checks the *guest* destination, and the guest is a Linux
+    /// container where paths are case-sensitive — an app inside it looks up the literal
+    /// lowercase `/var/run/docker.sock`, so a differently-cased request would relay a mount
+    /// no consumer can actually find. (macOS APFS's host-side case-insensitivity is irrelevant
+    /// here since this never compares against a host path.)
     static func isDockerSocketPath(_ path: String) -> Bool {
-        path.caseInsensitiveCompare(hostDockerSocketPath) == .orderedSame
+        path == hostDockerSocketPath
     }
 
     static func detect(candidates: [(source: String, target: String)]) -> Match? {
