@@ -20,6 +20,56 @@ extension ContainerInspectRoute {
         }
     }
 
+    private static func endpointSettings(networkID: String, gateway: String? = nil, ipAddress: String? = nil) -> ContainerEndpointSettings {
+        ContainerEndpointSettings(
+            IPAMConfig: nil,
+            Links: nil,
+            Aliases: nil,
+            NetworkID: networkID,
+            EndpointID: nil,
+            Gateway: gateway,
+            IPAddress: ipAddress,
+            IPPrefixLen: nil,
+            IPv6Gateway: nil,
+            GlobalIPv6Address: nil,
+            GlobalIPv6PrefixLen: nil,
+            MacAddress: nil,
+            DriverOpts: nil
+        )
+    }
+
+    /// Apple Container only reports live network attachments while a
+    /// container is running (`container.networks` is hardcoded to `[]` once
+    /// stopped), whereas Docker's `NetworkSettings.Networks` reflects the
+    /// container's configured attachments regardless of run state. Falling
+    /// back to the persisted `configuration.networks` keeps that parity,
+    /// though the IP/gateway are unknown without a live sandbox.
+    private static func networkEndpoints(for container: ContainerSnapshot) -> [String: ContainerEndpointSettings] {
+        // uniquingKeysWith rather than uniqueKeysWithValues: nothing in Attachment's array-based
+        // storage guarantees distinct .network names, and a duplicate would otherwise trap.
+        if !container.networks.isEmpty {
+            return Dictionary(
+                container.networks.map { attachment in
+                    (
+                        attachment.network,
+                        endpointSettings(
+                            networkID: attachment.network,
+                            gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
+                            ipAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address))
+                        )
+                    )
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+        }
+        return Dictionary(
+            container.configuration.networks.map { attachment in
+                (attachment.network, endpointSettings(networkID: attachment.network))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerInspect {
         { req in
             guard let id = req.parameters.get("id") else {
@@ -65,7 +115,7 @@ extension ContainerInspectRoute {
                 Volumes: nil,  // Could be derived from mounts if needed
                 WorkingDir: container.configuration.initProcess.workingDirectory.isEmpty ? nil : container.configuration.initProcess.workingDirectory,
                 Entrypoint: [container.configuration.initProcess.executable],
-                NetworkDisabled: container.networks.isEmpty,
+                NetworkDisabled: container.configuration.networks.isEmpty,
                 MacAddress: nil,  // no mechanism to derive this value
                 OnBuild: nil,  // no mechanism to derive this value
                 Labels: {
@@ -115,6 +165,7 @@ extension ContainerInspectRoute {
             let hostConfig: HostConfig = HostConfig()
 
             // Enhanced network settings with proper port mapping
+            let networkEndpoints = Self.networkEndpoints(for: container)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
@@ -123,46 +174,8 @@ extension ContainerInspectRoute {
                         bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
                     },
                 SandboxKey: nil,
-                Networks: Dictionary(
-                    uniqueKeysWithValues: container.networks.map { attachment in
-                        let endpoint = ContainerEndpointSettings(
-                            IPAMConfig: nil,
-                            Links: nil,
-                            Aliases: nil,
-                            NetworkID: attachment.network,
-                            EndpointID: nil,
-                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
-                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
-                            IPPrefixLen: nil,
-                            IPv6Gateway: nil,
-                            GlobalIPv6Address: nil,
-                            GlobalIPv6PrefixLen: nil,
-                            MacAddress: nil,
-                            DriverOpts: nil
-                        )
-                        return (attachment.network, endpoint)
-                    }
-                ),
-                EndpointsConfig: Dictionary(
-                    uniqueKeysWithValues: container.networks.map { attachment in
-                        let endpoint = ContainerEndpointSettings(
-                            IPAMConfig: nil,
-                            Links: nil,
-                            Aliases: nil,
-                            NetworkID: attachment.network,
-                            EndpointID: nil,
-                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
-                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
-                            IPPrefixLen: nil,
-                            IPv6Gateway: nil,
-                            GlobalIPv6Address: nil,
-                            GlobalIPv6PrefixLen: nil,
-                            MacAddress: nil,
-                            DriverOpts: nil
-                        )
-                        return (attachment.network, endpoint)
-                    }
-                )
+                Networks: networkEndpoints,
+                EndpointsConfig: networkEndpoints
             )
 
             let createdAt = AppleContainerTimestampResolver.containerCreationDate(container)
