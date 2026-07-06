@@ -120,6 +120,49 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("Duplicate configured network names do not crash inspect")
+    func duplicateConfiguredNetworkNamesDoNotCrash() async throws {
+        let container = makeSnapshot(
+            id: "c1",
+            status: .stopped,
+            configuredNetworks: [
+                AttachmentConfiguration(network: "dup", options: AttachmentOptions(hostname: "c1")),
+                AttachmentConfiguration(network: "dup", options: AttachmentOptions(hostname: "c1")),
+            ],
+            liveNetworks: []
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?.keys.contains("dup") == true)
+            }
+        }
+    }
+
+    @Test("Duplicate live network names do not crash inspect")
+    func duplicateLiveNetworkNamesDoNotCrash() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "dup",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [AttachmentConfiguration(network: "dup", options: AttachmentOptions(hostname: "c1"))],
+            liveNetworks: [attachment, attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?.keys.contains("dup") == true)
+            }
+        }
+    }
+
     @Test("No configured networks at all is reported as network-disabled")
     func noNetworksIsDisabled() async throws {
         let container = makeSnapshot(id: "c1", status: .stopped, configuredNetworks: [], liveNetworks: [])

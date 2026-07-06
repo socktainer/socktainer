@@ -27,9 +27,11 @@ extension ContainerInspectRoute {
     /// back to the persisted `configuration.networks` keeps that parity,
     /// though the IP/gateway are unknown without a live sandbox.
     private static func networkEndpoints(for container: ContainerSnapshot) -> [String: ContainerEndpointSettings] {
+        // uniquingKeysWith rather than uniqueKeysWithValues: nothing in Attachment's array-based
+        // storage guarantees distinct .network names, and a duplicate would otherwise trap.
         if !container.networks.isEmpty {
             return Dictionary(
-                uniqueKeysWithValues: container.networks.map { attachment in
+                container.networks.map { attachment in
                     (
                         attachment.network,
                         ContainerEndpointSettings(
@@ -48,11 +50,12 @@ extension ContainerInspectRoute {
                             DriverOpts: nil
                         )
                     )
-                }
+                },
+                uniquingKeysWith: { first, _ in first }
             )
         }
         return Dictionary(
-            uniqueKeysWithValues: container.configuration.networks.map { attachment in
+            container.configuration.networks.map { attachment in
                 (
                     attachment.network,
                     ContainerEndpointSettings(
@@ -71,7 +74,8 @@ extension ContainerInspectRoute {
                         DriverOpts: nil
                     )
                 )
-            }
+            },
+            uniquingKeysWith: { first, _ in first }
         )
     }
 
