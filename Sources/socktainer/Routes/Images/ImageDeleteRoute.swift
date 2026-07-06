@@ -36,11 +36,21 @@ extension ImageDeleteRoute {
             // Both carry the image digest as Actor.ID with the reference in `name`
             // (matches moby's logImageEvent / LogImageEvent shape).
             //
-            // moby's imageDeleteHelper (daemon/containerd/image_delete.go) gates "untag" on
-            // `!isDanglingImage(img)` — dangling images have no real tag to untag, so only
-            // "delete" is emitted for them. Verified against moby v28.5.2 source.
+            // moby's imageDeleteHelper (daemon/containerd/image_delete.go) gates both
+            // the "untag" event and the response's {Untagged} record on
+            // `!isDanglingImage(img)` — dangling images have no real tag to untag, so
+            // only "delete" is emitted and returned for them. Verified against
+            // moby v28.5.2 source.
+            //
+            // In this stack a dangling image is stored as "untagged@<digest>" (the
+            // sentinel LocalOCILayoutClient assigns when a loaded tarball has no
+            // RepoTags — the analogue of moby's "moby-dangling@" name). "<none>" is
+            // kept for refs imported verbatim from foreign tarball annotations.
+            // A pull-by-digest ref (repo@sha256:…) is NOT dangling and keeps its
+            // Untagged record, as in moby.
+            let isDangling = result.untagged.hasPrefix("untagged@") || result.untagged.contains("<none>")
+
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                let isDangling = result.untagged.contains("<none>")
                 if !isDangling {
                     await broadcaster.broadcast(
                         DockerEvent.make(
@@ -56,9 +66,12 @@ extension ImageDeleteRoute {
             }
 
             // Build response matching Docker Engine API:
-            //   {Untagged} for the tag that was removed
+            //   {Untagged} for the tag that was removed (omitted for dangling images)
             //   {Deleted}  for the image layers freed (only when the last reference was removed)
-            var deleteResponse = [ImageDeleteResponseItem(Deleted: nil, Untagged: result.untagged)]
+            var deleteResponse: [ImageDeleteResponseItem] = []
+            if !isDangling {
+                deleteResponse.append(ImageDeleteResponseItem(Deleted: nil, Untagged: result.untagged))
+            }
             if let digest = result.deletedDigest {
                 deleteResponse.append(ImageDeleteResponseItem(Deleted: digest, Untagged: nil))
             }
