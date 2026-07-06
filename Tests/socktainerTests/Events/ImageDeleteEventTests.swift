@@ -14,8 +14,13 @@ struct ImageDeleteEventTests {
     // moby's imageDeleteHelper skips ActionUnTag when isDanglingImage(img) — dangling images
     // have no real tag to untag (Name == "<none>"). Verified against moby v28.5.2 source:
     // daemon/containerd/image_delete.go `if !isDanglingImage(img) { logImageEvent(...ActionUnTag) }`.
-    @Test("dangling image delete emits 'delete' only — no 'untag'")
-    func danglingImageDeleteEmitsDeleteOnly() async throws {
+    // Covers both dangling forms: the store's "untagged@<digest>" sentinel (what
+    // LocalOCILayoutClient assigns to a loaded tarball with no RepoTags) and a
+    // "<none>" ref imported verbatim from a foreign tarball annotation.
+    @Test(
+        "dangling image delete emits 'delete' only — no 'untag'",
+        arguments: ["untagged@sha256:abc123", "<none>@sha256:abc123"])
+    func danglingImageDeleteEmitsDeleteOnly(untaggedRef: String) async throws {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
 
@@ -31,9 +36,9 @@ struct ImageDeleteEventTests {
             return collected
         }
 
-        // Mock returns a dangling reference ("<none>@sha256:...") with a deletedDigest —
-        // the delete event only fires when deletedDigest is non-nil, so this is required.
-        let danglingMock = DanglingImageDeleteMock()
+        // Mock returns a dangling reference with a deletedDigest — the delete
+        // event only fires when deletedDigest is non-nil, so this is required.
+        let danglingMock = DanglingImageDeleteMock(untagged: untaggedRef)
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
@@ -120,11 +125,13 @@ private func withImageRouteApp(
 }
 
 private struct DanglingImageDeleteMock: ClientImageProtocol {
+    // The dangling reference form to return: the store's "untagged@<digest>"
+    // sentinel or a verbatim "<none>" annotation. The route must skip "untag"
+    // and only emit "delete" for either.
+    let untagged: String
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
     func delete(id: String) async throws -> ImageDeletionResult {
-        // A dangling image has Name == "<none>" in Apple Container (mirrors moby).
-        // The route must skip "untag" and only emit "delete" for this case.
-        ImageDeletionResult(untagged: "<none>@sha256:abc123", digest: "sha256:abc123", deletedDigest: "sha256:abc123")
+        ImageDeletionResult(untagged: untagged, digest: "sha256:abc123", deletedDigest: "sha256:abc123")
     }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
         -> AsyncThrowingStream<String, Error>
