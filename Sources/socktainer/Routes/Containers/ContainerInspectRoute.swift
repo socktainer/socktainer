@@ -96,6 +96,9 @@ extension ContainerInspectRoute {
                 .flatMap { Data($0.utf8) }
                 .flatMap { try? JSONDecoder().decode(HealthcheckConfig.self, from: $0) }
 
+            // Round-trips the label the create route persisted; defaults to "no", matching moby.
+            let restartPolicy = RestartPolicyManager.decode(from: container.configuration.labels) ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
+
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
                 Domainname: container.configuration.dns?.domain,
@@ -161,8 +164,7 @@ extension ContainerInspectRoute {
                 )
             }
 
-            // Create enhanced HostConfig - using default initializer since struct has many optional fields
-            let hostConfig: HostConfig = HostConfig()
+            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy)
 
             // Enhanced network settings with proper port mapping
             let networkEndpoints = Self.networkEndpoints(for: container)
@@ -185,13 +187,16 @@ extension ContainerInspectRoute {
             // the loop hasn't recorded its first result yet.
             let health = await req.application.storage[HealthCheckManagerKey.self]?.currentHealth(for: container.id)
 
+            // True during the backoff window between a crash and its automatic restart.
+            let isPendingRestart = await ContainerRestartState.shared.isPendingRestart(id: container.id)
+
             let containerState: ContainerState = ContainerState(
-                Status: container.status.mobyState,
+                Status: isPendingRestart ? "restarting" : container.status.mobyState,
                 Running: container.status == .running,
                 Paused: false,  // Apple containers don't have a paused state like Docker
-                Restarting: false,
+                Restarting: isPendingRestart,
                 OOMKilled: false,
-                Dead: container.status == .stopped,
+                Dead: container.status == .stopped && !isPendingRestart,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
@@ -212,7 +217,7 @@ extension ContainerInspectRoute {
                 HostsPath: "/etc/hosts",
                 LogPath: nil,  // Apple containers don't have a log path
                 Name: "/" + container.id,
-                RestartCount: 0,
+                RestartCount: await ContainerRestartState.shared.count(id: container.id),
                 Driver: "",
                 Platform: "linux",
                 ImageManifestDescriptor: nil,
