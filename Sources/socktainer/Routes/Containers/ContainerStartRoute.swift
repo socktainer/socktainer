@@ -198,13 +198,29 @@ extension ContainerStartRoute {
             }
 
             let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
-            guard let restartPolicy else { return }
-
             let nextAttemptNumber = await ContainerRestartState.shared.count(id: nativeId) + 1
-            guard
-                RestartPolicyManager.shouldRestart(
-                    policy: restartPolicy, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
-            else { return }
+            let willRestart =
+                restartPolicy.map {
+                    RestartPolicyManager.shouldRestart(
+                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                } ?? false
+
+            // Staying stopped: moby tears down a container's network sandbox (and its DNS
+            // resolution) on every exit, not just --rm. Mirror that here, after the generation
+            // guard above so a stale, superseded observer can't unregister a live,
+            // already-restarted container's alias.
+            guard willRestart else {
+                if let dnsServer {
+                    let cached = await ContainerInfoCache.shared.get(id: nativeId)
+                    ContainerAliasCleanup.unregisterAllAliases(
+                        nativeId: nativeId,
+                        labels: cached?.labels ?? labels,
+                        cachedIP: cached?.ip,
+                        dnsServer: dnsServer
+                    )
+                }
+                return
+            }
 
             await ContainerRestartState.shared.markPendingRestart(id: nativeId)
             let backoffDelay = await ContainerRestartState.shared.nextBackoffDelayNanoseconds(
