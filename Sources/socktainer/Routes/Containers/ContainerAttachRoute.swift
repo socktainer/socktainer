@@ -319,28 +319,15 @@ extension ContainerAttachRoute {
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
                     group.addTask {
-                        // Retry the wait XPC round-trip rather than collapsing a transient
-                        // throw into a fake exit code of 0 (see ContainerExitCodeStore.resolveExitCode).
-                        let code = await ContainerExitCodeStore.resolveExitCode { try await process.wait() }
-                        await ProcessRegistry.shared.remove(id: container.id)
-                        try? await Task.sleep(nanoseconds: Self.outputFlushGraceNs)
-                        await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                        await ContainerExitCodeStore.shared.set(id: hexId, code: code)
-
-                        // docker run --rm: Apple Container auto-removes the container so DELETE
-                        // never arrives and ContainerDeleteRoute never fires. consumeAutoRemove
-                        // gates on the --rm flag (set at create) and dedups against the detached
-                        // die observer, so exactly one "destroy" fires — same action moby uses.
-                        if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
-                            await ContainerAutoRemoveCleanup.perform(
-                                hexId: hexId,
-                                nativeId: container.id,
-                                fallbackImage: container.configuration.image.reference,
-                                fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                                dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                                broadcaster: req.application.storage[EventBroadcasterKey.self]
-                            )
-                        }
+                        _ = await ContainerProcessExitMonitor.run(
+                            wait: { try await process.wait() },
+                            hexId: hexId,
+                            nativeId: container.id,
+                            fallbackImage: container.configuration.image.reference,
+                            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                        )
                     }
 
                     // Stdout reader

@@ -129,36 +129,15 @@ extension ContainerAttachWSRoute {
             // Process monitor — sole owner of teardown (no double-close with ws.onClose
             // because ws.onClose only closes the stdin write end, not the read ends).
             group.addTask {
-                // Retry the wait XPC round-trip rather than collapsing a transient
-                // throw into a fake exit code (see ContainerExitCodeStore.resolveExitCode).
-                let code = await ContainerExitCodeStore.resolveExitCode { try await process.wait() }
-
-                await ProcessRegistry.shared.remove(id: container.id)
-
-                // stdout/stderr write ends and stdin read end are Apple-owned —
-                // do not close them here (double-close causes fd-reuse crashes).
-                // ws.onClose owns the stdin write end; readers own their read ends.
-
-                try? await Task.sleep(nanoseconds: ContainerAttachRoute.outputFlushGraceNs)
-
-                // Record the exit code FIRST: this unblocks the /start die observer's
-                // waitForCode so its `die` event is emitted before the `destroy` below,
-                // preserving moby's die→destroy order for foreground `docker run --rm` over WS.
-                await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                await ContainerExitCodeStore.shared.set(id: hexId, code: code)
-
-                // docker run --rm over WS: emit the single post-exit "destroy" (consumeAutoRemove
-                // gates on the --rm flag and dedups against the detached die observer).
-                if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
-                    await ContainerAutoRemoveCleanup.perform(
-                        hexId: hexId,
-                        nativeId: container.id,
-                        fallbackImage: container.configuration.image.reference,
-                        fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                        dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                        broadcaster: req.application.storage[EventBroadcasterKey.self]
-                    )
-                }
+                _ = await ContainerProcessExitMonitor.run(
+                    wait: { try await process.wait() },
+                    hexId: hexId,
+                    nativeId: container.id,
+                    fallbackImage: container.configuration.image.reference,
+                    fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                    dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                    broadcaster: req.application.storage[EventBroadcasterKey.self]
+                )
 
                 try? await ws.close()
             }

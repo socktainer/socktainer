@@ -51,7 +51,7 @@ actor ContainerExitCodeStore {
     /// `ClientProcess.wait()` is an XPC round-trip to the Apple Container daemon; under
     /// concurrent load (many containers exiting at once) that round-trip can throw a transient
     /// connection error. The previous recorder collapsed any such throw into `?? 0`, recording
-    /// a fake exit code of 0 that then surfaced in the container `die` event (issue #90 / EVT-008:
+    /// a fake exit code of 0 that then surfaced in the container `die` event (issue #90:
     /// expected 7, observed 0). Retrying the wait yields the authoritative code; a process that
     /// has already exited answers the re-issued wait immediately. After `maxAttempts` failures we
     /// record `waitFailureSentinel` so observers can tell a failed wait from a real exit-0.
