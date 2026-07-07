@@ -129,13 +129,7 @@ extension ContainerLogsRoute {
         }
 
         guard timestamps else {
-            // Match the container's TTY mode: a TTY produces a raw, unmultiplexed
-            // stream, while non-TTY logs use Docker's 8-byte stdcopy framing. Shared
-            // with the attach/exec routes via writeDockerFrame so the wire format is
-            // defined in exactly one place.
-            var outputBuffer = ByteBufferAllocator().buffer(capacity: buffer.count + (ttyMode ? 0 : 8))
-            outputBuffer.writeDockerFrame(streamType: .stdout, data: buffer, ttyMode: ttyMode)
-            writeOutput(outputBuffer)
+            emitFrame(buffer, ttyMode: ttyMode, writeOutput: writeOutput)
             return Data()
         }
 
@@ -147,15 +141,12 @@ extension ContainerLogsRoute {
         // every line stamped with the same read-time value, since the true write time
         // isn't recoverable on this platform. A trailing line with no newline yet is
         // left in the returned remainder so it isn't stamped and framed prematurely.
-        let timestampPrefix = Data("\(AppleContainerTimestampResolver.iso8601Timestamp(Date())) ".utf8)
+        let prefix = timestampPrefix()
         var remaining = buffer
         while let newlineIndex = remaining.firstIndex(of: 0x0A) {
-            let line = timestampPrefix + remaining[remaining.startIndex...newlineIndex]
+            let line = prefix + remaining[remaining.startIndex...newlineIndex]
             remaining = remaining[remaining.index(after: newlineIndex)...]
-
-            var outputBuffer = ByteBufferAllocator().buffer(capacity: line.count + (ttyMode ? 0 : 8))
-            outputBuffer.writeDockerFrame(streamType: .stdout, data: line, ttyMode: ttyMode)
-            writeOutput(outputBuffer)
+            emitFrame(line, ttyMode: ttyMode, writeOutput: writeOutput)
         }
         return Data(remaining)
     }
@@ -165,9 +156,19 @@ extension ContainerLogsRoute {
     /// might just mean the writer hasn't flushed the rest of the line yet.
     static func flushFinalLogLine(_ buffer: Data, ttyMode: Bool, timestamps: Bool, writeOutput: (ByteBuffer) -> Void) {
         guard timestamps, !buffer.isEmpty else { return }
-        let line = Data("\(AppleContainerTimestampResolver.iso8601Timestamp(Date())) ".utf8) + buffer
-        var outputBuffer = ByteBufferAllocator().buffer(capacity: line.count + (ttyMode ? 0 : 8))
-        outputBuffer.writeDockerFrame(streamType: .stdout, data: line, ttyMode: ttyMode)
+        emitFrame(timestampPrefix() + buffer, ttyMode: ttyMode, writeOutput: writeOutput)
+    }
+
+    private static func timestampPrefix() -> Data {
+        Data("\(AppleContainerTimestampResolver.iso8601Timestamp(Date())) ".utf8)
+    }
+
+    /// Match the container's TTY mode: a TTY produces a raw, unmultiplexed stream, while
+    /// non-TTY logs use Docker's 8-byte stdcopy framing. Shared with the attach/exec routes
+    /// via writeDockerFrame so the wire format is defined in exactly one place.
+    private static func emitFrame(_ data: Data, ttyMode: Bool, writeOutput: (ByteBuffer) -> Void) {
+        var outputBuffer = ByteBufferAllocator().buffer(capacity: data.count + (ttyMode ? 0 : 8))
+        outputBuffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: ttyMode)
         writeOutput(outputBuffer)
     }
 }
