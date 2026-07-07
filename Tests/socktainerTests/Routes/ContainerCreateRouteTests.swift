@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
 import Foundation
+import Logging
 import Testing
 import Vapor
 import VaporTesting
@@ -509,6 +510,73 @@ struct DockerSocketRelayRouteTests {
                     string:
                         #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/Users/test/.socktainer/container.sock:/var/run/docker.sock:ro"]}}"#
                 )
+            ) { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+}
+
+@Suite("ContainerCreateRoute.restartPolicyLabel")
+struct RestartPolicyLabelTests {
+    private let logger = Logger(label: "test")
+
+    @Test("nil policy is not persisted")
+    func nilPolicyNotPersisted() {
+        #expect(ContainerCreateRoute.restartPolicyLabel(for: nil, logger: logger) == nil)
+    }
+
+    @Test("Empty or 'no' policy names are not persisted, matching moby's default")
+    func defaultPolicyNamesNotPersisted() {
+        #expect(ContainerCreateRoute.restartPolicyLabel(for: RestartPolicy(Name: "", MaximumRetryCount: nil), logger: logger) == nil)
+        #expect(ContainerCreateRoute.restartPolicyLabel(for: RestartPolicy(Name: "no", MaximumRetryCount: nil), logger: logger) == nil)
+    }
+
+    @Test("A non-default policy round-trips as JSON")
+    func nonDefaultPolicyRoundTrips() throws {
+        let label = try #require(ContainerCreateRoute.restartPolicyLabel(for: RestartPolicy(Name: "on-failure", MaximumRetryCount: 3), logger: logger))
+        let decoded = try JSONDecoder().decode(RestartPolicy.self, from: Data(label.utf8))
+        #expect(decoded.Name == "on-failure")
+        #expect(decoded.MaximumRetryCount == 3)
+    }
+}
+
+@Suite("ContainerCreateRoute — RestartPolicy validation")
+struct RestartPolicyValidationTests {
+
+    @Test("An unknown restart policy name is rejected with 400 before any image work")
+    func unknownPolicyNameReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-restart",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"RestartPolicy":{"Name":"bogus"}}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("Combining AutoRemove with a restart policy is rejected with 400, matching moby")
+    func autoRemoveWithRestartPolicyReturns400() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=bad-rm-restart",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"whatever:latest","HostConfig":{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("A valid restart policy passes validation, failing later only at the image check")
+    func validPolicyPassesValidation() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=good-restart",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3}}}"#)
             ) { res async in
                 #expect(res.status == .notFound)
             }

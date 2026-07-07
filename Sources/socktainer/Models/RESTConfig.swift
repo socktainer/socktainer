@@ -98,7 +98,7 @@ struct HostConfig: Content {
     let ConsoleSize: [Int]?
     let CgroupnsMode: String?
 
-    public init() {
+    public init(restartPolicy: RestartPolicy? = nil) {
         self.Binds = nil
         self.BlkioWeight = nil
         self.BlkioWeightDevice = nil
@@ -145,7 +145,7 @@ struct HostConfig: Content {
         self.Privileged = nil
         self.PublishAllPorts = nil
         self.ReadonlyRootfs = nil
-        self.RestartPolicy = nil
+        self.RestartPolicy = restartPolicy
         self.Ulimits = nil
         self.CpuCount = nil
         self.CpuPercent = nil

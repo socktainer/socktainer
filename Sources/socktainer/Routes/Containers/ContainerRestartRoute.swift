@@ -25,6 +25,10 @@ extension ContainerRestartRoute {
 
             let snapshot = try? await client.getContainer(id: id)
 
+            if let nativeId = snapshot?.id {
+                await ContainerRestartState.shared.reset(id: nativeId)
+            }
+
             do {
                 try await client.restart(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {
@@ -47,6 +51,35 @@ extension ContainerRestartRoute {
                 labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:])
             )
             await broadcaster.broadcast(event)
+
+            // Re-arm restart-policy enforcement the same way /start does — otherwise a
+            // manually-restarted container has no observer watching its next exit.
+            let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
+            let healthManager = req.application.storage[HealthCheckManagerKey.self]
+            let restartedSnapshot = await ContainerStartRoute.performPostStartSetup(
+                id: id, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: req.logger
+            )
+            if let snap = restartedSnapshot {
+                let eventId = DockerContainerID.hexId(for: snap)
+                let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
+                let generation = await ContainerRestartState.shared.currentGeneration(id: snap.id)
+                await ContainerStartRoute.armRestartObserver(
+                    nativeId: snap.id,
+                    eventId: eventId,
+                    image: snap.configuration.image.reference,
+                    name: snap.id,
+                    labels: LabelNormalization.restore(snap.configuration.labels),
+                    ip: snap.networks.first?.ipv4Address.address.description,
+                    refreshCache: true,
+                    restartPolicy: restartPolicy,
+                    generation: generation,
+                    broadcaster: broadcaster,
+                    dnsServer: dnsServer,
+                    healthManager: healthManager,
+                    client: client,
+                    logger: req.logger
+                )
+            }
 
             return .noContent
         }

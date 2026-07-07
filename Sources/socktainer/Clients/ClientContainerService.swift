@@ -246,6 +246,13 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
+    // Apple Container's Virtualization.framework has been observed to fail to service
+    // virtio-net queues promptly (guest kernel NETDEV WATCHDOG timeouts cascading into
+    // DNS/connect failures, and in the worst case a guest kernel panic) when many VMs boot
+    // or tear down at once — e.g. `docker compose up`/`down` firing many concurrent
+    // create+start or stop calls. start/stop/restart all hold a VMLifecycleAdmission slot for
+    // their full VM-transition duration; excess calls queue rather than piling onto the storm.
+
     func start(id: String, detachKeys: String?) async throws {
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
@@ -255,6 +262,12 @@ struct ClientContainerService: ClientContainerProtocol {
             return
         }
 
+        try await VMLifecycleAdmission.shared.withSlot {
+            try await self.startInternal(container: container)
+        }
+    }
+
+    private func startInternal(container: ContainerSnapshot) async throws {
         let stdin: FileHandle? = nil
         let stdout: FileHandle? = nil
         let stderr: FileHandle? = nil
@@ -297,8 +310,16 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
-        let signal = signal ?? "SIGTERM"
+        // Mark before issuing the request: a stop that throws because the VM already died
+        // on its own should still suppress restart-policy auto-restart for that exit.
+        await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
+        try await VMLifecycleAdmission.shared.withSlot {
+            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+        }
+    }
 
+    private func stopInternal(container: ContainerSnapshot, signal: String?, timeout: Int?) async throws {
+        let signal = signal ?? "SIGTERM"
         let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
         try await containerClient.stop(id: container.id, opts: options)
     }
@@ -315,6 +336,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let signal = signal ?? "SIGKILL"
 
+        await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
         try await containerClient.kill(id: container.id, signal: signal)
     }
 
@@ -324,11 +346,19 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
-        if container.status == .running {
-            try await stop(id: id, signal: signal, timeout: timeout)
+        let wasRunning = container.status == .running
+        if wasRunning {
+            await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
         }
 
-        try await start(id: id, detachKeys: nil)
+        // Hold a single slot across stop+start: acquiring separately would let other queued
+        // work run in between, leaving the container stopped longer than necessary.
+        try await VMLifecycleAdmission.shared.withSlot {
+            if wasRunning {
+                try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+            }
+            try await self.startInternal(container: container)
+        }
     }
 
     func delete(id: String) async throws {
