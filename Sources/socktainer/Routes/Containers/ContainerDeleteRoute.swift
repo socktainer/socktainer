@@ -38,6 +38,8 @@ extension ContainerDeleteRoute {
 
             func broadcastRemove() async {
                 await ContainerInfoCache.shared.remove(id: id)
+                // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
+                await ContainerRestartState.shared.reset(id: eventName)
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
@@ -114,6 +116,13 @@ extension ContainerDeleteRoute {
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+            } catch let abort as Abort {
+                // A deliberately-thrown Abort (e.g. the running-container-without-force 409)
+                // must propagate as-is, not get rewrapped into a 500 by the catch-all below.
+                throw abort
+            } catch {
+                req.logger.error("Failed to delete container \(id): \(error)")
+                throw Abort(.internalServerError, reason: "Failed to delete container: \(error)")
             }
 
             await broadcastRemove()

@@ -44,6 +44,34 @@ struct ComposeDNSTests {
         #expect(entries[nativeId] == ip, "the container's own name must register in the compose-label path too")
     }
 
+    @Test("Start skips a reserved network listed first and registers on the DNS-forwarded network instead")
+    func startSkipsReservedNetworkWhenNonReservedAttachmentExists() async throws {
+        let nativeId = "multi-network-ctr"
+        let reservedIP = "192.168.64.10"
+        let namedIP = "192.168.65.30"
+        let snapshot = try makeMultiNetworkSnapshot(
+            nativeId: nativeId,
+            attachments: [(network: "bridge", ip: reservedIP), (network: "myapp_default", ip: namedIP)],
+            labels: ["com.docker.compose.service": "web"]
+        )
+        let dnsServer = SocktainerDNSServer()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { _ async in }
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries[nativeId] == namedIP, "container name must resolve to the DNS-forwarded network's IP, not the reserved network listed first")
+        #expect(entries["web"] == namedIP, "compose alias must also use the DNS-forwarded network's IP")
+    }
+
     @Test("Start registers only service alias when project label is absent")
     func startRegistersServiceOnlyWithoutProject() async throws {
         let snapshot = try makeSnapshot(
@@ -321,6 +349,38 @@ private func makeSnapshot(nativeId: String, ip: String, labels: [String: String]
     let attachment = try JSONDecoder().decode(Attachment.self, from: attachmentJSON)
 
     return ContainerSnapshot(configuration: config, status: .stopped, networks: [attachment])
+}
+
+private func makeMultiNetworkSnapshot(nativeId: String, attachments: [(network: String, ip: String)], labels: [String: String]) throws -> ContainerSnapshot {
+    let proc = ProcessConfiguration(
+        executable: "/bin/sh", arguments: [], environment: [],
+        workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
+    )
+    let img = ImageDescription(
+        reference: "alpine:latest",
+        descriptor: Descriptor(
+            mediaType: "application/vnd.oci.image.index.v1+json",
+            digest: "sha256:abc", size: 0
+        )
+    )
+    var config = ContainerConfiguration(id: nativeId, image: img, process: proc)
+    config.labels = labels
+
+    let decodedAttachments = try attachments.map { attachment -> ContainerResource.Attachment in
+        let json = """
+            {
+                "network": "\(attachment.network)",
+                "hostname": "\(nativeId)",
+                "ipv4Address": "\(attachment.ip)/24",
+                "ipv4Gateway": "192.168.65.1",
+                "ipv6Address": null,
+                "macAddress": null
+            }
+            """.data(using: .utf8)!
+        return try JSONDecoder().decode(Attachment.self, from: json)
+    }
+
+    return ContainerSnapshot(configuration: config, status: .stopped, networks: decodedAttachments)
 }
 
 private struct ComposeMock: ClientContainerProtocol {
