@@ -332,29 +332,14 @@ extension ContainerAttachRoute {
                         // gates on the --rm flag (set at create) and dedups against the detached
                         // die observer, so exactly one "destroy" fires — same action moby uses.
                         if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
-                            // Clean up DNS entry registered at start — ContainerDeleteRoute
-                            // is never called for --rm containers (Apple Container reaps them).
-                            // Use the stored IP for the same ownership check ContainerDeleteRoute
-                            // uses: only unregister if this container still owns the entry.
-                            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                                let cachedIP = await ContainerInfoCache.shared.get(id: hexId)?.ip
-                                let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(container.id)]
-                                if cachedIP == nil || registered == nil || registered == cachedIP {
-                                    dnsServer.unregister(hostname: container.id)
-                                }
-                            }
-                            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                                let cached = await ContainerInfoCache.shared.get(id: hexId)
-                                await broadcaster.broadcast(
-                                    Self.makeAutoRemoveEvent(
-                                        id: hexId,
-                                        image: cached?.image ?? container.configuration.image.reference,
-                                        name: cached?.nativeId ?? container.id,
-                                        labels: cached?.labels
-                                            ?? LabelNormalization.restore(container.configuration.labels)
-                                    ))
-                                await ContainerInfoCache.shared.remove(id: hexId)
-                            }
+                            await ContainerAutoRemoveCleanup.perform(
+                                hexId: hexId,
+                                nativeId: container.id,
+                                fallbackImage: container.configuration.image.reference,
+                                fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                                dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                                broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            )
                         }
                     }
 

@@ -129,9 +129,9 @@ extension ContainerAttachWSRoute {
             // Process monitor — sole owner of teardown (no double-close with ws.onClose
             // because ws.onClose only closes the stdin write end, not the read ends).
             group.addTask {
-                // Fix: record -1 on wait failure so /wait doesn't lie to callers.
-                let code: Int32
-                do { code = try await process.wait() } catch { code = -1 }
+                // Retry the wait XPC round-trip rather than collapsing a transient
+                // throw into a fake exit code (see ContainerExitCodeStore.resolveExitCode).
+                let code = await ContainerExitCodeStore.resolveExitCode { try await process.wait() }
 
                 await ProcessRegistry.shared.remove(id: container.id)
 
@@ -150,26 +150,14 @@ extension ContainerAttachWSRoute {
                 // docker run --rm over WS: emit the single post-exit "destroy" (consumeAutoRemove
                 // gates on the --rm flag and dedups against the detached die observer).
                 if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
-                    // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
-                    if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                        let cachedIP = await ContainerInfoCache.shared.get(id: hexId)?.ip
-                        let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(container.id)]
-                        if cachedIP == nil || registered == nil || registered == cachedIP {
-                            dnsServer.unregister(hostname: container.id)
-                        }
-                    }
-                    let cached = await ContainerInfoCache.shared.get(id: hexId)
-                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                        await broadcaster.broadcast(
-                            ContainerAttachRoute.makeAutoRemoveEvent(
-                                id: hexId,
-                                image: cached?.image ?? container.configuration.image.reference,
-                                name: cached?.nativeId ?? container.id,
-                                labels: cached?.labels
-                                    ?? LabelNormalization.restore(container.configuration.labels)
-                            ))
-                    }
-                    await ContainerInfoCache.shared.remove(id: hexId)
+                    await ContainerAutoRemoveCleanup.perform(
+                        hexId: hexId,
+                        nativeId: container.id,
+                        fallbackImage: container.configuration.image.reference,
+                        fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                        dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                        broadcaster: req.application.storage[EventBroadcasterKey.self]
+                    )
                 }
 
                 try? await ws.close()
