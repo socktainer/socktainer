@@ -14,9 +14,10 @@ enum ContainerAliasCleanup {
         dnsServer: SocktainerDNSServer
     ) {
         guard let cachedIP else { return }
+        let entries = dnsServer.listEntries()
 
         func unregisterIfOwned(_ hostname: String) {
-            let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(hostname)]
+            let registered = entries[SocktainerDNSServer.normalize(hostname)]
             if registered != nil, registered != cachedIP { return }
             dnsServer.unregister(hostname: hostname)
         }
