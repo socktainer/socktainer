@@ -39,7 +39,7 @@ private struct StopFailureMock: ClientContainerProtocol {
     }
 }
 
-private func makeSnapshot(id: String) -> ContainerSnapshot {
+private func makeSnapshot(id: String, status: RuntimeStatus = .running) -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
         workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
@@ -49,7 +49,7 @@ private func makeSnapshot(id: String) -> ContainerSnapshot {
         descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
     )
     let config = ContainerConfiguration(id: id, image: img, process: proc)
-    return ContainerSnapshot(configuration: config, status: .running, networks: [])
+    return ContainerSnapshot(configuration: config, status: status, networks: [])
 }
 
 @Suite("ContainerStopRoute — generic error surfacing")
@@ -80,7 +80,8 @@ struct ContainerDeleteRouteGenericErrorTests {
 
     @Test("A non-ClientContainerError failure surfaces its real reason, not a generic message")
     func genericDeleteFailureSurfacesReason() async throws {
-        let snapshot = makeSnapshot(id: "delete-fail-ctr")
+        // .stopped so the request reaches client.delete() instead of failing earlier at client.stop().
+        let snapshot = makeSnapshot(id: "delete-fail-ctr", status: .stopped)
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)

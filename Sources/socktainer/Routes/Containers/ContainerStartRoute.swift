@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import Foundation
 import Logging
 import Vapor
 
@@ -41,8 +42,6 @@ extension ContainerStartRoute {
                     throw Abort(.notFound, reason: "No such container: \(id)")
                 }
 
-                // A user-driven /start begins a fresh restart-policy lifecycle: clear any
-                // leftover "explicitly stopped" flag and retry count from a previous run.
                 await ContainerRestartState.shared.reset(id: container.id)
 
                 await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
@@ -70,85 +69,13 @@ extension ContainerStartRoute {
                 req.logger.debug("Container \(id) was already running or bootstrapped")
             }
 
-            // Register DNS names now that the container has an IP.
-            // Names were stored in the label at create time (Compose service aliases).
-            // Resolve through getContainer: clients commonly start containers by
-            // the hex ID returned from create, which the native lookup rejects.
-            // Retry up to 5 times (500 ms total): Apple Container may return the container
-            // before the vmnet IP is assigned, leaving networks[] empty on the first fetch.
-            var startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
-            if startedSnapshot?.networks.isEmpty == true {
-                for _ in 0..<5 {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                    if let refreshed = try? await client.getContainer(id: id),
-                        !refreshed.networks.isEmpty
-                    {
-                        startedSnapshot = refreshed
-                        break
-                    }
-                }
-            }
-            if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
-                let snapshot = startedSnapshot,
-                snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole,
-                let firstAttachment = snapshot.networks.first
-            {
-                let ip = firstAttachment.ipv4Address.address.description
-
-                // Register the container's own name only on networks that have a DNS forwarder
-                // sidecar — same reserved set as firstNamedNetwork. On reserved networks
-                // (default/bridge/host/none) there is no forwarder so the registration would
-                // be unreachable and is skipped entirely.
-                let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
-                if !snapshot.id.isEmpty && !reservedNetworks.contains(firstAttachment.network) {
-                    dnsServer.register(hostname: snapshot.id, ip: ip)
-                    req.logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
-                }
-
-                // Names stored at create time (Compose service aliases via socktainer.dns.names)
-                if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
-                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.register(hostname: name, ip: ip)
-                    }
-                }
-
-                // Register Docker Compose service names so that containers in the same
-                // project can resolve each other by service name (e.g. "db") or the
-                // project-qualified form (e.g. "db.myapp").
-                //
-                // The qualified form (service.project) matches Docker's own DNS behaviour
-                // and avoids collisions when multiple Compose projects run concurrently.
-                if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
-                    !serviceName.isEmpty
-                {
-                    dnsServer.register(hostname: serviceName, ip: ip)
-                    if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
-                        !projectName.isEmpty
-                    {
-                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
-                        req.logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
-                    } else {
-                        req.logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
-                    }
-                }
-
-            }
-
-            // Kick off the healthcheck probe loop if a healthcheck label is set.
-            // The label was JSON-encoded by the create route from body.Healthcheck.
-            // Reuse startedSnapshot (already resolved via client.getContainer, which handles
-            // hex IDs) rather than calling ContainerClient().get(id:) directly — the raw call
-            // would fail when the client sends the hex digest instead of the Apple Container name.
-            // Use snapshot.id (the native Apple Container name) as the HealthCheckManager key so
-            // it matches the lookup in ContainerInspectRoute and ContainerListRoute, which read
-            // health via container.id (the native name, not the hex digest).
-            if let healthManager = req.application.storage[HealthCheckManagerKey.self],
-                let snapshot = startedSnapshot,
-                let labelValue = snapshot.configuration.labels[HealthCheckManager.healthcheckLabel],
-                let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8))
-            {
-                await healthManager.start(containerId: snapshot.id, config: healthcheck)
-            }
+            let startedSnapshot = await ContainerStartRoute.performPostStartSetup(
+                id: id,
+                client: client,
+                dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                healthManager: req.application.storage[HealthCheckManagerKey.self],
+                logger: req.logger
+            )
 
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
             // Derive the canonical 64-char Docker ID once here so the cache and all
@@ -191,15 +118,20 @@ extension ContainerStartRoute {
             // Runs as a detached background task — the start route returns immediately.
             if let snap = metadataSnapshot {
                 let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
-                ContainerStartRoute.observeExit(
+                let generation = await ContainerRestartState.shared.currentGeneration(id: snap.id)
+                await ContainerStartRoute.armRestartObserver(
                     nativeId: snap.id,
                     eventId: eventId,
                     image: snap.configuration.image.reference,
                     name: snap.id,
                     labels: LabelNormalization.restore(snap.configuration.labels),
+                    ip: startedSnapshot?.networks.first?.ipv4Address.address.description,
+                    refreshCache: false,
+                    restartPolicy: restartPolicy,
+                    generation: generation,
                     broadcaster: broadcaster,
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                    restartPolicy: restartPolicy,
+                    healthManager: req.application.storage[HealthCheckManagerKey.self],
                     client: client,
                     logger: req.logger
                 )
@@ -209,10 +141,9 @@ extension ContainerStartRoute {
         }
     }
 
-    /// Awaits the container's init process exit, fires the "die" event, and — unless the
-    /// container was explicitly stopped/killed or was created with `--rm` — honors its
-    /// `HostConfig.RestartPolicy` by restarting it and re-arming this same observer for the
-    /// next lifecycle. Runs as a detached background task.
+    /// Awaits the container's init process exit, fires the "die" event, and — unless it was
+    /// created with `--rm` — honors `HostConfig.RestartPolicy` by restarting it and re-arming
+    /// this observer for the next lifecycle. Runs as a detached background task.
     static func observeExit(
         nativeId: String,
         eventId: String,
@@ -221,16 +152,26 @@ extension ContainerStartRoute {
         labels: [String: String],
         broadcaster: EventBroadcaster,
         dnsServer: SocktainerDNSServer?,
+        healthManager: HealthCheckManager?,
         restartPolicy: RestartPolicy?,
         client: ClientContainerProtocol,
-        logger: Logger
+        logger: Logger,
+        generation: Int
     ) {
         Task.detached {
+            let startedAt = Date()
+
             // Await the authoritative exit code recorded by the start() background waiter
             // once the init process exits. Using the store's continuation-based wait (rather
             // than client.wait's timed grace-poll) means the die event always carries the
             // real code, even under load — no `?? 0` fallback race.
             let code = await ContainerExitCodeStore.shared.waitForCode(id: nativeId)
+
+            // A redundant /start also arms a second observer on this nativeId; bail before a
+            // stale one broadcasts its own "die" for an exit the current observer already owns.
+            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
+
+            let executionDuration = Date().timeIntervalSince(startedAt)
             var attrs = labels
             attrs["exitCode"] = String(code)
             let dieEvent = DockerEvent.simpleEvent(
@@ -256,31 +197,195 @@ extension ContainerStartRoute {
                     ContainerAttachRoute.makeAutoRemoveEvent(
                         id: eventId, image: image, name: name, labels: labels))
                 await ContainerInfoCache.shared.remove(id: nativeId)
+                await ContainerRestartState.shared.reset(id: nativeId)
                 return
             }
 
             let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
-            guard !explicitlyStopped, let restartPolicy else { return }
+            guard let restartPolicy else { return }
 
+            let nextAttemptNumber = await ContainerRestartState.shared.count(id: nativeId) + 1
+            guard
+                RestartPolicyManager.shouldRestart(
+                    policy: restartPolicy, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+            else { return }
+
+            await ContainerRestartState.shared.markPendingRestart(id: nativeId)
+            let backoffDelay = await ContainerRestartState.shared.nextBackoffDelayNanoseconds(
+                id: nativeId, ranAtLeast10Seconds: executionDuration >= 10)
+            try? await Task.sleep(nanoseconds: backoffDelay)
+
+            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
+                logger.info("restart-policy: aborting stale restart for \(nativeId) — a newer lifecycle has taken over")
+                return
+            }
+            // Record the attempt only once we're actually about to restart — a concurrent
+            // /start or /restart landing during the backoff sleep above must not inflate
+            // RestartCount for a restart that the generation check just aborted.
             let attempt = await ContainerRestartState.shared.nextAttempt(id: nativeId)
-            guard RestartPolicyManager.shouldRestart(policy: restartPolicy, exitCode: code, attempt: attempt) else { return }
-
-            try? await Task.sleep(nanoseconds: RestartPolicyManager.backoffDelayNanoseconds(attempt: attempt))
             do {
                 try await client.start(id: nativeId, detachKeys: nil)
             } catch {
+                await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
                 logger.warning("restart-policy: failed to restart \(nativeId) (attempt \(attempt)): \(error)")
                 return
             }
+            await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
+
+            let restartedSnapshot = await ContainerStartRoute.performPostStartSetup(
+                id: nativeId, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: logger
+            )
+
+            // Refresh the cache before broadcasting "start" so a listener that reacts to the
+            // event by reading ContainerInfoCache always sees the restarted container's new IP.
+            await ContainerStartRoute.armRestartObserver(
+                nativeId: nativeId,
+                eventId: eventId,
+                image: image,
+                name: name,
+                labels: labels,
+                ip: restartedSnapshot?.networks.first?.ipv4Address.address.description,
+                refreshCache: restartedSnapshot != nil,
+                restartPolicy: restartPolicy,
+                generation: generation,
+                broadcaster: broadcaster,
+                dnsServer: dnsServer,
+                healthManager: healthManager,
+                client: client,
+                logger: logger
+            )
             await broadcaster.broadcast(
                 DockerEvent.simpleEvent(id: eventId, type: "container", status: "start", image: image, name: name, labels: labels)
             )
-            ContainerStartRoute.observeExit(
-                nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,
-                broadcaster: broadcaster, dnsServer: dnsServer, restartPolicy: restartPolicy,
-                client: client, logger: logger
-            )
         }
+    }
+
+    /// Refreshes `ContainerInfoCache` (when `refreshCache` is true) and arms `observeExit`
+    /// to watch the container's next exit. Shared by `/start`, `/restart`, and the internal
+    /// restart-policy restart so all three leave the same cache/observer state behind.
+    static func armRestartObserver(
+        nativeId: String,
+        eventId: String,
+        image: String,
+        name: String,
+        labels: [String: String],
+        ip: String?,
+        refreshCache: Bool,
+        restartPolicy: RestartPolicy?,
+        generation: Int,
+        broadcaster: EventBroadcaster,
+        dnsServer: SocktainerDNSServer?,
+        healthManager: HealthCheckManager?,
+        client: ClientContainerProtocol,
+        logger: Logger
+    ) async {
+        if refreshCache {
+            await ContainerInfoCache.shared.set(hexId: eventId, nativeId: nativeId, image: image, labels: labels, ip: ip)
+        }
+
+        // A restart's internal stop step (ClientContainerService.restart) marks the container
+        // explicitly-stopped; clear it here so the new observer doesn't mistake a manual
+        // restart for a stop that should suppress restart-policy enforcement on the next exit.
+        _ = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
+
+        ContainerStartRoute.observeExit(
+            nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,
+            broadcaster: broadcaster, dnsServer: dnsServer, healthManager: healthManager,
+            restartPolicy: restartPolicy, client: client, logger: logger, generation: generation
+        )
+    }
+
+    /// Waits briefly for the container's network IP, re-registers its DNS entries, and
+    /// (re-)starts its healthcheck loop. Shared by the HTTP handler and the internal
+    /// restart-policy restart, so both leave a restarted container's DNS/health state current.
+    static func performPostStartSetup(
+        id: String,
+        client: ClientContainerProtocol,
+        dnsServer: SocktainerDNSServer?,
+        healthManager: HealthCheckManager?,
+        logger: Logger
+    ) async -> ContainerSnapshot? {
+        // Resolve through getContainer: clients commonly start containers by the hex ID
+        // returned from create, which the native lookup rejects. Retry up to 5 times
+        // (500 ms total): Apple Container may return the container before the vmnet IP
+        // is assigned, leaving networks[] empty on the first fetch.
+        var startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
+        if startedSnapshot?.networks.isEmpty == true {
+            for _ in 0..<5 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if let refreshed = try? await client.getContainer(id: id),
+                    !refreshed.networks.isEmpty
+                {
+                    startedSnapshot = refreshed
+                    break
+                }
+            }
+        }
+
+        if let dnsServer,
+            let snapshot = startedSnapshot,
+            snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole
+        {
+            // Register only on a network that has a DNS forwarder sidecar — same reserved set
+            // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
+            // forwarder so any registration would be unreachable; skip entirely if none of the
+            // container's attachments qualify, rather than falling back to the first attachment.
+            let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
+            if let dnsAttachment = snapshot.networks.first(where: { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }) {
+                let ip = dnsAttachment.ipv4Address.address.description
+
+                if !snapshot.id.isEmpty {
+                    dnsServer.register(hostname: snapshot.id, ip: ip)
+                    logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                }
+
+                // Names stored at create time (Compose service aliases via socktainer.dns.names)
+                if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.register(hostname: name, ip: ip)
+                    }
+                }
+
+                // Register Docker Compose service names so that containers in the same
+                // project can resolve each other by service name (e.g. "db") or the
+                // project-qualified form (e.g. "db.myapp").
+                //
+                // The qualified form (service.project) matches Docker's own DNS behaviour
+                // and avoids collisions when multiple Compose projects run concurrently.
+                if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
+                    !serviceName.isEmpty
+                {
+                    dnsServer.register(hostname: serviceName, ip: ip)
+                    if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
+                        !projectName.isEmpty
+                    {
+                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
+                    } else {
+                        logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
+                    }
+                }
+            }
+        }
+
+        // Kick off the healthcheck probe loop if a healthcheck label is set.
+        // The label was JSON-encoded by the create route from body.Healthcheck.
+        // Reuse startedSnapshot (already resolved via client.getContainer, which handles
+        // hex IDs) rather than calling ContainerClient().get(id:) directly — the raw call
+        // would fail when the client sends the hex digest instead of the Apple Container name.
+        // Use snapshot.id (the native Apple Container name) as the HealthCheckManager key so
+        // it matches the lookup in ContainerInspectRoute and ContainerListRoute, which read
+        // health via container.id (the native name, not the hex digest).
+        if let healthManager,
+            let snapshot = startedSnapshot,
+            let labelValue = snapshot.configuration.labels[HealthCheckManager.healthcheckLabel],
+            let healthcheck = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(labelValue.utf8))
+        {
+            await healthManager.start(containerId: snapshot.id, config: healthcheck)
+        }
+
+        return startedSnapshot
     }
 
     static func ensureDNSSidecarBeforeStart(for container: ContainerSnapshot, req: Request) async {

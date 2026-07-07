@@ -6,6 +6,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationExtras
 import Foundation
+import Logging
 import Vapor
 
 struct ContainerCreateRoute: RouteCollection {
@@ -132,6 +133,10 @@ extension ContainerCreateRoute {
                 }
             if let dockerSockRelay {
                 req.logger.info("[docker-sock] relaying \(dockerSockRelay.guestPath) → socktainer's own API")
+            }
+
+            if let restartPolicyError = RestartPolicyManager.validate(hostConfig: body.HostConfig) {
+                throw Abort(.badRequest, reason: restartPolicyError)
             }
 
             let rawId = Utility.createContainerID(name: containerName)
@@ -450,15 +455,8 @@ extension ContainerCreateRoute {
 
             // Apple Container has no native restart-policy concept; persist the requested
             // policy the same way as Healthcheck so the start route's die observer can honor it.
-            if let restartPolicy = body.HostConfig?.RestartPolicy, restartPolicy.Name != "", restartPolicy.Name != "no" {
-                do {
-                    let json = try JSONEncoder().encode(restartPolicy)
-                    if let jsonString = String(data: json, encoding: .utf8) {
-                        containerLabels[RestartPolicyManager.label] = jsonString
-                    }
-                } catch {
-                    req.logger.warning("Failed to encode restart policy: \(error) — restart policy will not be honored")
-                }
+            if let restartPolicyLabel = ContainerCreateRoute.restartPolicyLabel(for: body.HostConfig?.RestartPolicy, logger: req.logger) {
+                containerLabels[RestartPolicyManager.label] = restartPolicyLabel
             }
 
             if !dnsNames.isEmpty {
@@ -808,6 +806,19 @@ extension ContainerCreateRoute {
     /// (a sub-1-core request like 0.5 still needs at least one whole vCPU to run at all).
     static func vCpus(fromNanoCpus nanoCpus: Int) -> Int {
         max(1, nanoCpus / 1_000_000_000)
+    }
+
+    /// Encodes a restart policy for label persistence, matching Docker semantics of not
+    /// persisting the default ("no"/empty) policy. Returns nil (and logs) on encode failure.
+    static func restartPolicyLabel(for policy: RestartPolicy?, logger: Logger) -> String? {
+        guard let policy, policy.Name != "", policy.Name != "no" else { return nil }
+        do {
+            let json = try JSONEncoder().encode(policy)
+            return String(data: json, encoding: .utf8)
+        } catch {
+            logger.warning("Failed to encode restart policy: \(error) — restart policy will not be honored")
+            return nil
+        }
     }
 }
 // Function to convert PortBindings from HostConfig to PublishedPorts

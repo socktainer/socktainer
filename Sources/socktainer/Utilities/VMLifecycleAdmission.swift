@@ -21,7 +21,7 @@ actor VMLifecycleAdmission {
 
     private let limit: Int
     private var available: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
 
     init(limit: Int) {
         self.limit = limit
@@ -32,7 +32,7 @@ actor VMLifecycleAdmission {
     /// A `restart` (stop, then start) should wrap both under a single `withSlot` call rather
     /// than acquiring twice, so the container isn't left stopped while other queued work runs.
     func withSlot<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
-        await acquire()
+        try await acquire()
         do {
             let result = try await body()
             release()
@@ -43,20 +43,54 @@ actor VMLifecycleAdmission {
         }
     }
 
-    private func acquire() async {
+    private func acquire() async throws {
+        // A task cancelled before ever reaching acquire() (e.g. the holder released and a
+        // slot became free before this task's body was even scheduled) must not silently
+        // acquire via the fast path below, which has no cancellation check of its own.
+        try Task.checkCancellation()
         if available > 0 {
             available -= 1
             return
         }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // onCancel fires immediately for an already-cancelled task and only spawns a
+                // Task to reach this actor, racing against this closure's own append — if that
+                // Task wins, cancelWaiter finds nothing and the append below would otherwise
+                // orphan a waiter that release() later resumes normally instead of throwing.
+                // Checking cancellation here, synchronously before appending, closes that gap.
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append((id, continuation))
+                }
+            }
+            // A second race remains even after the check above: release() and cancelWaiter's
+            // spawned Task both independently compete to touch this waiter, and release() can
+            // win, resuming us normally before cancelWaiter ever runs (it then no-ops, finding
+            // nothing left to remove). Re-checking here catches that case — hand the slot we
+            // were just granted back to the pool instead of silently keeping it.
+            if Task.isCancelled {
+                release()
+                throw CancellationError()
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
+    }
+
+    // A cancelled caller that already left `waiters` (raced with `release()`) is a no-op here —
+    // whichever of the two touches it first wins, since both run serialized on this actor.
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 
     private func release() {
         if !waiters.isEmpty {
             let next = waiters.removeFirst()
-            next.resume()
+            next.continuation.resume()
         } else {
             available += 1
         }

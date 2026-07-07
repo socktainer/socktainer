@@ -57,6 +57,85 @@ struct VMLifecycleAdmissionTests {
         #expect(result == "recovered")
     }
 
+    @Test("A cancelled queued waiter never runs its body, and a later waiter is still admitted")
+    func cancelledWaiterDoesNotRunOrBlock() async throws {
+        actor Ran {
+            private(set) var value = false
+            func markRan() { value = true }
+        }
+
+        let admission = VMLifecycleAdmission(limit: 1)
+        let ran = Ran()
+        let holderAcquired = AsyncStream<Void>.makeStream()
+        let releaseHolder = AsyncStream<Void>.makeStream()
+
+        let holder = Task {
+            try await admission.withSlot {
+                holderAcquired.continuation.yield(())
+                for await _ in releaseHolder.stream { break }
+            }
+        }
+        var acquiredIterator = holderAcquired.stream.makeAsyncIterator()
+        _ = await acquiredIterator.next()
+
+        let cancelledWaiter = Task {
+            try await admission.withSlot { await ran.markRan() }
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        cancelledWaiter.cancel()
+
+        let nextWaiter = Task {
+            try await admission.withSlot { true }
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        releaseHolder.continuation.yield(())
+        releaseHolder.continuation.finish()
+        _ = try await holder.value
+
+        await #expect(throws: CancellationError.self) {
+            try await cancelledWaiter.value
+        }
+        #expect(try await nextWaiter.value, "a later waiter must still be admitted after the cancelled one")
+        #expect(await ran.value == false, "a cancelled waiter must never run its body")
+    }
+
+    @Test("A caller already cancelled before acquire() ever runs is still never admitted")
+    func preCancelledCallerNeverAdmitted() async throws {
+        for _ in 0..<200 {
+            let admission = VMLifecycleAdmission(limit: 1)
+            let holderAcquired = AsyncStream<Void>.makeStream()
+            let releaseHolder = AsyncStream<Void>.makeStream()
+
+            let holder = Task {
+                try await admission.withSlot {
+                    holderAcquired.continuation.yield(())
+                    for await _ in releaseHolder.stream { break }
+                }
+            }
+            var acquiredIterator = holderAcquired.stream.makeAsyncIterator()
+            _ = await acquiredIterator.next()
+
+            // No sleep between creation and cancel — racing to catch the task already
+            // cancelled by the time acquire() itself runs, not cancelled while queued.
+            let task = Task {
+                try await admission.withSlot { true }
+            }
+            task.cancel()
+
+            releaseHolder.continuation.yield(())
+            releaseHolder.continuation.finish()
+            _ = try await holder.value
+
+            do {
+                _ = try await task.value
+                Issue.record("a pre-cancelled caller must not be admitted")
+            } catch is CancellationError {
+                // expected
+            }
+        }
+    }
+
     @Test("Released slots are handed to waiters in FIFO order")
     func fifoOrdering() async throws {
         actor OrderLog {
@@ -67,14 +146,16 @@ struct VMLifecycleAdmissionTests {
         let admission = VMLifecycleAdmission(limit: 1)
         let log = OrderLog()
         let gate = AsyncStream<Void>.makeStream()
+        let holderAcquired = AsyncStream<Void>.makeStream()
 
         let holder = Task {
             try await admission.withSlot {
+                holderAcquired.continuation.yield(())
                 for await _ in gate.stream { break }
             }
         }
-        // Give the holder time to actually acquire before queuing waiters.
-        try? await Task.sleep(nanoseconds: 20_000_000)
+        var acquiredIterator = holderAcquired.stream.makeAsyncIterator()
+        _ = await acquiredIterator.next()
 
         let task1 = Task {
             try await admission.withSlot { await log.record(1) }

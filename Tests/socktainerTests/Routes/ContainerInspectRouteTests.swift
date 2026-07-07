@@ -175,3 +175,174 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 }
+
+/// Regression tests ensuring `docker inspect` reflects the restart-policy state that
+/// `RestartPolicyManager` / `ContainerRestartState` track internally — previously
+/// `HostConfig.RestartPolicy` was always nil and `RestartCount` was hardcoded to 0.
+@Suite("ContainerInspectRoute — restart-policy fidelity")
+struct ContainerInspectRouteRestartPolicyTests {
+
+    // MARK: - Helpers
+
+    private func makeSnapshot(nativeId: String, restartPolicyLabel: String? = nil) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh",
+            arguments: [],
+            environment: [],
+            workingDirectory: "/",
+            terminal: false,
+            user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:abc",
+                size: 0
+            )
+        )
+        var containerConfig = ContainerConfiguration(id: nativeId, image: img, process: proc)
+        if let restartPolicyLabel {
+            containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
+        }
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+    }
+
+    private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {
+        let policy = RestartPolicy(Name: name, MaximumRetryCount: maximumRetryCount)
+        return String(data: try! JSONEncoder().encode(policy), encoding: .utf8)!
+    }
+
+    // MARK: - Tests
+
+    @Test("HostConfig.RestartPolicy round-trips the persisted label")
+    func restartPolicyRoundTrips() async throws {
+        let nativeId = "inspect-restart-policy-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId, restartPolicyLabel: encodedPolicy(name: "on-failure", maximumRetryCount: 5))
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                #expect(res.status == .ok)
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.RestartPolicy?.Name == "on-failure")
+                #expect(inspect.HostConfig.RestartPolicy?.MaximumRetryCount == 5)
+            }
+        }
+    }
+
+    @Test("HostConfig.RestartPolicy defaults to 'no' when no policy was requested")
+    func restartPolicyDefaultsToNo() async throws {
+        let nativeId = "inspect-no-restart-policy-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId)
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.RestartPolicy?.Name == "no")
+            }
+        }
+    }
+
+    @Test("RestartCount reflects ContainerRestartState's tracked attempt count")
+    func restartCountReflectsAttempts() async throws {
+        let nativeId = "inspect-restart-count-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId, restartPolicyLabel: encodedPolicy(name: "always"))
+        let mock = InspectMock(snapshot: snapshot)
+
+        _ = await ContainerRestartState.shared.nextAttempt(id: nativeId)
+        _ = await ContainerRestartState.shared.nextAttempt(id: nativeId)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.RestartCount == 2)
+            }
+        }
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+    }
+
+    @Test("State.Restarting and Status reflect a pending automatic restart")
+    func pendingRestartReflectedInState() async throws {
+        let nativeId = "inspect-pending-restart-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId, restartPolicyLabel: encodedPolicy(name: "always"))
+        let mock = InspectMock(snapshot: snapshot)
+
+        await ContainerRestartState.shared.markPendingRestart(id: nativeId)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Restarting == true)
+                #expect(inspect.State.Status == "restarting")
+                #expect(inspect.State.Dead == false, "a container pending an automatic restart must not also report Dead")
+            }
+        }
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+    }
+
+    @Test("State.Restarting is false and Status is unaffected when no restart is pending")
+    func noPendingRestartLeavesStateUnaffected() async throws {
+        let nativeId = "inspect-no-pending-restart-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId)
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Restarting == false)
+                #expect(inspect.State.Status == "exited")
+            }
+        }
+    }
+}
+
+// MARK: - Mock
+
+/// Mock that returns `snapshot` for any `getContainer` call.
+private struct InspectMock: ClientContainerProtocol {
+    let snapshot: ContainerSnapshot
+
+    func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
+    func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
+    func enforceContainerRunning(container: ContainerSnapshot) throws {}
+    func start(id: String, detachKeys: String?) async throws {}
+    func stop(id: String, signal: String?, timeout: Int?) async throws {}
+    func restart(id: String, signal: String?, timeout: Int?) async throws {}
+    func kill(id: String, signal: String?) async throws {}
+    func delete(id: String) async throws {}
+    func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
+        RESTContainerWait(statusCode: 0)
+    }
+    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
+        ([], 0)
+    }
+}
