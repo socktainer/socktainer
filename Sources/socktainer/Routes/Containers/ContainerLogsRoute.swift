@@ -34,10 +34,23 @@ extension ContainerLogsRoute {
             // Create a streaming body
             // `follow=1` means tail like
             let follow = (try? req.query.get(Bool.self, at: "follow")) ?? false
+            let timestamps = (try? req.query.get(Bool.self, at: "timestamps")) ?? false
 
             let body = Response.Body { writer in
                 Task.detached {
                     var buffer = Data()
+
+                    // Flushes any trailing line left in `buffer` with no terminating
+                    // newline yet, then closes out the response. Only call this once
+                    // the stream has genuinely ended — flushing on a mid-stream read
+                    // gap could stamp and emit a line the writer hasn't finished yet.
+                    func finish() {
+                        ContainerLogsRoute.flushFinalLogLine(buffer, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
+                            _ = writer.write(.buffer(outputBuffer))
+                        }
+                        try? fileHandle.close()
+                        _ = writer.write(.end)
+                    }
 
                     do {
                         // Read initial logs
@@ -47,19 +60,17 @@ extension ContainerLogsRoute {
                             buffer.append(data)
 
                             // Process complete frames from buffer
-                            buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY) { outputBuffer in
+                            buffer = ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
                                 _ = writer.write(.buffer(outputBuffer))
                             }
                         }
 
                         if !follow {
-                            try? fileHandle.close()
-                            _ = writer.write(.end)
+                            finish()
                             return
                         }
                     } catch {
-                        try? fileHandle.close()
-                        _ = writer.write(.end)
+                        finish()
                         return
                     }
 
@@ -77,7 +88,7 @@ extension ContainerLogsRoute {
                             while let data = try fileHandle.read(upToCount: 4096), !data.isEmpty {
                                 gotData = true
                                 buffer.append(data)
-                                buffer = try ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY) { outputBuffer in
+                                buffer = ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
                                     frames.append(outputBuffer)
                                 }
                             }
@@ -100,8 +111,7 @@ extension ContainerLogsRoute {
                             try? await Task.sleep(for: .milliseconds(150))
                         }
                     }
-                    try? fileHandle.close()
-                    _ = writer.write(.end)
+                    finish()
                 }
             }
 
@@ -113,18 +123,52 @@ extension ContainerLogsRoute {
         }
     }
 
-    static func processDockerLogFrames(from buffer: Data, ttyMode: Bool, writeOutput: (ByteBuffer) -> Void) throws -> Data {
+    static func processDockerLogFrames(from buffer: Data, ttyMode: Bool, timestamps: Bool = false, writeOutput: (ByteBuffer) -> Void) -> Data {
         guard !buffer.isEmpty else {
             return buffer
         }
 
-        // Match the container's TTY mode: a TTY produces a raw, unmultiplexed
-        // stream, while non-TTY logs use Docker's 8-byte stdcopy framing. Shared
-        // with the attach/exec routes via writeDockerFrame so the wire format is
-        // defined in exactly one place.
-        var outputBuffer = ByteBufferAllocator().buffer(capacity: buffer.count + (ttyMode ? 0 : 8))
-        outputBuffer.writeDockerFrame(streamType: .stdout, data: buffer, ttyMode: ttyMode)
+        guard timestamps else {
+            emitFrame(buffer, ttyMode: ttyMode, writeOutput: writeOutput)
+            return Data()
+        }
+
+        // Real Docker stamps each line with the time it was written. Apple Container's
+        // log API is a raw byte stream with no per-line write-time metadata, so every
+        // complete line found in this pass is stamped with the same "now" value instead
+        // — reasonably accurate for live follow tailing (within the ~150ms poll
+        // interval), but a non-follow read of already-buffered historical output gets
+        // every line stamped with the same read-time value, since the true write time
+        // isn't recoverable on this platform. A trailing line with no newline yet is
+        // left in the returned remainder so it isn't stamped and framed prematurely.
+        let prefix = timestampPrefix()
+        var remaining = buffer
+        while let newlineIndex = remaining.firstIndex(of: 0x0A) {
+            let line = prefix + remaining[remaining.startIndex...newlineIndex]
+            remaining = remaining[remaining.index(after: newlineIndex)...]
+            emitFrame(line, ttyMode: ttyMode, writeOutput: writeOutput)
+        }
+        return Data(remaining)
+    }
+
+    /// Stamps and frames a trailing line left over with no terminating newline —
+    /// called once the stream has genuinely ended, not on a mid-stream read gap that
+    /// might just mean the writer hasn't flushed the rest of the line yet.
+    static func flushFinalLogLine(_ buffer: Data, ttyMode: Bool, timestamps: Bool, writeOutput: (ByteBuffer) -> Void) {
+        guard timestamps, !buffer.isEmpty else { return }
+        emitFrame(timestampPrefix() + buffer, ttyMode: ttyMode, writeOutput: writeOutput)
+    }
+
+    private static func timestampPrefix() -> Data {
+        Data("\(AppleContainerTimestampResolver.iso8601Timestamp(Date())) ".utf8)
+    }
+
+    /// Match the container's TTY mode: a TTY produces a raw, unmultiplexed stream, while
+    /// non-TTY logs use Docker's 8-byte stdcopy framing. Shared with the attach/exec routes
+    /// via writeDockerFrame so the wire format is defined in exactly one place.
+    private static func emitFrame(_ data: Data, ttyMode: Bool, writeOutput: (ByteBuffer) -> Void) {
+        var outputBuffer = ByteBufferAllocator().buffer(capacity: data.count + (ttyMode ? 0 : 8))
+        outputBuffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: ttyMode)
         writeOutput(outputBuffer)
-        return Data()
     }
 }
