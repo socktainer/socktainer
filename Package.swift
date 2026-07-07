@@ -7,8 +7,8 @@ let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unsp
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "unspecified"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "unspecified"
-let appleContainerVersion = "1.0.0"
-let appleContainerizationVersion = "0.33.3"
+let appleContainerVersion = "1.1.0"
+let appleContainerizationVersion = "0.35.0"
 
 let package = Package(
     name: "socktainer",
