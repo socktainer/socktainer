@@ -140,7 +140,11 @@ extension ImageInspectRoute {
             do {
                 image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
             } catch {
-                throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
+                // Docker phrasing ("No such image: <ref>") is load-bearing: docker-py
+                // only maps a 404 to ImageNotFound when the message contains
+                // "no such image"; otherwise callers' `except ImageNotFound` (which
+                // triggers an auto-pull, e.g. MiniStack's Lambda RIE image) is skipped.
+                throw Abort(.notFound, reason: "No such image: \(refOrId)")
             }
 
             let containers = includeManifests ? try await ContainerClient().list() : []
@@ -322,7 +326,7 @@ extension ImageInspectRoute {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' does not provide platform '\(requestedPlatform.description)'")
             }
 
-            throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
+            throw Abort(.notFound, reason: "No such image: \(refOrId)")
         }
     }
 }
