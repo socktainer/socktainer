@@ -191,6 +191,54 @@ struct ComposeDNSTests {
         #expect(dnsServer.listEntries()["web.shop"] == nil, "qualified alias must be unregistered on delete")
     }
 
+    @Test("Delete unregisters aliases via the cached IP when the live snapshot reports no network")
+    func deleteUsesCachedIPWhenLiveSnapshotHasNoNetwork() async throws {
+        let nativeId = "compose-web-stopped"
+        let ip = "192.168.65.40"
+
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [],
+            workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+        )
+        var config = ContainerConfiguration(id: nativeId, image: img, process: proc)
+        config.labels = ["com.docker.compose.service": "web", "com.docker.compose.project": "shop"]
+        // A genuinely stopped container: Apple Container reports an empty live network
+        // list, unlike this file's other fixtures which keep one attachment regardless
+        // of status.
+        let snapshot = ContainerSnapshot(configuration: config, status: .stopped, networks: [])
+
+        // ContainerDeleteRoute looks up ContainerInfoCache by the URL path id (the hex
+        // digest a real client would use), not by container.id.
+        let requestId = "abc999"
+        await ContainerInfoCache.shared.set(hexId: requestId, nativeId: nativeId, image: "alpine:latest", labels: config.labels, ip: ip)
+
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: nativeId, ip: ip)
+        dnsServer.register(hostname: "web", ip: ip)
+        dnsServer.register(hostname: "web.shop", ip: ip)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerDeleteRoute(client: ComposeMock(snapshot: snapshot)))
+
+            try await app.testing().test(.DELETE, "/v1.51/containers/\(requestId)") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        #expect(dnsServer.listEntries()[nativeId] == nil, "container name must be unregistered using the cached IP")
+        #expect(dnsServer.listEntries()["web"] == nil, "service alias must be unregistered using the cached IP")
+        #expect(dnsServer.listEntries()["web.shop"] == nil, "qualified alias must be unregistered using the cached IP")
+    }
+
     @Test("Delete preserves alias when another container has taken ownership")
     func deletePreservesAliasOwnedByAnotherContainer() async throws {
         let snapshot = try makeSnapshot(

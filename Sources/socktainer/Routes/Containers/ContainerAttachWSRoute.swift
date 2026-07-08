@@ -129,48 +129,15 @@ extension ContainerAttachWSRoute {
             // Process monitor — sole owner of teardown (no double-close with ws.onClose
             // because ws.onClose only closes the stdin write end, not the read ends).
             group.addTask {
-                // Fix: record -1 on wait failure so /wait doesn't lie to callers.
-                let code: Int32
-                do { code = try await process.wait() } catch { code = -1 }
-
-                await ProcessRegistry.shared.remove(id: container.id)
-
-                // stdout/stderr write ends and stdin read end are Apple-owned —
-                // do not close them here (double-close causes fd-reuse crashes).
-                // ws.onClose owns the stdin write end; readers own their read ends.
-
-                try? await Task.sleep(nanoseconds: ContainerAttachRoute.outputFlushGraceNs)
-
-                // Record the exit code FIRST: this unblocks the /start die observer's
-                // waitForCode so its `die` event is emitted before the `destroy` below,
-                // preserving moby's die→destroy order for foreground `docker run --rm` over WS.
-                await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                await ContainerExitCodeStore.shared.set(id: hexId, code: code)
-
-                // docker run --rm over WS: emit the single post-exit "destroy" (consumeAutoRemove
-                // gates on the --rm flag and dedups against the detached die observer).
-                if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
-                    // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
-                    if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                        let cachedIP = await ContainerInfoCache.shared.get(id: hexId)?.ip
-                        let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(container.id)]
-                        if cachedIP == nil || registered == nil || registered == cachedIP {
-                            dnsServer.unregister(hostname: container.id)
-                        }
-                    }
-                    let cached = await ContainerInfoCache.shared.get(id: hexId)
-                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                        await broadcaster.broadcast(
-                            ContainerAttachRoute.makeAutoRemoveEvent(
-                                id: hexId,
-                                image: cached?.image ?? container.configuration.image.reference,
-                                name: cached?.nativeId ?? container.id,
-                                labels: cached?.labels
-                                    ?? LabelNormalization.restore(container.configuration.labels)
-                            ))
-                    }
-                    await ContainerInfoCache.shared.remove(id: hexId)
-                }
+                _ = await ContainerProcessExitMonitor.run(
+                    wait: { try await process.wait() },
+                    hexId: hexId,
+                    nativeId: container.id,
+                    fallbackImage: container.configuration.image.reference,
+                    fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                    dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                    broadcaster: req.application.storage[EventBroadcasterKey.self]
+                )
 
                 try? await ws.close()
             }

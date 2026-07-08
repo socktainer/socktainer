@@ -185,18 +185,14 @@ extension ContainerStartRoute {
             // gates on the --rm flag and dedups against the foreground attach path, so a
             // container attached in the foreground does not get a second destroy.
             if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
-                // Clean up DNS entry with ownership check (same pattern as ContainerDeleteRoute).
-                if let dnsServer {
-                    let cachedIP = await ContainerInfoCache.shared.get(id: nativeId)?.ip
-                    let registered = dnsServer.listEntries()[SocktainerDNSServer.normalize(nativeId)]
-                    if cachedIP == nil || registered == nil || registered == cachedIP {
-                        dnsServer.unregister(hostname: nativeId)
-                    }
-                }
-                await broadcaster.broadcast(
-                    ContainerAttachRoute.makeAutoRemoveEvent(
-                        id: eventId, image: image, name: name, labels: labels))
-                await ContainerInfoCache.shared.remove(id: nativeId)
+                await ContainerAutoRemoveCleanup.perform(
+                    hexId: eventId,
+                    nativeId: nativeId,
+                    fallbackImage: image,
+                    fallbackLabels: labels,
+                    dnsServer: dnsServer,
+                    broadcaster: broadcaster
+                )
                 await ContainerRestartState.shared.reset(id: nativeId)
                 return
             }

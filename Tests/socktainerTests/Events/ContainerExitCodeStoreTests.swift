@@ -48,8 +48,8 @@ struct ResolveExitCodeTests {
         #expect(calls == 1)
     }
 
-    // The EVT-008 regression: a transient throw from the wait XPC round-trip must NOT be
-    // recorded as a fake exit code of 0. Retrying yields the authoritative code (7).
+    // A transient throw from the wait XPC round-trip must NOT be recorded as a fake exit
+    // code of 0. Retrying yields the authoritative code (7).
     @Test("retries past transient throws and returns the real code")
     func retriesPastTransientThrows() async {
         var calls = 0

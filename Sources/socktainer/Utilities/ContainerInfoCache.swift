@@ -36,6 +36,12 @@ actor ContainerInfoCache {
             store.removeValue(forKey: info.hexId)
             store.removeValue(forKey: info.nativeId)
         }
+        // Clear any lingering --rm mark so a stale observer that reaches consumeAutoRemove
+        // after this container was already deleted can't fire a second destroy event.
+        if let sibling = autoRemoveSibling[id] {
+            autoRemoveSibling.removeValue(forKey: id)
+            autoRemoveSibling.removeValue(forKey: sibling)
+        }
     }
 
     /// Records that a container was created with `--rm`, keyed by both ids so either the

@@ -89,4 +89,18 @@ struct ContainerInfoCacheTests {
         #expect(await cache.consumeAutoRemove(id: "native-name") == true)
         #expect(await cache.consumeAutoRemove(id: "hex123") == false)
     }
+
+    @Test("remove clears a pending --rm mark so a stale observer can't fire a second destroy")
+    func removeClearsAutoRemoveMark() async {
+        let cache = ContainerInfoCache()
+        await cache.set(hexId: "hex123", nativeId: "native-name", image: "alpine", labels: [:])
+        await cache.markAutoRemove(hexId: "hex123", nativeId: "native-name")
+
+        // ContainerDeleteRoute (or an earlier consumer) removes the container before a stale
+        // die observer gets to consumeAutoRemove — that observer must not find the mark.
+        await cache.remove(id: "hex123")
+
+        #expect(await cache.consumeAutoRemove(id: "hex123") == false)
+        #expect(await cache.consumeAutoRemove(id: "native-name") == false)
+    }
 }
