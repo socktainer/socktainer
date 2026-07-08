@@ -14,6 +14,11 @@ func configure(_ app: Application) async throws {
     // cap, yielding 413 "Payload Too Large". Raise it well above any real request.
     app.routes.defaultMaxBodySize = "64mb"
 
+    // Make error responses Docker-compatible (`{"message": ...}`) so SDKs like
+    // docker-py don't crash on their `response.json()['message']` lookup. Installed
+    // outermost so it wraps all routing/error handling. See DockerErrorMiddleware.
+    app.middleware.use(DockerErrorMiddleware(), at: .beginning)
+
     // Define app support path early since it's needed by multiple services
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
