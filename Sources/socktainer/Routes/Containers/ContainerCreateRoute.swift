@@ -867,14 +867,16 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
             // Use default values if not specified
             let hostAddress = binding.HostIp?.isEmpty == false ? binding.HostIp! : "0.0.0.0"
 
-            // If HostPort is empty/nil, find an available port
+            // If HostPort is empty/nil/"0", find an available port. Docker
+            // Engine treats HostPort "0" the same as "" (auto-allocate an
+            // ephemeral port); Testcontainers relies on that semantics.
             let hostPort: UInt16
-            if let hostPortString = binding.HostPort, !hostPortString.isEmpty {
-                if let parsedPort = UInt16(hostPortString) {
-                    hostPort = parsedPort
-                } else {
-                    hostPort = UInt16(try findAvailablePort())
-                }
+            if let hostPortString = binding.HostPort,
+                !hostPortString.isEmpty,
+                let parsedPort = UInt16(hostPortString),
+                parsedPort != 0
+            {
+                hostPort = parsedPort
             } else {
                 hostPort = UInt16(try findAvailablePort())
             }
