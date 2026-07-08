@@ -14,26 +14,19 @@ enum ContainerAliasCleanup {
         dnsServer: SocktainerDNSServer
     ) {
         guard let cachedIP else { return }
-        let entries = dnsServer.listEntries()
-
-        func unregisterIfOwned(_ hostname: String) {
-            let registered = entries[SocktainerDNSServer.normalize(hostname)]
-            if registered != nil, registered != cachedIP { return }
-            dnsServer.unregister(hostname: hostname)
-        }
 
         if !nativeId.isEmpty {
-            unregisterIfOwned(nativeId)
+            dnsServer.unregisterIfOwned(hostname: nativeId, expectedIP: cachedIP)
         }
         if let namesLabel = labels["socktainer.dns.names"] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                unregisterIfOwned(name)
+                dnsServer.unregisterIfOwned(hostname: name, expectedIP: cachedIP)
             }
         }
         if let serviceName = labels["com.docker.compose.service"], !serviceName.isEmpty {
-            unregisterIfOwned(serviceName)
+            dnsServer.unregisterIfOwned(hostname: serviceName, expectedIP: cachedIP)
             if let projectName = labels["com.docker.compose.project"], !projectName.isEmpty {
-                unregisterIfOwned("\(serviceName).\(projectName)")
+                dnsServer.unregisterIfOwned(hostname: "\(serviceName).\(projectName)", expectedIP: cachedIP)
             }
         }
     }

@@ -36,6 +36,29 @@ struct SocktainerDNSServerTests {
         #expect(server.listEntries().isEmpty)
     }
 
+    @Test("unregisterIfOwned removes a hostname registered to the expected IP")
+    func unregisterIfOwnedRemovesMatch() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "redis", ip: "192.168.1.20")
+        server.unregisterIfOwned(hostname: "redis", expectedIP: "192.168.1.20")
+        #expect(server.listEntries()["redis"] == nil)
+    }
+
+    @Test("unregisterIfOwned leaves a hostname registered to a different IP untouched")
+    func unregisterIfOwnedSkipsMismatch() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "redis", ip: "192.168.1.99")
+        server.unregisterIfOwned(hostname: "redis", expectedIP: "192.168.1.20")
+        #expect(server.listEntries()["redis"] == "192.168.1.99")
+    }
+
+    @Test("unregisterIfOwned on an unregistered hostname is a no-op")
+    func unregisterIfOwnedUnknownIsNoOp() {
+        let server = SocktainerDNSServer()
+        server.unregisterIfOwned(hostname: "nonexistent", expectedIP: "192.168.1.20")  // must not crash
+        #expect(server.listEntries().isEmpty)
+    }
+
     // MARK: - Normalization
 
     @Test("Hostname lookup is case-insensitive")

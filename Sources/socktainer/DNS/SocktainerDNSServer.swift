@@ -36,6 +36,19 @@ final class SocktainerDNSServer: @unchecked Sendable {
         }
     }
 
+    /// Unregisters `hostname` only if it's currently registered to `expectedIP` — atomically,
+    /// so a concurrent re-registration between a caller's ownership check and its unregister
+    /// call can't be dropped. A hostname registered to a different IP, or not registered at
+    /// all, is left untouched.
+    func unregisterIfOwned(hostname: String, expectedIP: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = Self.normalize(hostname)
+        guard let addr = entries[key], "\(addr[0]).\(addr[1]).\(addr[2]).\(addr[3])" == expectedIP else { return }
+        entries.removeValue(forKey: key)
+        log.info("[dns] unregistered \(key)")
+    }
+
     func listEntries() -> [String: String] {
         lock.lock()
         defer { lock.unlock() }

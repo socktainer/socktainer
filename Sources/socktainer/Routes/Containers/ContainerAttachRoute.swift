@@ -24,10 +24,6 @@ struct ContainerAttachRoute: RouteCollection {
 }
 
 extension ContainerAttachRoute {
-    /// Grace period between closing pipe write ends and unblocking /wait.
-    /// Lets pipe readers flush buffered output before Docker CLI closes the connection.
-    static let outputFlushGraceNs: UInt64 = 200_000_000  // 200ms
-
     /// Builds the container event emitted when `docker run --rm` triggers Apple Container's
     /// auto-removal: no DELETE arrives, so ContainerDeleteRoute never fires and this path
     /// substitutes for it. The action MUST be "destroy" — the same action ContainerDeleteRoute
@@ -130,6 +126,7 @@ extension ContainerAttachRoute {
             return try await handleAttachWithStdin(
                 req: req,
                 client: client,
+                hexId: id,
                 container: container,
                 query: query,
                 isUpgrade: isUpgrade,
@@ -366,6 +363,7 @@ extension ContainerAttachRoute {
     private static func handleAttachWithStdin(
         req: Request,
         client: ClientContainerProtocol,
+        hexId: String,
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         isUpgrade: Bool,
@@ -390,6 +388,7 @@ extension ContainerAttachRoute {
         return try await createContainerForAttachment(
             req: req,
             client: client,
+            hexId: hexId,
             container: currentContainer,
             query: query,
             shouldUpgrade: shouldUpgrade,
@@ -401,6 +400,7 @@ extension ContainerAttachRoute {
     private static func createContainerForAttachment(
         req: Request,
         client: ClientContainerProtocol,
+        hexId: String,
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         shouldUpgrade: Bool,
@@ -469,16 +469,15 @@ extension ContainerAttachRoute {
                             streamContinuation.finish()
                         }
 
-                        do {
-                            // Record the real exit code so /containers/{id}/wait can return it.
-                            let code = try await process.wait()
-                            await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                        } catch {
-                            // process.wait() failed — record a synthetic exit code so
-                            // /containers/{id}/wait can't block forever.
-                            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-                        }
-                        await ProcessRegistry.shared.remove(id: container.id)
+                        _ = await ContainerProcessExitMonitor.run(
+                            wait: { try await process.wait() },
+                            hexId: hexId,
+                            nativeId: container.id,
+                            fallbackImage: container.configuration.image.reference,
+                            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                        )
                     }
 
                     if let stdoutHandle = pipes.stdout?.read {
@@ -713,19 +712,15 @@ extension ContainerAttachRoute {
                 }
 
                 group.addTask {
-                    do {
-                        // Record the real exit code so /containers/{id}/wait can return it.
-                        let code = try await process.wait()
-                        await ContainerExitCodeStore.shared.set(id: container.id, code: code)
-                    } catch {
-                        // process.wait() failed — record a synthetic exit code so
-                        // /containers/{id}/wait can't block forever.
-                        await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-                    }
-                    await ProcessRegistry.shared.remove(id: container.id)
-
-                    // Give a small delay for any final output to be processed
-                    try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                    _ = await ContainerProcessExitMonitor.run(
+                        wait: { try await process.wait() },
+                        hexId: hexId,
+                        nativeId: container.id,
+                        fallbackImage: container.configuration.image.reference,
+                        fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                        dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                        broadcaster: req.application.storage[EventBroadcasterKey.self]
+                    )
 
                     // DockerTCPHandler owns pipes.stdin!.write after setStdinWriter(); it closes
                     // it via writeQueue on channelInactive / inputClosed. Closing it here too

@@ -9,6 +9,10 @@ import Foundation
 /// `wait` is injectable so the whole sequence — including the transient-throw retry and
 /// dual-id recording — is testable without a live Apple Container process.
 enum ContainerProcessExitMonitor {
+    /// Grace period between the process exiting and recording its exit code.
+    /// Lets pipe readers flush buffered output before other observers wake on the exit code.
+    static let outputFlushGraceNs: UInt64 = 200_000_000  // 200ms
+
     static func run(
         wait: () async throws -> Int32,
         hexId: String,
@@ -17,7 +21,7 @@ enum ContainerProcessExitMonitor {
         fallbackLabels: [String: String],
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?,
-        outputFlushGraceNs: UInt64 = ContainerAttachRoute.outputFlushGraceNs,
+        outputFlushGraceNs: UInt64 = ContainerProcessExitMonitor.outputFlushGraceNs,
         exitCodeRetryDelayNs: UInt64 = 100_000_000
     ) async -> Int32 {
         let code = await ContainerExitCodeStore.resolveExitCode(retryDelayNs: exitCodeRetryDelayNs, wait: wait)
