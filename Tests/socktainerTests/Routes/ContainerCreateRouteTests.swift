@@ -583,3 +583,28 @@ struct RestartPolicyValidationTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute — port binding conversion")
+struct ConvertPortBindingsTests {
+    @Test("an explicit HostPort is published verbatim")
+    func explicitHostPortIsKept() throws {
+        let ports = try convertPortBindings(from: ["5432/tcp": [PortBinding(HostIp: nil, HostPort: "15432")]])
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort == 15432)
+        #expect(ports[0].containerPort == 5432)
+    }
+
+    @Test(#"HostPort "0" auto-allocates an ephemeral port like Docker, never publishes literal port 0"#)
+    func hostPortZeroAutoAllocates() throws {
+        let ports = try convertPortBindings(from: ["5432/tcp": [PortBinding(HostIp: nil, HostPort: "0")]])
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort != 0)
+    }
+
+    @Test("an empty HostPort auto-allocates an ephemeral port")
+    func emptyHostPortAutoAllocates() throws {
+        let ports = try convertPortBindings(from: ["5432/tcp": [PortBinding(HostIp: nil, HostPort: "")]])
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort != 0)
+    }
+}
