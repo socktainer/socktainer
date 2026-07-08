@@ -205,13 +205,6 @@ extension ContainerCreateRoute {
 
             let imageConfig = try await img.config(for: requestedPlatform).config
 
-            let defaultUser: ProcessConfiguration.User = {
-                if let u = imageConfig?.user {
-                    return .raw(userString: u)
-                }
-                return .id(uid: 0, gid: 0)
-            }()
-
             let workingDirectory = imageConfig?.workingDir ?? "/"
 
             let imageConfigEnvironment = imageConfig?.env ?? []
@@ -308,13 +301,7 @@ extension ContainerCreateRoute {
             // Use working directory from request if provided and not empty, otherwise from image config
             let finalWorkingDirectory = (body.WorkingDir?.isEmpty == false) ? body.WorkingDir! : workingDirectory
 
-            // Handle user from request if provided
-            let finalUser: ProcessConfiguration.User = {
-                if let requestUser = body.User {
-                    return .raw(userString: requestUser)
-                }
-                return defaultUser
-            }()
+            let finalUser = ContainerCreateRoute.resolveUser(requestUser: body.User, imageUser: imageConfig?.user)
 
             // Ensure we have a valid executable
             guard let executable = commandLine.first, !executable.isEmpty else {
@@ -715,6 +702,19 @@ extension ContainerCreateRoute {
         if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
         if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
         return nil
+    }
+
+    /// Resolves the process user, preferring an explicit request override over the image
+    /// default. The Docker CLI always sends a `User` field — an empty string means
+    /// "not set", not "run as the empty-string user" — so it's treated the same as `nil`.
+    static func resolveUser(requestUser: String?, imageUser: String?) -> ProcessConfiguration.User {
+        if let requestUser, !requestUser.isEmpty {
+            return .raw(userString: requestUser)
+        }
+        if let imageUser, !imageUser.isEmpty {
+            return .raw(userString: imageUser)
+        }
+        return .id(uid: 0, gid: 0)
     }
 
     /// Mirrors moby's ShmSize handling: a positive request is used verbatim; 0 or omitted
