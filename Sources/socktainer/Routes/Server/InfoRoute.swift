@@ -77,7 +77,7 @@ struct InfoRoute: RouteCollection {
                 KernelVersion: try await kernelNameProvider(),
                 OSVersion: currentPlatform().osVersion ?? nil,
                 OSType: currentPlatform().os,
-                Architecture: currentPlatform().architecture,
+                Architecture: dockerInfoArchitecture(currentPlatform().architecture),
                 NCPU: hostCPUCoreCount(),
                 MemTotal: Int64(hostPhysicalMemory()),
                 HttpProxy: ProcessInfo.processInfo.environment["HTTP_PROXY"] ?? nil,

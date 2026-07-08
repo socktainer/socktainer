@@ -10,6 +10,19 @@ public func currentPlatform() -> Platform {
     Platform.current
 }
 
+/// Docker's `GET /info` reports `Architecture` in the `uname -m` convention
+/// (`aarch64`, `x86_64`), not the OCI/GOARCH convention (`arm64`, `amd64`) that
+/// `Platform.current.architecture` returns. Clients that key off `/info`
+/// Architecture (e.g. MiniStack's Lambda arch detection) reject `arm64`. Map to the
+/// Docker/uname value so socktainer matches real Docker on Apple Silicon.
+public func dockerInfoArchitecture(_ ociArchitecture: String) -> String {
+    switch ociArchitecture {
+    case "arm64", "aarch64": return "aarch64"
+    case "amd64", "x86_64": return "x86_64"
+    default: return ociArchitecture
+    }
+}
+
 public func platformOrThrow(_ platformString: String) throws -> Platform {
     let trimmed = platformString.trimmingCharacters(in: .whitespacesAndNewlines)
 
