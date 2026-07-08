@@ -52,6 +52,14 @@ struct SocktainerDNSServerTests {
         #expect(server.listEntries()["redis"] == "192.168.1.99")
     }
 
+    @Test("unregisterIfOwned strips a CIDR suffix from expectedIP, matching register's parsing")
+    func unregisterIfOwnedStripsCIDRSuffix() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "db", ip: "192.168.1.5")
+        server.unregisterIfOwned(hostname: "db", expectedIP: "192.168.1.5/24")
+        #expect(server.listEntries()["db"] == nil)
+    }
+
     @Test("unregisterIfOwned on an unregistered hostname is a no-op")
     func unregisterIfOwnedUnknownIsNoOp() {
         let server = SocktainerDNSServer()

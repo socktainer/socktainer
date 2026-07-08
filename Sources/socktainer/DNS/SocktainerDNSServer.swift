@@ -44,7 +44,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let key = Self.normalize(hostname)
-        guard let addr = entries[key], "\(addr[0]).\(addr[1]).\(addr[2]).\(addr[3])" == expectedIP else { return }
+        guard let addr = entries[key], let expected = Self.parseIPv4(expectedIP), addr == expected else { return }
         entries.removeValue(forKey: key)
         log.info("[dns] unregistered \(key)")
     }
