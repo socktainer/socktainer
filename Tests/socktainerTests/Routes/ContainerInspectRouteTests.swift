@@ -120,6 +120,61 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("An IPv4-only attachment reports no IPv6 fields")
+    func ipv4OnlyAttachmentReportsNoIPv6() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1"))],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                let endpoint = inspect.NetworkSettings.Networks?["mynet"]
+                #expect(endpoint?.GlobalIPv6Address == nil)
+                #expect(endpoint?.GlobalIPv6PrefixLen == nil)
+                #expect(endpoint?.IPv6Gateway == nil)
+            }
+        }
+    }
+
+    @Test("A running container with an IPv6 attachment reports GlobalIPv6Address and prefix length")
+    func runningContainerReportsIPv6Attachment() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: CIDRv6("fd18:2f24:9eff:1:1c1e:56ff:fe7c:1a2b/64"),
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1"))],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                let endpoint = inspect.NetworkSettings.Networks?["mynet"]
+                #expect(endpoint?.IPAddress == "192.168.64.5")
+                #expect(endpoint?.GlobalIPv6Address == "fd18:2f24:9eff:1:1c1e:56ff:fe7c:1a2b")
+                #expect(endpoint?.GlobalIPv6PrefixLen == 64)
+                #expect(endpoint?.IPv6Gateway == nil)
+            }
+        }
+    }
+
     @Test("Duplicate configured network names do not crash inspect")
     func duplicateConfiguredNetworkNamesDoNotCrash() async throws {
         let container = makeSnapshot(
