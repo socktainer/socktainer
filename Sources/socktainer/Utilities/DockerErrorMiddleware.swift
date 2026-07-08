@@ -25,6 +25,12 @@ struct DockerErrorMiddleware: AsyncMiddleware {
                 return Self.ensureMessageField(in: response)
             }
             return response
+        } catch is CancellationError {
+            // Vapor's default error handling rethrows CancellationError so request
+            // cancellation propagates and downstream cleanup runs. This middleware is
+            // outermost, so it must preserve that behaviour rather than turn a
+            // cancellation into a 500.
+            throw CancellationError()
         } catch {
             let status: HTTPResponseStatus
             let reason: String
@@ -45,7 +51,9 @@ struct DockerErrorMiddleware: AsyncMiddleware {
     /// `{"message": ...}`.
     static func ensureMessageField(in response: Response) -> Response {
         guard let bodyData = response.body.data, !bodyData.isEmpty else {
-            return response
+            // An error status with no body still lacks `message` — the exact shape that
+            // breaks docker-py. Synthesise a Docker error so `message` is always present.
+            return makeDockerError(status: response.status, message: "error", headers: response.headers)
         }
         guard
             let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
