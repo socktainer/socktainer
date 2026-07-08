@@ -70,9 +70,10 @@ extension ContainerListRoute {
                 let networkMode = container.networks.first?.network ?? "default"
 
                 let networkSettings = Dictionary(
-                    uniqueKeysWithValues: container.networks.map { attachment in
+                    container.networks.map { attachment in
                         (attachment.network, ContainerEndpointSettings.live(attachment))
-                    }
+                    },
+                    uniquingKeysWith: { first, _ in first }
                 )
 
                 let mounts = container.configuration.mounts.map { mount in

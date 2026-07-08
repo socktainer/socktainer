@@ -111,4 +111,23 @@ struct ContainerListRouteNetworkSettingsTests {
             }
         }
     }
+
+    @Test("Duplicate live network names do not crash list")
+    func duplicateLiveNetworkNamesDoNotCrash() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "dup",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeRunningSnapshot(id: "c1", networks: [attachment, attachment])
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json") { res async throws in
+                let summaries = try res.content.decode([RESTContainerSummary].self)
+                #expect(summaries.first?.NetworkSettings.Networks?.keys.contains("dup") == true)
+            }
+        }
+    }
 }
