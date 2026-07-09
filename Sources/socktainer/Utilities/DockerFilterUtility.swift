@@ -12,8 +12,11 @@ struct DockerNetworkFilterUtility {
             if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
                 filters = decoded
 
-                // Validate keys
-                let allowedKeys: Set<String> = ["name", "id", "label", "dangling"]
+                // Validate keys — the full set moby accepts for network list
+                // (docker network ls -f): dangling, driver, id, label, name,
+                // scope, type. Must stay in sync with the knownKeys handled by
+                // ClientNetworkService.applyFilters.
+                let allowedKeys: Set<String> = ["dangling", "driver", "id", "label", "name", "scope", "type"]
                 let filterKeys = Set(filters.keys)
                 if !filterKeys.isSubset(of: allowedKeys) {
                     logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
