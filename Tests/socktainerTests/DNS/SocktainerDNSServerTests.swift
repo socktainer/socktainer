@@ -3,6 +3,7 @@ import ContainerResource
 import ContainerizationOCI
 import Darwin
 import Foundation
+import Logging
 import SocktainerDNSImage
 import Testing
 
@@ -494,5 +495,87 @@ struct SidecarNetworkTests {
             roleLabel: NetworkDNSManager.dnsRole
         )
         #expect(result == nil, "a DNS sidecar must not ensure another sidecar for its own network")
+    }
+}
+
+// MARK: - ContainerStartRoute.dnsAttachmentIP (cache/cleanup IP must match the registered IP)
+
+@Suite("ContainerStartRoute.dnsAttachmentIP")
+struct DNSAttachmentIPTests {
+
+    @Test("Skips a reserved first attachment and returns the named network's IP")
+    func skipsReservedFirstAttachment() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
+            labels: [:]
+        )
+        let result = ContainerStartRoute.dnsAttachmentIP(in: snapshot)
+        #expect(result == "192.168.65.20", "must match the IP dnsServer.register(hostname:ip:) is actually called with")
+    }
+
+    @Test("A single named network returns its own IP")
+    func singleNamedNetwork() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.20", network: "stackdemo_default", labels: [:])
+        #expect(ContainerStartRoute.dnsAttachmentIP(in: snapshot) == "192.168.65.20")
+    }
+
+    @Test("Only reserved networks returns nil")
+    func onlyReservedNetworksReturnsNil() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
+        #expect(ContainerStartRoute.dnsAttachmentIP(in: snapshot) == nil)
+    }
+
+    @Test("Nil snapshot returns nil")
+    func nilSnapshotReturnsNil() {
+        #expect(ContainerStartRoute.dnsAttachmentIP(in: nil) == nil)
+    }
+}
+
+// MARK: - ContainerStartRoute.registerDNSAliasesOnResume (daemon-restart re-registration)
+
+@Suite("ContainerStartRoute.registerDNSAliasesOnResume")
+struct RegisterDNSAliasesOnResumeTests {
+
+    @Test("Re-registers on a named network even when the first attachment is reserved")
+    func reRegistersPastReservedFirstAttachment() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
+            labels: [:]
+        )
+        let dnsServer = SocktainerDNSServer()
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        #expect(dnsServer.listEntries()["web-1"] == "192.168.65.20")
+    }
+
+    @Test("A container on only reserved networks is not registered")
+    func onlyReservedNetworksSkipsRegistration() throws {
+        let container = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
+        let dnsServer = SocktainerDNSServer()
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        #expect(dnsServer.listEntries().isEmpty)
+    }
+
+    @Test("Also registers socktainer.dns.names and Compose service/project aliases")
+    func registersAllAliases() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "db-1",
+            ip: "192.168.65.20",
+            network: "stackdemo_default",
+            labels: [
+                "socktainer.dns.names": "postgres,pg",
+                "com.docker.compose.service": "db",
+                "com.docker.compose.project": "stackdemo",
+            ]
+        )
+        let dnsServer = SocktainerDNSServer()
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        let entries = dnsServer.listEntries()
+        #expect(entries["db-1"] == "192.168.65.20")
+        #expect(entries["postgres"] == "192.168.65.20")
+        #expect(entries["pg"] == "192.168.65.20")
+        #expect(entries["db"] == "192.168.65.20")
+        #expect(entries["db.stackdemo"] == "192.168.65.20")
     }
 }

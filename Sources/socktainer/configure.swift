@@ -212,35 +212,12 @@ func configure(_ app: Application) async throws {
     // restarted (not re-created) via docker start cannot be resolved by peers.
     let resumeClient = ContainerClient()
     if let runningContainers = try? await resumeClient.list() {
-        let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
         for container in runningContainers where container.status == .running {
             // Skip DNS-sidecar containers — they are internal infrastructure.
             guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole
             else { continue }
 
-            // Re-register DNS entries for containers on named networks.
-            if let firstAttachment = container.networks.first,
-                !reservedNetworks.contains(firstAttachment.network)
-            {
-                let ip = firstAttachment.ipv4Address.address.description
-                dnsServer.register(hostname: container.id, ip: ip)
-                if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
-                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
-                        dnsServer.register(hostname: name, ip: ip)
-                    }
-                }
-                if let serviceName = container.configuration.labels["com.docker.compose.service"],
-                    !serviceName.isEmpty
-                {
-                    dnsServer.register(hostname: serviceName, ip: ip)
-                    if let projectName = container.configuration.labels["com.docker.compose.project"],
-                        !projectName.isEmpty
-                    {
-                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
-                    }
-                }
-                app.logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
-            }
+            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
 
             // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],

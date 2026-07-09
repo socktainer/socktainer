@@ -72,7 +72,7 @@ extension ContainerRestartRoute {
                     image: snap.configuration.image.reference,
                     name: snap.id,
                     labels: LabelNormalization.restore(snap.configuration.labels),
-                    ip: snap.networks.first?.ipv4Address.address.description,
+                    ip: ContainerStartRoute.dnsAttachmentIP(in: snap),
                     refreshCache: true,
                     restartPolicy: restartPolicy,
                     generation: generation,
