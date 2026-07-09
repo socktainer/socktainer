@@ -84,7 +84,7 @@ extension ContainerStartRoute {
             if let snap = metadataSnapshot {
                 // Store under canonical hexId so later lookups by the Docker hex ID always
                 // hit, regardless of whether /start was called by name or short ID.
-                let containerIP = startedSnapshot?.networks.first?.ipv4Address.address.description
+                let containerIP = ContainerStartRoute.dnsAttachmentIP(in: startedSnapshot)
                 await ContainerInfoCache.shared.set(
                     hexId: eventId,
                     nativeId: snap.id,
@@ -125,7 +125,7 @@ extension ContainerStartRoute {
                     image: snap.configuration.image.reference,
                     name: snap.id,
                     labels: LabelNormalization.restore(snap.configuration.labels),
-                    ip: startedSnapshot?.networks.first?.ipv4Address.address.description,
+                    ip: ContainerStartRoute.dnsAttachmentIP(in: startedSnapshot),
                     refreshCache: false,
                     restartPolicy: restartPolicy,
                     generation: generation,
@@ -198,13 +198,29 @@ extension ContainerStartRoute {
             }
 
             let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
-            guard let restartPolicy else { return }
-
             let nextAttemptNumber = await ContainerRestartState.shared.count(id: nativeId) + 1
-            guard
-                RestartPolicyManager.shouldRestart(
-                    policy: restartPolicy, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
-            else { return }
+            let willRestart =
+                restartPolicy.map {
+                    RestartPolicyManager.shouldRestart(
+                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                } ?? false
+
+            // Staying stopped: moby tears down a container's network sandbox (and its DNS
+            // resolution) on every exit, not just --rm. Mirror that here, after the generation
+            // guard above so a stale, superseded observer can't unregister a live,
+            // already-restarted container's alias.
+            guard willRestart else {
+                if let dnsServer {
+                    let cached = await ContainerInfoCache.shared.get(id: nativeId)
+                    ContainerAliasCleanup.unregisterAllAliases(
+                        nativeId: nativeId,
+                        labels: cached?.labels ?? labels,
+                        cachedIP: cached?.ip,
+                        dnsServer: dnsServer
+                    )
+                }
+                return
+            }
 
             await ContainerRestartState.shared.markPendingRestart(id: nativeId)
             let backoffDelay = await ContainerRestartState.shared.nextBackoffDelayNanoseconds(
@@ -241,7 +257,7 @@ extension ContainerStartRoute {
                 image: image,
                 name: name,
                 labels: labels,
-                ip: restartedSnapshot?.networks.first?.ipv4Address.address.description,
+                ip: ContainerStartRoute.dnsAttachmentIP(in: restartedSnapshot),
                 refreshCache: restartedSnapshot != nil,
                 restartPolicy: restartPolicy,
                 generation: generation,
@@ -327,10 +343,7 @@ extension ContainerStartRoute {
             // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
             // forwarder so any registration would be unreachable; skip entirely if none of the
             // container's attachments qualify, rather than falling back to the first attachment.
-            let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
-            if let dnsAttachment = snapshot.networks.first(where: { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }) {
-                let ip = dnsAttachment.ipv4Address.address.description
-
+            if let ip = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
                 if !snapshot.id.isEmpty {
                     dnsServer.register(hostname: snapshot.id, ip: ip)
                     logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
@@ -403,5 +416,39 @@ extension ContainerStartRoute {
         if roleLabel == NetworkDNSManager.dnsRole { return nil }
         let reserved: Set<String> = ["default", "bridge", "host", "none"]
         return configuredNetworks.first { !$0.isEmpty && !reserved.contains($0) }
+    }
+
+    /// The IP DNS aliases are registered under — the first non-reserved network
+    /// attachment. Every cache/cleanup site (ContainerInfoCache.ip, ContainerDeleteRoute)
+    /// must derive its IP the same way, or unregisterIfOwned's ownership check silently
+    /// fails to match on multi-network containers.
+    static func dnsAttachmentIP(in snapshot: ContainerSnapshot?) -> String? {
+        let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
+        return snapshot?.networks.first { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }?
+            .ipv4Address.address.description
+    }
+
+    /// Re-registers a resumed container's DNS aliases (name, `socktainer.dns.names`,
+    /// Compose service/project) — called once per still-running container when
+    /// Socktainer starts, since SocktainerDNSServer's registry is in-memory and lost
+    /// across daemon restarts. Uses dnsAttachmentIP so a container whose first network
+    /// attachment happens to be reserved (e.g. bridge) still gets re-registered on its
+    /// named network, instead of being skipped entirely.
+    static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) {
+        guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
+
+        dnsServer.register(hostname: container.id, ip: ip)
+        if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
+            for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                dnsServer.register(hostname: name, ip: ip)
+            }
+        }
+        if let serviceName = container.configuration.labels["com.docker.compose.service"], !serviceName.isEmpty {
+            dnsServer.register(hostname: serviceName, ip: ip)
+            if let projectName = container.configuration.labels["com.docker.compose.project"], !projectName.isEmpty {
+                dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+            }
+        }
+        logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
     }
 }

@@ -74,7 +74,7 @@ extension ContainerDeleteRoute {
                     // Prefer the cached IP — reliable even once the container has genuinely
                     // stopped and Apple Container reports an empty live network list — falling
                     // back to the live snapshot for a container never observed via /start.
-                    let containerIP = container.networks.first?.ipv4Address.address.description
+                    let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
                         labels: cached?.labels ?? LabelNormalization.restore(container.configuration.labels),
