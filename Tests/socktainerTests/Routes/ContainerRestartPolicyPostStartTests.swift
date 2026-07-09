@@ -86,6 +86,15 @@ struct ContainerRestartPolicyPostStartTests {
                 #expect(res.status == .noContent)
             }
 
+            // Widen the real backoff the observer will sleep for from the base 100ms to 800ms
+            // (same doubling ContainerRestartState.nextBackoffDelayNanoseconds uses on a real
+            // crash loop) — 100ms left too little margin between confirming the backoff window
+            // and issuing the manual /start below, so a loaded CI runner could occasionally let
+            // the observer win the race legitimately, flaking this assertion.
+            for _ in 0..<3 {
+                _ = await ContainerRestartState.shared.nextBackoffDelayNanoseconds(id: nativeId, ranAtLeast10Seconds: false)
+            }
+
             // Crash: the observer decides to restart and enters its backoff sleep.
             await ContainerExitCodeStore.shared.set(id: nativeId, code: 1)
             let enteredBackoff = try await pollUntil(timeoutSeconds: 2) {
@@ -104,9 +113,9 @@ struct ContainerRestartPolicyPostStartTests {
             }
         }
 
-        // Give the stale observer time to wake from its (100ms) backoff sleep and hit the
-        // generation check — it must abort instead of calling client.start() a third time.
-        try await Task.sleep(nanoseconds: 2_000_000_000)
+        // Give the stale observer time to wake from its (800ms, widened above) backoff sleep and
+        // hit the generation check — it must abort instead of calling client.start() a third time.
+        try await Task.sleep(nanoseconds: 3_000_000_000)
         captureTask.cancel()
 
         #expect(await mock.startCallCount() == 2, "the stale observer must not have called client.start() again")
