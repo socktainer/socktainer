@@ -16,11 +16,25 @@ struct SystemDFQuery: Vapor.Content {
     let type: [String]?
 }
 
+/// Narrow seam for `buildContainerSummaries`' per-container disk usage lookup — kept separate
+/// from `ClientContainerProtocol` (implemented by ~20 test mocks across the suite) so this one
+/// method can be stubbed in tests without touching every other container route's fixtures.
+protocol ContainerDiskUsageProviding: Sendable {
+    func diskUsage(id: String) async throws -> UInt64
+}
+
+struct ContainerClientDiskUsageProvider: ContainerDiskUsageProviding {
+    func diskUsage(id: String) async throws -> UInt64 {
+        try await ContainerClient().diskUsage(id: id)
+    }
+}
+
 struct SystemDFRoute: RouteCollection {
     let imageClient: ClientImageProtocol
     let containerClient: ClientContainerProtocol
     let volumeClient: ClientVolumeProtocol
     let builderClient: ClientBuilderProtocol
+    let diskUsageProvider: ContainerDiskUsageProviding
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.GET, pattern: "/system/df", use: handler)
@@ -47,7 +61,7 @@ struct SystemDFRoute: RouteCollection {
 
         let containerSummaries: [RESTContainerSummary]?
         if includeAll || requestedTypes.contains("container") {
-            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers)
+            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers, diskUsageProvider: diskUsageProvider)
         } else {
             containerSummaries = nil
         }
@@ -170,12 +184,14 @@ extension SystemDFRoute {
         }
     }
 
-    fileprivate static func buildContainerSummaries(containers: [ContainerSnapshot]) async throws -> [RESTContainerSummary] {
-        let containerClient = ContainerClient()
-        return try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
+    fileprivate static func buildContainerSummaries(
+        containers: [ContainerSnapshot],
+        diskUsageProvider: ContainerDiskUsageProviding
+    ) async throws -> [RESTContainerSummary] {
+        try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
             for container in containers {
                 group.addTask {
-                    let size = try await containerClient.diskUsage(id: container.id)
+                    let size = try await diskUsageProvider.diskUsage(id: container.id)
                     return containerSummary(from: container, size: Int64(clamping: size))
                 }
             }
@@ -244,9 +260,10 @@ extension SystemDFRoute {
 
         let networkMode = container.networks.first?.network ?? "default"
         let networkSettings = Dictionary(
-            uniqueKeysWithValues: container.networks.map { attachment in
+            container.networks.map { attachment in
                 (attachment.network, ContainerEndpointSettings.live(attachment))
-            }
+            },
+            uniquingKeysWith: { first, _ in first }
         )
 
         let mounts = container.configuration.mounts.map { mount in
