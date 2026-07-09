@@ -289,6 +289,40 @@ struct ShmSizeBytesTests {
     }
 }
 
+@Suite("ContainerCreateRoute.resolveUser")
+struct ResolveUserTests {
+
+    @Test("An empty request User falls back to the image default, not root")
+    func emptyRequestUserFallsBackToImageDefault() {
+        let user = ContainerCreateRoute.resolveUser(requestUser: "", imageUser: "curl_user")
+        #expect(user == .raw(userString: "curl_user"))
+    }
+
+    @Test("A nil request User falls back to the image default")
+    func nilRequestUserFallsBackToImageDefault() {
+        let user = ContainerCreateRoute.resolveUser(requestUser: nil, imageUser: "curl_user")
+        #expect(user == .raw(userString: "curl_user"))
+    }
+
+    @Test("An explicit request User overrides the image default")
+    func explicitRequestUserOverridesImageDefault() {
+        let user = ContainerCreateRoute.resolveUser(requestUser: "1000:1000", imageUser: "curl_user")
+        #expect(user == .raw(userString: "1000:1000"))
+    }
+
+    @Test("No request User and no image default resolves to root")
+    func noUserAnywhereResolvesToRoot() {
+        let user = ContainerCreateRoute.resolveUser(requestUser: nil, imageUser: nil)
+        #expect(user == .id(uid: 0, gid: 0))
+    }
+
+    @Test("An empty image User is treated the same as no image default")
+    func emptyImageUserResolvesToRoot() {
+        let user = ContainerCreateRoute.resolveUser(requestUser: nil, imageUser: "")
+        #expect(user == .id(uid: 0, gid: 0))
+    }
+}
+
 @Suite("ContainerCreateRoute — ShmSize validation")
 struct ShmSizeValidationTests {
 
