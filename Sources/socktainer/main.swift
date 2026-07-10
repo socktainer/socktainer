@@ -57,4 +57,11 @@ app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.
 try await configure(app)
 
 // Start the app
-try await app.execute()
+try await app.startup()
+do {
+    try openUnixSocketToAllUsers(homeDirectory: homeDirectory)
+} catch {
+    try? await app.asyncShutdown()
+    throw error
+}
+try await app.running?.onStop.get()
