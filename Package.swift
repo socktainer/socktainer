@@ -5,8 +5,8 @@ import PackageDescription
 let buildGitCommit = ProcessInfo.processInfo.environment["BUILD_GIT_COMMIT"] ?? "unspecified"
 let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unspecified"
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
-let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "unspecified"
-let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "unspecified"
+let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "v1.32"
+let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "v1.51"
 let appleContainerVersion = "1.1.0"
 let appleContainerizationVersion = "0.35.0"
 
