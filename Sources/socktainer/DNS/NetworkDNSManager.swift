@@ -27,6 +27,9 @@ actor NetworkDNSManager {
     static let networkLabel = "socktainer.network"
     static let containerPrefix = "socktainer-dns-"
     static let dnsPort = 2054
+    static let sidecarCPUs = 1
+    // Virtualization.framework rejects anything below 200 MiB.
+    static let sidecarMemoryInBytes: UInt64 = 256.mib()
 
     private let appSupportURL: URL
     private let dnsPort: Int
@@ -102,17 +105,31 @@ actor NetworkDNSManager {
         }
     }
 
-    /// Scans for and removes any stale DNS containers left from a previous Socktainer run.
-    /// Should be called once at startup.
-    func cleanupStaleDNSContainers() async {
+    // A recreated sidecar never gets its old IP back (upstream allocates rotating,
+    // never reusing freed addresses), while existing containers keep that IP baked
+    // in resolv.conf — so healthy sidecars must be adopted, never recreated.
+    func adoptOrRemoveSidecarsFromPreviousRun() async {
         let client = ContainerClient()
         guard let containers = try? await client.list() else { return }
         for container in containers {
-            guard container.configuration.labels[Self.roleLabel] == Self.dnsRole else { continue }
-            log.info("[dns-manager] cleaning up stale DNS container: \(container.id)")
+            guard ClientContainerService.isDNSSidecar(container) else { continue }
+            if Self.shouldAdoptSidecar(status: container.status, networkExists: await networkStillExists(for: container)) {
+                log.info("[dns-manager] adopting running DNS container: \(container.id)")
+                continue
+            }
+            log.info("[dns-manager] removing stale DNS container: \(container.id)")
             if container.status == .running { try? await client.stop(id: container.id) }
             try? await client.delete(id: container.id)
         }
+    }
+
+    static func shouldAdoptSidecar(status: RuntimeStatus, networkExists: Bool) -> Bool {
+        status == .running && networkExists
+    }
+
+    private func networkStillExists(for container: ContainerSnapshot) async -> Bool {
+        guard let networkId = container.configuration.labels[Self.networkLabel] else { return false }
+        return (try? await NetworkClient().get(id: networkId)) != nil
     }
 
     // MARK: - Private implementation
@@ -153,6 +170,8 @@ actor NetworkDNSManager {
         )
 
         var config = ContainerConfiguration(id: containerId, image: image.description, process: processConfig)
+        config.resources.cpus = sidecarCPUs
+        config.resources.memoryInBytes = sidecarMemoryInBytes
         config.labels = [
             roleLabel: dnsRole,
             networkLabel: networkId,
