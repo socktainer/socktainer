@@ -28,8 +28,40 @@ permissions:
   contents: read
 
 jobs:
+  # pr-check jobs are mandatory status checks: they must always report a
+  # conclusion. A workflow-level paths filter would leave doc-only PRs stuck
+  # on "Expected" checks, so path detection runs as a job and the heavy
+  # macOS jobs skip via `if:` — a skipped job still reports and satisfies
+  # branch protection.
+  changes:
+    name: detect build-affecting changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The pull_request checkout is the merge commit: HEAD^1 is the base
+          # branch tip, so `git diff HEAD^1 HEAD` lists the PR's changed files.
+          fetch-depth: 2
+      - name: Diff changed files against build-affecting paths
+        id: filter
+        run: |
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          build_paths='^(\.github/workflows/pr-check\.yaml|\.swift-format|Makefile|Package\.swift|Package\.resolved|Sources/|Tests/|pkginstaller/|scripts/|entitlements\.plist)'
+          if echo "$changed" | grep -qE "$build_paths"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: macos-26
     timeout-minutes: 40
     env:
@@ -81,6 +113,8 @@ jobs:
 
   tests-lint-format:
     name: formatters & tests
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: macos-26
     timeout-minutes: 40
     steps:
@@ -124,7 +158,8 @@ jobs:
 
   integration-test:
     name: integration test
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.build == 'true'
     runs-on: macos-26
     timeout-minutes: 40
     env:
