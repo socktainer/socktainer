@@ -217,39 +217,70 @@ struct ClientBuilderService: ClientBuilderProtocol {
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
         let imageConfig = try await image.config(for: builderPlatform).config
-        let processConfig = ProcessConfiguration(
-            executable: "/usr/local/bin/container-builder-shim",
-            arguments: ["--debug", "--vsock", useRosetta ? nil : "--enable-qemu"].compactMap { $0 },
-            environment: imageConfig?.env ?? [],
-            workingDirectory: "/",
-            terminal: false,
-            user: .id(uid: 0, gid: 0)
-        )
-
-        var config = ContainerConfiguration(id: builderContainerId, image: imageDesc, process: processConfig)
-        config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory, defaultCPUs: BuildConfig.defaultCPUs, defaultMemory: BuildConfig.defaultMemory)
-        config.labels = [ResourceLabelKeys.role: ResourceRoleValues.builder]
-        config.mounts = [
-            Filesystem.tmpfs(destination: "/run", options: []),
-            Filesystem.virtiofs(source: exportsMount.path, destination: "/var/lib/container-builder-shim/exports", options: []),
-        ]
-        config.rosetta = useRosetta
 
         guard let defaultNetwork = try await networkClient.builtin else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
-        let networkStatus = defaultNetwork.status
+        let nameserver = IPv4Address(defaultNetwork.status.ipv4Subnet.lower.value + 1).description
 
-        config.networks = [
-            AttachmentConfiguration(network: defaultNetwork.id, options: AttachmentOptions(hostname: builderContainerId))
-        ]
-        let nameserver = IPv4Address(networkStatus.ipv4Subnet.lower.value + 1).description
-        config.dns = ContainerConfiguration.DNSConfiguration(nameservers: [nameserver], domain: nil, searchDomains: [], options: [])
+        let config = try Self.builderContainerConfiguration(
+            builderContainerId: builderContainerId,
+            imageDescription: imageDesc,
+            imageEnv: imageConfig?.env,
+            useRosetta: useRosetta,
+            builderCPUs: builderCPUs,
+            builderMemory: builderMemory,
+            exportsMountPath: exportsMount.path,
+            networkId: defaultNetwork.id,
+            nameserver: nameserver
+        )
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await containerClient.create(configuration: config, options: .default, kernel: kernel)
         try await startBuildKit(containerId: builderContainerId)
         return try await containerClient.get(id: builderContainerId)
+    }
+
+    /// Pure construction of the BuildKit guest's ContainerConfiguration — no real service
+    /// calls, so it's directly unit-testable without a live daemon. Kept separate from
+    /// `createAndStartBuilder` (which resolves the image/network inputs this needs).
+    static func builderContainerConfiguration(
+        builderContainerId: String,
+        imageDescription: ImageDescription,
+        imageEnv: [String]?,
+        useRosetta: Bool,
+        builderCPUs: Int64,
+        builderMemory: String,
+        exportsMountPath: String,
+        networkId: String,
+        nameserver: String
+    ) throws -> ContainerConfiguration {
+        let processConfig = ProcessConfiguration(
+            executable: "/usr/local/bin/container-builder-shim",
+            arguments: ["--debug", "--vsock", useRosetta ? nil : "--enable-qemu"].compactMap { $0 },
+            environment: imageEnv ?? [],
+            workingDirectory: "/",
+            terminal: false,
+            user: .id(uid: 0, gid: 0)
+        )
+
+        var config = ContainerConfiguration(id: builderContainerId, image: imageDescription, process: processConfig)
+        config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory, defaultCPUs: BuildConfig.defaultCPUs, defaultMemory: BuildConfig.defaultMemory)
+        config.labels = [ResourceLabelKeys.role: ResourceRoleValues.builder]
+        config.mounts = [
+            Filesystem.tmpfs(destination: "/run", options: []),
+            Filesystem.virtiofs(source: exportsMountPath, destination: "/var/lib/container-builder-shim/exports", options: []),
+        ]
+        // BuildKit's runc-native snapshotter rbind-mounts a snapshot to read the build
+        // context/Dockerfile, which needs CAP_SYS_ADMIN — root alone doesn't grant it.
+        // Matches apple/container's own builder bootstrap (BuilderStart.swift).
+        config.capAdd = ["ALL"]
+        config.rosetta = useRosetta
+        config.networks = [
+            AttachmentConfiguration(network: networkId, options: AttachmentOptions(hostname: builderContainerId))
+        ]
+        config.dns = ContainerConfiguration.DNSConfiguration(nameservers: [nameserver], domain: nil, searchDomains: [], options: [])
+        return config
     }
 
     private func startBuildKit(containerId: String) async throws {
