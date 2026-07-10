@@ -16,11 +16,42 @@ struct SystemDFQuery: Vapor.Content {
     let type: [String]?
 }
 
+/// Narrow seam for `buildContainerSummaries`' per-container disk usage lookup — kept separate
+/// from `ClientContainerProtocol` (implemented by ~20 test mocks across the suite) so this one
+/// method can be stubbed in tests without touching every other container route's fixtures.
+protocol ContainerDiskUsageProviding: Sendable {
+    func diskUsage(id: String) async throws -> UInt64
+}
+
+struct ContainerClientDiskUsageProvider: ContainerDiskUsageProviding {
+    func diskUsage(id: String) async throws -> UInt64 {
+        try await ContainerClient().diskUsage(id: id)
+    }
+}
+
+/// Narrow seam for the total image-layer disk usage figure, kept separate from
+/// `ClientImageProtocol` for the same reason as `ContainerDiskUsageProviding` above.
+protocol ImageLayerDiskUsageProviding: Sendable {
+    func calculateDiskUsage(activeReferences: Set<String>) async throws -> (
+        totalCount: Int, activeCount: Int, totalSize: UInt64, reclaimableSize: UInt64
+    )
+}
+
+struct ClientImageLayerDiskUsageProvider: ImageLayerDiskUsageProviding {
+    func calculateDiskUsage(activeReferences: Set<String>) async throws -> (
+        totalCount: Int, activeCount: Int, totalSize: UInt64, reclaimableSize: UInt64
+    ) {
+        try await ClientImage.calculateDiskUsage(activeReferences: activeReferences)
+    }
+}
+
 struct SystemDFRoute: RouteCollection {
     let imageClient: ClientImageProtocol
     let containerClient: ClientContainerProtocol
     let volumeClient: ClientVolumeProtocol
     let builderClient: ClientBuilderProtocol
+    let diskUsageProvider: ContainerDiskUsageProviding
+    let imageLayerDiskUsageProvider: ImageLayerDiskUsageProviding
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.GET, pattern: "/system/df", use: handler)
@@ -47,7 +78,7 @@ struct SystemDFRoute: RouteCollection {
 
         let containerSummaries: [RESTContainerSummary]?
         if includeAll || requestedTypes.contains("container") {
-            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers)
+            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers, diskUsageProvider: diskUsageProvider)
         } else {
             containerSummaries = nil
         }
@@ -62,7 +93,7 @@ struct SystemDFRoute: RouteCollection {
         let layersSize: Int64?
         if includeAll || requestedTypes.contains("image") {
             let activeReferences = Set(allContainers.map(\.configuration.image.reference))
-            let usage = try await ClientImage.calculateDiskUsage(activeReferences: activeReferences)
+            let usage = try await imageLayerDiskUsageProvider.calculateDiskUsage(activeReferences: activeReferences)
             layersSize = Int64(clamping: usage.totalSize)
         } else {
             layersSize = nil
@@ -170,12 +201,14 @@ extension SystemDFRoute {
         }
     }
 
-    fileprivate static func buildContainerSummaries(containers: [ContainerSnapshot]) async throws -> [RESTContainerSummary] {
-        let containerClient = ContainerClient()
-        return try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
+    fileprivate static func buildContainerSummaries(
+        containers: [ContainerSnapshot],
+        diskUsageProvider: ContainerDiskUsageProviding
+    ) async throws -> [RESTContainerSummary] {
+        try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
             for container in containers {
                 group.addTask {
-                    let size = try await containerClient.diskUsage(id: container.id)
+                    let size = try await diskUsageProvider.diskUsage(id: container.id)
                     return containerSummary(from: container, size: Int64(clamping: size))
                 }
             }
@@ -244,24 +277,10 @@ extension SystemDFRoute {
 
         let networkMode = container.networks.first?.network ?? "default"
         let networkSettings = Dictionary(
-            uniqueKeysWithValues: container.networks.map { attachment in
-                let endpoint = ContainerEndpointSettings(
-                    IPAMConfig: nil,
-                    Links: nil,
-                    Aliases: nil,
-                    NetworkID: attachment.network,
-                    EndpointID: nil,
-                    Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
-                    IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
-                    IPPrefixLen: nil,
-                    IPv6Gateway: nil,
-                    GlobalIPv6Address: nil,
-                    GlobalIPv6PrefixLen: nil,
-                    MacAddress: nil,
-                    DriverOpts: nil
-                )
-                return (attachment.network, endpoint)
-            }
+            container.networks.map { attachment in
+                (attachment.network, ContainerEndpointSettings.live(attachment))
+            },
+            uniquingKeysWith: { first, _ in first }
         )
 
         let mounts = container.configuration.mounts.map { mount in
@@ -306,7 +325,7 @@ extension SystemDFRoute {
         )
 
         return RESTContainerSummary(
-            Id: container.id,
+            Id: DockerContainerID.hexId(for: container),
             Names: ["/" + container.id],
             Image: container.configuration.image.reference,
             ImageID: container.configuration.image.digest,

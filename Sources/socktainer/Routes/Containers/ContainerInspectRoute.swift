@@ -20,24 +20,6 @@ extension ContainerInspectRoute {
         }
     }
 
-    private static func endpointSettings(networkID: String, gateway: String? = nil, ipAddress: String? = nil) -> ContainerEndpointSettings {
-        ContainerEndpointSettings(
-            IPAMConfig: nil,
-            Links: nil,
-            Aliases: nil,
-            NetworkID: networkID,
-            EndpointID: nil,
-            Gateway: gateway,
-            IPAddress: ipAddress,
-            IPPrefixLen: nil,
-            IPv6Gateway: nil,
-            GlobalIPv6Address: nil,
-            GlobalIPv6PrefixLen: nil,
-            MacAddress: nil,
-            DriverOpts: nil
-        )
-    }
-
     /// Apple Container only reports live network attachments while a
     /// container is running (`container.networks` is hardcoded to `[]` once
     /// stopped), whereas Docker's `NetworkSettings.Networks` reflects the
@@ -50,21 +32,14 @@ extension ContainerInspectRoute {
         if !container.networks.isEmpty {
             return Dictionary(
                 container.networks.map { attachment in
-                    (
-                        attachment.network,
-                        endpointSettings(
-                            networkID: attachment.network,
-                            gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
-                            ipAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address))
-                        )
-                    )
+                    (attachment.network, ContainerEndpointSettings.live(attachment))
                 },
                 uniquingKeysWith: { first, _ in first }
             )
         }
         return Dictionary(
             container.configuration.networks.map { attachment in
-                (attachment.network, endpointSettings(networkID: attachment.network))
+                (attachment.network, ContainerEndpointSettings.configured(networkID: attachment.network))
             },
             uniquingKeysWith: { first, _ in first }
         )
