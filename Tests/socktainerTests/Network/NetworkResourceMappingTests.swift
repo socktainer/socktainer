@@ -13,6 +13,7 @@ private func makeNetworkResource(
     configSubnet: String? = nil,
     statusSubnet: String = "192.168.100.0/24",
     gateway: String = "192.168.100.1",
+    statusIPv6Subnet: String? = nil,
     labels: [String: String] = [:]
 ) throws -> NetworkResource {
     let configuration = try NetworkConfiguration(
@@ -25,7 +26,7 @@ private func makeNetworkResource(
     let status = NetworkStatus(
         ipv4Subnet: try CIDRv4(statusSubnet),
         ipv4Gateway: try IPv4Address(gateway),
-        ipv6Subnet: nil
+        ipv6Subnet: try statusIPv6Subnet.map { try CIDRv6($0) }
     )
     return NetworkResource(configuration: configuration, status: status)
 }
@@ -105,6 +106,20 @@ struct NetworkResourceMappingTests {
         #expect(summary.Internal == false)
         #expect(summary.Attachable == false)
         #expect(summary.Ingress == false)
+    }
+
+    @Test("EnableIPv6 is false when the network has no IPv6 prefix in status")
+    func enableIPv6FalseWhenNoIPv6Status() throws {
+        let resource = try makeNetworkResource(statusIPv6Subnet: nil)
+        let summary = RESTNetworkSummary(networkResource: resource)
+        #expect(summary.EnableIPv6 == false)
+    }
+
+    @Test("EnableIPv6 is true when the network plugin reports an IPv6 prefix in status")
+    func enableIPv6TrueWhenIPv6StatusPresent() throws {
+        let resource = try makeNetworkResource(statusIPv6Subnet: "fd00::/64")
+        let summary = RESTNetworkSummary(networkResource: resource)
+        #expect(summary.EnableIPv6 == true)
     }
 
     @Test("Containers is nil by default (populated separately in list())")
