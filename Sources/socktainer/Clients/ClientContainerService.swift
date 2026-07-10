@@ -100,9 +100,17 @@ struct ClientContainerService: ClientContainerProtocol {
     private let containerClient = ContainerClient()
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
-        let allContainers = try await containerClient.list()
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
         let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
         return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+    }
+
+    static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
+        snapshots.filter { !isDNSSidecar($0) }
+    }
+
+    static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
+        snapshot.configuration.labels[NetworkDNSManager.roleLabel] == NetworkDNSManager.dnsRole
     }
 
     /// Applies parsed Docker container filters to a snapshot list.
@@ -222,12 +230,13 @@ struct ClientContainerService: ClientContainerProtocol {
     func getContainer(id: String) async throws -> ContainerSnapshot? {
         let id = ContainerNameUtility.sanitize(id)
         do {
-            return try await containerClient.get(id: id)
+            let snapshot = try await containerClient.get(id: id)
+            return Self.isDNSSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
             // prefix of one fed back from `docker ps` output; resolve it
             // against the derived IDs of all containers.
-            let allContainers = try await containerClient.list()
+            let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
             switch DockerContainerID.resolve(reference: id, entries: entries) {
             case .match(let nativeId):
@@ -425,7 +434,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = try await containerClient.list()
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
 
         var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
 

@@ -214,7 +214,7 @@ func configure(_ app: Application) async throws {
     if let runningContainers = try? await resumeClient.list() {
         for container in runningContainers where container.status == .running {
             // Skip DNS-sidecar containers — they are internal infrastructure.
-            guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole
+            guard !ClientContainerService.isDNSSidecar(container)
             else { continue }
 
             ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
@@ -229,8 +229,7 @@ func configure(_ app: Application) async throws {
         }
     }
 
-    // Clean up any CoreDNS containers left from a previous run
-    await dnsManager.cleanupStaleDNSContainers()
+    await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
 
     // Reap networks orphaned by a previous run (containers removed, network left behind).
     // Apple Container's vmnet state degrades as stale networks accumulate and eventually
