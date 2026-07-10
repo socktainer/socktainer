@@ -84,6 +84,7 @@ struct ContainerListRouteNetworkSettingsTests {
                 let summaries = try res.content.decode([RESTContainerSummary].self)
                 let endpoint = summaries.first?.NetworkSettings.Networks?["mynet"]
                 #expect(endpoint?.IPAddress == "192.168.64.5")
+                #expect(endpoint?.IPPrefixLen == 24)
                 #expect(endpoint?.GlobalIPv6Address == "fd18:2f24:9eff:1:1c1e:56ff:fe7c:1a2b")
                 #expect(endpoint?.GlobalIPv6PrefixLen == 64)
                 #expect(endpoint?.IPv6Gateway == nil)

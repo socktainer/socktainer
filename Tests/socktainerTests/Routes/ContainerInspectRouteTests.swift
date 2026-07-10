@@ -116,6 +116,7 @@ struct ContainerInspectRouteNetworkSettingsTests {
             try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
                 let inspect = try res.content.decode(RESTContainerInspect.self)
                 #expect(inspect.NetworkSettings.Networks?["mynet"]?.IPAddress == "192.168.64.5")
+                #expect(inspect.NetworkSettings.Networks?["mynet"]?.IPPrefixLen == 24)
             }
         }
     }

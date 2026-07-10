@@ -10,7 +10,7 @@ extension ContainerEndpointSettings {
             EndpointID: nil,
             Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
             IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
-            IPPrefixLen: nil,
+            IPPrefixLen: Int(attachment.ipv4Address.prefix.length),
             IPv6Gateway: nil,
             GlobalIPv6Address: attachment.ipv6Address?.address.description,
             GlobalIPv6PrefixLen: attachment.ipv6Address.map { Int($0.prefix.length) },
