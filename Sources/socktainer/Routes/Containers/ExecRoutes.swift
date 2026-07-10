@@ -65,6 +65,18 @@ actor ExecManager {
     func exitCode(id: String) -> Int32? {
         exitCodes[id]
     }
+
+    // The Docker client reads the exit code with a single GET /exec/{id}/json
+    // right after the start stream closes, so the stream must not close before
+    // the exit code is recorded. Exit-code recording is bounded by the wait
+    // tasks' XPC-stall fallback, so this poll always resolves.
+    func waitForExitCode(id: String, timeoutNanoseconds: UInt64 = 12_000_000_000, pollNanoseconds: UInt64 = 25_000_000) async -> Int32? {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while exitCodes[id] == nil && DispatchTime.now().uptimeNanoseconds < deadline {
+            try? await Task.sleep(nanoseconds: pollNanoseconds)
+        }
+        return exitCodes[id]
+    }
 }
 
 // Request & Response DTOs
@@ -552,6 +564,10 @@ struct ExecRoute: RouteCollection {
 
                     // Keep the exec entry so the client's follow-up
                     // `GET /exec/{id}/json` can read the recorded exit code.
+                    // Pipe EOF can precede the wait() task recording the exit
+                    // code; closing the stream first makes the client's inspect
+                    // read ExitCode nil and report 0 for a failing command.
+                    _ = await ExecManager.shared.waitForExitCode(id: execId)
                     streamContinuation.finish()
                 }
             }
