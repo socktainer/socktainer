@@ -51,6 +51,14 @@ private struct FixedDiskUsageProvider: ContainerDiskUsageProviding {
     func diskUsage(id: String) async throws -> UInt64 { 0 }
 }
 
+private struct FixedImageLayerDiskUsageProvider: ImageLayerDiskUsageProviding {
+    func calculateDiskUsage(activeReferences: Set<String>) async throws -> (
+        totalCount: Int, activeCount: Int, totalSize: UInt64, reclaimableSize: UInt64
+    ) {
+        (0, 0, 0, 0)
+    }
+}
+
 @Suite("SystemDFRoute — container network settings")
 struct SystemDFRouteNetworkSettingsTests {
 
@@ -69,7 +77,8 @@ struct SystemDFRouteNetworkSettingsTests {
                     containerClient: StaticSnapshotClientMock(snapshot: container),
                     volumeClient: EmptyVolumeClient(),
                     builderClient: EmptyBuilderClient(),
-                    diskUsageProvider: FixedDiskUsageProvider()
+                    diskUsageProvider: FixedDiskUsageProvider(),
+                    imageLayerDiskUsageProvider: FixedImageLayerDiskUsageProvider()
                 ))
             try await test(app)
         }
@@ -88,6 +97,22 @@ struct SystemDFRouteNetworkSettingsTests {
                 #expect(res.status == .ok)
                 let body = try res.content.decode(SystemDFResponse.self)
                 #expect(body.Containers?.first?.NetworkSettings.Networks?.keys.contains("dup") == true)
+            }
+        }
+    }
+
+    @Test("Container Id is the canonical hex digest, matching /containers/json and /containers/{id}/json")
+    func containerIdIsCanonicalHexDigest() async throws {
+        let container = try makeContainerSnapshot(nativeId: "my-native-container", ip: "192.168.64.5", network: "mynet", labels: [:], status: .running)
+        let expectedHexId = DockerContainerID.hexId(for: container)
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/system/df") { res async throws in
+                let body = try res.content.decode(SystemDFResponse.self)
+                #expect(body.Containers?.first?.Id == expectedHexId)
+                #expect(
+                    body.Containers?.first?.Id != "my-native-container",
+                    "Id must not leak the raw native id — ContainerListRoute and ContainerInspectRoute both report the hex digest")
+                #expect(body.Containers?.first?.Names == ["/my-native-container"], "Names, unlike Id, is the human-readable native id")
             }
         }
     }

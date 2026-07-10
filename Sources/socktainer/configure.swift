@@ -179,7 +179,8 @@ func configure(_ app: Application) async throws {
     try app.register(
         collection: SystemDFRoute(
             imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient,
-            diskUsageProvider: ContainerClientDiskUsageProvider()
+            diskUsageProvider: ContainerClientDiskUsageProvider(),
+            imageLayerDiskUsageProvider: ClientImageLayerDiskUsageProvider()
         ))
     try app.register(collection: VersionRoute())
 

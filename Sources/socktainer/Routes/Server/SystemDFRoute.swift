@@ -29,12 +29,29 @@ struct ContainerClientDiskUsageProvider: ContainerDiskUsageProviding {
     }
 }
 
+/// Narrow seam for the total image-layer disk usage figure, kept separate from
+/// `ClientImageProtocol` for the same reason as `ContainerDiskUsageProviding` above.
+protocol ImageLayerDiskUsageProviding: Sendable {
+    func calculateDiskUsage(activeReferences: Set<String>) async throws -> (
+        totalCount: Int, activeCount: Int, totalSize: UInt64, reclaimableSize: UInt64
+    )
+}
+
+struct ClientImageLayerDiskUsageProvider: ImageLayerDiskUsageProviding {
+    func calculateDiskUsage(activeReferences: Set<String>) async throws -> (
+        totalCount: Int, activeCount: Int, totalSize: UInt64, reclaimableSize: UInt64
+    ) {
+        try await ClientImage.calculateDiskUsage(activeReferences: activeReferences)
+    }
+}
+
 struct SystemDFRoute: RouteCollection {
     let imageClient: ClientImageProtocol
     let containerClient: ClientContainerProtocol
     let volumeClient: ClientVolumeProtocol
     let builderClient: ClientBuilderProtocol
     let diskUsageProvider: ContainerDiskUsageProviding
+    let imageLayerDiskUsageProvider: ImageLayerDiskUsageProviding
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.GET, pattern: "/system/df", use: handler)
@@ -76,7 +93,7 @@ struct SystemDFRoute: RouteCollection {
         let layersSize: Int64?
         if includeAll || requestedTypes.contains("image") {
             let activeReferences = Set(allContainers.map(\.configuration.image.reference))
-            let usage = try await ClientImage.calculateDiskUsage(activeReferences: activeReferences)
+            let usage = try await imageLayerDiskUsageProvider.calculateDiskUsage(activeReferences: activeReferences)
             layersSize = Int64(clamping: usage.totalSize)
         } else {
             layersSize = nil
@@ -308,7 +325,7 @@ extension SystemDFRoute {
         )
 
         return RESTContainerSummary(
-            Id: container.id,
+            Id: DockerContainerID.hexId(for: container),
             Names: ["/" + container.id],
             Image: container.configuration.image.reference,
             ImageID: container.configuration.image.digest,
