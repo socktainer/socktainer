@@ -217,6 +217,23 @@ struct ContainerTopRouteTests {
         #expect(await runner.commands.isEmpty)
     }
 
+    @Test("a scratch image without a ps binary gets a self-explanatory 500")
+    func missingPsBinary() async throws {
+        struct VmexecError: Error, CustomStringConvertible {
+            var description: String {
+                #"internalError: "vmexec error: internalError: "failed to find target executable ps""#
+            }
+        }
+        let snapshot = try makeContainerSnapshot(nativeId: "scratch-app", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+        let runner = ThrowingGuestCommandRunner(error: VmexecError())
+        try await withTopApp(snapshot: snapshot, runner: runner) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/scratch-app/top") { res async in
+                #expect(res.status == .internalServerError)
+                #expect(res.body.string.contains("requires a ps binary inside the container image"))
+            }
+        }
+    }
+
     @Test("pid snapshot failure surfaces as 500 with moby's message shape")
     func pidSnapshotFailure() async throws {
         let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
@@ -324,6 +341,14 @@ private struct GuestRunResult {
 
     static func ok(_ stdout: String) -> GuestRunResult { GuestRunResult(exitCode: 0, stdout: stdout, stderr: "") }
     static func failed(_ stderr: String) -> GuestRunResult { GuestRunResult(exitCode: 1, stdout: "", stderr: stderr) }
+}
+
+private struct ThrowingGuestCommandRunner: GuestCommandRunning {
+    let error: Error
+
+    func run(containerId: String, command: [String]) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        throw error
+    }
 }
 
 private actor RecordingGuestCommandRunner: GuestCommandRunning {

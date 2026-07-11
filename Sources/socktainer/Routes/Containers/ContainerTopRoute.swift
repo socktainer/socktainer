@@ -155,6 +155,12 @@ struct ContainerTopRoute: RouteCollection {
         output.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
     }
 
+    /// vminitd reports a missing executable only as text inside a nested
+    /// internalError chain — string matching is the sole available signal.
+    static func isMissingPsBinary(_ error: Error) -> Bool {
+        String(describing: error).contains("failed to find target executable ps")
+    }
+
     /// moby runs `ps <args> -q<pids>` and retries without `-q` when the args
     /// conflict with it (e.g. BSD `f`); the parser's pid filter covers both paths.
     static func runPs(runner: GuestCommandRunning, containerId: String, command: [String], pids: [Int]) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
@@ -215,6 +221,14 @@ struct ContainerTopRoute: RouteCollection {
                 throw abort
             } catch {
                 req.logger.error("Failed to run top in container \(reference): \(error)")
+                if isMissingPsBinary(error) {
+                    return Response(
+                        status: .internalServerError,
+                        body: .init(
+                            string:
+                                "docker top requires a ps binary inside the container image, and \(reference)'s image has none (scratch/distroless): socktainer runs ps in the guest, it cannot inspect the VM from the host like Docker does"
+                        ))
+                }
                 return Response(status: .internalServerError, body: .init(string: "Failed to run ps in container: \(error)"))
             }
         }
