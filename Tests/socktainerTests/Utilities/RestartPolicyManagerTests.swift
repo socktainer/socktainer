@@ -33,10 +33,12 @@ struct RestartPolicyManagerShouldRestartTests {
         #expect(RestartPolicyManager.shouldRestart(policy: policy, exitCode: 1, attempt: 50, hasBeenManuallyStopped: false))
     }
 
-    @Test("always restarts even after an explicit stop/kill, matching moby's documented gotcha")
-    func alwaysIgnoresManualStop() {
-        let policy = RestartPolicy(Name: "always", MaximumRetryCount: nil)
-        #expect(RestartPolicyManager.shouldRestart(policy: policy, exitCode: 0, attempt: 1, hasBeenManuallyStopped: true))
+    @Test("a manual stop suppresses every policy, like moby's restart-manager cancel")
+    func manualStopSuppressesEveryPolicy() {
+        for name in ["always", "unless-stopped", "on-failure"] {
+            let policy = RestartPolicy(Name: name, MaximumRetryCount: nil)
+            #expect(!RestartPolicyManager.shouldRestart(policy: policy, exitCode: 1, attempt: 1, hasBeenManuallyStopped: true), Comment(rawValue: name))
+        }
     }
 
     @Test("unless-stopped restarts regardless of exit code when not manually stopped")
@@ -69,12 +71,6 @@ struct RestartPolicyManagerShouldRestartTests {
     func onFailureUnboundedWithoutMax() {
         let policy = RestartPolicy(Name: "on-failure", MaximumRetryCount: nil)
         #expect(RestartPolicyManager.shouldRestart(policy: policy, exitCode: 1, attempt: 1000, hasBeenManuallyStopped: false))
-    }
-
-    @Test("on-failure restarts on a non-zero exit even after an explicit stop/kill — it only cares about the exit code")
-    func onFailureIgnoresManualStop() {
-        let policy = RestartPolicy(Name: "on-failure", MaximumRetryCount: nil)
-        #expect(RestartPolicyManager.shouldRestart(policy: policy, exitCode: 1, attempt: 1, hasBeenManuallyStopped: true))
     }
 
     @Test("Unknown or 'no' policy names never restart")

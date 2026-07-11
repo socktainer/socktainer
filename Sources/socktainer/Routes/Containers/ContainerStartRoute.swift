@@ -199,8 +199,11 @@ extension ContainerStartRoute {
 
             let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let nextAttemptNumber = await ContainerRestartState.shared.count(id: nativeId) + 1
+            // The armed policy is the immutable create-time label; a docker update landing
+            // while the container runs must govern THIS exit, so the override is read now.
+            let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
-                restartPolicy.map {
+                effectivePolicy.map {
                     RestartPolicyManager.shouldRestart(
                         policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
                 } ?? false
@@ -230,6 +233,21 @@ extension ContainerStartRoute {
             guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
                 await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
                 logger.info("restart-policy: aborting stale restart for \(nativeId) — a newer lifecycle has taken over")
+                return
+            }
+            // A docker update or docker stop landing during the backoff sleep (up to
+            // 60s) must cancel the restart decided under the old inputs.
+            let policyAfterBackoff = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
+            let stoppedDuringBackoff = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
+            let stillWantsRestart =
+                policyAfterBackoff.map {
+                    RestartPolicyManager.shouldRestart(
+                        policy: $0, exitCode: code, attempt: nextAttemptNumber,
+                        hasBeenManuallyStopped: explicitlyStopped || stoppedDuringBackoff)
+                } ?? false
+            guard stillWantsRestart else {
+                await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
+                logger.info("restart-policy: aborting restart for \(nativeId) — policy or stop state changed during backoff")
                 return
             }
             // Record the attempt only once we're actually about to restart — a concurrent

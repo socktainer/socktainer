@@ -17,6 +17,10 @@ enum RestartPolicyManager {
             return "can't create 'AutoRemove' container with restart policy"
         }
 
+        return validatePolicy(policy)
+    }
+
+    static func validatePolicy(_ policy: RestartPolicy) -> String? {
         switch policy.Name {
         case "always", "unless-stopped", "no":
             if let maxRetryCount = policy.MaximumRetryCount, maxRetryCount != 0 {
@@ -39,14 +43,15 @@ enum RestartPolicyManager {
         }
     }
 
-    /// `always` restarts even after an explicit stop/kill; only `unless-stopped` honors
-    /// `hasBeenManuallyStopped`. Matches moby's documented gotcha — restartmanager.go, v28.5.2.
+    /// A manual stop suppresses every policy: moby's stop path cancels the
+    /// RestartManager (`ExitOnNext` → `Cancel`), which is what our transient
+    /// stop flag stands in for. moby's persistent flag only gates
+    /// `unless-stopped` across daemon restarts — a feature we don't have.
     static func shouldRestart(policy: RestartPolicy, exitCode: Int32, attempt: Int, hasBeenManuallyStopped: Bool) -> Bool {
+        guard !hasBeenManuallyStopped else { return false }
         switch policy.Name {
-        case "always":
+        case "always", "unless-stopped":
             return true
-        case "unless-stopped":
-            return !hasBeenManuallyStopped
         case "on-failure":
             guard exitCode != 0 else { return false }
             let maxRetries = policy.MaximumRetryCount ?? 0

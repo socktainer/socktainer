@@ -238,6 +238,38 @@ struct ContainerRestartPolicyPostStartTests {
         await ContainerRestartState.shared.reset(id: nativeId)
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
+
+    @Test("A manual stop keeps an always container down, like moby's restart-manager cancel")
+    func manualStopSuppressesAlwaysPolicy() async throws {
+        let nativeId = "restart-always-stop-ctr"
+        let ip = "192.168.65.80"
+        let network = "myapp_default"
+
+        let mock = RestartMock(snapshot: try makeSnapshot(nativeId: nativeId, ip: ip, network: network, restartPolicyName: "always"))
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        // /stop marks the container explicitly-stopped before the exit lands.
+        await ContainerRestartState.shared.markExplicitlyStopped(id: nativeId)
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: 0)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        #expect(await mock.startCallCount() == 1, "the observer must not restart a manually stopped always container")
+        #expect(await ContainerRestartState.shared.count(id: nativeId) == 0)
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
 }
 
 private actor EventCollector {

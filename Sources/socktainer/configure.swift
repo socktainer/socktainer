@@ -35,6 +35,7 @@ func configure(_ app: Application) async throws {
     }
 
     let containerClient = ClientContainerService()
+    await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
@@ -82,7 +83,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerTopRoute())
     try app.register(collection: ContainerUnpauseRoute())
-    try app.register(collection: ContainerUpdateRoute())
+    try app.register(collection: ContainerUpdateRoute(client: containerClient))
     try app.register(collection: ContainerWaitRoute(client: containerClient))
 
     // /images
