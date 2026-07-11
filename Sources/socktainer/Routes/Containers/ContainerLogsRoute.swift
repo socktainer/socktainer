@@ -33,8 +33,8 @@ extension ContainerLogsRoute {
             let fileHandle = boot ? fhs[1] : fhs[0]
             // Create a streaming body
             // `follow=1` means tail like
-            let follow = (try? req.query.get(Bool.self, at: "follow")) ?? false
-            let timestamps = (try? req.query.get(Bool.self, at: "timestamps")) ?? false
+            let follow = MobyBool.queryValue(req.query["follow"] as String?)
+            let timestamps = MobyBool.queryValue(req.query["timestamps"] as String?)
 
             let body = Response.Body { writer in
                 Task.detached {

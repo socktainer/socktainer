@@ -90,9 +90,11 @@ struct ClientNetworkService: ClientNetworkProtocol {
         }
         return allNetworks.filter { network in
             var excludedReason: String? = nil
-            if let danglingArr = filtersDict["dangling"], let danglingStr = danglingArr.first {
+            if let danglingArr = filtersDict["dangling"], let danglingStr = danglingArr.first,
+                let wantsDangling = MobyBool.parse(danglingStr)
+            {
                 let isDangling = (network.Containers == nil || network.Containers?.isEmpty == true)
-                if (danglingStr == "true" && !isDangling) || (danglingStr == "false" && isDangling) {
+                if wantsDangling != isDangling {
                     excludedReason = "dangling mismatch"
                 }
             }

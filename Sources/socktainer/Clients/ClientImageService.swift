@@ -386,7 +386,7 @@ struct ClientImageService: ClientImageProtocol {
 
                 if let danglingFilters = filters["dangling"] {
                     if let danglingValue = danglingFilters.first {
-                        let shouldBeDangling = (danglingValue == "true" || danglingValue == "1")
+                        let shouldBeDangling = MobyBool.parse(danglingValue) ?? false
                         if shouldBeDangling {
                             shouldDelete = isDangling
                         } else {
