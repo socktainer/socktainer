@@ -13,7 +13,7 @@ struct ContainerStatsRoute: RouteCollection {
             throw Abort(.badRequest, reason: "Missing container ID")
         }
 
-        let stream = (req.query["stream"] as String?) != "false"
+        let stream = MobyBool.queryValue(req.query["stream"] as String?, defaultingTo: true)
         let client = ContainerClient()
 
         // Verify container exists before starting to stream

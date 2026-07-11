@@ -535,7 +535,7 @@ public struct ConnectionHijackingMiddleware: AsyncMiddleware {
 
             // Determine content type based on TTY setting if not already set
             if headers.first(name: "Content-Type") == nil {
-                let ttyEnabled = request.query["tty"] == "true" || request.query["Tty"] == "true"
+                let ttyEnabled = MobyBool.queryValue(request.query["tty"]) || MobyBool.queryValue(request.query["Tty"])
                 let contentType = ttyEnabled ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
 
                 headers.replaceOrAdd(name: "Content-Type", value: contentType)
