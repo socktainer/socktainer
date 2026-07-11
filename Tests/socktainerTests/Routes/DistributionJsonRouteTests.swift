@@ -7,11 +7,18 @@ import VaporTesting
 
 @testable import socktainer
 
-private struct FakeDistributionProvider: DistributionInspectProviding {
+private actor FakeDistributionProvider: DistributionInspectProviding {
     let result: RESTDistributionInspect?
     let error: Error?
+    private(set) var receivedReference: String?
+
+    init(result: RESTDistributionInspect?, error: Error?) {
+        self.result = result
+        self.error = error
+    }
 
     func inspect(reference: String, authentication: Authentication?) async throws -> RESTDistributionInspect {
+        receivedReference = reference
         if let error { throw error }
         return result!
     }
@@ -58,11 +65,13 @@ struct DistributionJsonRouteTests {
 
     @Test("slash-qualified references reach the provider intact")
     func slashQualifiedReference() async throws {
-        try await withDistributionApp(FakeDistributionProvider(result: alpineInspect, error: nil)) { app in
+        let provider = FakeDistributionProvider(result: alpineInspect, error: nil)
+        try await withDistributionApp(provider) { app in
             try await app.testing().test(.GET, "/v1.51/distribution/public.ecr.aws/docker/library/alpine/json") { res async in
                 #expect(res.status == .ok)
             }
         }
+        #expect(await provider.receivedReference == "public.ecr.aws/docker/library/alpine")
     }
 
     @Test("registry 404 answers manifest unknown")
