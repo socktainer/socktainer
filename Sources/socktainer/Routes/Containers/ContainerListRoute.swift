@@ -70,24 +70,10 @@ extension ContainerListRoute {
                 let networkMode = container.networks.first?.network ?? "default"
 
                 let networkSettings = Dictionary(
-                    uniqueKeysWithValues: container.networks.map { attachment in
-                        let endpoint = ContainerEndpointSettings(
-                            IPAMConfig: nil,
-                            Links: nil,
-                            Aliases: nil,
-                            NetworkID: attachment.network,
-                            EndpointID: nil,
-                            Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
-                            IPAddress: stripSubnetFromIP(String(describing: attachment.ipv4Address)),
-                            IPPrefixLen: nil,
-                            IPv6Gateway: nil,
-                            GlobalIPv6Address: nil,
-                            GlobalIPv6PrefixLen: nil,
-                            MacAddress: nil,
-                            DriverOpts: nil
-                        )
-                        return (attachment.network, endpoint)
-                    }
+                    container.networks.map { attachment in
+                        (attachment.network, ContainerEndpointSettings.live(attachment))
+                    },
+                    uniquingKeysWith: { first, _ in first }
                 )
 
                 let mounts = container.configuration.mounts.map { mount in

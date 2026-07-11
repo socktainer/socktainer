@@ -30,7 +30,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 // If CoreDNS shows up as an attached container, docker compose down
                 // reports "Resource is still in use" and skips the DELETE /networks/{id}
                 // call — preventing our cleanup hook from firing.
-                guard container.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole else {
+                guard !ClientContainerService.isDNSSidecar(container) else {
                     continue
                 }
                 for attachment in container.networks {
@@ -182,6 +182,9 @@ extension RESTNetworkSummary {
             networkResource.configuration.ipv4Subnet.map { String(describing: $0) }
             ?? String(describing: networkResource.status.ipv4Subnet)
         let gateway = String(describing: networkResource.status.ipv4Gateway)
+        // Non-nil once the network plugin has assigned an IPv6 prefix (vmnet NAT66
+        // auto-prefix, or an explicit one from `container network create --subnet-v6`).
+        let hasIPv6Prefix = networkResource.status.ipv6Subnet != nil
 
         let createdTimestamp = AppleContainerTimestampResolver.iso8601Timestamp(
             AppleContainerTimestampResolver.networkCreationDate(networkResource)
@@ -194,11 +197,7 @@ extension RESTNetworkSummary {
             Scope: "local",  // We will always use "local", other modes are not available
             Driver: driver,
             EnableIPv4: true,
-            // NOTE: IPv6 is not used in Apple container
-            //       https://github.com/apple/container/issues/460
-            EnableIPv6: false,
-            // NOTE: IPv6 is not used in Apple container
-            //       https://github.com/apple/container/issues/460
+            EnableIPv6: hasIPv6Prefix,
             // NOTE: Apple container has no mechanism to set networks as internal
             Internal: false,
             Attachable: false,

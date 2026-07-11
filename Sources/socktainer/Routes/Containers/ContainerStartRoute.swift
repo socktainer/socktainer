@@ -337,7 +337,7 @@ extension ContainerStartRoute {
 
         if let dnsServer,
             let snapshot = startedSnapshot,
-            snapshot.configuration.labels[NetworkDNSManager.roleLabel] != NetworkDNSManager.dnsRole
+            !ClientContainerService.isDNSSidecar(snapshot)
         {
             // Register only on a network that has a DNS forwarder sidecar — same reserved set
             // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
