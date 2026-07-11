@@ -72,7 +72,9 @@ extension ContainerInspectRoute {
                 .flatMap { try? JSONDecoder().decode(HealthcheckConfig.self, from: $0) }
 
             // Round-trips the label the create route persisted; defaults to "no", matching moby.
-            let restartPolicy = RestartPolicyManager.decode(from: container.configuration.labels) ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
+            let restartPolicy =
+                await RestartPolicyManager.effectivePolicy(hexId: DockerContainerID.hexId(for: container), labels: container.configuration.labels)
+                ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
 
             let containerConfig: ContainerConfig = ContainerConfig(
                 Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist

@@ -40,6 +40,7 @@ extension ContainerDeleteRoute {
                 await ContainerInfoCache.shared.remove(id: id)
                 // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
                 await ContainerRestartState.shared.reset(id: eventName)
+                await RestartPolicyOverrideStore.shared.remove(id: eventId)
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(

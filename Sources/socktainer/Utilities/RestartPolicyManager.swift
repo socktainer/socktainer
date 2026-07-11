@@ -17,6 +17,10 @@ enum RestartPolicyManager {
             return "can't create 'AutoRemove' container with restart policy"
         }
 
+        return validatePolicy(policy)
+    }
+
+    static func validatePolicy(_ policy: RestartPolicy) -> String? {
         switch policy.Name {
         case "always", "unless-stopped", "no":
             if let maxRetryCount = policy.MaximumRetryCount, maxRetryCount != 0 {

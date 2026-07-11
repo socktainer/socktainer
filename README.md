@@ -370,6 +370,13 @@ Ownership rules:
   - An explicit `docker stop` / `docker kill` only suppresses the next auto-restart for `unless-stopped`. `always` restarts the container anyway, and `on-failure` restarts whenever the exit code is non-zero — regardless of whether a human or a crash caused the exit. Use `unless-stopped` if you don't want a manual stop to be overridden.
   - **Caveat:** the policy is enforced only by the running `socktainer` process — it does not survive a `socktainer` restart or host reboot, unlike real Docker's daemon-level reconciliation. `always`/`unless-stopped` containers are not automatically resumed on `socktainer` startup.
 
+- `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
+- `docker save` and `docker export` currently fail: Apple's Containerization `ContentStore` keeps image metadata but not the underlying content blobs, so there is nothing to export ([platform limitation](https://github.com/apple/containerization)). This also breaks the `docker save | docker load` round-trip.
+- `docker pause` / `docker unpause` are **not supported** — there is no freezer/checkpoint equivalent for Apple Container VMs.
+- `docker network connect` / `disconnect` are accepted as **no-ops**: Virtualization.framework offers no NIC hotplug and Apple Container has no post-create attach API, so network membership is fixed at container create. Containers on user-created networks reach each other by name through socktainer's DNS, which covers the common Compose use.
+- **Static container IPs** (`--ip`, IPAM per-container config) cannot be honored: Apple Container assigns addresses from a rotating allocator with no way to request a specific one. Name-based discovery via socktainer DNS is the supported alternative; addresses stay stable for a container's lifetime.
+- Not yet implemented (endpoints answer an explicit error instead of pretending): `docker commit`, `docker diff`, `docker search`, `docker top`, and `GET /distribution/{name}/json`.
+
 ### Docker Compose — inter-service DNS
 
 Socktainer registers service names in its DNS server so Compose services can

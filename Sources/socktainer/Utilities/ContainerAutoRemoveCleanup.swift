@@ -35,5 +35,6 @@ enum ContainerAutoRemoveCleanup {
                 ))
         }
         await ContainerInfoCache.shared.remove(id: hexId)
+        await RestartPolicyOverrideStore.shared.remove(id: hexId)
     }
 }
