@@ -139,6 +139,23 @@ struct ContainerUpdateRouteTests {
         }
     }
 
+    @Test("an explicit PidsLimit of 0 (unlimited) counts as a resource request, not an empty update")
+    func pidsLimitZeroIsARequest() async throws {
+        let id = "update-pids-\(UUID().uuidString.prefix(8))"
+        try await withUpdateApp(makeSnapshot(id: id)) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/\(id)/update",
+                beforeRequest: { req in
+                    try req.content.encode(["PidsLimit": Int64(0)])
+                }
+            ) { res async throws in
+                #expect(res.status == .badRequest)
+                let body = try res.content.decode(UpdateErrorBody.self)
+                #expect(body.reason.contains("PidsLimit"))
+            }
+        }
+    }
+
     @Test("a policy update alongside resource fields succeeds with a warning")
     func policyWithResourcesWarns() async throws {
         let id = "update-warn-\(UUID().uuidString.prefix(8))"

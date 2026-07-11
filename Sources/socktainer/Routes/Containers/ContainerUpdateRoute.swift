@@ -89,7 +89,8 @@ struct ContainerUpdateRoute: RouteCollection {
         if let value = body.CpuPeriod, value != 0 { fields.append("CpuPeriod") }
         if let value = body.CpuQuota, value != 0 { fields.append("CpuQuota") }
         if let value = body.CpusetCpus, !value.isEmpty { fields.append("CpusetCpus") }
-        if let value = body.PidsLimit, value != 0 { fields.append("PidsLimit") }
+        // PidsLimit is moby's one pointer resource: 0/-1 mean unlimited, null means no change.
+        if body.PidsLimit != nil { fields.append("PidsLimit") }
         if let value = body.BlkioWeight, value != 0 { fields.append("BlkioWeight") }
         return fields
     }
