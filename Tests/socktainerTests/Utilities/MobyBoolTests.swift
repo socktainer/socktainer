@@ -22,16 +22,17 @@ struct MobyBoolTests {
     func queryDefaulting() {
         #expect(MobyBool.queryValue(nil, defaultingTo: true))
         #expect(!MobyBool.queryValue(nil, defaultingTo: false))
+        #expect(!MobyBool.queryValue("", defaultingTo: true))
         #expect(!MobyBool.queryValue("0", defaultingTo: true))
         #expect(MobyBool.queryValue("1", defaultingTo: false))
     }
 
-    @Test("query parameters follow moby's httputils.BoolValue: only a few spellings are false")
+    @Test("query parameters follow moby's httputils.BoolValue: trimmed, only a few spellings are false")
     func queryParsing() {
-        for value in [nil, "", "0", "no", "false", "FALSE", "none", "No"] as [String?] {
+        for value in [nil, "", "0", "no", "false", "FALSE", "none", "No", " false", " 0 "] as [String?] {
             #expect(!MobyBool.queryValue(value), "\(value ?? "nil")")
         }
-        for value in ["1", "true", "t", "yes", "anything-else", " false"] {
+        for value in ["1", "true", "t", "yes", "anything-else"] {
             #expect(MobyBool.queryValue(value), "\(value)")
         }
     }

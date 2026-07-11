@@ -11,11 +11,11 @@ enum MobyBool {
         }
     }
 
-    /// Query parameters: moby's httputils.BoolValue. Lowercased, false only
-    /// for a small set of spellings — any other non-empty value is true
-    /// (so `tty=1` and even `tty=yes-please` are true, exactly like dockerd).
+    /// Query parameters: moby's httputils.BoolValue. Trimmed and lowercased,
+    /// false only for a small set of spellings — any other non-empty value is
+    /// true (so `tty=1` and even `tty=yes-please` are true, exactly like dockerd).
     static func queryValue(_ value: String?) -> Bool {
-        !["", "0", "no", "false", "none"].contains((value ?? "").lowercased())
+        !["", "0", "no", "false", "none"].contains((value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     /// moby's httputils.BoolValueOrDefault: an absent parameter keeps the
