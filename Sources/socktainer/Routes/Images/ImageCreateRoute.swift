@@ -54,23 +54,15 @@ extension ImageCreateRoute {
             let pulledRef = "\(image)\(decodedTag.isEmpty ? "" : ":\(decodedTag)")"
             response.body = .init(stream: { writer in
                 Task {
-                    do {
-                        for try await progress in progressStream {
-                            let json = "{\"status\": \"\(progress.replacingOccurrences(of: "\"", with: "\\\""))\"}"  // Docker style
-                            _ = writer.write(.buffer(ByteBuffer(string: json + "\n")))
-                        }
-                        _ = writer.write(.end)
-                        if let broadcaster = app.storage[EventBroadcasterKey.self] {
-                            // moby's pull event uses the reference as Actor.ID and the
-                            // image name as the `name` attribute (no `image` key).
-                            await broadcaster.broadcast(
-                                DockerEvent.make(
-                                    type: "image", action: "pull", actorID: pulledRef,
-                                    attributes: ["name": image]))
-                        }
-                    } catch {
-                        _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
-                        _ = writer.write(.error(error))
+                    let progressId = pulledRef.split(separator: "/").last.map(String.init) ?? pulledRef
+                    await DockerProgressFrame.pipe(progressStream, id: progressId, to: writer) {
+                        guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
+                        // moby's pull event uses the reference as Actor.ID and the
+                        // image name as the `name` attribute (no `image` key).
+                        await broadcaster.broadcast(
+                            DockerEvent.make(
+                                type: "image", action: "pull", actorID: pulledRef,
+                                attributes: ["name": image]))
                     }
                 }
             })

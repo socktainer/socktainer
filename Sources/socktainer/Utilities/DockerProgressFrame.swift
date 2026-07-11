@@ -76,4 +76,29 @@ enum DockerProgressFrame {
         _ = writer.write(.end)
     }
 
+    /// Pull variant: byte counts become a single aggregate progress bar
+    /// keyed on `id` (apple/container reports no per-layer attribution).
+    static func pipe(
+        _ progress: AsyncThrowingStream<PullProgress, Error>,
+        id: String,
+        to writer: any BodyStreamWriter,
+        onSuccess: (() async -> Void)? = nil
+    ) async {
+        do {
+            for try await update in progress {
+                switch update {
+                case .message(let message):
+                    write(status(message), to: writer)
+                case .downloading(let current, let total):
+                    write(Self.progress(status: "Downloading", id: id, current: current, total: total), to: writer)
+                case .extracting(let current, let total):
+                    write(Self.progress(status: "Extracting", id: id, current: current, total: total), to: writer)
+                }
+            }
+            await onSuccess?()
+        } catch {
+            write(Self.error(String(describing: error)), to: writer)
+        }
+        _ = writer.write(.end)
+    }
 }

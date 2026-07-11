@@ -134,7 +134,7 @@ private struct DanglingImageDeleteMock: ClientImageProtocol {
         ImageDeletionResult(untagged: untagged, digest: "sha256:abc123", deletedDigest: "sha256:abc123")
     }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
-        -> AsyncThrowingStream<String, Error>
+        -> AsyncThrowingStream<PullProgress, Error>
     { AsyncThrowingStream { $0.finish() } }
     func push(reference: String, platform: Platform?, logger: Logger) async throws
         -> AsyncThrowingStream<String, Error>
@@ -155,7 +155,7 @@ private struct ImageDeleteMock: ClientImageProtocol {
         ImageDeletionResult(untagged: "docker.io/library/\(id)", digest: digest, deletedDigest: nil)
     }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
-        -> AsyncThrowingStream<String, Error>
+        -> AsyncThrowingStream<PullProgress, Error>
     {
         AsyncThrowingStream { $0.finish() }
     }

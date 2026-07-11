@@ -436,7 +436,7 @@ private struct StubImageClient: ClientImageProtocol {
         ImageDeletionResult(untagged: id, digest: "sha256:abc", deletedDigest: nil)
     }
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
-        -> AsyncThrowingStream<String, Error>
+        -> AsyncThrowingStream<PullProgress, Error>
     {
         AsyncThrowingStream { $0.finish() }
     }
