@@ -603,6 +603,7 @@ struct ClientImageService: ClientImageProtocol {
 
         if hasOCILayout {
             ociLayoutPath = extractedPath
+            try OCILayoutPruner.pruneManifestsWithMissingBlobs(at: ociLayoutPath, logger: logger)
         } else {
             ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
             try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
@@ -613,13 +614,31 @@ struct ClientImageService: ClientImageProtocol {
             )
         }
 
-        let images = try await imageStore.load(
-            from: ociLayoutPath,
-            progress: { progressEvents in
-                for event in progressEvents {
-                    logger.debug("Load progress event: \(event.event) = \(event.value)")
-                }
-            })
+        // Apple's ImageStore.load imports every index.json descriptor inside ONE
+        // ingest session; descriptors sharing a blob (multi-tag saves, images on a
+        // common base layer) then collide with "File exists" in the ingest dir.
+        // Loading one descriptor at a time gives each import a fresh session.
+        let indexURL = ociLayoutPath.appendingPathComponent("index.json")
+        var index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
+        let descriptors = index.manifests
+
+        guard !descriptors.isEmpty else {
+            throw OCILayoutPruner.PruneError.nothingLoadable
+        }
+
+        var images: [Containerization.Image] = []
+        for descriptor in descriptors {
+            index.manifests = [descriptor]
+            try JSONEncoder().encode(index).write(to: indexURL)
+            images +=
+                try await imageStore.load(
+                    from: ociLayoutPath,
+                    progress: { progressEvents in
+                        for event in progressEvents {
+                            logger.debug("Load progress event: \(event.event) = \(event.value)")
+                        }
+                    })
+        }
 
         let loadedImages = images.map { $0.reference }
         for image in loadedImages {
@@ -632,14 +651,6 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
-
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-        let exportPath = tempDir.appendingPathComponent("oci-layout")
-        try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
-
         var resolvedRefs: [String] = []
 
         for reference in references {
@@ -653,9 +664,21 @@ struct ClientImageService: ClientImageProtocol {
             }
         }
 
+        return try await exportTarball(resolvedReferences: resolvedRefs, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: logger)
+    }
+
+    func exportTarball(resolvedReferences: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let exportPath = tempDir.appendingPathComponent("oci-layout")
+        try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
+
         do {
             try await imageStore.save(
-                references: resolvedRefs,
+                references: resolvedReferences,
                 out: exportPath,
                 platform: platform
             )
@@ -678,7 +701,7 @@ struct ClientImageService: ClientImageProtocol {
         let dockerManifests = try await ContainerImageUtility.convertOCIToDockerTar(
             ociLayoutPath: exportPath,
             dockerFormatPath: dockerFormatPath,
-            resolvedRefs: resolvedRefs,
+            resolvedRefs: resolvedReferences,
             logger: logger
         )
 
@@ -689,7 +712,7 @@ struct ClientImageService: ClientImageProtocol {
 
         try ArchiveUtility.create(tarPath: tarballPath, from: dockerFormatPath)
 
-        logger.info("Successfully exported \(references.count) image(s) to tarball in Docker format")
+        logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
         return tarballPath
     }
