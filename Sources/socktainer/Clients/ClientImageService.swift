@@ -22,7 +22,7 @@ protocol ClientImageProtocol: Sendable {
     func list(includeSystemImages: Bool) async throws -> [ClientImage]
     func delete(id: String) async throws -> ImageDeletionResult
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
-        String, Error
+        PullProgress, Error
     >
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
@@ -40,6 +40,46 @@ extension ClientImageProtocol {
 
 enum ClientImageError: Error {
     case notFound(id: String)
+}
+
+enum PullProgress: Sendable {
+    case message(String)
+    case downloading(current: Int64, total: Int64)
+    case extracting(current: Int64, total: Int64)
+}
+
+actor PullByteCounter {
+    private var current: Int64 = 0
+    private var total: Int64 = 0
+    private var lastEmit: ContinuousClock.Instant?
+    private let emitInterval: Duration
+
+    init(emitInterval: Duration = .milliseconds(100)) {
+        self.emitInterval = emitInterval
+    }
+
+    func apply(_ events: [ProgressUpdateEvent]) -> (current: Int64, total: Int64)? {
+        var changed = false
+        for event in events {
+            switch event {
+            case .addSize(let value): current += value
+            case .setSize(let value): current = value
+            case .addTotalSize(let value): total += value
+            case .setTotalSize(let value): total = value
+            default: continue
+            }
+            changed = true
+        }
+        guard changed, shouldEmitNow() else { return nil }
+        lastEmit = .now
+        return (current, total)
+    }
+
+    private func shouldEmitNow() -> Bool {
+        if total > 0 && current >= total { return true }
+        guard let lastEmit else { return true }
+        return ContinuousClock.Instant.now - lastEmit >= emitInterval
+    }
 }
 
 /// Seam that abstracts the static `ClientImage` API for testing.
@@ -192,7 +232,7 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
-        String, Error
+        PullProgress, Error
     > {
         let reference = try {
             guard let tag, !tag.isEmpty else {
@@ -213,9 +253,10 @@ struct ClientImageService: ClientImageProtocol {
 
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
-            continuation.yield("Trying to pull \(reference)")
+            continuation.yield(.message("Trying to pull \(reference)"))
             Task {
                 do {
+                    let byteCounter = PullByteCounter()
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
@@ -225,30 +266,29 @@ struct ClientImageService: ClientImageProtocol {
                                 switch event {
                                 case .setDescription(let description),
                                     .setSubDescription(let description),
-                                    .setItemsName(let description),
                                     .custom(let description):
-                                    continuation.yield(description)
-                                case .addTotalSize(let size),
-                                    .setTotalSize(let size),
-                                    .addSize(let size),
-                                    .setSize(let size):
-                                    let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-                                    continuation.yield("Downloaded \(humanReadableSize)")
-                                case .addTotalItems(let items),
-                                    .setTotalItems(let items),
-                                    .addItems(let items),
-                                    .setItems(let items):
-                                    continuation.yield("Processing \(items) layer\(items == 1 ? "" : "s")")
+                                    continuation.yield(.message(description))
                                 default:
                                     break
                                 }
                             }
+                            if let bytes = await byteCounter.apply(progressEvents) {
+                                continuation.yield(.downloading(current: bytes.current, total: bytes.total))
+                            }
                         }
                     )
-                    continuation.yield("Unpacking image")
-                    try await image.unpack(platform: platform, progressUpdate: nil)
+                    continuation.yield(.message("Unpacking image"))
+                    let unpackCounter = PullByteCounter()
+                    try await image.unpack(
+                        platform: platform,
+                        progressUpdate: { progressEvents in
+                            if let bytes = await unpackCounter.apply(progressEvents) {
+                                continuation.yield(.extracting(current: bytes.current, total: bytes.total))
+                            }
+                        }
+                    )
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
-                    continuation.yield("Image digest: \(image.digest)")
+                    continuation.yield(.message("Image digest: \(image.digest)"))
                     continuation.finish()
                 } catch {
                     // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
@@ -259,7 +299,7 @@ struct ClientImageService: ClientImageProtocol {
                     {
                         let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
                         logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
-                        continuation.yield("linux/arm64 not available — retrying with linux/amd64 (Rosetta)")
+                        continuation.yield(.message("linux/arm64 not available — retrying with linux/amd64 (Rosetta)"))
                         do {
                             let fallbackImage = try await ClientImage.pull(
                                 reference: reference,
@@ -269,16 +309,14 @@ struct ClientImageService: ClientImageProtocol {
                             )
                             try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
                             logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
-                            continuation.yield("Image digest: \(fallbackImage.digest)")
+                            continuation.yield(.message("Image digest: \(fallbackImage.digest)"))
                             continuation.finish()
                         } catch let fallbackError {
                             logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
-                            continuation.yield(String(describing: fallbackError))
                             continuation.finish(throwing: fallbackError)
                         }
                     } else {
                         logger.error("Failed to pull image \(reference): \(error)")
-                        continuation.yield(errMsg)
                         continuation.finish(throwing: error)
                     }
                 }

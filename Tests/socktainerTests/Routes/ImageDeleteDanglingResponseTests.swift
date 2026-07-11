@@ -102,7 +102,7 @@ private struct FixedResultImageMock: ClientImageProtocol {
     let result: ImageDeletionResult
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
     func delete(id: String) async throws -> ImageDeletionResult { result }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {

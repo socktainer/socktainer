@@ -46,10 +46,7 @@ extension ImagePushRoute {
                 do {
                     platform = try platformOrThrow(platformString)
                 } catch {
-                    let response = Response(status: .internalServerError)
-                    response.headers.add(name: .contentType, value: "application/json")
-                    response.body = .init(string: "{\"message\": \"Failed to parse platform\"}\n")
-                    return response
+                    throw Abort(.badRequest, reason: "invalid platform: \(platformString)")
                 }
             } else {
                 platform = nil
@@ -58,24 +55,24 @@ extension ImagePushRoute {
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
 
-            let progressStream = try await client.push(
-                reference: reference,
-                platform: platform,
-                logger: req.logger
-            )
+            let progressStream: AsyncThrowingStream<String, Error>
+            do {
+                progressStream = try await client.push(
+                    reference: reference,
+                    platform: platform,
+                    logger: req.logger
+                )
+            } catch ClientImageError.notFound(let id) {
+                throw Abort(.notFound, reason: "No such image: \(id)")
+            } catch let abort as Abort {
+                throw abort
+            } catch {
+                throw Abort(.internalServerError, reason: "Failed to push \(reference): \(error)")
+            }
 
             response.body = .init(stream: { writer in
                 Task {
-                    do {
-                        for try await progress in progressStream {
-                            let json = "{\"status\": \"\(progress.replacingOccurrences(of: "\"", with: "\\\""))\"}"
-                            _ = writer.write(.buffer(ByteBuffer(string: json + "\n")))
-                        }
-                        _ = writer.write(.end)
-                    } catch {
-                        _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
-                        _ = writer.write(.error(error))
-                    }
+                    await DockerProgressFrame.pipe(progressStream, to: writer)
                 }
             })
             return response

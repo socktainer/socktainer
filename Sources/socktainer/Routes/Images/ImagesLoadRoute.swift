@@ -25,10 +25,7 @@ extension ImagesLoadRoute {
                 do {
                     platform = try platformOrThrow(platformString)
                 } catch {
-                    let response = Response(status: .badRequest)
-                    response.headers.add(name: .contentType, value: "application/json")
-                    response.body = .init(string: "{\"message\": \"Failed to parse platform\"}\n")
-                    return response
+                    throw Abort(.badRequest, reason: "invalid platform: \(platformString)")
                 }
             } else {
                 platform = currentPlatform()
@@ -53,7 +50,7 @@ extension ImagesLoadRoute {
                         }
 
                         guard bodyBuffer.readableBytes > 0 else {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"message\": \"Request body is required\"}\n")))
+                            DockerProgressFrame.write(DockerProgressFrame.error("Request body is required"), to: writer)
                             _ = writer.write(.end)
                             return
                         }
@@ -69,13 +66,13 @@ extension ImagesLoadRoute {
                         try Data(buffer: bodyBuffer).write(to: tarPath)
 
                         guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"AppleContainerAppSupportUrl not configured\"}\n")))
+                            DockerProgressFrame.write(DockerProgressFrame.error("AppleContainerAppSupportUrl not configured"), to: writer)
                             _ = writer.write(.end)
                             return
                         }
 
                         if !quiet {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"status\": \"Loading images from tarball\"}\n")))
+                            DockerProgressFrame.write(DockerProgressFrame.status("Loading images from tarball"), to: writer)
                         }
 
                         let loadedImages = try await client.load(
@@ -83,16 +80,16 @@ extension ImagesLoadRoute {
 
                         for image in loadedImages {
                             if !quiet {
-                                _ = writer.write(.buffer(ByteBuffer(string: "{\"status\": \"Loaded image \(image)\"}\n")))
+                                DockerProgressFrame.write(DockerProgressFrame.status("Loaded image \(image)"), to: writer)
                             }
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"stream\": \"Loaded image: \(image)\"}\n")))
+                            DockerProgressFrame.write(DockerProgressFrame.stream("Loaded image: \(image)\n"), to: writer)
                         }
 
                         _ = writer.write(.end)
                     } catch {
                         req.logger.error("Failed to load images: \(error)")
-                        _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
-                        _ = writer.write(.error(error))
+                        DockerProgressFrame.write(DockerProgressFrame.error(String(describing: error)), to: writer)
+                        _ = writer.write(.end)
                     }
                 }
             })
