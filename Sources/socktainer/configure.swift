@@ -126,7 +126,7 @@ func configure(_ app: Application) async throws {
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
     try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig))
-    try app.register(collection: DistributionJsonRoute())
+    try app.register(collection: DistributionJsonRoute(systemConfig: systemConfig))
 
     // --- plugin routes ---
     try app.register(collection: PluginsCreateRoute())
