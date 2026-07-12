@@ -73,11 +73,10 @@ struct VolumePruneRoute: RouteCollection {
         guard values.count == 1 else {
             throw Abort(.badRequest, reason: "invalid filter 'all': got more than one value")
         }
-        switch values[0].lowercased() {
-        case "1", "t", "true": return true
-        case "0", "f", "false": return false
-        default: throw Abort(.badRequest, reason: "invalid filter 'all=\(values[0])'")
+        guard let parsed = MobyBool.parse(values[0]) else {
+            throw Abort(.badRequest, reason: "invalid filter 'all=\(values[0])'")
         }
+        return parsed
     }
 
     /// Narrows the prune set to anonymous volumes unless all=true was given.
