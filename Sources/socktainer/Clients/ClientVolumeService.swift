@@ -12,6 +12,10 @@ protocol ClientVolumeProtocol: Sendable {
 }
 
 struct ClientVolumeService: ClientVolumeProtocol {
+    /// moby's volume.AnonymousLabel — stamped on volumes auto-created without a
+    /// user-supplied name so that volume prune (without all=true) targets only them.
+    static let anonymousVolumeLabel = "com.docker.volume.anonymous"
+
     func create(request: RESTVolumeCreate) async throws -> Volume {
         let result = try await ClientVolume.create(
             name: request.Name,
