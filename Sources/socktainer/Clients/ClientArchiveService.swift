@@ -98,6 +98,10 @@ protocol ClientArchiveProtocol: Sendable {
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
+
+    /// Export the container's entire root filesystem as an uncompressed tar
+    /// (docker export). The caller owns the returned file and deletes it when done.
+    func exportRootfs(containerId: String) async throws -> URL
 }
 
 /// Service for performing archive operations on container filesystems
@@ -170,6 +174,30 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let tarData = try Data(contentsOf: tarPath)
 
         return (tarData: tarData, stat: pathStat)
+    }
+
+    /// Reading rootfs.ext4 while the guest VM writes to it is a volatile
+    /// snapshot — the same guarantee moby gives when exporting a running
+    /// container's mounted layer. The export runs detached because it is
+    /// synchronous I/O that can take minutes for large filesystems.
+    func exportRootfs(containerId: String) async throws -> URL {
+        let rootfsPath = getRootfsPath(containerId: containerId)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: containerId)
+        }
+        let tarPath = FileManager.default.temporaryDirectory.appendingPathComponent("export-\(UUID().uuidString).tar")
+        let blockDevicePath = rootfsPath.path
+        let archivePath = tarPath.path
+        do {
+            try await Task.detached(priority: .utility) {
+                let reader = try EXT4.EXT4Reader(blockDevice: FilePath(blockDevicePath))
+                try reader.export(archive: FilePath(archivePath))
+            }.value
+        } catch {
+            try? FileManager.default.removeItem(at: tarPath)
+            throw ClientArchiveError.operationFailed(message: "failed to read rootfs of \(containerId): \(error)")
+        }
+        return tarPath
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
