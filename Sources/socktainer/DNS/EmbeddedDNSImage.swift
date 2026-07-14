@@ -50,7 +50,7 @@ enum EmbeddedDNSImage {
         log.info("[dns-embedded] importing embedded DNS forwarder image")
         let imageClient = ClientImageService(containerSystemConfig: containerSystemConfig)
         let loaded = try await imageClient.load(
-            tarballPath: SocktainerDNSImage.archiveURL,
+            tarballPath: try SocktainerDNSImage.archiveURL(),
             platform: .current,
             appleContainerAppSupportUrl: appSupportURL,
             logger: log
