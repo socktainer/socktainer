@@ -7,6 +7,8 @@ enum GuestProcess {
     /// awaits every child before returning — so `terminate` must run *inside*
     /// the group to make the pending `wait` return. Killing after the group
     /// would deadlock: teardown blocks on `wait` until the guest exits anyway.
+    /// Parent cancellation reaches teardown the same way (the sleep throws
+    /// `CancellationError` before the deadline), so it terminates too.
     static func waitBounded(
         timeoutNs: UInt64 = defaultTimeoutNs,
         wait: @escaping @Sendable () async throws -> Int32,
@@ -20,11 +22,16 @@ enum GuestProcess {
                 return .timedOut
             }
             defer { group.cancelAll() }
-            switch try await group.next() ?? .timedOut {
-            case .exited(let code): return code
-            case .timedOut:
+            do {
+                switch try await group.next() ?? .timedOut {
+                case .exited(let code): return code
+                case .timedOut:
+                    await terminate()
+                    throw GuestProcessTimedOut()
+                }
+            } catch is CancellationError {
                 await terminate()
-                throw GuestProcessTimedOut()
+                throw CancellationError()
             }
         }
     }

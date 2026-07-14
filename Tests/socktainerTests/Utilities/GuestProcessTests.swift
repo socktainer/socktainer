@@ -59,6 +59,42 @@ struct GuestProcessTests {
         #expect(await log.events == [.terminated, .waitReturned])
     }
 
+    @Test("parent cancellation terminates the guest so teardown can't deadlock on the non-cancellable wait")
+    func cancellationTerminatesAndUnblocksWait() async {
+        let gate = Gate()
+        let log = EventLog()
+        let fuse = Task {
+            guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { return }
+            await gate.open()
+        }
+        defer { fuse.cancel() }
+
+        let task = Task {
+            try await GuestProcess.waitBounded(
+                timeoutNs: Self.never,
+                wait: {
+                    await gate.wait()
+                    await log.record(.waitReturned)
+                    return 0
+                },
+                terminate: {
+                    await log.record(.terminated)
+                    await gate.open()
+                }
+            )
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        task.cancel()
+
+        let thrown: Error?
+        switch await task.result {
+        case .success: thrown = nil
+        case .failure(let error): thrown = error
+        }
+        #expect(thrown is CancellationError)
+        #expect(await log.events == [.terminated, .waitReturned])
+    }
+
     @Test("a wait that returns before the deadline yields its exit code and never terminates")
     func returnsExitCodeWithoutTerminating() async throws {
         try await confirmation("terminate is not called", expectedCount: 0) { terminated in
