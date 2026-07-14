@@ -1,5 +1,5 @@
 {
-  "originHash" : "0fc1974a4dbd6489e4087033c59ae2bd461f7532dd1acca9f01ae2783128f7d0",
+  "originHash" : "2930f73e155f13128787a8b274ba55eb02b39ac723d368e18975989422af2428",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -60,8 +60,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/socktainer/dns-forwarder.git",
       "state" : {
-        "revision" : "13aab5bf2e348ec3a501684e798bff7119f6038e",
-        "version" : "0.1.0"
+        "revision" : "07a861b754bcc6e7b749d149178054d215941faa",
+        "version" : "0.2.0"
       }
     },
     {

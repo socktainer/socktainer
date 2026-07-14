@@ -270,16 +270,19 @@ struct SocktainerDNSQueryTests {
     }
 }
 
-// MARK: - EmbeddedDNSImage / SocktainerDNSImage SwiftPM resource
+// MARK: - EmbeddedDNSImage / SocktainerDNSImage
 
-@Suite("EmbeddedDNSImage — SwiftPM resource")
+@Suite("EmbeddedDNSImage")
 struct EmbeddedDNSImageTests {
 
-    @Test("SocktainerDNSImage.archiveURL resolves to an existing file")
-    func archiveURLResolvesToExistingFile() {
-        let url = SocktainerDNSImage.archiveURL
-        #expect(url.lastPathComponent == "socktainer-dns.tar.gz")
-        #expect(FileManager.default.fileExists(atPath: url.path), "tarball must be present in SwiftPM resource bundle")
+    @Test("SocktainerDNSImage carries a gzip archive that archiveURL() materializes to disk")
+    func archiveMaterializesFromEmbeddedBytes() throws {
+        let data = SocktainerDNSImage.archiveData
+        #expect(!data.isEmpty)
+        #expect(Array(data.prefix(2)) == [0x1f, 0x8b], "embedded archive must be gzip")
+
+        let url = try SocktainerDNSImage.archiveURL()
+        #expect(try Data(contentsOf: url) == data, "materialized file must match the embedded archive")
     }
 
     @Test("EmbeddedDNSImage.tag matches SocktainerDNSImage.reference")

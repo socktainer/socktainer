@@ -22,7 +22,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
-        .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.1.0"),
+        .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.2.0"),
     ],
     targets: [
         .executableTarget(
