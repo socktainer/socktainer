@@ -42,7 +42,10 @@ struct GuestCommandRunner: GuestCommandRunning {
             throw error
         }
         let (exitCode, stdoutData, stderrData) = try await pipes.collectOutput {
-            try await process.wait()
+            try await GuestProcess.waitBounded(
+                wait: { try await process.wait() },
+                terminate: { try? await process.kill(SIGKILL) }
+            )
         }
         return (
             exitCode,
@@ -217,6 +220,8 @@ struct ContainerTopRoute: RouteCollection {
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 return Response(status: .badRequest, body: .init(string: "ambiguous container reference \(reference): matches \(matchList)"))
+            } catch is GuestProcessTimedOut {
+                return Response(status: .internalServerError, body: .init(string: "ps: timed out in container \(reference)"))
             } catch let abort as Abort {
                 throw abort
             } catch {
