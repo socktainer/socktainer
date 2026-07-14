@@ -39,52 +39,23 @@ enum ContainerImageUtility {
 
             let configDigest = configFile.replacingOccurrences(of: ".json", with: "")
             let configSrcPath = dockerFormatPath.appendingPathComponent(configFile)
-            let configDstPath = blobsDir.appendingPathComponent(configDigest)
 
             if FileManager.default.fileExists(atPath: configSrcPath.path) {
-                try FileManager.default.copyItem(at: configSrcPath, to: configDstPath)
-
-                let configData = try Data(contentsOf: configDstPath)
-                let configSize = configData.count
-                let configRealDigest = configData.sha256Hex()
-
-                if configRealDigest != configDigest {
-                    logger.warning("Config digest mismatch: expected \(configDigest), got \(configRealDigest)")
-                    let correctPath = blobsDir.appendingPathComponent(configRealDigest)
-                    try FileManager.default.moveItem(at: configDstPath, to: correctPath)
-                }
+                let (effectiveConfigDigest, configSize) = try resolveBlob(from: configSrcPath, claimedDigest: configDigest, in: blobsDir, logger: logger)
 
                 var layerDescriptors: [[String: Any]] = []
 
                 for layer in layers {
                     let layerDigest = layer.replacingOccurrences(of: "/layer.tar", with: "")
                     let layerSrcPath = dockerFormatPath.appendingPathComponent(layer)
-                    let layerDstPath = blobsDir.appendingPathComponent(layerDigest)
 
                     if FileManager.default.fileExists(atPath: layerSrcPath.path) {
-                        try FileManager.default.copyItem(at: layerSrcPath, to: layerDstPath)
-
-                        let layerData = try Data(contentsOf: layerDstPath)
-                        let layerSize = layerData.count
-                        let layerRealDigest = layerData.sha256Hex()
-
-                        if layerRealDigest != layerDigest {
-                            logger.warning("Layer digest mismatch: expected \(layerDigest), got \(layerRealDigest)")
-                            let correctPath = blobsDir.appendingPathComponent(layerRealDigest)
-                            try FileManager.default.moveItem(at: layerDstPath, to: correctPath)
-
-                            layerDescriptors.append([
-                                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                                "digest": "sha256:\(layerRealDigest)",
-                                "size": layerSize,
-                            ])
-                        } else {
-                            layerDescriptors.append([
-                                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                                "digest": "sha256:\(layerDigest)",
-                                "size": layerSize,
-                            ])
-                        }
+                        let (effectiveLayerDigest, layerSize) = try resolveBlob(from: layerSrcPath, claimedDigest: layerDigest, in: blobsDir, logger: logger)
+                        layerDescriptors.append([
+                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": "sha256:\(effectiveLayerDigest)",
+                            "size": layerSize,
+                        ])
                     }
                 }
 
@@ -92,7 +63,7 @@ enum ContainerImageUtility {
                     "schemaVersion": 2,
                     "config": [
                         "mediaType": "application/vnd.oci.image.config.v1+json",
-                        "digest": "sha256:\(configDigest)",
+                        "digest": "sha256:\(effectiveConfigDigest)",
                         "size": configSize,
                     ],
                     "layers": layerDescriptors,
@@ -140,6 +111,50 @@ enum ContainerImageUtility {
         }
 
         return loadedImages
+    }
+
+    /// Hashes a blob in fixed-size chunks so a multi-GB layer never has to be held
+    /// in memory at once. Returns the digest and byte count for its descriptor.
+    private static func sha256OfFile(at url: URL) throws -> (digest: String, size: Int) {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var size = 0
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+            size += chunk.count
+        }
+        let digest = hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+        return (digest, size)
+    }
+
+    /// Copies a docker-archive blob into the content-addressed store (skipping if already
+    /// present), then returns the digest it actually hashes to and its byte count —
+    /// relocating it to its real digest when the claimed one is wrong, so the manifest
+    /// never references a blob that was moved out from under it. Config and layer blobs
+    /// share this path so the two can't drift (an earlier divergence lost the real digest).
+    private static func resolveBlob(from source: URL, claimedDigest: String, in blobsDir: URL, logger: Logger) throws -> (digest: String, size: Int) {
+        let destination = blobsDir.appendingPathComponent(claimedDigest)
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.copyItem(at: source, to: destination)
+        }
+        let (realDigest, size) = try sha256OfFile(at: destination)
+        guard realDigest != claimedDigest else { return (claimedDigest, size) }
+        logger.warning("Blob digest mismatch: expected \(claimedDigest), got \(realDigest)")
+        try moveBlob(from: destination, toDigest: realDigest, in: blobsDir)
+        return (realDigest, size)
+    }
+
+    /// Relocates a blob copied under a claimed digest to its real one. The store is
+    /// content-addressed, so an existing target holds identical bytes — drop the
+    /// redundant copy rather than fail moving onto it.
+    private static func moveBlob(from source: URL, toDigest digest: String, in blobsDir: URL) throws {
+        let target = blobsDir.appendingPathComponent(digest)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try FileManager.default.removeItem(at: source)
+        } else {
+            try FileManager.default.moveItem(at: source, to: target)
+        }
     }
 
     static func convertOCIToDockerTar(
