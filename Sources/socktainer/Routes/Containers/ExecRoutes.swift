@@ -764,7 +764,13 @@ struct ExecRoute: RouteCollection {
                             try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                         }
 
-                        // Connection was closed - the process monitor will handle cleanup
+                        // Connection was closed - the process monitor will handle cleanup.
+                        await ExecRoute.broadcastExecDetach(
+                            execRunning: await ExecManager.shared.isRunning(id: execId),
+                            execId: execId,
+                            container: container,
+                            broadcaster: execBroadcaster
+                        )
                     }
 
                     // Process monitor with proper cleanup
@@ -801,6 +807,15 @@ struct ExecRoute: RouteCollection {
                 // `GET /exec/{id}/json` can read the recorded exit code.
             }
         }
+    }
+
+    /// The client's channel died while the exec still runs (no exit code recorded):
+    /// the client detached — moby emits a plain "exec_detach" carrying the execID
+    /// (daemon/exec.go). A process exit records its code before the monitor closes
+    /// the channel, so `execRunning` is false there and nothing is emitted.
+    static func broadcastExecDetach(execRunning: Bool, execId: String, container: ContainerSnapshot, broadcaster: EventBroadcaster?) async {
+        guard execRunning, let broadcaster else { return }
+        await broadcaster.broadcast(DockerEvent.containerEvent("exec_detach", container: container, extraAttributes: ["execID": execId]))
     }
 
     /// Maps Docker's exec-start `ConsoleSize` to an initial terminal size.

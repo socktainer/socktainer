@@ -36,6 +36,13 @@ extension ClientImageProtocol {
     func list() async throws -> [ClientImage] {
         try await list(includeSystemImages: false)
     }
+
+    /// Store-reference → digest map used to shape save/load events like moby's, whose
+    /// Actor.ID is the image digest. References the store cannot resolve fall back to
+    /// the reference itself at the emission site.
+    func digestsByReference() async -> [String: String] {
+        ((try? await list()) ?? []).reduce(into: [:]) { $0[$1.reference] = $1.digest }
+    }
 }
 
 enum ClientImageError: Error {

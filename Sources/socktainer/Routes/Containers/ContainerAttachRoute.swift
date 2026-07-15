@@ -33,6 +33,33 @@ extension ContainerAttachRoute {
         DockerEvent.simpleEvent(id: id, type: "container", status: "destroy", image: image, name: name, labels: labels)
     }
 
+    /// moby logs "attach" once the attach is set up, before streaming — including a
+    /// logs-only attach (daemon/attach.go). Nothing is emitted when the container
+    /// lookup failed or neither stream nor logs was requested.
+    /// Shared by the HTTP and WS attach routes.
+    static func broadcastAttach(container: ContainerSnapshot?, stream: Bool, logs: Bool, broadcaster: EventBroadcaster?) async {
+        guard let container, stream || logs, let broadcaster else { return }
+        await broadcaster.broadcast(DockerEvent.containerEvent("attach", container: container))
+    }
+
+    /// moby logs "detach" only when a streaming attach ends while the container still
+    /// runs (daemon/attach.go) — never for a logs-only attach, and never when the
+    /// container's own exit closed the stream. Shared by the HTTP and WS attach routes.
+    static func broadcastLogDetach(container: ContainerSnapshot, stream: Bool, currentStatus: RuntimeStatus?, broadcaster: EventBroadcaster?) async {
+        guard stream, currentStatus == .running, let broadcaster else { return }
+        await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
+    }
+
+    /// Interactive (bootstrap) attach detach: the connection died while no exit code is
+    /// recorded yet, so the client left a still-running process — moby's
+    /// interactive-detach path (daemon/attach.go). A process exit records its code
+    /// before the exit monitor tears the connection down, so it never lands here.
+    /// Shared by the HTTP TCP-upgrade and WS attach routes.
+    static func broadcastInteractiveDetach(container: ContainerSnapshot, channelActive: Bool, recordedExitCode: Int32?, broadcaster: EventBroadcaster?) async {
+        guard !channelActive, recordedExitCode == nil, let broadcaster else { return }
+        await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             // TODO: This should be refactored to some generic implementation that is shared
@@ -152,6 +179,9 @@ extension ContainerAttachRoute {
         // that same source rather than short-circuiting to no output.
         let shouldStreamOutput = stdout || stderr || (!stdout && !stderr)
 
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        await broadcastAttach(container: container, stream: stream, logs: logs, broadcaster: broadcaster)
+
         // Create streaming response body using container logs when not using stdin
         let body = Response.Body { writer in
             Task.detached {
@@ -229,6 +259,12 @@ extension ContainerAttachRoute {
                     }
                 } catch {
                     // Client disconnected (a write failed) — stop streaming.
+                    await broadcastLogDetach(
+                        container: container,
+                        stream: stream,
+                        currentStatus: (try? await containerClient.get(id: container.id))?.status,
+                        broadcaster: broadcaster
+                    )
                 }
             }
         }
@@ -296,6 +332,13 @@ extension ContainerAttachRoute {
         }
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
+
+        await broadcastAttach(
+            container: container,
+            stream: query.stream ?? false,
+            logs: query.logs ?? false,
+            broadcaster: req.application.storage[EventBroadcasterKey.self]
+        )
 
         let contentType =
             isTTY
@@ -451,6 +494,14 @@ extension ContainerAttachRoute {
         }
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
+
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        await broadcastAttach(
+            container: container,
+            stream: query.stream ?? false,
+            logs: query.logs ?? false,
+            broadcaster: broadcaster
+        )
 
         guard shouldUpgrade else {
 
@@ -709,6 +760,12 @@ extension ContainerAttachRoute {
                         guard channel.isActive else { break }
                         try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                     }
+                    await broadcastInteractiveDetach(
+                        container: container,
+                        channelActive: channel.isActive,
+                        recordedExitCode: await ContainerExitCodeStore.shared.get(id: container.id),
+                        broadcaster: broadcaster
+                    )
                 }
 
                 group.addTask {
