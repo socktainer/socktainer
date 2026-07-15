@@ -184,7 +184,7 @@ extension ContainerStartRoute {
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            let exitSnapshot = (try? await client.getContainer(id: nativeId)) ?? nil
+            let exitSnapshot = try? await client.getContainer(id: nativeId)
             if let exitSnapshot {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
