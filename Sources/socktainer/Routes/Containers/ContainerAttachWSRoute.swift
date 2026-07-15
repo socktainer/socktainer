@@ -112,6 +112,10 @@ extension ContainerAttachWSRoute {
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        // A bootstrap attach streams the process stdio regardless of query flags.
+        await ContainerAttachRoute.broadcastAttach(container: container, stream: true, logs: query.logs ?? false, broadcaster: broadcaster)
+
         // Wire WS → stdin. Guard ws.isClosed so a late-arriving frame after
         // teardown doesn't write to a closed fd.
         if stdin {
@@ -136,10 +140,20 @@ extension ContainerAttachWSRoute {
                     fallbackImage: container.configuration.image.reference,
                     fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                    broadcaster: req.application.storage[EventBroadcasterKey.self]
+                    broadcaster: broadcaster
                 )
 
                 try? await ws.close()
+            }
+
+            group.addTask {
+                try? await ws.onClose.get()
+                await ContainerAttachRoute.broadcastInteractiveDetach(
+                    container: container,
+                    channelActive: false,
+                    recordedExitCode: await ContainerExitCodeStore.shared.get(id: container.id),
+                    broadcaster: broadcaster
+                )
             }
 
             // Stdout → WS binary frames. Break on send error (client disconnected).
@@ -192,6 +206,9 @@ extension ContainerAttachWSRoute {
             return
         }
 
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        await ContainerAttachRoute.broadcastAttach(container: container, stream: stream, logs: logs, broadcaster: broadcaster)
+
         // Wait for the log file, escaping when the WS closes or after ~10s.
         // The timeout guards against an indefinite poll when a container is
         // removed via another API call while the WS is still open.
@@ -220,11 +237,21 @@ extension ContainerAttachWSRoute {
 
         let containerClient = ContainerClient()
 
+        @Sendable func broadcastDetachIfStillRunning() async {
+            await ContainerAttachRoute.broadcastLogDetach(
+                container: container,
+                stream: stream,
+                currentStatus: (try? await containerClient.get(id: container.id))?.status,
+                broadcaster: broadcaster
+            )
+        }
+
         // Drain buffered output, breaking on client disconnect.
         while !ws.isClosed, let data = try? fileHandle.read(upToCount: 4096), !data.isEmpty {
             do {
                 try await ws.send(raw: data, opcode: .binary)
             } catch {
+                await broadcastDetachIfStillRunning()
                 try? await ws.close()
                 return
             }
@@ -250,6 +277,7 @@ extension ContainerAttachWSRoute {
             }
         }
 
+        await broadcastDetachIfStillRunning()
         try? await ws.close()
     }
 

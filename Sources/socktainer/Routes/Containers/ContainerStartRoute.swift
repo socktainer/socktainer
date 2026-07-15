@@ -98,6 +98,13 @@ extension ContainerStartRoute {
                 return .noContent
             }
 
+            // moby logs per-volume "mount" events while setting up the container's mounts,
+            // before the "start" event (daemon/volumes_unix.go). Same pragmatism as the
+            // ungated "start" below: a redundant /start re-emits them.
+            if let snap = metadataSnapshot {
+                await VolumeMountEvents.broadcastMounts(for: snap, containerId: eventId, broadcaster: broadcaster)
+            }
+
             // Emit "start" on every successful /start. We intentionally do NOT gate this on
             // "did this call transition the container to running": for a foreground `docker run`,
             // the attach route bootstraps and starts the container BEFORE /start is invoked, so
@@ -172,8 +179,20 @@ extension ContainerStartRoute {
             guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
 
             let executionDuration = Date().timeIntervalSince(startedAt)
+
+            // moby unmounts the container's volumes during exit cleanup, before logging
+            // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
+            // snapshot is re-fetched here; a --rm container already reaped by Apple
+            // Container resolves to nil and skips its unmount events.
+            let exitSnapshot = (try? await client.getContainer(id: nativeId)) ?? nil
+            if let exitSnapshot {
+                await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
+            }
+
             var attrs = labels
             attrs["exitCode"] = String(code)
+            // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
+            attrs["execDuration"] = String(Int(executionDuration))
             let dieEvent = DockerEvent.simpleEvent(
                 id: eventId, type: "container", status: "die",
                 image: image, name: name, labels: attrs
@@ -285,6 +304,9 @@ extension ContainerStartRoute {
                 client: client,
                 logger: logger
             )
+            if let snap = restartedSnapshot ?? exitSnapshot {
+                await VolumeMountEvents.broadcastMounts(for: snap, containerId: eventId, broadcaster: broadcaster)
+            }
             await broadcaster.broadcast(
                 DockerEvent.simpleEvent(id: eventId, type: "container", status: "start", image: image, name: name, labels: labels)
             )

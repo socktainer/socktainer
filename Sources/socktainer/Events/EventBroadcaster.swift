@@ -1,3 +1,4 @@
+import ContainerResource
 import Vapor
 
 struct EventBroadcasterKey: StorageKey {
@@ -69,6 +70,25 @@ extension DockerEvent {
         attributes["name"] = name.isEmpty ? id : name
         for (key, value) in extraAttributes { attributes[key] = value }
         return make(type: type, action: status, actorID: id, attributes: attributes)
+    }
+
+    /// Container-shaped event derived from a snapshot: canonical 64-char Docker id,
+    /// image reference, native name, and restored labels — the fields every
+    /// container lifecycle event site otherwise re-derives by hand.
+    static func containerEvent(
+        _ action: String,
+        container: ContainerSnapshot,
+        extraAttributes: [String: String] = [:]
+    ) -> DockerEvent {
+        simpleEvent(
+            id: DockerContainerID.hexId(for: container),
+            type: "container",
+            status: action,
+            image: container.configuration.image.reference,
+            name: container.id,
+            labels: LabelNormalization.restore(container.configuration.labels),
+            extraAttributes: extraAttributes
+        )
     }
 }
 
