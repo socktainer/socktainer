@@ -45,11 +45,19 @@ actor ReconnectingContainerClient<Client: Sendable> {
     }
 
     func withClient<T>(_ operation: @Sendable (Client) async throws -> T) async throws -> T {
+        let currentCount = reconnectCount
+        let currentClient = client
         do {
-            return try await operation(client)
+            return try await operation(currentClient)
         } catch let error as ContainerizationError where error.code == .interrupted {
-            reconnectCount += 1
-            client = makeClient()
+            // Guard against a reconnect storm: if many concurrent callers hit the same
+            // stale connection, only the first to reach here (reconnectCount still
+            // matches what it observed before the call) recreates the client — the
+            // rest reuse the one that task already built.
+            if reconnectCount == currentCount {
+                reconnectCount += 1
+                client = makeClient()
+            }
             return try await operation(client)
         }
     }
