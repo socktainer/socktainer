@@ -87,10 +87,9 @@ enum ContainerImageUtility {
                 }
 
                 indexManifests.append(manifestDescriptor)
-            }
-
-            for repoTag in dockerManifest.repoTags ?? [] {
-                loadedImages.append(repoTag)
+                loadedImages.append(contentsOf: dockerManifest.repoTags ?? [])
+            } else {
+                logger.warning("Skipping \((dockerManifest.repoTags ?? []).joined(separator: ", ")): config \(configFile) missing from archive")
             }
         }
 

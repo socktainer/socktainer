@@ -64,6 +64,40 @@ struct ContainerImageConvertTests {
         #expect(!fixture.blobExists("sha256:\(claimed)"))
     }
 
+    @Test("a tag whose config file is missing from the archive is not reported as loaded")
+    func missingConfigTagIsNotReported() async throws {
+        let fixture = try DockerArchiveFixture()
+        defer { fixture.cleanUp() }
+
+        let layerDigest = try fixture.writeLayer()
+        try fixture.writeManifest(configDigest: String(repeating: "c", count: 64), layerDigest: layerDigest, tag: "phantom:latest")
+
+        let loaded = try await ContainerImageUtility.convertDockerTarToOCI(
+            dockerFormatPath: fixture.dockerFormatDir, ociLayoutPath: fixture.ociLayoutDir, logger: Logger(label: "test"))
+
+        #expect(loaded.isEmpty)
+        #expect(try fixture.allManifests().isEmpty)
+    }
+
+    @Test("an entry with a missing config does not suppress reporting of the valid entries")
+    func missingConfigOnlySkipsItsOwnTag() async throws {
+        let fixture = try DockerArchiveFixture()
+        defer { fixture.cleanUp() }
+
+        let configDigest = try fixture.writeConfig()
+        let layerDigest = try fixture.writeLayer()
+        try fixture.writeManifests([
+            (config: configDigest, layer: layerDigest, tag: "kept:latest"),
+            (config: String(repeating: "c", count: 64), layer: layerDigest, tag: "phantom:latest"),
+        ])
+
+        let loaded = try await ContainerImageUtility.convertDockerTarToOCI(
+            dockerFormatPath: fixture.dockerFormatDir, ociLayoutPath: fixture.ociLayoutDir, logger: Logger(label: "test"))
+
+        #expect(loaded == ["kept:latest"])
+        #expect(try fixture.allManifests().count == 1)
+    }
+
     @Test("a layer larger than the streaming-hash chunk is hashed correctly across chunk boundaries")
     func largeLayerHashesAcrossChunks() async throws {
         let fixture = try DockerArchiveFixture()
