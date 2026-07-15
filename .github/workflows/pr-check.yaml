@@ -235,6 +235,27 @@ jobs:
           sudo docker image prune --all --force
           [[ "1" == $(sudo docker image ls | wc -l | xargs) ]]
 
+      - name: check docker load with socktainer
+        run: |
+          # OCI tarballs shaped like real `docker save` output, crafted without Docker.
+          ./scripts/craft-oci-fixtures.sh /tmp/oci-fixtures
+          # single manifest with complete blobs
+          sudo docker load -i /tmp/oci-fixtures/baseline.tar
+          sudo docker image ls | grep 'crafted-baseline'
+          # multi-platform index shipping only one platform's blobs (docker save v25+)
+          sudo docker load -i /tmp/oci-fixtures/sparse.tar
+          sudo docker image ls | grep 'crafted-sparse'
+          # two tags sharing one manifest blob (docker save tag1 tag2)
+          sudo docker load -i /tmp/oci-fixtures/multi-tag.tar
+          sudo docker image ls | grep 'crafted-one'
+          sudo docker image ls | grep 'crafted-two'
+          # a loaded image has its blobs in the content store, so save round-trips
+          sudo docker save crafted-baseline:latest -o /tmp/oci-fixtures/roundtrip.tar
+          sudo docker rmi crafted-baseline:latest crafted-sparse:latest crafted-one:latest crafted-two:latest
+          sudo docker load -i /tmp/oci-fixtures/roundtrip.tar
+          sudo docker image ls | grep 'crafted-baseline'
+          sudo docker rmi crafted-baseline:latest
+
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails
       #       on CI host.
