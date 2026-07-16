@@ -1,7 +1,6 @@
 import ContainerizationArchive
 import ContainerizationOCI
 import CryptoKit
-import DataCompression
 import Foundation
 import Logging
 
@@ -407,7 +406,7 @@ enum ContainerImageUtility {
             // content in memory, unlike `DataCompression.gunzip()`, so a
             // small, highly-compressible malicious layer can't exhaust memory
             // before `maxExpandedLayerSize` catches it mid-stream.
-            let (digest, size) = try sha256OfFile(at: tarPath)
+            let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
             let diffID: String
             do {
                 diffID = try GzipStreamDecoder.sha256OfDecompressedContent(at: tarPath, cap: maxExpandedLayerSize)
@@ -428,10 +427,10 @@ enum ContainerImageUtility {
             // Unlike gzip, zstd needs no in-memory pass at all: both the stored
             // blob's digest and the decompressed diff_id are computed by
             // streaming files in chunks, and storage is a plain file copy.
-            let (digest, size) = try sha256OfFile(at: tarPath)
+            let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
             let decompressedPath = try ArchiveReader.decompressZstd(tarPath)
             defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
-            let (diffID, _) = try sha256OfFile(at: decompressedPath)
+            let (diffID, _) = try FileHashing.sha256OfFile(at: decompressedPath)
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.copyItem(at: tarPath, to: destination)
@@ -441,7 +440,7 @@ enum ContainerImageUtility {
                 mediaType: "application/vnd.oci.image.layer.v1.tar+zstd")
 
         case .plainOrUnknown:
-            return try gzipCompressAndStore(plainTarData: try Data(contentsOf: tarPath), into: blobsDir)
+            return try gzipCompressAndStore(plainTarPath: tarPath, into: blobsDir)
 
         case .bzip2, .xz:
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -449,7 +448,7 @@ enum ContainerImageUtility {
             defer { try? FileManager.default.removeItem(at: tempDir) }
             let plainPath = tempDir.appendingPathComponent("layer.tar")
             try reserializeToPlainTar(from: tarPath, to: plainPath)
-            return try gzipCompressAndStore(plainTarData: try Data(contentsOf: plainPath), into: blobsDir)
+            return try gzipCompressAndStore(plainTarPath: plainPath, into: blobsDir)
 
         case .foreignFormat(let format):
             throw Error.invalidTarball(reason: "\(format) is not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
@@ -460,33 +459,19 @@ enum ContainerImageUtility {
     /// uncompressed or bzip2/xz input is always gzip-compressed before storage
     /// (daemon/containerd/image_import.go's `saveArchive`). diff_id is the
     /// pre-compression hash; the stored blob's digest is the compressed hash.
-    private static func gzipCompressAndStore(plainTarData: Data, into blobsDir: URL) throws -> ImportedLayerBlob {
-        guard let compressed = plainTarData.gzip() else {
+    private static func gzipCompressAndStore(plainTarPath: URL, into blobsDir: URL) throws -> ImportedLayerBlob {
+        let tempDestination = blobsDir.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tempDestination) }
+        let result: GzipStreamEncoder.Result
+        do {
+            result = try GzipStreamEncoder.compressFile(at: plainTarPath, to: tempDestination)
+        } catch {
             throw Error.invalidTarball(reason: "failed to gzip-compress layer")
         }
-        let digest = compressed.sha256Hex()
-        let destination = blobsDir.appendingPathComponent(digest)
-        if !FileManager.default.fileExists(atPath: destination.path) {
-            try compressed.write(to: destination)
-        }
+        try moveBlob(from: tempDestination, toDigest: result.compressedDigest, in: blobsDir)
         return ImportedLayerBlob(
-            digest: digest, size: compressed.count, diffID: plainTarData.sha256Hex(),
+            digest: result.compressedDigest, size: result.compressedSize, diffID: result.uncompressedDigest,
             mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
-    }
-
-    /// Hashes a blob in fixed-size chunks so a multi-GB layer never has to be held
-    /// in memory at once. Returns the digest and byte count for its descriptor.
-    private static func sha256OfFile(at url: URL) throws -> (digest: String, size: Int) {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        var size = 0
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-            hasher.update(data: chunk)
-            size += chunk.count
-        }
-        let digest = hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
-        return (digest, size)
     }
 
     /// Copies a docker-archive blob into the content-addressed store (skipping if already
@@ -499,7 +484,7 @@ enum ContainerImageUtility {
         if !FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.copyItem(at: source, to: destination)
         }
-        let (realDigest, size) = try sha256OfFile(at: destination)
+        let (realDigest, size) = try FileHashing.sha256OfFile(at: destination)
         guard realDigest != claimedDigest else { return (claimedDigest, size) }
         logger.warning("Blob digest mismatch: expected \(claimedDigest), got \(realDigest)")
         try moveBlob(from: destination, toDigest: realDigest, in: blobsDir)

@@ -10,6 +10,11 @@ import Foundation
 /// before anything could check its size. Both the compressed input and the
 /// decompressed output are read/produced in fixed-size chunks; exceeding
 /// `cap` aborts mid-stream instead of after the fact.
+///
+/// Concatenated gzip members (`cat a.gz b.gz > combined.gz`, valid per RFC
+/// 1952 §2.2) are decompressed as one continuous logical stream, matching
+/// both real `gunzip` and Go's `compress/gzip` (which defaults
+/// `Multistream: true`) — moby's own decompression path this mirrors.
 enum GzipStreamDecoder {
     enum Error: Swift.Error, Equatable {
         case invalidHeader
@@ -17,86 +22,171 @@ enum GzipStreamDecoder {
         case exceedsCap
     }
 
-    private static let chunkSize = 1 << 20
+    private static let chunkSize = CompressionStreamDriver.defaultChunkSize
+    private static let trailerSize = 8  // CRC32 + ISIZE, per member
 
     static func sha256OfDecompressedContent(at path: URL, cap: Int) throws -> String {
-        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
-        guard let fileSize = attributes[.size] as? UInt64 else {
-            throw Error.invalidHeader
-        }
-
         let handle = try FileHandle(forReadingFrom: path)
         defer { try? handle.close() }
-
-        let headerLength = try readHeaderLength(handle)
-        // The final 8 bytes (CRC32 + ISIZE) are a trailer, not part of the
-        // DEFLATE stream Compression's decoder consumes.
-        let payloadEnd = fileSize - 8
-        guard payloadEnd >= headerLength else { throw Error.invalidHeader }
-        try handle.seek(toOffset: UInt64(headerLength))
-
-        let placeholder = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
-        defer { placeholder.deallocate() }
-        var stream = compression_stream(dst_ptr: placeholder, dst_size: 0, src_ptr: placeholder, src_size: 0, state: nil)
-        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
-            throw Error.decodeFailed
-        }
-        defer { compression_stream_destroy(&stream) }
+        let source = ChunkedByteSource(handle: handle)
 
         var hasher = SHA256()
         var totalDecompressed = 0
-        var remaining = Int(payloadEnd) - headerLength
-        var outputBuffer = [UInt8](repeating: 0, count: chunkSize)
+        var decodedAnyMember = false
 
-        while true {
-            let wantedBytes = min(chunkSize, remaining)
-            let sourceChunk = wantedBytes > 0 ? (try handle.read(upToCount: wantedBytes) ?? Data()) : Data()
-            remaining -= sourceChunk.count
-            let isFinalChunk = remaining == 0
-
-            var status: compression_status = COMPRESSION_STATUS_OK
-            try sourceChunk.withUnsafeBytes { (sourceRaw: UnsafeRawBufferPointer) in
-                stream.src_ptr = sourceRaw.bindMemory(to: UInt8.self).baseAddress ?? UnsafePointer(placeholder)
-                stream.src_size = sourceChunk.count
-
-                repeat {
-                    try outputBuffer.withUnsafeMutableBufferPointer { outputPtr in
-                        stream.dst_ptr = outputPtr.baseAddress!
-                        stream.dst_size = chunkSize
-                        let flags: Int32 = isFinalChunk ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
-                        status = compression_stream_process(&stream, flags)
-                        guard status != COMPRESSION_STATUS_ERROR else { throw Error.decodeFailed }
-
-                        let produced = chunkSize - stream.dst_size
-                        guard produced > 0 else { return }
-                        hasher.update(bufferPointer: UnsafeRawBufferPointer(start: outputPtr.baseAddress, count: produced))
-                        totalDecompressed += produced
-                        guard totalDecompressed <= cap else { throw Error.exceedsCap }
-                    }
-                } while status == COMPRESSION_STATUS_OK && (stream.src_size > 0 || isFinalChunk)
-            }
-
-            if isFinalChunk { break }
+        while try source.hasMoreBytes() {
+            try decodeOneMember(path: path, source: source, into: &hasher, totalDecompressed: &totalDecompressed, cap: cap)
+            decodedAnyMember = true
+            try source.consume(trailerSize)  // CRC32 + ISIZE
         }
+        guard decodedAnyMember else { throw Error.invalidHeader }
 
         return hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
     }
 
-    /// Reads just enough of the file to find where the DEFLATE payload
-    /// starts, honoring the optional FEXTRA/FNAME/FCOMMENT/FHCRC fields
-    /// (RFC 1952 §2.3) rather than assuming the fixed 10-byte minimum.
-    private static func readHeaderLength(_ handle: FileHandle) throws -> Int {
-        // Comfortably covers a FNAME/FCOMMENT-bearing header in practice;
-        // re-read with a larger window in the rare case a name/comment
-        // field runs past it.
-        var probe = try handle.read(upToCount: 1024) ?? Data()
-        while true {
-            if let length = try? parseGzipHeaderLength(probe) { return length }
-            guard probe.count < (1 << 20) else { throw Error.invalidHeader }
-            guard let more = try handle.read(upToCount: probe.count), !more.isEmpty else {
-                throw Error.invalidHeader
+    private static func decodeOneMember(
+        path: URL, source: ChunkedByteSource, into hasher: inout SHA256, totalDecompressed: inout Int, cap: Int
+    ) throws {
+        let headerLength = try readHeaderLength(source)
+        try source.consume(headerLength)
+        let memberOffset = try source.currentFileOffset()
+
+        try CompressionStreamDriver.withStream(operation: COMPRESSION_STREAM_DECODE, onError: { Error.decodeFailed }) { stream, placeholder in
+            var outputBuffer = [UInt8](repeating: 0, count: chunkSize)
+            var status: compression_status = COMPRESSION_STATUS_OK
+
+            while status != COMPRESSION_STATUS_END {
+                let chunkStartOffset = try source.currentFileOffset()
+                let sourceChunk = try source.read(upTo: chunkSize)
+                let isLastAvailableChunk = try sourceChunk.count < chunkSize && !source.hasMoreBytes()
+
+                status = try CompressionStreamDriver.process(
+                    &stream, input: sourceChunk, finalize: isLastAvailableChunk, outputBuffer: &outputBuffer, placeholder: placeholder,
+                    onError: { Error.decodeFailed },
+                    onOutput: { produced in
+                        hasher.update(bufferPointer: produced)
+                        totalDecompressed += produced.count
+                        guard totalDecompressed <= cap else { throw Error.exceedsCap }
+                    })
+
+                if status == COMPRESSION_STATUS_END {
+                    // `compression_stream` reports the whole fed chunk as
+                    // consumed once it hits the DEFLATE end marker, even when
+                    // this chunk also holds bytes past it (this member's
+                    // trailer, and potentially a next member) — unlike
+                    // zlib's `inflate()`, which tracks the exact boundary via
+                    // `avail_in`. Resolving that ambiguity means re-decoding
+                    // everything fed to this member so far, once per
+                    // binary-search trial, so it's only worth doing when
+                    // there's a reason to suspect it's needed: either the
+                    // file still has more content after this chunk (an
+                    // unambiguous "there's definitely another member" —
+                    // cheap regardless of size, since a lone huge member has
+                    // nothing left to disambiguate), or this was the
+                    // member's very first read (several small members can
+                    // land in one chunk together, which `hasMoreBytes()`
+                    // alone would miss — but priorLength is 0 here, so
+                    // re-decoding is cheap too). A large member with nothing
+                    // after it skips this entirely.
+                    let priorLength = chunkStartOffset - memberOffset
+                    if try source.hasMoreBytes() || priorLength == 0 {
+                        let memberLength = try findMemberLength(
+                            path: path, memberOffset: memberOffset, priorLength: priorLength,
+                            finalChunkLength: sourceChunk.count, cap: cap)
+                        // The binary search's success signal (does decoding
+                        // reach END) is trustworthy once `process` no longer
+                        // exits early, but a corrupt or adversarial input is
+                        // still worth guarding against with an independent
+                        // check: what immediately follows the found
+                        // boundary's 8-byte trailer must be either true EOF
+                        // or another gzip header — never silently trust a
+                        // boundary that lands somewhere else.
+                        guard try boundaryLooksValid(path: path, at: memberOffset + memberLength + trailerSize) else {
+                            throw Error.decodeFailed
+                        }
+                        let boundaryWithinChunk = memberLength - priorLength
+                        source.unread(sourceChunk.suffix(from: sourceChunk.startIndex + boundaryWithinChunk))
+                    }
+                } else {
+                    guard !isLastAvailableChunk else { throw Error.decodeFailed }
+                }
             }
-            probe.append(more)
+        }
+    }
+
+    /// True when `offset` is at true end-of-file, or the two bytes there are
+    /// a gzip magic number — the only two shapes a genuine member boundary
+    /// can take.
+    private static func boundaryLooksValid(path: URL, at offset: Int) throws -> Bool {
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(offset))
+        let magic = try handle.read(upToCount: 2) ?? Data()
+        return magic.isEmpty || magic.elementsEqual([0x1f, 0x8b])
+    }
+
+    /// Binary-searches for the shortest prefix of this member's compressed
+    /// bytes (starting at `memberOffset`) that decodes to completion —
+    /// re-reading from disk for each trial rather than keeping already-fed
+    /// chunks in memory, so a large ambiguous member can't reintroduce the
+    /// unbounded-memory problem this decoder exists to avoid (bounded,
+    /// if redundant, disk I/O instead).
+    private static func findMemberLength(path: URL, memberOffset: Int, priorLength: Int, finalChunkLength: Int, cap: Int) throws -> Int {
+        var lower = priorLength
+        var upper = priorLength + finalChunkLength
+        while lower < upper {
+            let mid = lower + (upper - lower) / 2
+            if try memberDecodes(path: path, memberOffset: memberOffset, length: mid, cap: cap) {
+                upper = mid
+            } else {
+                lower = mid + 1
+            }
+        }
+        return lower
+    }
+
+    private static func memberDecodes(path: URL, memberOffset: Int, length: Int, cap: Int) throws -> Bool {
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(memberOffset))
+
+        return try CompressionStreamDriver.withStream(operation: COMPRESSION_STREAM_DECODE, onError: { Error.decodeFailed }) { stream, placeholder in
+            var outputBuffer = [UInt8](repeating: 0, count: chunkSize)
+            var status: compression_status = COMPRESSION_STATUS_OK
+            var remaining = length
+            var totalProduced = 0
+
+            while status == COMPRESSION_STATUS_OK {
+                let wanted = min(chunkSize, remaining)
+                let chunk = wanted > 0 ? (try handle.read(upToCount: wanted) ?? Data()) : Data()
+                remaining -= chunk.count
+                do {
+                    status = try CompressionStreamDriver.process(
+                        &stream, input: chunk, finalize: remaining == 0, outputBuffer: &outputBuffer, placeholder: placeholder,
+                        onError: { Error.decodeFailed },
+                        onOutput: { produced in
+                            totalProduced += produced.count
+                            guard totalProduced <= cap else { throw Error.exceedsCap }
+                        })
+                } catch {
+                    return false
+                }
+                if remaining == 0 { break }
+            }
+            return status == COMPRESSION_STATUS_END
+        }
+    }
+
+    /// Reads just enough to find where the DEFLATE payload starts, honoring
+    /// the optional FEXTRA/FNAME/FCOMMENT/FHCRC fields (RFC 1952 §2.3) rather
+    /// than assuming the fixed 10-byte minimum.
+    private static func readHeaderLength(_ source: ChunkedByteSource) throws -> Int {
+        var probeSize = 1024
+        while true {
+            let probe = try source.peek(upTo: probeSize)
+            if let length = try? parseGzipHeaderLength(probe) { return length }
+            guard probe.count == probeSize, probeSize < (1 << 20) else { throw Error.invalidHeader }
+            probeSize *= 2
         }
     }
 
@@ -126,6 +216,70 @@ enum GzipStreamDecoder {
             guard offset < data.count else { throw Error.invalidHeader }
             offset += 1
             if data[data.startIndex + offset - 1] == 0 { return offset }
+        }
+    }
+}
+
+/// A forward-only byte source backed by a `FileHandle`, supporting the
+/// look-ahead (`peek`) and give-back (`unread`) operations gzip's
+/// multi-member framing needs: the header parser must see bytes before
+/// committing to consuming them, and `compression_stream_process` routinely
+/// under-consumes a chunk (leaving the next member's trailer/header inside
+/// it) without ever reading the whole file into memory at once.
+private final class ChunkedByteSource {
+    private let handle: FileHandle
+    private var buffer = Data()
+    private var bufferStartOffset = 0
+
+    init(handle: FileHandle) {
+        self.handle = handle
+    }
+
+    func hasMoreBytes() throws -> Bool {
+        try fill(upTo: 1)
+        return !buffer.isEmpty
+    }
+
+    /// The absolute file offset of the next unread byte.
+    func currentFileOffset() throws -> Int {
+        bufferStartOffset
+    }
+
+    func peek(upTo count: Int) throws -> Data {
+        try fill(upTo: count)
+        return buffer.prefix(count)
+    }
+
+    func consume(_ count: Int) throws {
+        try fill(upTo: count)
+        let removed = min(count, buffer.count)
+        buffer.removeFirst(removed)
+        bufferStartOffset += removed
+    }
+
+    func read(upTo count: Int) throws -> Data {
+        try fill(upTo: count)
+        let chunk = buffer.prefix(count)
+        buffer.removeFirst(chunk.count)
+        bufferStartOffset += chunk.count
+        return chunk
+    }
+
+    /// Restores bytes `compression_stream_process` didn't consume — always
+    /// the unconsumed suffix of what was just handed to it via `read` — so
+    /// the trailer (and any following member's header) is seen again.
+    func unread(_ bytes: Data) {
+        guard !bytes.isEmpty else { return }
+        buffer = bytes + buffer
+        bufferStartOffset -= bytes.count
+    }
+
+    private func fill(upTo target: Int) throws {
+        while buffer.count < target {
+            guard let more = try handle.read(upToCount: max(target - buffer.count, 1 << 16)), !more.isEmpty else {
+                return
+            }
+            buffer.append(more)
         }
     }
 }

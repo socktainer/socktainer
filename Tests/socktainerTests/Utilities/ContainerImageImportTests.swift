@@ -16,14 +16,10 @@ struct ContainerImageImportTests {
         let fixture = try ImportFixture()
         defer { fixture.cleanUp() }
 
-        let tarPath = try fixture.makeTar(fileContents: "hello from import\n")
+        let content = "hello from import\n"
+        let tarPath = try fixture.makeTar(fileContents: content)
         let tarData = try Data(contentsOf: tarPath)
         let expectedDiffID = "sha256:\(tarData.sha256Hex())"
-        // moby's docker import always gzip-compresses an uncompressed input before
-        // storing it (daemon/containerd/image_import.go) — it never stores a plain
-        // tar layer — so the manifest's layer digest is the compressed hash, distinct
-        // from diff_id, which stays the uncompressed hash.
-        let expectedLayerDigest = "sha256:\(tarData.gzip()!.sha256Hex())"
 
         _ = try ContainerImageUtility.buildSingleLayerOCILayout(
             tarPath: tarPath,
@@ -41,8 +37,16 @@ struct ContainerImageImportTests {
 
         let manifest = try fixture.manifest(index.manifests[0])
         #expect(manifest.layers.count == 1)
-        #expect(manifest.layers[0].digest == expectedLayerDigest)
         #expect(manifest.layers[0].mediaType == MediaTypes.imageLayerGzip)
+
+        // Compressed bytes are an implementation detail of the gzip encoder,
+        // so this checks self-consistency and correct decompression instead
+        // of a byte-for-byte match.
+        let layerData = try fixture.blobData(manifest.layers[0].digest)
+        #expect(manifest.layers[0].digest == "sha256:\(layerData.sha256Hex())")
+        let layerPath = fixture.root.appendingPathComponent("layer.tar.gz")
+        try layerData.write(to: layerPath)
+        #expect(try GzipStreamDecoder.sha256OfDecompressedContent(at: layerPath, cap: 10_000_000) == tarData.sha256Hex())
 
         let config = try fixture.config(manifest)
         #expect(config.rootfs.diffIDs == [expectedDiffID])
