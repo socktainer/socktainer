@@ -137,15 +137,15 @@ enum DockerfileChangeApplier {
     /// whether the first word contains `=`.
     private static func applyKeyValuePairs(_ rest: String, instruction: String, set: (String, String) -> Void) throws {
         let (firstRaw, remainder) = splitFirstToken(Substring(rest))
-        let firstKey = dequote(firstRaw)
+        let firstKey = try dequote(firstRaw, instruction: instruction)
         if !firstKey.contains("="), let remainder {
-            set(firstKey, dequote(remainder))
+            set(firstKey, try dequote(remainder, instruction: instruction))
             return
         }
         guard firstKey.contains("=") else {
             throw DockerfileChangeError.invalidValue(instruction: instruction, value: rest)
         }
-        for token in tokenize(rest) {
+        for token in try tokenize(rest, instruction: instruction) {
             // A blank name is only rejected in this `KEY=VALUE` form — real
             // docker build accepts a blank name from the legacy branch above
             // (`ENV "" value` sets "" to "value"); the two forms are not
@@ -176,17 +176,16 @@ enum DockerfileChangeApplier {
             }
             return array
         }
-        return tokenize(rest)
+        return try tokenize(rest, instruction: instruction)
     }
 
-    /// Splits `value` on unquoted, unescaped whitespace into raw (not yet
-    /// dequoted) tokens.
-    private static func tokenize(_ value: String) -> [String] {
+    /// Splits `value` on unquoted, unescaped whitespace into dequoted tokens.
+    private static func tokenize(_ value: String, instruction: String) throws -> [String] {
         var tokens: [String] = []
         var remainder: Substring? = Substring(value)
         while let current = remainder, !current.isEmpty {
             let (rawToken, rest) = splitFirstToken(current)
-            if !rawToken.isEmpty { tokens.append(dequote(rawToken)) }
+            if !rawToken.isEmpty { tokens.append(try dequote(rawToken, instruction: instruction)) }
             remainder = rest
         }
         return tokens
@@ -235,7 +234,14 @@ enum DockerfileChangeApplier {
     /// escape or quote is preserved literally — this is applied to the WHOLE
     /// remainder for the legacy `KEY VALUE` form, not per-word, which is why
     /// internal spacing in the value survives untouched.
-    private static func dequote<S: StringProtocol>(_ value: S) -> String {
+    ///
+    /// A quote left open at the end (`FOO="bar`) is rejected — real `docker
+    /// build` does the same ("unexpected end of statement ... looking for
+    /// matching double-quote"). A trailing, unconsumed backslash is NOT
+    /// rejected: real `docker build` silently drops it (`FOO=bar\` -> `bar`),
+    /// since a Dockerfile's line-continuation backslash has nothing left to
+    /// continue onto at the end of a single `--change` entry.
+    private static func dequote<S: StringProtocol>(_ value: S, instruction: String) throws -> String {
         var result = ""
         var escaped = false
         var quote: Character?
@@ -256,6 +262,9 @@ enum DockerfileChangeApplier {
             } else {
                 result.append(char)
             }
+        }
+        guard quote == nil else {
+            throw DockerfileChangeError.invalidValue(instruction: instruction, value: String(value))
         }
         return result
     }

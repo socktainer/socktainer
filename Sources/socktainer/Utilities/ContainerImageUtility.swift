@@ -11,6 +11,11 @@ enum ContainerImageUtility {
         case invalidTarball(reason: String)
     }
 
+    /// Bounds decompressed gzip content the same way `maxImportBodySize`
+    /// bounds the upload itself, so a small, extreme-ratio malicious layer
+    /// can't expand past a reasonable ceiling before being rejected.
+    private static let maxExpandedLayerSize = 8 * 1024 * 1024 * 1024
+
     static func convertDockerTarToOCI(
         dockerFormatPath: URL,
         ociLayoutPath: URL,
@@ -396,23 +401,27 @@ enum ContainerImageUtility {
         switch try classifyLayerSource(at: tarPath) {
         case .gzip:
             // Stored as-is (unchanged from the request body): copied straight
-            // from `tarPath` rather than re-written from an in-memory buffer.
-            // The compressed bytes still need one full-buffer pass — decoding
-            // them (for the diff_id) requires it, and `DataCompression`, the
-            // only gzip codec available here, exposes no streaming API — so
-            // the digest is hashed from that already-loaded buffer rather than
-            // re-reading the file a second time.
-            let compressed = try Data(contentsOf: tarPath)
-            guard let decompressed = compressed.gunzip() else {
+            // from `tarPath` and hashed by streaming the file in chunks. The
+            // diff_id is the decompressed content's hash — decompressed via
+            // `GzipStreamDecoder`, which never materializes the expanded
+            // content in memory, unlike `DataCompression.gunzip()`, so a
+            // small, highly-compressible malicious layer can't exhaust memory
+            // before `maxExpandedLayerSize` catches it mid-stream.
+            let (digest, size) = try sha256OfFile(at: tarPath)
+            let diffID: String
+            do {
+                diffID = try GzipStreamDecoder.sha256OfDecompressedContent(at: tarPath, cap: maxExpandedLayerSize)
+            } catch GzipStreamDecoder.Error.exceedsCap {
+                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+            } catch {
                 throw Error.invalidTarball(reason: "failed to decompress gzip layer")
             }
-            let digest = compressed.sha256Hex()
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.copyItem(at: tarPath, to: destination)
             }
             return ImportedLayerBlob(
-                digest: digest, size: compressed.count, diffID: decompressed.sha256Hex(),
+                digest: digest, size: size, diffID: diffID,
                 mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
 
         case .zstd:

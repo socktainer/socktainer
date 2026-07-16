@@ -106,6 +106,21 @@ struct DockerfileChangeApplierTests {
         #expect(config.env == ["=value"])
     }
 
+    @Test("an unterminated quote is rejected, matching moby's 'unexpected end of statement'")
+    func envUnterminatedQuoteIsRejected() throws {
+        var config = SynthesizedImageConfig()
+        #expect(throws: DockerfileChangeError.self) {
+            try DockerfileChangeApplier.apply(["ENV FOO=\"bar"], to: &config)
+        }
+    }
+
+    @Test("a trailing unconsumed backslash is silently dropped, not rejected")
+    func envTrailingBackslashIsDropped() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV FOO=bar\\"], to: &config)
+        #expect(config.env == ["FOO=bar"])
+    }
+
     @Test("the legacy LABEL KEY VALUE form takes the whole remainder verbatim")
     func labelLegacyFormTakesWholeRemainder() throws {
         var config = SynthesizedImageConfig()
