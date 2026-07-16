@@ -781,17 +781,34 @@ struct ClientImageService: ClientImageProtocol {
     /// `docker import` produces a new image, it cannot target an existing digest.
     private func resolveImportReference(repo: String?, tag: String?) throws -> String? {
         guard let repo, !repo.isEmpty else { return nil }
-        guard !Self.isDigestReference(repo) else {
+        if case .digestNotAllowed = Self.validateImportReference(repo: repo, tag: tag ?? "") {
             throw ClientImageError.digestReferenceNotAllowed(repo: repo)
         }
         let raw = (tag?.isEmpty == false) ? "\(repo):\(tag!)" : repo
         return try ClientImage.normalizeReference(raw, containerSystemConfig: containerSystemConfig)
     }
 
-    /// A Docker reference's grammar reserves `@` exclusively for introducing a
-    /// digest (`name@algorithm:hex`), so its presence alone is unambiguous —
-    /// matching moby's `reference.Digested` check, which isn't sha256-specific.
-    static func isDigestReference(_ repo: String) -> Bool {
-        repo.range(of: #"@[a-z0-9]+:[0-9a-f]+$"#, options: .regularExpression) != nil
+    enum ImportReferenceValidation: Equatable {
+        case valid
+        case digestNotAllowed
+        case malformed(reason: String)
+    }
+
+    /// Mirrors moby's early `httputils.RepoTagReference` validation
+    /// (api/server/router/image/image_routes.go's `postImagesCreate` validates
+    /// before the layer reader is even constructed): parses `repo`/`tag`
+    /// through the same reference grammar `normalizeReference` uses, so any
+    /// malformed reference — not just a digest — is rejected before the
+    /// request body is read, and both callers of this check (the route's
+    /// fail-fast and this file's own `resolveImportReference`) agree.
+    static func validateImportReference(repo: String, tag: String) -> ImportReferenceValidation {
+        guard !repo.isEmpty else { return .valid }
+        let raw = tag.isEmpty ? repo : "\(repo):\(tag)"
+        do {
+            let parsed = try Reference.parse(raw)
+            return parsed.digest != nil ? .digestNotAllowed : .valid
+        } catch {
+            return .malformed(reason: String(describing: error))
+        }
     }
 }

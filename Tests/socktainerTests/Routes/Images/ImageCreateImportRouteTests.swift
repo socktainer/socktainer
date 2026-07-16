@@ -36,6 +36,33 @@ struct ImageCreateImportRouteTests {
 
         #expect(!(await client.importImageWasCalled), "importImage must not run when repo is a digest reference")
     }
+
+    @Test("a malformed (non-digest) reference in repo is also rejected without the body ever being read")
+    func malformedReferenceRejectedBeforeBodyIsRead() async throws {
+        let client = SpyImageClient()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[AppleContainerAppSupportUrlKey.self] = FileManager.default.temporaryDirectory
+            try app.register(collection: ImageCreateRoute(client: client))
+
+            // "UPPERCASE" fails Reference.parse's path grammar (lowercase alnum
+            // only) — a malformed reference the old digest-only check would not
+            // have caught before reading the body.
+            let hugeGarbageBody = ByteBuffer(repeating: 0xFF, count: 10_000_000)
+            try await app.testing().test(
+                .POST, "/v1.51/images/create?fromSrc=-&repo=UPPERCASE",
+                body: hugeGarbageBody
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("invalid reference format"))
+            }
+        }
+
+        #expect(!(await client.importImageWasCalled), "importImage must not run when repo is malformed")
+    }
 }
 
 private actor SpyImageClient: ClientImageProtocol {

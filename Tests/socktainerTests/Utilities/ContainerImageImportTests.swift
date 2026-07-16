@@ -1,3 +1,4 @@
+import ContainerizationArchive
 import ContainerizationOCI
 import CryptoKit
 import DataCompression
@@ -47,6 +48,56 @@ struct ContainerImageImportTests {
         #expect(config.rootfs.diffIDs == [expectedDiffID])
         #expect(config.architecture == "arm64")
         #expect(config.os == "linux")
+    }
+
+    /// `tar cf scratch.tar -T /dev/null` (two 512-byte zero blocks, no file
+    /// entries) is the standard idiom for building a "scratch" base image, and
+    /// real `docker import` accepts it. This is a structurally valid, empty
+    /// tar — not a foreign format — so the tar-family confirmation check must
+    /// tell it apart from actual foreign content (which produces a spurious,
+    /// path-less entry instead of a clean EOF).
+    @Test("a zero-entry (scratch) tar is accepted, not treated as a foreign format")
+    func zeroEntryTarIsAccepted() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let tarPath = fixture.root.appendingPathComponent("scratch.tar")
+        try Data(repeating: 0, count: 1024).write(to: tarPath)
+
+        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+            tarPath: tarPath,
+            ociLayoutPath: fixture.ociLayoutDir,
+            platform: Platform(arch: "arm64", os: "linux"),
+            config: SynthesizedImageConfig(),
+            message: nil,
+            reference: nil,
+            logger: fixture.logger
+        )
+
+        let index = try fixture.index()
+        #expect(index.manifests.count == 1)
+    }
+
+    @Test("a gzip-wrapped zero-entry tar is also accepted")
+    func gzipWrappedZeroEntryTarIsAccepted() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let tarPath = fixture.root.appendingPathComponent("scratch.tar.gz")
+        try #require(Data(repeating: 0, count: 1024).gzip()).write(to: tarPath)
+
+        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+            tarPath: tarPath,
+            ociLayoutPath: fixture.ociLayoutDir,
+            platform: Platform(arch: "arm64", os: "linux"),
+            config: SynthesizedImageConfig(),
+            message: nil,
+            reference: nil,
+            logger: fixture.logger
+        )
+
+        let index = try fixture.index()
+        #expect(index.manifests.count == 1)
     }
 
     @Test("a repo:tag reference registers the tag via the manifest annotation")
@@ -219,6 +270,23 @@ struct ContainerImageImportTests {
         try layerData.write(to: layerPath)
         try ArchiveUtility.extract(tarPath: layerPath, to: extractDir)
         #expect(try String(contentsOf: extractDir.appendingPathComponent("hello.txt"), encoding: .utf8) == content)
+
+        // diff_id must be the digest of the real decompressed layer content —
+        // not the still-compressed input, and not disconnected from what's
+        // actually stored. Independently decompress the stored blob (gunzip
+        // for bzip2/xz, which are reserialized to gzip; the zstd decoder for
+        // zstd, which is stored as-is) and compare hashes directly, rather
+        // than only asserting the layer's file contents extract correctly.
+        let decompressed: Data
+        if fixtureCase.format == "zstd" {
+            let decompressedPath = try ArchiveReader.decompressZstd(layerPath)
+            defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
+            decompressed = try Data(contentsOf: decompressedPath)
+        } else {
+            decompressed = try #require(layerData.gunzip())
+        }
+        let expectedDiffID = "sha256:\(decompressed.sha256Hex())"
+        #expect(try fixture.config(manifest).rootfs.diffIDs == [expectedDiffID])
     }
 
     @Test("a zip body is rejected instead of silently hashed as raw bytes")
@@ -244,6 +312,43 @@ struct ContainerImageImportTests {
     @Test("a cpio body is rejected instead of silently hashed as raw bytes")
     func cpioBodyIsRejectedCleanly() async throws {
         try assertForeignFormatRejected(magic: Array("070701".utf8), expectedFormat: "cpio")
+    }
+
+    /// A gzip-wrapped zip: `classifyLayerSource` sees gzip at the outer magic
+    /// bytes and only the tar-family confirmation gate (not the magic-byte
+    /// blacklist, which never looks past the outer layer) catches that the
+    /// decompressed content isn't tar.
+    private static let gzipWrappedZipBase64 =
+        "H4sICKyaWGoAA3ppcC1hcmNoaXZlLnppcAAL8GZm4WIAgS+hH2IYkAAHgwxDcn5eSWpeiX5oCCcD8+pZEVkgXFrBzcDI8o2RgYEFpC4AxQRda471PEA2CAsgmZCWmZOqV1JRgs+kjNScnHyF8vyinBSuAJzuQjY1Jz8vPSWziAT3+Xyc1MULZIPwMiwmJQ5KgM9/IJcrQL2BJ9j4kTxbXJpEWqghx6o4pkE5mXnZpEUuI5McM65kJwGP6LeOIBqRCFkhpmM4FdU01CQIMQ2olmFJoxOSaYgESZypqEkQ2Y0zkExFJEjiTEVNjshufYTF1IFOhtgBOSHIjxKC5xkZMNMm6ZEtjhKAEkwYhiLSKS7DWdlANBsQzgBqL2UC8QDH16NZIwUAAA=="
+
+    @Test("a gzip-wrapped zip is rejected, not just a bare zip")
+    func gzipWrappedZipIsRejectedCleanly() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let bodyPath = fixture.root.appendingPathComponent("import.tar")
+        try #require(Data(base64Encoded: Self.gzipWrappedZipBase64)).write(to: bodyPath)
+
+        try assertRejected(bodyPath: bodyPath, fixture: fixture, expectedFormat: "not a supported docker import source")
+    }
+
+    /// A real `xar` archive (macOS's `xar -cf`) — a libarchive-readable
+    /// container format with no distinctive-enough magic bytes to be worth a
+    /// dedicated blacklist entry, exercising the tar-family confirmation gate
+    /// (added alongside the blacklist) against a format the blacklist never
+    /// covered at all.
+    private static let xarBase64 =
+        "eGFyIQAcAAEAAAAAAAACVwAAAAAAAAVdAAAAAXjatFRNb6MwEL33VyDuxGOD+YhcelipvyB72Zuxh8RaMBGQbNpfv7YhzVZNe6i0J8bPb2bsZ96Ip0vfRWccJzPYx5huII7QqkEbu3+Mf+6ekzJ+qh/ERY71QyTmQblPJNSIcnYZyWx6rBmwPIEiofkOqi2DLQdB3lNC0gHV7+nUR9P80uFjPB0kjf1OJIa2nXCuXdoaBXQyr764ICHwJci1Rli1psPIaHfstYyWswxRJDq0+/kQstdwwdf6afWu1dqLslsvh12FuB5YHo+dUeFW5JLsX80xJlfqZR6lmlEn92/JGK/yNE+bVGMGDeRtVdK2KbkuWUoZlgpQc0oF+VhpbSFHdTDnTztImbYlqEJx5AAlq4A3VLcNl1mOTct4AVxxiYJ8KLSIR97UEyiDrBC/F5NW98VkcFdM+r/ERIS2lSVtsiZlGdOcN6DykqbcyVpkvFQSVAb8+2IC14XMUq01AKVMcZ1lSIuUIhSMaZQ5aI55/pmYkbDS/fVq6Df+nrg5jsMZrbTK6R+2FslxFfzZWI3jD28Z3K1+CUXsMKEarJ68N/5dLoTgLVoBJEATgB1jW8q3rBTk6jrX5G5xoT5Yt9xmxTatfjmX3bL7L2j9jSa/oMkbbT8Op2P954DYCbIsFtxof0H/CevThGM9vXRnaezGqdjgJEgAl23H4+DMerom9IPGGvIsc6fy4TIO8GwU2qGmeVEULHUJb1AgGOu51LmFFhlz/+sChL355Yi1nzBOSx8+vL2qBzfzZb69pCAe8wOShAkpSJiXfwEAAP//AwAHkJqpqPqpEol7Pvd4RO/qGfoSUaLpKPZ42mNkYohMT8zlzHdaDQAMygL3eNrLSM3JyVcozy/KSeECAB5yBGc="
+
+    @Test("a xar archive is rejected instead of silently hashed as raw bytes")
+    func xarBodyIsRejectedCleanly() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let bodyPath = fixture.root.appendingPathComponent("import.tar")
+        try #require(Data(base64Encoded: Self.xarBase64)).write(to: bodyPath)
+
+        try assertRejected(bodyPath: bodyPath, fixture: fixture, expectedFormat: "not a supported docker import source")
     }
 
     @Test("an iso9660 body is rejected instead of silently hashed as raw bytes")

@@ -48,6 +48,71 @@ struct DockerfileChangeApplierTests {
         #expect(config.env == ["FOO=baz"])
     }
 
+    @Test("the legacy ENV KEY VALUE form takes the whole remainder verbatim, even if it contains '='")
+    func envLegacyFormTakesWholeRemainder() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV FOO bar=1 baz=2"], to: &config)
+        #expect(config.env == ["FOO=bar=1 baz=2"])
+    }
+
+    @Test("the legacy ENV form preserves internal whitespace in the value")
+    func envLegacyFormPreservesInternalWhitespace() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV NAME   spaced   out"], to: &config)
+        #expect(config.env == ["NAME=spaced   out"])
+    }
+
+    @Test("a backslash-escaped space in a modern ENV pair is kept literal, not a token separator")
+    func envBackslashEscapedSpace() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV DESC=hello\\ world"], to: &config)
+        #expect(config.env == ["DESC=hello world"])
+    }
+
+    @Test("a backslash-escaped quote inside a quoted ENV value is kept literal")
+    func envBackslashEscapedQuote() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV ESCAPED=\"a\\\"b\""], to: &config)
+        #expect(config.env == ["ESCAPED=a\"b"])
+    }
+
+    @Test("ENV with only a key and no value is rejected")
+    func envSingleTokenIsRejected() throws {
+        var config = SynthesizedImageConfig()
+        #expect(throws: DockerfileChangeError.self) {
+            try DockerfileChangeApplier.apply(["ENV JUSTONE"], to: &config)
+        }
+    }
+
+    @Test("an empty quoted ENV value clears to an empty string, not a parse error")
+    func envEmptyQuotedValue() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV FOO=\"\""], to: &config)
+        #expect(config.env == ["FOO="])
+    }
+
+    @Test("ENV with a blank name in KEY=VALUE form is rejected, matching moby's 'ENV names can not be blank'")
+    func envBlankNameIsRejected() throws {
+        var config = SynthesizedImageConfig()
+        #expect(throws: DockerfileChangeError.self) {
+            try DockerfileChangeApplier.apply(["ENV =value"], to: &config)
+        }
+    }
+
+    @Test("ENV with a blank quoted name in the legacy KEY VALUE form is accepted, unlike KEY=VALUE form")
+    func envBlankNameInLegacyFormIsAccepted() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["ENV \"\" value"], to: &config)
+        #expect(config.env == ["=value"])
+    }
+
+    @Test("the legacy LABEL KEY VALUE form takes the whole remainder verbatim")
+    func labelLegacyFormTakesWholeRemainder() throws {
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(["LABEL JUSTONE value with spaces"], to: &config)
+        #expect(config.labels == ["JUSTONE": "value with spaces"])
+    }
+
     @Test("LABEL with a quoted value containing spaces is parsed as one pair")
     func labelQuotedValue() throws {
         var config = SynthesizedImageConfig()

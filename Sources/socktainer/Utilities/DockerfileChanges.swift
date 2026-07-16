@@ -114,37 +114,48 @@ enum DockerfileChangeApplier {
 
     /// `ENV KEY=VALUE ...` (one or more pairs) or the legacy `ENV KEY VALUE` form.
     private static func applyEnv(_ rest: String, to config: inout SynthesizedImageConfig) throws {
-        let tokens = splitRespectingQuotes(rest)
-        guard !tokens.isEmpty else {
-            throw DockerfileChangeError.invalidValue(instruction: "ENV", value: rest)
-        }
-        if tokens.count == 2, !tokens[0].contains("=") {
-            config.setEnv(key: tokens[0], value: tokens[1])
-            return
-        }
-        for token in tokens {
-            guard let equalsIndex = token.firstIndex(of: "=") else {
-                throw DockerfileChangeError.invalidValue(instruction: "ENV", value: token)
-            }
-            let key = String(token[..<equalsIndex])
-            let value = String(token[token.index(after: equalsIndex)...])
+        try applyKeyValuePairs(rest, instruction: "ENV") { key, value in
             config.setEnv(key: key, value: value)
         }
     }
 
     /// `LABEL KEY=VALUE ...`, quoting allowed for values containing spaces.
     private static func applyLabels(_ rest: String, to config: inout SynthesizedImageConfig) throws {
-        let tokens = splitRespectingQuotes(rest)
-        guard !tokens.isEmpty else {
-            throw DockerfileChangeError.invalidValue(instruction: "LABEL", value: rest)
+        try applyKeyValuePairs(rest, instruction: "LABEL") { key, value in
+            config.labels[key] = value
         }
-        for token in tokens {
-            guard let equalsIndex = token.firstIndex(of: "=") else {
-                throw DockerfileChangeError.invalidValue(instruction: "LABEL", value: token)
+    }
+
+    /// Shared `ENV`/`LABEL` grammar: one or more `KEY=VALUE` pairs (quoting and
+    /// backslash-escaping honored per pair), or the legacy `KEY VALUE` form —
+    /// used only when the first word has no `=`, in which case the ENTIRE
+    /// remainder of the line (internal whitespace preserved, not re-split into
+    /// further words) becomes the single value. Verified against real
+    /// `docker build` (BuildKit) output: `ENV FOO bar=1 baz=2` sets one
+    /// variable `FOO="bar=1 baz=2"`, and `ENV NAME   spaced   out` preserves
+    /// the internal run of spaces — both are legacy form, decided solely by
+    /// whether the first word contains `=`.
+    private static func applyKeyValuePairs(_ rest: String, instruction: String, set: (String, String) -> Void) throws {
+        let (firstRaw, remainder) = splitFirstToken(Substring(rest))
+        let firstKey = dequote(firstRaw)
+        if !firstKey.contains("="), let remainder {
+            set(firstKey, dequote(remainder))
+            return
+        }
+        guard firstKey.contains("=") else {
+            throw DockerfileChangeError.invalidValue(instruction: instruction, value: rest)
+        }
+        for token in tokenize(rest) {
+            // A blank name is only rejected in this `KEY=VALUE` form — real
+            // docker build accepts a blank name from the legacy branch above
+            // (`ENV "" value` sets "" to "value"); the two forms are not
+            // symmetric, verified against real `docker build` output.
+            guard let equalsIndex = token.firstIndex(of: "="), equalsIndex > token.startIndex else {
+                throw DockerfileChangeError.invalidValue(instruction: instruction, value: token)
             }
             let key = String(token[..<equalsIndex])
             let value = String(token[token.index(after: equalsIndex)...])
-            config.labels[key] = value
+            set(key, value)
         }
     }
 
@@ -165,35 +176,87 @@ enum DockerfileChangeApplier {
             }
             return array
         }
-        return splitRespectingQuotes(rest)
+        return tokenize(rest)
     }
 
-    /// Splits on whitespace, treating a `"..."`/`'...'` span as one token and
-    /// dropping its quotes (enough for `LABEL desc="two words"`-style values;
-    /// no backslash-escape support).
-    private static func splitRespectingQuotes(_ value: String) -> [String] {
+    /// Splits `value` on unquoted, unescaped whitespace into raw (not yet
+    /// dequoted) tokens.
+    private static func tokenize(_ value: String) -> [String] {
         var tokens: [String] = []
-        var current = ""
-        var quoteChar: Character?
+        var remainder: Substring? = Substring(value)
+        while let current = remainder, !current.isEmpty {
+            let (rawToken, rest) = splitFirstToken(current)
+            if !rawToken.isEmpty { tokens.append(dequote(rawToken)) }
+            remainder = rest
+        }
+        return tokens
+    }
+
+    /// Splits off the first whitespace-delimited raw token, honoring
+    /// `"..."`/`'...'` quoting and backslash-escaping so an escaped or quoted
+    /// space doesn't end the token early. Returns the raw (not yet dequoted)
+    /// token and everything after the whitespace that follows it — `nil` if
+    /// nothing follows.
+    private static func splitFirstToken(_ value: Substring) -> (first: Substring, remainder: Substring?) {
+        var start = value.startIndex
+        while start < value.endIndex, value[start] == " " || value[start] == "\t" {
+            start = value.index(after: start)
+        }
+        var index = start
+        var escaped = false
+        var quote: Character?
+        while index < value.endIndex {
+            let char = value[index]
+            if escaped {
+                escaped = false
+            } else if char == "\\" {
+                escaped = true
+            } else if let openQuote = quote {
+                if char == openQuote { quote = nil }
+            } else if char == "\"" || char == "'" {
+                quote = char
+            } else if char == " " || char == "\t" {
+                break
+            }
+            index = value.index(after: index)
+        }
+        let first = value[start..<index]
+        guard index < value.endIndex else { return (first, nil) }
+        var remainderStart = index
+        while remainderStart < value.endIndex, value[remainderStart] == " " || value[remainderStart] == "\t" {
+            remainderStart = value.index(after: remainderStart)
+        }
+        return (first, remainderStart < value.endIndex ? value[remainderStart...] : "")
+    }
+
+    /// Removes backslash-escapes (`\X` -> literal `X`) and strips a matching
+    /// pair of enclosing `"`/`'` quote characters, honoring escapes even
+    /// inside a quoted span (`"a\"b"` -> `a"b"`). Whitespace outside of an
+    /// escape or quote is preserved literally — this is applied to the WHOLE
+    /// remainder for the legacy `KEY VALUE` form, not per-word, which is why
+    /// internal spacing in the value survives untouched.
+    private static func dequote<S: StringProtocol>(_ value: S) -> String {
+        var result = ""
+        var escaped = false
+        var quote: Character?
         for char in value {
-            if let openQuote = quoteChar {
+            if escaped {
+                result.append(char)
+                escaped = false
+            } else if char == "\\" {
+                escaped = true
+            } else if let openQuote = quote {
                 if char == openQuote {
-                    quoteChar = nil
+                    quote = nil
                 } else {
-                    current.append(char)
+                    result.append(char)
                 }
             } else if char == "\"" || char == "'" {
-                quoteChar = char
-            } else if char == " " || char == "\t" {
-                if !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
+                quote = char
             } else {
-                current.append(char)
+                result.append(char)
             }
         }
-        if !current.isEmpty { tokens.append(current) }
-        return tokens
+        return result
     }
 }

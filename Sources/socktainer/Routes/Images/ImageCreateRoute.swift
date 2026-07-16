@@ -87,9 +87,15 @@ extension ImageCreateRoute {
         let repo = query.repo ?? ""
         let tag = query.tag ?? ""
         // Matches moby: repo/tag is validated before the layer reader is even set
-        // up, so a bad reference is rejected without reading the request body.
-        if ClientImageService.isDigestReference(repo) {
+        // up, so any malformed reference — not just a digest — is rejected
+        // without reading the request body.
+        switch ClientImageService.validateImportReference(repo: repo, tag: tag) {
+        case .valid:
+            break
+        case .digestNotAllowed:
             throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
+        case .malformed(let reason):
+            throw Abort(.badRequest, reason: "invalid reference format: \(reason)")
         }
 
         let platform: Platform
@@ -107,22 +113,15 @@ extension ImageCreateRoute {
             throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
         }
 
-        let bodyBuffer: ByteBuffer
-        if let data = req.body.data {
-            bodyBuffer = data
-        } else {
-            var collectedBuffer = ByteBufferAllocator().buffer(capacity: 0)
-            for try await chunk in req.body {
-                var chunkBuffer = chunk
-                collectedBuffer.writeBuffer(&chunkBuffer)
-            }
-            bodyBuffer = collectedBuffer
-        }
-
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tarPath = tempDir.appendingPathComponent("import.tar")
-        try Data(buffer: bodyBuffer).write(to: tarPath)
+        do {
+            try await writeBodyToFile(req.body, at: tarPath)
+        } catch {
+            try? FileManager.default.removeItem(at: tempDir)
+            throw error
+        }
 
         // moby defaults an empty message to "Imported from <src>".
         let message = (query.message?.isEmpty ?? true) ? "Imported from \(fromSrc)" : query.message!
@@ -162,5 +161,37 @@ extension ImageCreateRoute {
             }
         })
         return response
+    }
+
+    /// Import bodies are single-layer tarballs and can legitimately be several
+    /// GB; this bounds them well above any real use while still rejecting a
+    /// runaway or malicious upload before it fills disk.
+    private static let maxImportBodySize = 8 * 1024 * 1024 * 1024
+
+    /// Streams the request body to disk in chunks rather than buffering the
+    /// whole tarball in memory first, enforcing `maxImportBodySize` as it goes.
+    private static func writeBodyToFile(_ body: Request.Body, at destination: URL) async throws {
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw Abort(.internalServerError, reason: "failed to create temporary file for import")
+        }
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+
+        var totalBytes = 0
+        func writeAndCheckLimit(_ buffer: ByteBuffer) throws {
+            totalBytes += buffer.readableBytes
+            guard totalBytes <= maxImportBodySize else {
+                throw Abort(.payloadTooLarge, reason: "import body exceeds the \(maxImportBodySize)-byte limit")
+            }
+            try handle.write(contentsOf: Data(buffer: buffer))
+        }
+
+        if let data = body.data {
+            try writeAndCheckLimit(data)
+            return
+        }
+        for try await chunk in body {
+            try writeAndCheckLimit(chunk)
+        }
     }
 }

@@ -92,11 +92,12 @@ struct ClientImageServiceImportTests {
         defer { fixture.cleanUp() }
 
         let tarPath = try fixture.makeTar(contents: "content\n")
+        let digestRepo = "crafted-import@sha256:\(String(repeating: "a", count: 64))"
 
-        await #expect(throws: ClientImageError.self) {
+        do {
             _ = try await fixture.service.importImage(
                 tarPath: tarPath,
-                repo: "crafted-import@sha256:\(String(repeating: "a", count: 64))",
+                repo: digestRepo,
                 tag: nil,
                 message: nil,
                 changes: [],
@@ -104,6 +105,11 @@ struct ClientImageServiceImportTests {
                 appleContainerAppSupportUrl: fixture.storeDir,
                 logger: fixture.logger
             )
+            Issue.record("expected importImage to throw for a digest reference")
+        } catch ClientImageError.digestReferenceNotAllowed(let repo) {
+            #expect(repo == digestRepo)
+        } catch {
+            Issue.record("expected ClientImageError.digestReferenceNotAllowed, got \(error)")
         }
     }
 }

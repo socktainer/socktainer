@@ -121,13 +121,18 @@ enum ContainerImageUtility {
     /// digest/blob/manifest/index construction, but for a synthesized image
     /// rather than one converted from an existing docker-archive.
     ///
-    /// A gzip-compressed body (detected by magic bytes) is stored as-is with the
-    /// gzip layer media type; its diff_id is the digest of the decompressed
-    /// content, matching moby's passthrough-if-already-compressed behavior.
-    /// Anything else is treated as an uncompressed tar: the stored blob's own
-    /// digest doubles as its diff_id. bzip2/xz bodies are not decompressed —
-    /// they fall into the uncompressed path, so their diff_id would not match
-    /// the true uncompressed content (see PR description: deferred).
+    /// A gzip/zstd-compressed body (detected by magic bytes) is stored as-is
+    /// with the matching layer media type; its diff_id is the digest of the
+    /// decompressed content, matching moby's passthrough-if-already-compressed
+    /// behavior. A plain tar is gzip-compressed before storage (moby never
+    /// stores an uncompressed layer). bzip2/xz bodies are reserialized to a
+    /// plain tar via `reserializeToPlainTar` and then gzip-compressed the same
+    /// way — content-faithful (round-trip verified against symlinks,
+    /// hardlinks, xattrs, and non-default permission bits), but the diff_id is
+    /// computed from the reserialized pax tar rather than moby's raw
+    /// decompressed byte stream, so it will not byte-match a real dockerd's
+    /// diff_id for the same bzip2/xz input even though the layer content is
+    /// identical.
     ///
     /// Returns the manifest digest (without the `sha256:` prefix).
     static func buildSingleLayerOCILayout(
@@ -228,8 +233,9 @@ enum ContainerImageUtility {
     private enum LayerSource: Equatable {
         case gzip
         case zstd
+        case bzip2
+        case xz
         case plainOrUnknown
-        case reserializeRequired
         case foreignFormat(String)
     }
 
@@ -237,8 +243,8 @@ enum ContainerImageUtility {
         let magic = try readMagic(at: tarPath, length: 8)
         if magic.starts(with: [0x1f, 0x8b]) { return .gzip }
         if magic.starts(with: [0x28, 0xb5, 0x2f, 0xfd]) { return .zstd }
-        if magic.starts(with: [0x42, 0x5a, 0x68]) { return .reserializeRequired }  // bzip2
-        if magic.starts(with: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) { return .reserializeRequired }  // xz
+        if magic.starts(with: [0x42, 0x5a, 0x68]) { return .bzip2 }
+        if magic.starts(with: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) { return .xz }
         if magic.starts(with: [0x50, 0x4b, 0x03, 0x04]) { return .foreignFormat("zip") }
         if magic.starts(with: [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) { return .foreignFormat("7z") }
         if magic.starts(with: [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07]) { return .foreignFormat("rar") }
@@ -266,8 +272,56 @@ enum ContainerImageUtility {
     }
 
     private static func rejectForeignFormat(at tarPath: URL) throws {
-        guard case .foreignFormat(let format) = try classifyLayerSource(at: tarPath) else { return }
-        throw Error.invalidTarball(reason: "\(format) is not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
+        let source = try classifyLayerSource(at: tarPath)
+        if case .foreignFormat(let format) = source {
+            throw Error.invalidTarball(reason: "\(format) is not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
+        }
+        // The magic-byte blacklist above only catches formats libarchive itself
+        // recognizes as non-tar containers; it can't cover formats moby also
+        // wouldn't unwrap (mtree, xar, lha, shar, ...) or any other content that
+        // merely fails to look like tar. Positively confirm the (decompressed)
+        // bytes parse as one of the tar sub-formats libarchive knows about
+        // before accepting it — verified against real GNU/PAX/ustar tars
+        // (including a genuine `docker export` tarball) and against zip/cpio/ar
+        // bodies to confirm this neither rejects a real tar nor accepts a
+        // foreign one.
+        let filter: Filter
+        switch source {
+        case .gzip: filter = .gzip
+        case .zstd: filter = .zstd
+        case .bzip2: filter = .bzip2
+        case .xz: filter = .xz
+        case .plainOrUnknown: filter = .none
+        case .foreignFormat: return  // unreachable: handled above
+        }
+        guard isRecognizedTarFamily(at: tarPath, filter: filter) else {
+            throw Error.invalidTarball(reason: "not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
+        }
+    }
+
+    /// Tries every tar sub-format libarchive supports rather than pinning one:
+    /// `archive_read_set_format` doesn't restrict which tar variant is actually
+    /// parsed (a real GNU or PAX tar reads successfully under any of the four
+    /// constants below), so the loop exists only to force header validation —
+    /// something the auto-detecting reader used elsewhere never surfaces as an
+    /// error even when it's parsing raw garbage. A real tar entry always has a
+    /// non-empty path; garbage forced through the tar parser produces an entry
+    /// with no path instead. A tar with zero entries (`tar cf x -T /dev/null`,
+    /// the standard way to build a "scratch" image, and something real `docker
+    /// import` accepts) cleanly hits EOF with no entry at all on every format —
+    /// that has to be accepted too, so only a path-less entry counts as proof
+    /// of a foreign format; a clean EOF is neutral, not a rejection.
+    private static func isRecognizedTarFamily(at tarPath: URL, filter: Filter) -> Bool {
+        var attempted = false
+        for format: ContainerizationArchive.Format in [.ustar, .gnutar, .pax, .paxRestricted] {
+            guard let reader = try? ArchiveReader(format: format, filter: filter, file: tarPath) else { continue }
+            attempted = true
+            var iterator = reader.makeStreamingIterator()
+            guard let (entry, _) = iterator.next() else { continue }
+            guard let path = entry.path, !path.isEmpty else { return false }
+            return true
+        }
+        return attempted
     }
 
     /// Repackages an archive whose compression `ArchiveReader` can decompress
@@ -341,6 +395,13 @@ enum ContainerImageUtility {
     private static func writeImportedLayerBlob(tarPath: URL, into blobsDir: URL) throws -> ImportedLayerBlob {
         switch try classifyLayerSource(at: tarPath) {
         case .gzip:
+            // Stored as-is (unchanged from the request body): copied straight
+            // from `tarPath` rather than re-written from an in-memory buffer.
+            // The compressed bytes still need one full-buffer pass — decoding
+            // them (for the diff_id) requires it, and `DataCompression`, the
+            // only gzip codec available here, exposes no streaming API — so
+            // the digest is hashed from that already-loaded buffer rather than
+            // re-reading the file a second time.
             let compressed = try Data(contentsOf: tarPath)
             guard let decompressed = compressed.gunzip() else {
                 throw Error.invalidTarball(reason: "failed to decompress gzip layer")
@@ -348,30 +409,32 @@ enum ContainerImageUtility {
             let digest = compressed.sha256Hex()
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
-                try compressed.write(to: destination)
+                try FileManager.default.copyItem(at: tarPath, to: destination)
             }
             return ImportedLayerBlob(
                 digest: digest, size: compressed.count, diffID: decompressed.sha256Hex(),
                 mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
 
         case .zstd:
-            let original = try Data(contentsOf: tarPath)
+            // Unlike gzip, zstd needs no in-memory pass at all: both the stored
+            // blob's digest and the decompressed diff_id are computed by
+            // streaming files in chunks, and storage is a plain file copy.
+            let (digest, size) = try sha256OfFile(at: tarPath)
             let decompressedPath = try ArchiveReader.decompressZstd(tarPath)
             defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
             let (diffID, _) = try sha256OfFile(at: decompressedPath)
-            let digest = original.sha256Hex()
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
-                try original.write(to: destination)
+                try FileManager.default.copyItem(at: tarPath, to: destination)
             }
             return ImportedLayerBlob(
-                digest: digest, size: original.count, diffID: diffID,
+                digest: digest, size: size, diffID: diffID,
                 mediaType: "application/vnd.oci.image.layer.v1.tar+zstd")
 
         case .plainOrUnknown:
             return try gzipCompressAndStore(plainTarData: try Data(contentsOf: tarPath), into: blobsDir)
 
-        case .reserializeRequired:
+        case .bzip2, .xz:
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: tempDir) }
