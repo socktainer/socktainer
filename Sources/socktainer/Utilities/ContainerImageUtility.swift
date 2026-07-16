@@ -15,6 +15,17 @@ enum ContainerImageUtility {
     /// can't expand past a reasonable ceiling before being rejected.
     private static let maxExpandedLayerSize = 8 * 1024 * 1024 * 1024
 
+    /// Tar pads every entry to a 512-byte boundary (a header block plus a
+    /// content block rounded up), so counting only the bytes `entryReader.read`
+    /// returns undercounts the real decompressed size — an archive of millions
+    /// of empty files would count as ~0 bytes despite the header-parsing and
+    /// (for `reserializeToPlainTar`) header-writing cost being real.
+    private static let tarBlockSize = 512
+
+    private static func tarBlockPadding(forContentSize contentSize: Int) -> Int {
+        (tarBlockSize - contentSize % tarBlockSize) % tarBlockSize
+    }
+
     static func convertDockerTarToOCI(
         dockerFormatPath: URL,
         ociLayoutPath: URL,
@@ -337,22 +348,31 @@ enum ContainerImageUtility {
         let reader = try ArchiveReader(file: source)
         let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: destination)
         var totalDecompressedBytes = 0
+        func enforceCap() throws {
+            guard totalDecompressedBytes <= maxExpandedLayerSize else {
+                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+            }
+        }
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
         for (entry, entryReader) in reader.makeStreamingIterator() {
+            totalDecompressedBytes += tarBlockSize
+            try enforceCap()
             let transaction = writer.makeTransactionWriter()
             try transaction.writeHeader(entry: entry)
-            var buffer = [UInt8](repeating: 0, count: 1 << 20)
+            var entryContentBytes = 0
             while true {
                 let read = buffer.withUnsafeMutableBufferPointer { entryReader.read($0.baseAddress!, maxLength: $0.count) }
                 guard read > 0 else {
                     if read < 0 { throw Error.invalidTarball(reason: "failed to read archive entry while repackaging") }
                     break
                 }
+                entryContentBytes += read
                 totalDecompressedBytes += read
-                guard totalDecompressedBytes <= maxExpandedLayerSize else {
-                    throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
-                }
+                try enforceCap()
                 try buffer.withUnsafeBytes { try transaction.writeChunk(data: UnsafeRawBufferPointer(rebasing: $0.prefix(read))) }
             }
+            totalDecompressedBytes += tarBlockPadding(forContentSize: entryContentBytes)
+            try enforceCap()
             try transaction.finish()
         }
         try writer.finishEncoding()
@@ -377,8 +397,16 @@ enum ContainerImageUtility {
         }
         do {
             var totalDecompressedBytes = 0
+            func enforceCap() throws {
+                guard totalDecompressedBytes <= maxExpandedLayerSize else {
+                    throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+                }
+            }
+            var buffer = [UInt8](repeating: 0, count: 1 << 16)
             for (_, entryReader) in reader.makeStreamingIterator() {
-                var buffer = [UInt8](repeating: 0, count: 1 << 16)
+                totalDecompressedBytes += tarBlockSize
+                try enforceCap()
+                var entryContentBytes = 0
                 while true {
                     let read = buffer.withUnsafeMutableBufferPointer { entryReader.read($0.baseAddress!, maxLength: $0.count) }
                     guard read > 0 else {
@@ -387,11 +415,12 @@ enum ContainerImageUtility {
                         }
                         break
                     }
+                    entryContentBytes += read
                     totalDecompressedBytes += read
-                    guard totalDecompressedBytes <= maxExpandedLayerSize else {
-                        throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
-                    }
+                    try enforceCap()
                 }
+                totalDecompressedBytes += tarBlockPadding(forContentSize: entryContentBytes)
+                try enforceCap()
             }
         } catch let error as Error {
             throw error

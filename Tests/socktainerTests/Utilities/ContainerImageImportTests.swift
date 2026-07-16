@@ -346,6 +346,40 @@ struct ContainerImageImportTests {
         }
     }
 
+    @Test("many empty entries are still bounded by the cap even though their content bytes alone round to zero")
+    func manyEmptyEntriesAreBoundedByHeaderAccounting() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        // Plain (uncompressed), not gzip-wrapped: a gzip layer's expansion cap
+        // is separately enforced by `GzipStreamDecoder` over the raw
+        // decompressed byte stream (headers included), which would catch an
+        // undercounting bug here for the wrong reason. A plain tar isolates
+        // `validateTar`'s own per-entry accounting, since `writeImportedLayerBlob`
+        // applies no expansion cap at all to an already-uncompressed input.
+        for i in 0..<2000 {
+            try Data().write(to: fixture.rootfsDir.appendingPathComponent("empty-\(i)"))
+        }
+        let tarPath = fixture.root.appendingPathComponent("many-empty.tar")
+        try ArchiveUtility.create(tarPath: tarPath, from: fixture.rootfsDir)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: tarPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 100_000
+            )
+            Issue.record("expected many-empty-entry import exceeding the cap via header/padding accounting to be rejected")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("exceeds"))
+        }
+    }
+
     @Test("a zip body is rejected instead of silently hashed as raw bytes")
     func zipBodyIsRejectedCleanly() async throws {
         try assertForeignFormatRejected(magic: [0x50, 0x4b, 0x03, 0x04], expectedFormat: "zip")
