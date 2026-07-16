@@ -6,6 +6,7 @@ import Vapor
 struct RESTImageListQuery: Vapor.Content {
     let manifests: Bool?
     let digests: Bool?
+    let filters: String?
 }
 
 struct ImageListRoute: RouteCollection {
@@ -62,6 +63,8 @@ extension ImageListRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageSummary] {
         { req in
             let query = try req.query.decode(RESTImageListQuery.self)
+            // moby validates the filters before doing any listing work.
+            let filters = try DockerImageFilterUtility.parseImageListFilters(filterParam: query.filters, logger: req.logger)
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
@@ -176,7 +179,28 @@ extension ImageListRoute {
                 imagesSummaries.append(summary)
             }
 
-            return imagesSummaries
+            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters)
         }
+    }
+
+    /// Applies the `dangling` and `reference` image-ls filters. Different keys
+    /// AND together, matching moby.
+    static func applyFilters(_ summaries: [RESTImageSummary], filters: [String: [String]]) throws -> [RESTImageSummary] {
+        var result = summaries
+        if let dangling = filters["dangling"], !dangling.isEmpty {
+            // moby's filters.GetBoolOrDefault recognizes only 0/1/true/false
+            // here (stricter than the MobyBool query-parameter semantics) and
+            // rejects an unrecognized or conflicting value with a 400.
+            let isTrue = dangling.contains("1") || dangling.contains("true")
+            let isFalse = dangling.contains("0") || dangling.contains("false")
+            guard isTrue != isFalse else {
+                throw Abort(.badRequest, reason: "invalid filter 'dangling=[\(dangling.joined(separator: " "))]'")
+            }
+            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags) == isTrue }
+        }
+        if let patterns = filters["reference"], !patterns.isEmpty {
+            result = result.filter { ImageListFilter.referenceMatches(patterns: patterns, repoTags: $0.RepoTags) }
+        }
+        return result
     }
 }

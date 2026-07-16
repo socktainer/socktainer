@@ -252,6 +252,36 @@ struct DockerImageFilterUtility {
 
         return parsedFilters
     }
+
+    /// Parses the `filters` query for GET /images/json. moby's image-ls accepts
+    /// before, dangling, label, reference, since, and until, and rejects any
+    /// other key with a 400 (filters.Validate); this normalizes the three JSON
+    /// shapes docker clients send into `[key: [value]]`.
+    static func parseImageListFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
+        var parsedFilters: [String: [String]] = [:]
+        let allowedKeys: Set<String> = ["before", "dangling", "label", "reference", "since", "until"]
+
+        guard let filterParam, let data = filterParam.data(using: .utf8) else { return parsedFilters }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            logger.warning("Failed to decode image list filters")
+            return parsedFilters
+        }
+        for (key, value) in json {
+            guard allowedKeys.contains(key) else {
+                throw Abort(.badRequest, reason: "invalid filter '\(key)'")
+            }
+            // {"reference": {"alpine:*": true}} / {"reference": ["alpine:*"]} / {"reference": "alpine:*"}
+            if let dict = value as? [String: Any] {
+                let keys = dict.compactMap { (k, v) in (v as? Bool == true) ? k : nil }
+                if !keys.isEmpty { parsedFilters[key] = keys }
+            } else if let arr = value as? [String] {
+                parsedFilters[key] = arr
+            } else if let str = value as? String {
+                parsedFilters[key] = [str]
+            }
+        }
+        return parsedFilters
+    }
 }
 
 // utility for parsing build cache filters from query string
