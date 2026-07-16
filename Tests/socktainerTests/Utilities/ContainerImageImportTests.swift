@@ -293,6 +293,59 @@ struct ContainerImageImportTests {
         #expect(try fixture.config(manifest).rootfs.diffIDs == [expectedDiffID])
     }
 
+    @Test(
+        "a bzip2/xz/zstd layer whose decompressed size exceeds the configured cap is rejected",
+        arguments: reserializeFixtures)
+    func decompressedContentExceedingCapIsRejected(fixtureCase: (format: String, base64: String, expectedMediaType: String)) async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let compressedPath = fixture.root.appendingPathComponent("cap-\(fixtureCase.format).tar")
+        try #require(Data(base64Encoded: fixtureCase.base64)).write(to: compressedPath)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: compressedPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 10
+            )
+            Issue.record("expected \(fixtureCase.format) import exceeding the cap to be rejected")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("exceeds"))
+        }
+    }
+
+    @Test("a gzip layer whose decompressed size exceeds the configured cap is rejected")
+    func gzipDecompressedContentExceedingCapIsRejected() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let plainTarPath = try fixture.makeTar(fileContents: "reserialize round-trip\n")
+        let gzipPath = fixture.root.appendingPathComponent("cap-gzip.tar.gz")
+        try #require(try Data(contentsOf: plainTarPath).gzip()).write(to: gzipPath)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: gzipPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 10
+            )
+            Issue.record("expected a gzip import exceeding the cap to be rejected")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("exceeds"))
+        }
+    }
+
     @Test("a zip body is rejected instead of silently hashed as raw bytes")
     func zipBodyIsRejectedCleanly() async throws {
         try assertForeignFormatRejected(magic: [0x50, 0x4b, 0x03, 0x04], expectedFormat: "zip")

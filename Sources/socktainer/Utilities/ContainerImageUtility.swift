@@ -146,10 +146,11 @@ enum ContainerImageUtility {
         config: SynthesizedImageConfig,
         message: String?,
         reference: String?,
-        logger: Logger
+        logger: Logger,
+        maxExpandedLayerSize: Int = ContainerImageUtility.maxExpandedLayerSize
     ) throws -> String {
         try rejectForeignFormat(at: tarPath)
-        try validateTar(at: tarPath)
+        try validateTar(at: tarPath, maxExpandedLayerSize: maxExpandedLayerSize)
 
         let blobsDir = ociLayoutPath.appendingPathComponent("blobs/sha256")
         try FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
@@ -157,7 +158,7 @@ enum ContainerImageUtility {
         let ociLayout = "{\"imageLayoutVersion\": \"1.0.0\"}"
         try ociLayout.write(to: ociLayoutPath.appendingPathComponent("oci-layout"), atomically: true, encoding: .utf8)
 
-        let layer = try writeImportedLayerBlob(tarPath: tarPath, into: blobsDir)
+        let layer = try writeImportedLayerBlob(tarPath: tarPath, into: blobsDir, maxExpandedLayerSize: maxExpandedLayerSize)
 
         let createdAt = ISO8601DateFormatter().string(from: Date())
         var imageConfigDict: [String: Any] = [
@@ -332,9 +333,10 @@ enum ContainerImageUtility {
     /// but `DataCompression` cannot (bzip2/xz/zstd) into a canonical
     /// uncompressed tar, so the diff_id and stored blob reflect the real
     /// content instead of the still-compressed bytes.
-    private static func reserializeToPlainTar(from source: URL, to destination: URL) throws {
+    private static func reserializeToPlainTar(from source: URL, to destination: URL, maxExpandedLayerSize: Int) throws {
         let reader = try ArchiveReader(file: source)
         let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: destination)
+        var totalDecompressedBytes = 0
         for (entry, entryReader) in reader.makeStreamingIterator() {
             let transaction = writer.makeTransactionWriter()
             try transaction.writeHeader(entry: entry)
@@ -344,6 +346,10 @@ enum ContainerImageUtility {
                 guard read > 0 else {
                     if read < 0 { throw Error.invalidTarball(reason: "failed to read archive entry while repackaging") }
                     break
+                }
+                totalDecompressedBytes += read
+                guard totalDecompressedBytes <= maxExpandedLayerSize else {
+                    throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
                 }
                 try buffer.withUnsafeBytes { try transaction.writeChunk(data: UnsafeRawBufferPointer(rebasing: $0.prefix(read))) }
             }
@@ -357,7 +363,7 @@ enum ContainerImageUtility {
     /// own) and confirms the remainder actually parses as an archive, so
     /// `docker import` of a non-tar or empty file fails cleanly instead of
     /// silently registering an unusable image.
-    private static func validateTar(at tarPath: URL) throws {
+    private static func validateTar(at tarPath: URL, maxExpandedLayerSize: Int) throws {
         let attributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path)
         guard let size = attributes?[.size] as? UInt64, size > 0 else {
             throw Error.invalidTarball(reason: "empty request body")
@@ -370,6 +376,7 @@ enum ContainerImageUtility {
             throw Error.invalidTarball(reason: "not a valid tar archive: \(error.localizedDescription)")
         }
         do {
+            var totalDecompressedBytes = 0
             for (_, entryReader) in reader.makeStreamingIterator() {
                 var buffer = [UInt8](repeating: 0, count: 1 << 16)
                 while true {
@@ -379,6 +386,10 @@ enum ContainerImageUtility {
                             throw Error.invalidTarball(reason: "not a valid tar archive")
                         }
                         break
+                    }
+                    totalDecompressedBytes += read
+                    guard totalDecompressedBytes <= maxExpandedLayerSize else {
+                        throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
                     }
                 }
             }
@@ -396,7 +407,7 @@ enum ContainerImageUtility {
         let mediaType: String
     }
 
-    private static func writeImportedLayerBlob(tarPath: URL, into blobsDir: URL) throws -> ImportedLayerBlob {
+    private static func writeImportedLayerBlob(tarPath: URL, into blobsDir: URL, maxExpandedLayerSize: Int) throws -> ImportedLayerBlob {
         switch try classifyLayerSource(at: tarPath) {
         case .gzip:
             // Stored as-is (unchanged from the request body): copied straight
@@ -430,6 +441,10 @@ enum ContainerImageUtility {
             let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
             let decompressedPath = try ArchiveReader.decompressZstd(tarPath)
             defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
+            let decompressedAttributes = try? FileManager.default.attributesOfItem(atPath: decompressedPath.path)
+            guard let decompressedSize = decompressedAttributes?[.size] as? UInt64, decompressedSize <= UInt64(maxExpandedLayerSize) else {
+                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+            }
             let (diffID, _) = try FileHashing.sha256OfFile(at: decompressedPath)
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
@@ -447,7 +462,7 @@ enum ContainerImageUtility {
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: tempDir) }
             let plainPath = tempDir.appendingPathComponent("layer.tar")
-            try reserializeToPlainTar(from: tarPath, to: plainPath)
+            try reserializeToPlainTar(from: tarPath, to: plainPath, maxExpandedLayerSize: maxExpandedLayerSize)
             return try gzipCompressAndStore(plainTarPath: plainPath, into: blobsDir)
 
         case .foreignFormat(let format):
