@@ -59,6 +59,10 @@ struct SystemDFRoute: RouteCollection {
 
     func handler(_ req: Request) async throws -> Response {
         let query = try req.query.decode(SystemDFQuery.self)
+        // moby rejects an unknown object type with a 400 instead of silently
+        // returning an all-null document. Validate the raw ordered list so the
+        // reported value is the first unknown in query order, as moby does.
+        try Self.validateTypes(query.type ?? [])
         let requestedTypes = Set(query.type ?? [])
         let includeAll = requestedTypes.isEmpty
 
@@ -131,6 +135,19 @@ struct SystemDFRoute: RouteCollection {
         )
 
         return try await response.encodeResponse(status: .ok, for: req)
+    }
+
+    /// The object types moby's GET /system/df accepts. An unknown value is a 400,
+    /// matching moby's getDiskUsage type switch default.
+    static let validTypes: Set<String> = ["container", "image", "volume", "build-cache"]
+
+    /// Rejects the first unrecognized type in query order (matching moby, which
+    /// reports the first bad value it iterates, not an alphabetically-sorted one
+    /// — verified live: `type=zzz&type=aaa` reports `zzz`).
+    static func validateTypes(_ types: [String]) throws {
+        if let unknown = types.first(where: { !validTypes.contains($0) }) {
+            throw Abort(.badRequest, reason: "unknown object type: \(unknown)")
+        }
     }
 }
 
