@@ -44,6 +44,31 @@ struct ContainerLogsTailTests {
         #expect(lastLines("", 3) == "")
     }
 
+    @Test("tailBacklog over chunked reads equals lastLines over the whole stream", arguments: [1, 2, 3, 7])
+    func tailBacklogMatchesOneShot(chunkSize: Int) throws {
+        // 30 lines through tiny chunks forces many trim cycles, including
+        // chunk boundaries that split lines mid-way.
+        let whole = (1...30).map { "line \($0)" }.joined(separator: "\n") + "\n"
+        let bytes = Array(whole.utf8)
+        for tail in [0, 1, 2, 5, 29, 30, 100] {
+            var offset = 0
+            let streamed = try ContainerLogsRoute.tailBacklog(tail: tail) {
+                guard offset < bytes.count else { return nil }
+                let next = min(offset + chunkSize, bytes.count)
+                defer { offset = next }
+                return Data(bytes[offset..<next])
+            }
+            #expect(streamed == ContainerLogsRoute.lastLines(Data(whole.utf8), count: tail), "tail=\(tail)")
+        }
+    }
+
+    @Test("tailBacklog keeps a trailing line with no newline")
+    func tailBacklogTrailingPartial() throws {
+        var chunks: [Data?] = [Data("a\nb\nc\nlast-par".utf8), Data("tial".utf8), nil]
+        let result = try ContainerLogsRoute.tailBacklog(tail: 2) { chunks.removeFirst() }
+        #expect(String(decoding: result, as: UTF8.self) == "c\nlast-partial")
+    }
+
     @Test("parseTail maps the moby query value to a line count or nil for all")
     func parseTailValues() {
         #expect(ContainerLogsRoute.parseTail(nil) == nil)

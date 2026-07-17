@@ -69,16 +69,24 @@ extension ContainerLogsRoute {
                     do {
                         if let tail {
                             // Apple Container's log API is a forward byte stream with
-                            // no reverse-seek. Read it through, trimming to the last
-                            // `tail` lines after each chunk so memory stays bounded to
-                            // ~tail lines rather than the whole (unrotated) log.
-                            var backlog = Data()
-                            while let data = try fileHandle.read(upToCount: 4096), !data.isEmpty {
-                                backlog.append(data)
-                                backlog = ContainerLogsRoute.lastLines(backlog, count: tail)
-                            }
+                            // no reverse-seek. Read it through, keeping only the last
+                            // `tail` lines so memory stays bounded to ~2x tail lines
+                            // rather than the whole (unrotated) log.
+                            let backlog = try ContainerLogsRoute.tailBacklog(tail: tail) { try fileHandle.read(upToCount: 4096) }
+                            var frames: [ByteBuffer] = []
                             buffer = ContainerLogsRoute.processDockerLogFrames(from: backlog, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
-                                _ = writer.write(.buffer(outputBuffer))
+                                frames.append(outputBuffer)
+                            }
+                            // Await each write so a client disconnect aborts the
+                            // response instead of queueing the whole window (the
+                            // same contract as the follow loop below).
+                            for frame in frames {
+                                do {
+                                    try await writer.write(.buffer(frame)).get()
+                                } catch {
+                                    finish()
+                                    return
+                                }
                             }
                         } else {
                             // Read initial logs
@@ -165,6 +173,25 @@ extension ContainerLogsRoute {
     /// trailing line with no terminating newline still counts as a line, and a
     /// single trailing newline is not treated as an extra empty line. `count == 0`
     /// yields no output.
+    /// Reads a stream through chunk by chunk via `read` (nil or empty means
+    /// EOF) and returns only its last `tail` lines. The window is trimmed once
+    /// it holds twice the wanted lines, not on every chunk, so each byte is
+    /// scanned O(1) times amortized even for a huge `tail` over a huge log.
+    static func tailBacklog(tail: Int, read: () throws -> Data?) rethrows -> Data {
+        var backlog = Data()
+        var newlines = 0
+        let trimAt = max(tail, 1) > Int.max / 2 ? Int.max : max(tail, 1) * 2
+        while let data = try read(), !data.isEmpty {
+            newlines += data.reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+            backlog.append(data)
+            if newlines >= trimAt {
+                backlog = lastLines(backlog, count: tail)
+                newlines = tail
+            }
+        }
+        return lastLines(backlog, count: tail)
+    }
+
     static func lastLines(_ data: Data, count: Int) -> Data {
         guard count > 0 else { return Data() }
         guard !data.isEmpty else { return data }
