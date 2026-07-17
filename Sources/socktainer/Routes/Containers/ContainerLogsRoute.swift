@@ -68,6 +68,14 @@ extension ContainerLogsRoute {
 
                     do {
                         if let tail {
+                            // tail=0 without follow returns an empty backlog; skip
+                            // reading the log at all. With follow the read-through
+                            // below still runs so the handle reaches EOF and the
+                            // follow loop emits only new lines.
+                            if tail == 0, !follow {
+                                finish()
+                                return
+                            }
                             // Apple Container's log API is a forward byte stream with
                             // no reverse-seek. Read it through, keeping only the last
                             // `tail` lines so memory stays bounded to ~2x tail lines
