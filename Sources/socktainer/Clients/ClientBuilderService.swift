@@ -46,7 +46,7 @@ protocol ClientBuilderProtocol: Sendable {
 
 struct ClientBuilderService: ClientBuilderProtocol {
     private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
-    private let networkClient = NetworkClient()
+    private let networkClient = ReconnectingContainerClient(makeClient: { NetworkClient() })
     private let builderContainerId: String
     private let builderPort: UInt32
     private let builderCPUs: Int64
@@ -218,7 +218,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         let imageConfig = try await image.config(for: builderPlatform).config
 
-        guard let defaultNetwork = try await networkClient.builtin else {
+        guard let defaultNetwork = try await networkClient.withClient({ try await $0.builtin }) else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
         let nameserver = IPv4Address(defaultNetwork.status.ipv4Subnet.lower.value + 1).description

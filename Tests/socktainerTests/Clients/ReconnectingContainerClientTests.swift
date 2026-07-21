@@ -53,6 +53,36 @@ struct ReconnectingContainerClientTests {
         #expect(reconnectCount == 1)
     }
 
+    @Test("Reconnects when the stale connection is buried inside ContainerClient's own error wrapping")
+    func retryRecoversWhenStaleErrorIsWrapped() async throws {
+        let generations = Counter()
+        let client = ReconnectingContainerClient<FakeConnection>(makeClient: {
+            FakeConnection(generation: generations.nextSync())
+        })
+
+        let attempts = Counter()
+        let result = try await client.withClient { connection -> Int in
+            let attempt = attempts.nextSync()
+            if attempt == 1 {
+                // Mirrors what ContainerClient's own methods actually throw: they catch
+                // the raw XPC error and rewrap it as `.internalError` with the original
+                // `.interrupted` error as `cause` (see e.g. ContainerClient.get/create/
+                // bootstrap/kill/stop/delete/createProcess/dial). A naive check of only
+                // the outer `error.code` would miss this and never reconnect.
+                throw ContainerizationError(
+                    .internalError,
+                    message: "failed to get container",
+                    cause: ContainerizationError(.interrupted, message: "XPC connection error: Connection invalid")
+                )
+            }
+            return connection.generation
+        }
+
+        #expect(result == 2, "the retried call should observe the freshly reconnected client (generation 2)")
+        let reconnectCount = await client.reconnectCount
+        #expect(reconnectCount == 1)
+    }
+
     @Test("Does not retry or reconnect for a non-stale error")
     func nonStaleErrorNotRetried() async throws {
         let generations = Counter()

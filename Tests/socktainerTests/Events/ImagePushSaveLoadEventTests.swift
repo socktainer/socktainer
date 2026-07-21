@@ -216,6 +216,13 @@ private struct FakeImageClient: ClientImageProtocol {
         ([], 0)
     }
 
+    func importImage(
+        tarPath: URL, repo: String?, tag: String?, message: String?, changes: [String],
+        platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger
+    ) async throws -> (reference: String?, digest: String) {
+        (repo, "sha256:" + String(repeating: "a", count: 64))
+    }
+
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
         loadedImages
     }

@@ -27,11 +27,10 @@ import ContainerizationError
 /// long-running server process holding the stale struct would otherwise fail every
 /// subsequent request until restarted.
 ///
-/// `withClient` runs the operation against the current client and, on that specific
-/// error code, replaces it with a freshly constructed one (a new XPC connection) and
-/// retries exactly once. Any other error — a real "not found", a bad argument, etc. — is
-/// rethrown immediately without reconnecting, since it isn't evidence of a stale
-/// connection.
+/// `withClient` runs the operation against the current client and, if the failure is
+/// evidence of a stale connection, replaces it with a freshly constructed one (a new
+/// XPC connection) and retries exactly once. Any other error — a real "not found", a bad
+/// argument, etc. — is rethrown immediately without reconnecting.
 actor ReconnectingContainerClient<Client: Sendable> {
     private var client: Client
     private let makeClient: @Sendable () -> Client
@@ -49,7 +48,7 @@ actor ReconnectingContainerClient<Client: Sendable> {
         let currentClient = client
         do {
             return try await operation(currentClient)
-        } catch let error as ContainerizationError where error.code == .interrupted {
+        } catch let error as ContainerizationError where Self.isStaleConnection(error) {
             // Guard against a reconnect storm: if many concurrent callers hit the same
             // stale connection, only the first to reach here (reconnectCount still
             // matches what it observed before the call) recreates the client — the
@@ -60,5 +59,22 @@ actor ReconnectingContainerClient<Client: Sendable> {
             }
             return try await operation(client)
         }
+    }
+
+    /// `ContainerClient`'s own methods (`create`, `get`, `bootstrap`, `kill`, `stop`,
+    /// `delete`, `createProcess`, `dial`, ...) wrap the XPC-layer error in an outer
+    /// `ContainerizationError(.internalError, cause: error)` before it reaches us, so the
+    /// stale-connection code is usually buried in `cause` rather than on the error we
+    /// catch directly. Walk the chain to find it, the same way apple/container's own
+    /// callers unwrap `cause` (e.g. `MachineCreate.swift`'s `error.cause as?
+    /// ContainerizationError`).
+    private static func isStaleConnection(_ error: ContainerizationError) -> Bool {
+        if error.code == .interrupted {
+            return true
+        }
+        guard let cause = error.cause as? ContainerizationError else {
+            return false
+        }
+        return isStaleConnection(cause)
     }
 }

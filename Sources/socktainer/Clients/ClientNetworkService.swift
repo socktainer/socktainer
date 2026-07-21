@@ -13,10 +13,10 @@ protocol ClientNetworkProtocol: Sendable {
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
-    private let networkClient = NetworkClient()
+    private let networkClient = ReconnectingContainerClient(makeClient: { NetworkClient() })
 
     func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
-        let networksList = try await networkClient.list()
+        let networksList = try await networkClient.withClient { try await $0.list() }
         var allNetworks = networksList.map { RESTNetworkSummary(networkResource: $0) }
         let containerClient = ClientContainerService()
         let allContainers = try await containerClient.list(showAll: true, filters: [:])
@@ -154,7 +154,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
     }
 
     func delete(id: String, logger: Logger) async throws {
-        try await networkClient.delete(id: id)
+        try await networkClient.withClient { try await $0.delete(id: id) }
         logger.debug("Deleted network with id: \(id)")
     }
 
@@ -168,7 +168,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
             labels: ResourceLabels(labels),
             plugin: "container-network-vmnet"
         )
-        _ = try await networkClient.create(configuration: configuration)
+        _ = try await networkClient.withClient { try await $0.create(configuration: configuration) }
         logger.debug("Created network with id: \(configuration.name)")
         return RESTNetworkCreate(Id: configuration.name, Warning: "")
     }
