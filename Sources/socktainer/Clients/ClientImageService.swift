@@ -30,6 +30,16 @@ protocol ClientImageProtocol: Sendable {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64)
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
+    func importImage(
+        tarPath: URL,
+        repo: String?,
+        tag: String?,
+        message: String?,
+        changes: [String],
+        platform: Platform,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> (reference: String?, digest: String)
 }
 
 extension ClientImageProtocol {
@@ -47,6 +57,7 @@ extension ClientImageProtocol {
 
 enum ClientImageError: Error {
     case notFound(id: String)
+    case digestReferenceNotAllowed(repo: String)
 }
 
 enum PullProgress: Sendable {
@@ -722,5 +733,89 @@ struct ClientImageService: ClientImageProtocol {
         logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
         return tarballPath
+    }
+
+    /// `docker import`: synthesizes a single-layer OCI image from `tarPath` (the
+    /// raw `fromSrc=-` request body) and loads it into the image store the same
+    /// way `load()` does. Returns the registered reference (nil if untagged) and
+    /// the digest `imageStore.load` assigned — the same "id" concept `list`/
+    /// `delete`/`load` already use elsewhere in this file.
+    func importImage(
+        tarPath: URL,
+        repo: String?,
+        tag: String?,
+        message: String?,
+        changes: [String],
+        platform: Platform,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> (reference: String?, digest: String) {
+        let reference = try resolveImportReference(repo: repo, tag: tag)
+
+        var config = SynthesizedImageConfig()
+        try DockerfileChangeApplier.apply(changes, to: &config)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
+        try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
+
+        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+            tarPath: tarPath,
+            ociLayoutPath: ociLayoutPath,
+            platform: platform,
+            config: config,
+            message: message,
+            reference: reference,
+            logger: logger
+        )
+
+        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+        let images = try await imageStore.load(from: ociLayoutPath, progress: nil)
+        guard let image = images.first else {
+            throw ClientImageError.notFound(id: reference ?? "imported image")
+        }
+
+        logger.info("Imported image \(image.reference) (\(image.digest))")
+        return (reference, image.digest)
+    }
+
+    /// Mirrors moby's `httputils.RepoTagReference`: empty repo means an
+    /// untagged import; an empty tag defaults to "latest" (via
+    /// `normalizeReference`'s `.normalize()`); a digest reference is rejected —
+    /// `docker import` produces a new image, it cannot target an existing digest.
+    private func resolveImportReference(repo: String?, tag: String?) throws -> String? {
+        guard let repo, !repo.isEmpty else { return nil }
+        if case .digestNotAllowed = Self.validateImportReference(repo: repo, tag: tag ?? "") {
+            throw ClientImageError.digestReferenceNotAllowed(repo: repo)
+        }
+        let raw = (tag?.isEmpty == false) ? "\(repo):\(tag!)" : repo
+        return try ClientImage.normalizeReference(raw, containerSystemConfig: containerSystemConfig)
+    }
+
+    enum ImportReferenceValidation: Equatable {
+        case valid
+        case digestNotAllowed
+        case malformed(reason: String)
+    }
+
+    /// Mirrors moby's early `httputils.RepoTagReference` validation
+    /// (api/server/router/image/image_routes.go's `postImagesCreate` validates
+    /// before the layer reader is even constructed): parses `repo`/`tag`
+    /// through the same reference grammar `normalizeReference` uses, so any
+    /// malformed reference — not just a digest — is rejected before the
+    /// request body is read, and both callers of this check (the route's
+    /// fail-fast and this file's own `resolveImportReference`) agree.
+    static func validateImportReference(repo: String, tag: String) -> ImportReferenceValidation {
+        guard !repo.isEmpty else { return .valid }
+        let raw = tag.isEmpty ? repo : "\(repo):\(tag)"
+        do {
+            let parsed = try Reference.parse(raw)
+            return parsed.digest != nil ? .digestNotAllowed : .valid
+        } catch {
+            return .malformed(reason: String(describing: error))
+        }
     }
 }

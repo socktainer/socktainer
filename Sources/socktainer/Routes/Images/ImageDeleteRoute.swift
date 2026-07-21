@@ -28,6 +28,8 @@ extension ImageDeleteRoute {
                 switch error {
                 case .notFound(let id):
                     throw Abort(.notFound, reason: "No such image: \(id)")
+                case .digestReferenceNotAllowed(let repo):
+                    throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
                 }
             }
 
