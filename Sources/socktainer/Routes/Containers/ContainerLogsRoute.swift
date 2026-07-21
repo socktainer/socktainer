@@ -17,9 +17,23 @@ extension ContainerLogsRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
+            // moby validates the stream parameters before resolving the container:
+            // a request that attaches to neither stream is a 400. The docker CLI
+            // always sends stdout=1&stderr=1, so neither is a client error, not a
+            // request for the default.
+            let wantStdout = MobyBool.queryValue(req.query["stdout"] as String?)
+            let wantStderr = MobyBool.queryValue(req.query["stderr"] as String?)
+            guard wantStdout || wantStderr else {
+                throw Abort(.badRequest, reason: "Bad parameters: you must choose at least one stream")
+            }
+
             guard let container = try await client.getContainer(id: id) else {
                 throw Abort(.notFound, reason: "Container not found")
             }
+
+            // `tail=<N>` limits the backlog to the last N lines; "all" (the
+            // default) or an unparseable value streams the whole backlog.
+            let tail = ContainerLogsRoute.parseTail(req.query["tail"] as String?)
 
             // Containers started with a TTY produce a raw, unmultiplexed log
             // stream; non-TTY containers use Docker's 8-byte stdcopy framing.
@@ -53,15 +67,46 @@ extension ContainerLogsRoute {
                     }
 
                     do {
-                        // Read initial logs
-                        while true {
-                            let data = try fileHandle.read(upToCount: 4096)
-                            guard let data, !data.isEmpty else { break }
-                            buffer.append(data)
+                        if let tail {
+                            // tail=0 without follow returns an empty backlog; skip
+                            // reading the log at all. With follow the read-through
+                            // below still runs so the handle reaches EOF and the
+                            // follow loop emits only new lines.
+                            if tail == 0, !follow {
+                                finish()
+                                return
+                            }
+                            // Apple Container's log API is a forward byte stream with
+                            // no reverse-seek. Read it through, keeping only the last
+                            // `tail` lines so memory stays bounded to ~2x tail lines
+                            // rather than the whole (unrotated) log.
+                            let backlog = try ContainerLogsRoute.tailBacklog(tail: tail) { try fileHandle.read(upToCount: 4096) }
+                            var frames: [ByteBuffer] = []
+                            buffer = ContainerLogsRoute.processDockerLogFrames(from: backlog, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
+                                frames.append(outputBuffer)
+                            }
+                            // Await each write so a client disconnect aborts the
+                            // response instead of queueing the whole window (the
+                            // same contract as the follow loop below).
+                            for frame in frames {
+                                do {
+                                    try await writer.write(.buffer(frame)).get()
+                                } catch {
+                                    finish()
+                                    return
+                                }
+                            }
+                        } else {
+                            // Read initial logs
+                            while true {
+                                let data = try fileHandle.read(upToCount: 4096)
+                                guard let data, !data.isEmpty else { break }
+                                buffer.append(data)
 
-                            // Process complete frames from buffer
-                            buffer = ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
-                                _ = writer.write(.buffer(outputBuffer))
+                                // Process complete frames from buffer
+                                buffer = ContainerLogsRoute.processDockerLogFrames(from: buffer, ttyMode: isTTY, timestamps: timestamps) { outputBuffer in
+                                    _ = writer.write(.buffer(outputBuffer))
+                                }
                             }
                         }
 
@@ -121,6 +166,57 @@ extension ContainerLogsRoute {
                 body: body
             )
         }
+    }
+
+    /// Parses moby's `tail` query value. "all", an absent value, or anything
+    /// non-numeric means the whole backlog (nil); a non-negative integer means
+    /// only that many trailing lines.
+    static func parseTail(_ value: String?) -> Int? {
+        guard let value, !value.isEmpty, value.lowercased() != "all" else { return nil }
+        guard let n = Int(value), n >= 0 else { return nil }
+        return n
+    }
+
+    /// Returns only the last `count` newline-delimited lines of `data`. A
+    /// trailing line with no terminating newline still counts as a line, and a
+    /// single trailing newline is not treated as an extra empty line. `count == 0`
+    /// yields no output.
+    /// Reads a stream through chunk by chunk via `read` (nil or empty means
+    /// EOF) and returns only its last `tail` lines. The window is trimmed once
+    /// it holds twice the wanted lines, not on every chunk, so each byte is
+    /// scanned O(1) times amortized even for a huge `tail` over a huge log.
+    static func tailBacklog(tail: Int, read: () throws -> Data?) rethrows -> Data {
+        var backlog = Data()
+        var newlines = 0
+        let trimAt = max(tail, 1) > Int.max / 2 ? Int.max : max(tail, 1) * 2
+        while let data = try read(), !data.isEmpty {
+            newlines += data.reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+            backlog.append(data)
+            if newlines >= trimAt {
+                backlog = lastLines(backlog, count: tail)
+                newlines = tail
+            }
+        }
+        return lastLines(backlog, count: tail)
+    }
+
+    static func lastLines(_ data: Data, count: Int) -> Data {
+        guard count > 0 else { return Data() }
+        guard !data.isEmpty else { return data }
+        // Ignore one trailing newline so "a\nb\n" with count 1 yields "b\n".
+        var searchEnd = data.endIndex
+        if data.last == 0x0A { searchEnd = data.index(before: data.endIndex) }
+        var seen = 0
+        var i = searchEnd
+        while i > data.startIndex {
+            let prev = data.index(before: i)
+            if data[prev] == 0x0A {
+                seen += 1
+                if seen == count { return Data(data[i...]) }
+            }
+            i = prev
+        }
+        return data
     }
 
     static func processDockerLogFrames(from buffer: Data, ttyMode: Bool, timestamps: Bool = false, writeOutput: (ByteBuffer) -> Void) -> Data {
