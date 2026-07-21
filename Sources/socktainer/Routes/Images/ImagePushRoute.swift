@@ -70,9 +70,19 @@ extension ImagePushRoute {
                 throw Abort(.internalServerError, reason: "Failed to push \(reference): \(error)")
             }
 
+            let app = req.application
+            // moby's push event uses the familiar reference as Actor.ID and the familiar
+            // name without tag as the `name` attribute (daemon/containerd/image_push.go).
+            let familiarName = (try? Reference.parse(reference))?.name ?? imageName
             response.body = .init(stream: { writer in
                 Task {
-                    await DockerProgressFrame.pipe(progressStream, to: writer)
+                    await DockerProgressFrame.pipe(progressStream, to: writer) {
+                        guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
+                        await broadcaster.broadcast(
+                            DockerEvent.make(
+                                type: "image", action: "push", actorID: reference,
+                                attributes: ["name": familiarName]))
+                    }
                 }
             })
             return response

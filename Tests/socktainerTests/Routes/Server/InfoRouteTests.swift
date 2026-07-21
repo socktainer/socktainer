@@ -65,6 +65,12 @@ private struct StubImageClient: ClientImageProtocol {
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
         URL(fileURLWithPath: "/dev/null")
     }
+    func importImage(
+        tarPath: URL, repo: String?, tag: String?, message: String?, changes: [String], platform: Platform,
+        appleContainerAppSupportUrl: URL, logger: Logger
+    ) async throws -> (reference: String?, digest: String) {
+        (nil, "sha256:0000000000000000000000000000000000000000000000000000000000000000")
+    }
 }
 
 // MARK: - loadSystemConfig

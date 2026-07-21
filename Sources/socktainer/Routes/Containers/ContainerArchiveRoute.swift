@@ -68,6 +68,12 @@ struct ContainerArchiveRoute: RouteCollection {
                 headers.add(name: .contentType, value: "application/x-tar")
                 headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
 
+                // moby emits "archive-path" on a successful GET (daemon/archive_unix.go);
+                // HEAD emits nothing.
+                if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                    await broadcaster.broadcast(DockerEvent.containerEvent("archive-path", container: container))
+                }
+
                 return Response(
                     status: .ok,
                     headers: headers,
@@ -151,6 +157,12 @@ struct ContainerArchiveRoute: RouteCollection {
                     tarPath: tarPath,
                     noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false
                 )
+
+                // moby emits "extract-to-dir" after a successful extraction
+                // (daemon/archive_unix.go).
+                if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                    await broadcaster.broadcast(DockerEvent.containerEvent("extract-to-dir", container: container))
+                }
 
                 return Response(status: .ok)
             } catch let error as ClientArchiveError {

@@ -50,11 +50,28 @@ struct ImagesGetRoute: RouteCollection {
             switch error {
             case .notFound(let id):
                 throw Abort(.notFound, reason: id)
+            case .digestReferenceNotAllowed(let repo):
+                throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
             }
         }
         let tempDir = tarballPath.deletingLastPathComponent()
 
-        let response = try await req.fileio.asyncStreamFile(at: tarballPath.path)
+        // moby emits one "save" event per exported image with the digest as Actor.ID
+        // (daemon/containerd/image_exporter.go). A reference the store cannot resolve
+        // to a digest is carried as-is.
+        let digestsByReference = await client.digestsByReference()
+        let savedActorIds = references.map { digestsByReference[$0] ?? $0 }
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+
+        let response = try await req.fileio.asyncStreamFile(at: tarballPath.path) { result in
+            guard case .success = result, let broadcaster else { return }
+            for actorId in savedActorIds {
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "image", action: "save", actorID: actorId,
+                        attributes: ["name": actorId]))
+            }
+        }
 
         response.headers.contentType = HTTPMediaType(type: "application", subType: "x-tar")
 

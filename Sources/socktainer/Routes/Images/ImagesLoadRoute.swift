@@ -78,11 +78,25 @@ extension ImagesLoadRoute {
                         let loadedImages = try await client.load(
                             tarballPath: tarPath, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
 
+                        // moby emits one "load" event per loaded image with the digest as
+                        // Actor.ID (daemon/containerd/image_exporter.go). Loaded references
+                        // come straight from the store, so the digest lookup normally hits;
+                        // a miss falls back to the reference.
+                        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+                        let digestsByReference = broadcaster != nil ? await client.digestsByReference() : [:]
+
                         for image in loadedImages {
                             if !quiet {
                                 DockerProgressFrame.write(DockerProgressFrame.status("Loaded image \(image)"), to: writer)
                             }
                             DockerProgressFrame.write(DockerProgressFrame.stream("Loaded image: \(image)\n"), to: writer)
+                            if let broadcaster {
+                                let actorId = digestsByReference[image] ?? image
+                                await broadcaster.broadcast(
+                                    DockerEvent.make(
+                                        type: "image", action: "load", actorID: actorId,
+                                        attributes: ["name": actorId]))
+                            }
                         }
 
                         _ = writer.write(.end)

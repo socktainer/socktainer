@@ -2,7 +2,7 @@ import ContainerizationOS
 import Vapor
 
 struct ContainerResizeRoute: RouteCollection {
-    let client: ClientContainerService
+    let client: ClientContainerProtocol
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/resize", use: ContainerResizeRoute.resize(client: client))
     }
@@ -28,7 +28,18 @@ struct ContainerResizeRoute: RouteCollection {
 
             if let process = await ProcessRegistry.shared.get(id: container.id) {
                 let size = Terminal.Size(width: UInt16(min(w, Int(UInt16.max))), height: UInt16(min(h, Int(UInt16.max))))
-                try? await process.resize(size)
+                // moby emits "resize" only after the task resize succeeded, carrying the
+                // requested height/width as decimal strings (daemon/resize.go). Exec resize
+                // stays silent — moby logs no event there.
+                if (try? await process.resize(size)) != nil,
+                    let broadcaster = req.application.storage[EventBroadcasterKey.self]
+                {
+                    await broadcaster.broadcast(
+                        DockerEvent.containerEvent(
+                            "resize", container: container,
+                            extraAttributes: ["height": String(h), "width": String(w)]
+                        ))
+                }
             }
 
             return Response(status: .ok)
