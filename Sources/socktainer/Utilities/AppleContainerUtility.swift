@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import Containerization
+import ContainerizationError
 import Foundation
 
 public func getLinuxDefaultKernelName() async throws -> String {
@@ -31,11 +32,10 @@ public struct AppleContainerVersionCheck {
     }
 
     /// Error types for version checking
-    public enum VersionCheckError: Error, LocalizedError {
+    public enum VersionCheckError: Error, LocalizedError, Equatable {
         case incompatibleVersion(detected: String, expected: String)
         case versionDetectionFailed(String)
-        case xpcConnectionError
-        case notStartedError
+        case appleContainerUnavailable
 
         public var errorDescription: String? {
             switch self {
@@ -44,10 +44,9 @@ public struct AppleContainerVersionCheck {
                     "Apple Container version mismatch: detected \(detected) but this socktainer binary requires \(expected). This version incompatibility will cause XPC connection errors. Skip the check using --no-check-compatibility flag."
             case .versionDetectionFailed(let reason):
                 return "Failed to detect Apple Container version: \(reason)"
-            case .xpcConnectionError:
-                return "XPC connection error detected. This usually indicates an incompatible Apple Container version."
-            case .notStartedError:
-                return "Ensure container system service has been started with `container system start`."
+            case .appleContainerUnavailable:
+                return
+                    "Unable to connect to the Apple Container service. Check its status with `container system status` and start it with `container system start` if necessary."
             }
         }
 
@@ -55,10 +54,15 @@ public struct AppleContainerVersionCheck {
 
     /// Checks if the installed Apple Container version is compatible
     public static func checkCompatibility() async throws {
+        try await checkCompatibility {
+            try await ClientHealthCheck.ping(timeout: .seconds(2)).apiServerVersion
+        }
+    }
+
+    static func checkCompatibility(fetchAPIServerVersion: @Sendable () async throws -> String) async throws {
         do {
             // Attempt to get version from Apple Container daemon
-            let healthCheck = try await ClientHealthCheck.ping(timeout: .seconds(2))
-            let serverVersionFull = healthCheck.apiServerVersion
+            let serverVersionFull = try await fetchAPIServerVersion()
             let serverVersion = extractSemver(from: serverVersionFull) ?? serverVersionFull
 
             // Check if client and server versions are compatible
@@ -72,18 +76,21 @@ public struct AppleContainerVersionCheck {
 
         } catch let error as VersionCheckError {
             throw error
+        } catch let error as ContainerizationError where isAppleContainerUnavailable(error) {
+            throw VersionCheckError.appleContainerUnavailable
         } catch {
-            // Check for XPC connection issues which indicate version incompatibility
-            if error.localizedDescription.contains("XPC connection") || error.localizedDescription.contains("Connection interrupted") {
-                throw VersionCheckError.xpcConnectionError
-            }
-            if error.localizedDescription.contains("The operation couldn’t be completed") {
-                throw VersionCheckError.notStartedError
-            }
-
             // Other errors are version detection failures
             throw VersionCheckError.versionDetectionFailed(error.localizedDescription)
         }
+    }
+
+    private static func isAppleContainerUnavailable(_ error: ContainerizationError) -> Bool {
+        if error.isCode(.interrupted) || error.isCode(.timeout) {
+            return true
+        }
+
+        // XPCClient reports response timeouts as internalError in Apple Container 1.1.0.
+        return error.isCode(.internalError) && error.message.hasPrefix("XPC timeout for request")
     }
 
     /// Performs compatibility check with user-friendly output and exit if it fails
