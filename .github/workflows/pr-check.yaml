@@ -160,20 +160,24 @@ jobs:
       # at "Testing access to container-apiserver" with an XPC error. tmate
       # was used here to work around that by providing a session whose
       # computed domain happened to work, but tmate is deprecated in Homebrew
-      # (disabled 2026-12-11). Instead: let the first start write the plist,
-      # bootstrap it into the system domain ourselves (Mach lookups chain
-      # gui -> user -> system, so a system-domain service is reachable from
-      # any session; the plist's LimitLoadToSessionType allows System), then
-      # re-run start, which now passes its ping and completes the
-      # init-filesystem and kernel setup it skips on failure.
+      # (disabled 2026-12-11). Instead: when the first start fails, it has
+      # already written the plist - bootstrap it into the system domain
+      # ourselves (Mach lookups chain gui -> user -> system, so a
+      # system-domain service is reachable from any session; the plist's
+      # LimitLoadToSessionType allows System), then re-run start, which now
+      # passes its ping and completes the init-filesystem and kernel setup
+      # it skips on failure. Gated on the first start failing so an eventual
+      # upstream fix doesn't turn the bootstrap into a spurious "already
+      # bootstrapped" error.
       - name: Start container system
         run: |
-          sudo container system start --enable-kernel-install || true
-          PLIST="$(sudo find /var/root "$HOME" -maxdepth 6 \
-            -path '*/com.apple.container/apiserver/apiserver.plist' 2>/dev/null | head -1)"
-          [ -n "$PLIST" ] || { echo "apiserver.plist not found" >&2; exit 1; }
-          sudo launchctl bootstrap system "$PLIST"
-          sudo container system start --enable-kernel-install
+          if ! sudo container system start --enable-kernel-install; then
+            PLIST="$(sudo find /var/root "$HOME" -maxdepth 6 \
+              -path '*/com.apple.container/apiserver/apiserver.plist' 2>/dev/null | head -1)"
+            [ -n "$PLIST" ] || { echo "apiserver.plist not found" >&2; exit 1; }
+            sudo launchctl bootstrap system "$PLIST"
+            sudo container system start --enable-kernel-install
+          fi
           sudo container system status
 
       - name: run socktainer
