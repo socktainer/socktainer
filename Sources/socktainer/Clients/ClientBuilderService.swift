@@ -45,8 +45,8 @@ protocol ClientBuilderProtocol: Sendable {
 }
 
 struct ClientBuilderService: ClientBuilderProtocol {
-    private let containerClient = ContainerClient()
-    private let networkClient = NetworkClient()
+    private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
+    private let networkClient = ReconnectingContainerClient(makeClient: { NetworkClient() })
     private let builderContainerId: String
     private let builderPort: UInt32
     private let builderCPUs: Int64
@@ -168,13 +168,13 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
     private func dialBuilderSocket() async throws -> FileHandle {
         let container = try await runningBuilderContainer(logger: nil)
-        return try await containerClient.dial(id: container.id, port: builderPort)
+        return try await containerClient.withClient { try await $0.dial(id: container.id, port: builderPort) }
     }
 
     private func runningBuilderContainer(logger: Logger?) async throws -> ContainerSnapshot {
         let container: ContainerSnapshot
         do {
-            container = try await containerClient.get(id: builderContainerId)
+            container = try await containerClient.withClient { try await $0.get(id: builderContainerId) }
         } catch let error as ContainerizationError where error.code == .notFound {
             logger?.info("Builder container not found, creating a new builder instance")
             return try await createAndStartBuilder(logger: logger)
@@ -187,12 +187,12 @@ struct ClientBuilderService: ClientBuilderProtocol {
             case .stopped:
                 logger?.info("Builder container is stopped, starting it")
                 try await startBuildKit(containerId: container.id)
-                return try await containerClient.get(id: container.id)
+                return try await containerClient.withClient { try await $0.get(id: container.id) }
             case .stopping:
                 throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is stopping")
             case .unknown:
                 logger?.warning("Builder container has unknown state, recreating it")
-                try? await containerClient.delete(id: container.id)
+                try? await containerClient.withClient { try await $0.delete(id: container.id) }
                 return try await createAndStartBuilder(logger: logger)
             @unknown default:
                 throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is in an unsupported state")
@@ -218,7 +218,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         let imageConfig = try await image.config(for: builderPlatform).config
 
-        guard let defaultNetwork = try await networkClient.builtin else {
+        guard let defaultNetwork = try await networkClient.withClient({ try await $0.builtin }) else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
         let nameserver = IPv4Address(defaultNetwork.status.ipv4Subnet.lower.value + 1).description
@@ -236,9 +236,9 @@ struct ClientBuilderService: ClientBuilderProtocol {
         )
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
-        try await containerClient.create(configuration: config, options: .default, kernel: kernel)
+        try await containerClient.withClient { try await $0.create(configuration: config, options: .default, kernel: kernel) }
         try await startBuildKit(containerId: builderContainerId)
-        return try await containerClient.get(id: builderContainerId)
+        return try await containerClient.withClient { try await $0.get(id: builderContainerId) }
     }
 
     /// Pure construction of the BuildKit guest's ContainerConfiguration — no real service
@@ -288,12 +288,12 @@ struct ClientBuilderService: ClientBuilderProtocol {
         defer { try? io.close() }
 
         do {
-            let process = try await containerClient.bootstrap(id: containerId, stdio: io.stdio)
+            let process = try await containerClient.withClient { try await $0.bootstrap(id: containerId, stdio: io.stdio) }
             try await process.start()
             try io.closeAfterStart()
         } catch {
-            try? await containerClient.stop(id: containerId)
-            try? await containerClient.delete(id: containerId)
+            try? await containerClient.withClient { try await $0.stop(id: containerId) }
+            try? await containerClient.withClient { try await $0.delete(id: containerId) }
             if let containerizationError = error as? ContainerizationError {
                 throw containerizationError
             }
@@ -311,13 +311,16 @@ struct ClientBuilderService: ClientBuilderProtocol {
             throw ContainerizationError(.internalError, message: "Failed to create I/O pipes")
         }
         let process: ClientProcess
+        let processConfigToSend = processConfig
         do {
-            process = try await containerClient.createProcess(
-                containerId: container.id,
-                processId: UUID().uuidString.lowercased(),
-                configuration: processConfig,
-                stdio: pipes.stdioArray
-            )
+            process = try await containerClient.withClient {
+                try await $0.createProcess(
+                    containerId: container.id,
+                    processId: UUID().uuidString.lowercased(),
+                    configuration: processConfigToSend,
+                    stdio: pipes.stdioArray
+                )
+            }
         } catch {
             pipes.closeAll()
             throw error

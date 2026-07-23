@@ -97,10 +97,10 @@ enum ClientContainerError: Error {
 }
 
 struct ClientContainerService: ClientContainerProtocol {
-    private let containerClient = ContainerClient()
+    private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
-        let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
         let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
         return Self.applyFilters(running, filters: filters, allContainers: allContainers)
     }
@@ -230,13 +230,13 @@ struct ClientContainerService: ClientContainerProtocol {
     func getContainer(id: String) async throws -> ContainerSnapshot? {
         let id = ContainerNameUtility.sanitize(id)
         do {
-            let snapshot = try await containerClient.get(id: id)
+            let snapshot = try await containerClient.withClient { try await $0.get(id: id) }
             return Self.isDNSSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
             // prefix of one fed back from `docker ps` output; resolve it
             // against the derived IDs of all containers.
-            let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
+            let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
             switch DockerContainerID.resolve(reference: id, entries: entries) {
             case .match(let nativeId):
@@ -284,7 +284,7 @@ struct ClientContainerService: ClientContainerProtocol {
         let stdio = [stdin, stdout, stderr]
 
         do {
-            let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
+            let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
@@ -330,7 +330,7 @@ struct ClientContainerService: ClientContainerProtocol {
     private func stopInternal(container: ContainerSnapshot, signal: String?, timeout: Int?) async throws {
         let signal = signal ?? "SIGTERM"
         let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
-        try await containerClient.stop(id: container.id, opts: options)
+        try await containerClient.withClient { try await $0.stop(id: container.id, opts: options) }
     }
 
     func kill(id: String, signal: String?) async throws {
@@ -346,7 +346,7 @@ struct ClientContainerService: ClientContainerProtocol {
         let signal = signal ?? "SIGKILL"
 
         await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
-        try await containerClient.kill(id: container.id, signal: signal)
+        try await containerClient.withClient { try await $0.kill(id: container.id, signal: signal) }
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
@@ -375,7 +375,7 @@ struct ClientContainerService: ClientContainerProtocol {
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
-        try await containerClient.delete(id: container.id)
+        try await containerClient.withClient { try await $0.delete(id: container.id) }
     }
 
     // Poll until the container is no longer running, then return the real exit
@@ -408,7 +408,7 @@ struct ClientContainerService: ClientContainerProtocol {
             // the recorder), so also stop once it's gone, then grace-poll the
             // store below.
             while await ContainerExitCodeStore.shared.get(id: id) == nil {
-                let current = try await containerClient.list().filter { $0.id == id }.first
+                let current = try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first
                 if current == nil {
                     var graceTries = 0
                     while await ContainerExitCodeStore.shared.get(id: id) == nil && graceTries < 30 {
@@ -423,7 +423,7 @@ struct ClientContainerService: ClientContainerProtocol {
             // `removed` must block until the container is actually gone, not just
             // exited — otherwise the requested condition was never satisfied.
             if condition == .removed {
-                while (try await containerClient.list().filter { $0.id == id }.first) != nil {
+                while (try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first) != nil {
                     try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
                 }
             }
@@ -434,7 +434,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = Self.withoutDNSSidecars(try await containerClient.list())
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
 
         var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
 
@@ -506,7 +506,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
         for container in containersToDelete {
             do {
-                try await containerClient.delete(id: container.id)
+                try await containerClient.withClient { try await $0.delete(id: container.id) }
                 deletedIds.append(container.id)
             } catch {
                 continue
