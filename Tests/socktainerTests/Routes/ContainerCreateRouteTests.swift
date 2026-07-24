@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
+import ContainerizationError
 import Foundation
 import Logging
 import Testing
@@ -640,5 +641,28 @@ struct ConvertPortBindingsTests {
         let ports = try convertPortBindings(from: ["5432/tcp": [PortBinding(HostIp: nil, HostPort: "")]])
         #expect(ports.count == 1)
         #expect(ports[0].hostPort != 0)
+    }
+}
+
+@Suite("ContainerCreateRoute — image existence error mapping")
+struct ImageExistenceErrorTests {
+    @Test("a genuine not-found is reported with Docker's load-bearing 'No such image: <ref>' text")
+    func notFoundMapsToNoSuchImage() {
+        let mapped = ContainerCreateRoute.imageExistenceError(
+            ContainerizationError(.notFound, message: "image with reference redis:latest"),
+            image: "redis:latest"
+        )
+        let abort = mapped as? AbortError
+        #expect(abort?.status == .notFound)
+        #expect(abort?.reason == "No such image: redis:latest")
+    }
+
+    @Test("a non-not-found error (e.g. XPC interruption, issue #130) is preserved, not mislabeled as a missing image")
+    func transientErrorIsPreserved() {
+        let xpc = ContainerizationError(.interrupted, message: "XPC connection error: Connection interrupted")
+        let mapped = ContainerCreateRoute.imageExistenceError(xpc, image: "redis:latest")
+        // Must NOT be collapsed into a 404 "No such image" — the real cause has to reach the client.
+        #expect((mapped as? AbortError)?.status != .notFound)
+        #expect((mapped as? ContainerizationError)?.code == .interrupted)
     }
 }
