@@ -10,6 +10,26 @@ import VaporTesting
 
 @testable import socktainer
 
+/// Asserts a create request got past input validation to the pre-flight image stage.
+///
+/// The create handler checks image existence right after validation. The test
+/// environment has no Apple Container apiserver, so that check always fails — as
+/// `.notFound` (→ 404 "No such image") when the image is simply absent, or as
+/// `.internalServerError` when the missing apiserver surfaces as an XPC
+/// `ContainerizationError(.interrupted, …)` (which the route now preserves instead
+/// of mislabeling as "No such image"). Either outcome proves the input passed
+/// validation; a validation failure would be `.badRequest` or `.payloadTooLarge`.
+private func expectReachedImageStage(
+    _ res: TestingHTTPResponse,
+    sourceLocation: SourceLocation = #_sourceLocation
+) {
+    #expect(
+        res.status == .notFound || res.status == .internalServerError,
+        "expected to reach the pre-flight image stage (404 or 500), got \(res.status)",
+        sourceLocation: sourceLocation
+    )
+}
+
 /// Regression tests for the >16 KB request-body fix on `POST /containers/create`.
 ///
 /// `Request.body.collect()` defaults to Vapor's `1 << 14` (16 KB) cap, and
@@ -29,9 +49,6 @@ import VaporTesting
 @Suite("ContainerCreateRoute — request body size")
 struct ContainerCreateRouteTests {
 
-    /// The Abort error body shape (`{"error":true,"reason":"…"}`).
-    private struct ErrorBody: Content { let reason: String }
-
     @Test("a >16 KB create body is collected, not rejected with 413")
     func largeBodyIsAccepted() async throws {
         // Valid create JSON, padded well past 16 KB via a large label value.
@@ -44,13 +61,11 @@ struct ContainerCreateRouteTests {
                 .POST, "/v1.51/containers/create?name=body-size-probe",
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: payload)
-            ) { res async throws in
+            ) { res async in
                 // The body streamed in and was collected past 16 KB; the request
-                // then fails only at the image-existence check. With the bug the
+                // then fails only at the pre-flight image stage. With the bug the
                 // body cap (16 KB) would raise 413 before the handler ran.
-                #expect(res.status == .notFound)
-                let err = try res.content.decode(ErrorBody.self)
-                #expect(err.reason.contains("No such image"))
+                expectReachedImageStage(res)
             }
         }
     }
@@ -267,7 +282,7 @@ struct StopSignalValidationTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","StopSignal":"SIGWINCH"}"#)
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -366,7 +381,7 @@ struct CapabilityValidationTests {
                 body: ByteBuffer(
                     string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"CapAdd":["NET_ADMIN"],"CapDrop":["MKNOD"]}}"#)
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -379,7 +394,7 @@ struct CapabilityValidationTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"CapAdd":["ALL"]}}"#)
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -494,7 +509,7 @@ struct CpuLimitRouteValidationTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"NanoCpus":1500000000}}"#)
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -513,7 +528,7 @@ struct DockerSocketRelayRouteTests {
                     string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/var/run/docker.sock:/var/run/docker.sock:ro"]}}"#
                 )
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -529,7 +544,7 @@ struct DockerSocketRelayRouteTests {
                         #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Mounts":[{"Type":"bind","Source":"/var/run/docker.sock","Target":"/var/run/docker.sock","ReadOnly":true}]}}"#
                 )
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -546,7 +561,7 @@ struct DockerSocketRelayRouteTests {
                         #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Binds":["/Users/test/.socktainer/container.sock:/var/run/docker.sock:ro"]}}"#
                 )
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
@@ -613,7 +628,7 @@ struct RestartPolicyValidationTests {
                 headers: ["Content-Type": "application/json"],
                 body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3}}}"#)
             ) { res async in
-                #expect(res.status == .notFound)
+                expectReachedImageStage(res)
             }
         }
     }
