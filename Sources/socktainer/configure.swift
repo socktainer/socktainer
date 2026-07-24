@@ -235,12 +235,23 @@ func configure(_ app: Application) async throws {
         }
     }
 
-    await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
-
-    // Reap networks orphaned by a previous run (containers removed, network left behind).
-    // Apple Container's vmnet state degrades as stale networks accumulate and eventually
-    // breaks container-to-container routing (EHOSTUNREACH); runs after the DNS-sidecar
-    // cleanup so a network whose only member was its sidecar now appears empty.
-    await OrphanedNetworkReaper.reap(networkClient: networkClient, logger: app.logger)
+    // Sidecar adoption and network reaping (in that order — a network whose only
+    // member was its sidecar must appear empty to the reaper) are best-effort
+    // housekeeping over XPC calls that hang indefinitely when the runtime is
+    // wedged (apple/container#1884). Time-box them: a daemon that skips
+    // housekeeping still serves clients, one that never binds its socket serves
+    // nothing. Network reaping context: Apple Container's vmnet state degrades
+    // as orphaned networks accumulate and eventually breaks container-to-container
+    // routing (EHOSTUNREACH).
+    let housekeepingLogger = app.logger
+    let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
+    }
+    if !housekeepingFinished {
+        app.logger.warning(
+            "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."
+        )
+    }
 
 }
