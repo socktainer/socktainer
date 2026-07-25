@@ -25,8 +25,16 @@ enum VolumeNotFound {
             if containerError.code == .notFound {
                 return true
             }
+            // The flattened shape is specifically `.invalidArgument` carrying the
+            // whole "volume '<name>' not found" payload. Require both the code and
+            // the exact message envelope so an unrelated invalid-argument error is
+            // not caught. (Docker volume names cannot contain a quote, so the
+            // prefix/suffix pair pins the payload precisely.)
+            guard containerError.code == .invalidArgument else {
+                return false
+            }
             let message = containerError.message
-            return message.contains("volume '") && message.contains("not found")
+            return message.hasPrefix("volume '") && message.hasSuffix("' not found")
         }
         return false
     }
