@@ -102,6 +102,56 @@ struct VolumeDeleteForceTests {
         #expect(calls.isEmpty, "force purges a missing volume silently, without a delete call")
     }
 
+    @Test(
+        "A volume that vanishes between inspect and delete is a 404 without force",
+        arguments: NotFound.allCases)
+    func deleteRaceWithoutForceIsNotFound(notFound: NotFound) async throws {
+        let log = CallLog()
+        // inspect succeeds, but the delete then hits the not-found shape.
+        let mock = RecordingVolumeMock(
+            existing: Self.volume(name: "pgdata"), notFound: notFound, log: log, deleteError: notFound.error("pgdata"))
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: VolumeDeleteRoute(client: mock))
+
+            try await app.testing().test(.DELETE, "/v1.51/volumes/pgdata") { res async in
+                #expect(res.status == .notFound)
+                #expect(res.body.string.contains("no such volume"))
+            }
+        }
+
+        let calls = await log.calls
+        #expect(calls == ["delete"], "the delete was attempted before the race was detected")
+    }
+
+    @Test(
+        "A volume that vanishes between inspect and delete is a silent 204 with force",
+        arguments: NotFound.allCases)
+    func deleteRaceWithForceIsNoOp(notFound: NotFound) async throws {
+        let log = CallLog()
+        let mock = RecordingVolumeMock(
+            existing: Self.volume(name: "pgdata"), notFound: notFound, log: log, deleteError: notFound.error("pgdata"))
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: VolumeDeleteRoute(client: mock))
+
+            try await app.testing().test(.DELETE, "/v1.51/volumes/pgdata?force=1") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let calls = await log.calls
+        #expect(calls == ["delete"], "force swallows the race after the delete attempt")
+    }
+
     // MARK: - Helpers
 
     private static func volume(name: String, driver: String = "local") -> Volume {
@@ -125,11 +175,17 @@ private struct RecordingVolumeMock: ClientVolumeProtocol {
     let existing: Volume?
     let notFound: VolumeDeleteForceTests.NotFound
     let log: CallLog
+    /// When set, `delete` throws this after logging, simulating a volume that
+    /// vanished between the route's inspect and its delete call.
+    var deleteError: (any Error)?
 
     func create(request: RESTVolumeCreate) async throws -> Volume {
         throw VolumeError.storageError("not used")
     }
-    func delete(name: String) async throws { await log.add("delete") }
+    func delete(name: String) async throws {
+        await log.add("delete")
+        if let deleteError { throw deleteError }
+    }
     func list(filters: String?, logger: Logger) async throws -> [Volume] {
         existing.map { [$0] } ?? []
     }

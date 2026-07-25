@@ -45,6 +45,15 @@ struct VolumeDeleteRoute: RouteCollection {
             if let abortError = error as? AbortError {
                 throw abortError
             }
+            // The volume can vanish between the inspect above and this delete
+            // (another client, or `container volume rm`). moby maps that race to
+            // the same force contract: a silent 204 under force, else a 404.
+            if VolumeNotFound.matches(error) {
+                if force {
+                    return Response(status: .noContent)
+                }
+                throw Abort(.notFound, reason: "get \(name): no such volume")
+            }
             throw Abort(.internalServerError, reason: "Failed to delete volume: \(error)")
         }
     }
