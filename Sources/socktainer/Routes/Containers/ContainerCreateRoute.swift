@@ -150,7 +150,7 @@ extension ContainerCreateRoute {
             do {
                 _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: systemConfig)
             } catch {
-                throw Abort(.notFound, reason: "No such image: \(body.Image)")
+                throw ContainerCreateRoute.imageExistenceError(error, image: body.Image)
             }
 
             // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
@@ -707,6 +707,23 @@ extension ContainerCreateRoute {
         if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
         if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
         return nil
+    }
+
+    /// Maps an error from the pre-flight image existence check to a client-facing error.
+    ///
+    /// A genuine not-found is reported with Docker's `No such image: <ref>` phrasing,
+    /// which is load-bearing: docker-py raises `ImageNotFound` off that exact text.
+    /// Any other error — most notably a transient `ContainerizationError(.interrupted,
+    /// "XPC connection error: …")` (see issue #130) — is preserved unchanged so its real
+    /// cause reaches the client instead of being mislabeled as a missing image.
+    ///
+    /// Extracted as a pure function so the mapping can be asserted in unit tests without
+    /// driving Apple Container APIs.
+    static func imageExistenceError(_ error: Error, image: String) -> Error {
+        if let containerError = error as? ContainerizationError, containerError.code == .notFound {
+            return Abort(.notFound, reason: "No such image: \(image)")
+        }
+        return error
     }
 
     /// Resolves the process user, preferring an explicit request override over the image
