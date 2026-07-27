@@ -151,43 +151,34 @@ jobs:
       - name: install apple container
         run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
 
-      - name: setup tmate
+      # `container system start` writes the apiserver launchd plist, then
+      # bootstraps it via a launchctl call whose output and exit status it
+      # discards (ServiceManager.register in apple/container). It derives the
+      # target domain from `launchctl managername` + getuid(): under sudo in
+      # a CI session that yields a domain like user/0 that can't be
+      # bootstrapped into, so the registration silently fails and start dies
+      # at "Testing access to container-apiserver" with an XPC error. tmate
+      # was used here to work around that by providing a session whose
+      # computed domain happened to work, but tmate is deprecated in Homebrew
+      # (disabled 2026-12-11). Instead: when the first start fails, it has
+      # already written the plist - bootstrap it into the system domain
+      # ourselves (Mach lookups chain gui -> user -> system, so a
+      # system-domain service is reachable from any session; the plist's
+      # LimitLoadToSessionType allows System), then re-run start, which now
+      # passes its ping and completes the init-filesystem and kernel setup
+      # it skips on failure. Gated on the first start failing so an eventual
+      # upstream fix doesn't turn the bootstrap into a spurious "already
+      # bootstrapped" error.
+      - name: Start container system
         run: |
-          brew install tmate
-
-      - name: Start internal tmate session and start container system using this tmate session
-        run: |
-          # Start a detached tmate session
-          tmate -S /tmp/tmate.sock new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
-          # skip welcome screen
-          tmate -F -S /tmp/tmate.sock send-keys "q" C-m
-
-          # Send Apple Container commands automatically
-          tmate -S /tmp/tmate.sock send-keys "echo 'Starting Apple Container...'" C-m
-          tmate -S /tmp/tmate.sock send-keys "sudo container system start --enable-kernel-install | tee /tmp/container.log" C-m
-
-          # Loop until 'container system status' returns exit code 1 or timeout (60s)
-          START=$SECONDS
-          TIMEOUT=60
-
-          while [ $((SECONDS - START)) -lt $TIMEOUT ]; do
-            # Capture tmate session output
-            tmate -S /tmp/tmate.sock capture-pane -p > /tmp/container.log
-            cat /tmp/container.log
-
-            # Check container status locally
-            if sudo container system status >/dev/null 2>&1; then
-              # Exit code 0 → container is ready
-              echo "Container is ready. Exiting loop."
-              break
-            else
-              echo "Container not ready yet..."
-            fi
-          done
-
-          # stop tmate session
-          tmate -S /tmp/tmate.sock kill-session
+          if ! sudo container system start --enable-kernel-install; then
+            PLIST="$(sudo find /var/root "$HOME" -maxdepth 6 \
+              -path '*/com.apple.container/apiserver/apiserver.plist' 2>/dev/null | head -1)"
+            [ -n "$PLIST" ] || { echo "apiserver.plist not found" >&2; exit 1; }
+            sudo launchctl bootstrap system "$PLIST"
+            sudo container system start --enable-kernel-install
+          fi
+          sudo container system status
 
       - name: run socktainer
         run: |
