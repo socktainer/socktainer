@@ -144,7 +144,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
             do {
                 let socket = try await dialBuilderSocket()
                 let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                let builder = try Builder(socket: socket, group: group, logger: logger)
+                let builder = try await Builder(socket: socket, group: group, logger: logger)
                 do {
                     _ = try await builder.info()
                     return builder
