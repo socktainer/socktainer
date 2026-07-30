@@ -1,0 +1,27 @@
+# Set update schedule for GitHub Actions and Swift dependencies
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "03:00"
+    open-pull-requests-limit: 20
+
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "03:00"
+    open-pull-requests-limit: 20
+    groups:
+      apple-container:
+        applies-to: version-updates
+        patterns:
+          - "apple-container"
+          - "apple-containerization"
+      apple-swift:
+        applies-to: version-updates
+        patterns:
+          - "apple-swift-*"
