@@ -1,4 +1,4 @@
-import ContainerAPIClient
+import ContainerResource
 import Testing
 
 @testable import socktainer
@@ -12,27 +12,27 @@ struct ContainerNameShorteningTests {
         #expect(ContainerNameUtility.sanitize(name) == name)
     }
 
-    @Test("64-character name is returned unchanged")
-    func exactly64CharPassthrough() {
-        let name = "a" + String(repeating: "b", count: 63)
-        #expect(name.count == 64)
+    @Test("63-character name is returned unchanged")
+    func exactly63CharPassthrough() {
+        let name = "a" + String(repeating: "b", count: 62)
+        #expect(name.count == 63)
         #expect(ContainerNameUtility.sanitize(name) == name)
     }
 
-    @Test("65-character name is shortened to exactly 64 characters")
-    func shortens65CharName() {
-        let name = "a" + String(repeating: "b", count: 64)
-        #expect(name.count == 65)
+    @Test("64-character name is shortened to exactly 63 characters")
+    func shortens64CharName() {
+        let name = "a" + String(repeating: "b", count: 63)
+        #expect(name.count == 64)
         let result = ContainerNameUtility.sanitize(name)
-        #expect(result.count == 64)
+        #expect(result.count == 63)
     }
 
-    @Test("Name longer than 100 characters is shortened to exactly 64 characters")
+    @Test("Name longer than 100 characters is shortened to exactly 63 characters")
     func shortensVeryLongName() {
         let name = "act-Build-and-Test-on-Multiple-Platforms-build-ubuntu-latest-some-extra-suffix-here"
-        #expect(name.count > 64)
+        #expect(name.count > 63)
         let result = ContainerNameUtility.sanitize(name)
-        #expect(result.count == 64)
+        #expect(result.count == 63)
     }
 
     @Test("Shortening is deterministic")
@@ -51,12 +51,12 @@ struct ContainerNameShorteningTests {
         #expect(ContainerNameUtility.sanitize(name1) != ContainerNameUtility.sanitize(name2))
     }
 
-    @Test("Shortened name passes validEntityName")
+    @Test("Shortened name passes ManagedContainer.nameValid")
     func shortenedNamePassesValidation() throws {
         let name = "act-" + String(repeating: "valid-name-segment", count: 5)
         #expect(name.count > 64)
         let result = ContainerNameUtility.sanitize(name)
-        try Utility.validEntityName(result)
+        #expect(ManagedContainer.nameValid(result))
     }
 
     @Test("Shortened name preserves readable prefix")

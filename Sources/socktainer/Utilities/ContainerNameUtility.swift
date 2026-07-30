@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 enum ContainerNameUtility {
-    static let maxLength = 64
+    static let maxLength = 63
 
     static func sanitize(_ name: String) -> String {
         guard name.count > maxLength else { return name }

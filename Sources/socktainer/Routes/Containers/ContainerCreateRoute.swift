@@ -141,7 +141,9 @@ extension ContainerCreateRoute {
 
             let rawId = Utility.createContainerID(name: containerName)
             let id = ContainerNameUtility.sanitize(rawId)
-            try Utility.validEntityName(id)
+            guard ManagedContainer.nameValid(id) else {
+                throw Abort(.badRequest, reason: "invalid container name: \(id)")
+            }
 
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
