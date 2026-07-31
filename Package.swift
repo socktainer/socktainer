@@ -14,7 +14,9 @@ func resolvedVersion(for identity: String) -> String {
         let pin = pins.first(where: { ($0["identity"] as? String) == identity }),
         let state = pin["state"] as? [String: Any],
         let version = state["version"] as? String
-    else { return "0.0.0" }
+    else {
+        fatalError("Package.resolved has no resolved version for \(identity)")
+    }
     return version
 }
 
