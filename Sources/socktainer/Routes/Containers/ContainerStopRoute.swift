@@ -25,6 +25,13 @@ extension ContainerStopRoute {
 
             let snapshot = try? await client.getContainer(id: id)
 
+            // Docker Engine API: stopping an already-stopped container is a 304
+            // Not Modified with no stop/die event (moby's containerStop returns
+            // containerNotModifiedError when !ctr.IsRunning()).
+            if snapshot?.status == .stopped {
+                return .notModified
+            }
+
             do {
                 try await client.stop(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {

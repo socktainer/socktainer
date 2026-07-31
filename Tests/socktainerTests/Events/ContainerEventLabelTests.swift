@@ -17,7 +17,9 @@ struct ContainerStopEventLabelTests {
     func stopEventCarriesLabels() async throws {
         let id = "stop-ctr-hex"
         let nativeId = "stop-native"
-        let snapshot = makeSnapshot(nativeId: nativeId, image: "redis:7", labels: ["svc": "cache"])
+        // A running container so /stop actually stops and emits the stop event
+        // (an already-stopped container is a 304 no-op under the moby contract).
+        let snapshot = makeSnapshot(nativeId: nativeId, image: "redis:7", labels: ["svc": "cache"], status: .running)
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
         let captureTask = Task<DockerEvent?, Never> {
@@ -233,7 +235,7 @@ struct ContainerAutoRemoveEventTests {
 
 // MARK: - Shared helpers
 
-private func makeSnapshot(nativeId: String, image: String, labels: [String: String]) -> ContainerSnapshot {
+private func makeSnapshot(nativeId: String, image: String, labels: [String: String], status: RuntimeStatus = .stopped) -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
         workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
@@ -247,7 +249,7 @@ private func makeSnapshot(nativeId: String, image: String, labels: [String: Stri
     )
     var config = ContainerConfiguration(id: nativeId, image: img, process: proc)
     config.labels = labels
-    return ContainerSnapshot(configuration: config, status: .stopped, networks: [])
+    return ContainerSnapshot(configuration: config, status: status, networks: [])
 }
 
 /// Mock returning a fixed snapshot and succeeding on all mutations.
