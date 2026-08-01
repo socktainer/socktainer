@@ -228,14 +228,16 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
-        let id = ContainerNameUtility.sanitize(id)
+        let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
-            let snapshot = try await containerClient.withClient { try await $0.get(id: id) }
+            let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
             return Self.isDNSSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
             // prefix of one fed back from `docker ps` output; resolve it
-            // against the derived IDs of all containers.
+            // against the derived IDs of all containers. Use the original
+            // unsanitized reference: sanitize() mangles 64-char hex IDs into
+            // non-hex strings (containing "-"), which breaks hex prefix matching.
             let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
             switch DockerContainerID.resolve(reference: id, entries: entries) {
@@ -314,7 +316,6 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -334,13 +335,12 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func kill(id: String, signal: String?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
 
         guard container.status == .running else {
-            throw ClientContainerError.notRunning(id: id)
+            throw ClientContainerError.notRunning(id: container.id)
         }
 
         let signal = signal ?? "SIGKILL"
@@ -350,7 +350,6 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -371,7 +370,6 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func delete(id: String) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
