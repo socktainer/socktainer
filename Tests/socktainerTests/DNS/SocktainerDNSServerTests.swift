@@ -171,9 +171,17 @@ struct SocktainerDNSServerTests {
 // MARK: - DNS query behaviour
 
 /// Sends a minimal DNS A or AAAA query via UDP and returns the RCODE from the response.
-/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
-/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
 private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
+    guard
+        let response = sendDnsQuery(makeDnsQuery(name: name, type: type, edns0: false), port: port),
+        response.count >= 4
+    else { return nil }
+    return response[3] & 0x0F
+}
+
+/// Builds a DNS query packet (ID 0x1234, RD=1), optionally with an EDNS0 OPT
+/// additional record (ARCOUNT=1, UDP payload 4096) like real resolvers send.
+private func makeDnsQuery(name: String, type: UInt16, edns0: Bool) -> [UInt8] {
     var qname = [UInt8]()
     for label in name.split(separator: ".") {
         let bytes = Array(label.utf8)
@@ -184,10 +192,25 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
 
     var packet = [UInt8]()
     packet += [0x12, 0x34, 0x01, 0x00]  // ID + RD=1 query
-    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]  // QDCOUNT=1, rest 0
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00]  // QDCOUNT=1
+    if edns0 {
+        packet += [0x00, 0x01]  // ARCOUNT=1
+    } else {
+        packet += [0x00, 0x00]
+    }
     packet += qname
     packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+    if edns0 {
+        // EDNS0 OPT record: root name, TYPE=41, CLASS=4096 (UDP payload), TTL=0, RDLEN=0
+        packet += [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+    return packet
+}
 
+/// Sends raw query bytes via UDP to 127.0.0.1:port and returns the raw response.
+/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
+/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
+private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
     var dst = sockaddr_in()
     dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     dst.sin_family = sa_family_t(AF_INET)
@@ -211,9 +234,46 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
         guard sent > 0 else { continue }
         var buf = [UInt8](repeating: 0, count: 512)
         let n = recv(fd, &buf, buf.count, 0)
-        if n >= 4 { return buf[3] & 0x0F }
+        if n >= 12 { return Array(buf[0..<n]) }
     }
     return nil
+}
+
+/// Sends an EDNS0-OPT query and returns the response's ARCOUNT and the bytes remaining
+/// after the question and answer sections. Both are 0 for a well-formed response — an
+/// echoed OPT record or trailing bytes would make them nonzero.
+private func dnsResponseTail(type: UInt16, name: String, port: Int) -> (arcount: Int, remaining: Int)? {
+    guard
+        let response = sendDnsQuery(makeDnsQuery(name: name, type: type, edns0: true), port: port),
+        response.count >= 12
+    else { return nil }
+    let qd = Int((UInt16(response[4]) << 8) | UInt16(response[5]))
+    let an = Int((UInt16(response[6]) << 8) | UInt16(response[7]))
+    let arcount = Int((UInt16(response[10]) << 8) | UInt16(response[11]))
+    var pos = 12
+    func skipName() {
+        while pos < response.count {
+            let len = Int(response[pos])
+            pos += 1
+            if len == 0 { break }
+            if (len & 0xC0) == 0xC0 {
+                pos += 1
+                break
+            }  // compression pointer (2 bytes total)
+            pos += len
+        }
+    }
+    for _ in 0..<qd {
+        skipName()
+        pos += 4
+    }
+    for _ in 0..<an {
+        skipName()
+        guard pos + 10 <= response.count else { break }
+        let rdlen = Int((UInt16(response[pos + 8]) << 8) | UInt16(response[pos + 9]))
+        pos += 10 + rdlen
+    }
+    return (arcount, response.count - pos)
 }
 
 @Suite("SocktainerDNSServer — query behaviour")
@@ -229,6 +289,24 @@ struct SocktainerDNSQueryTests {
         server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
         let rcode = dnsRcode(type: 1, name: "supabase_db_supabase", port: port)
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
+    }
+
+    // Regression: NS & AR sections should be dropped when their count is set to 0.
+    @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
+    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "redis", ip: "192.168.1.10")
+
+        guard let tail = dnsResponseTail(type: 1, name: "redis", port: port) else {
+            Issue.record("No response for EDNS0 A query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
     }
 
     @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")
