@@ -187,13 +187,8 @@ actor HealthCheckManager {
 
     // MARK: - Default probe (real exec)
 
-    private enum ProbeOutcome {
-        case exited(Int32)
-        case timedOut
-    }
-
-    /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
-    /// Returns the exit code, or 1 on any failure.
+    /// Runs `cmd` inside the container via `createProcess`, bounded by a
+    /// timeout. Returns the exit code, or 1 on any failure (timeout included).
     static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
         do {
             let containerClient = ContainerClient()
@@ -216,23 +211,11 @@ actor HealthCheckManager {
             )
             try await process.start()
 
-            let outcome: ProbeOutcome = try await withThrowingTaskGroup(of: ProbeOutcome.self) { group in
-                group.addTask { .exited(try await process.wait()) }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: timeoutNs)
-                    return .timedOut
-                }
-                let result = try await group.next() ?? .timedOut
-                group.cancelAll()
-                return result
-            }
-            switch outcome {
-            case .exited(let code):
-                return code
-            case .timedOut:
-                try? await process.kill(SIGTERM)
-                return 1
-            }
+            return try await GuestProcess.waitBounded(
+                timeoutNs: timeoutNs,
+                wait: { try await process.wait() },
+                terminate: { try? await process.kill(SIGKILL) }
+            )
         } catch {
             return 1
         }
