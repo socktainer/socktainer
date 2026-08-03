@@ -46,13 +46,22 @@ struct ExecWaitOutcomeTests {
         // fix's timeout race, this call would never return and the test
         // itself would hang — mirroring how a stalled process.wait() left
         // the hijacked channel open forever.
+        //
+        // Simulated here with a continuation that only resumes via a real-time
+        // callback, never observing Task cancellation — a genuinely
+        // non-cooperative stall. (A `Task.sleep`-based stand-in would throw
+        // `CancellationError` the instant it's cancelled, masking the bug
+        // this test guards against: the caller must not depend on the loser
+        // task ever finishing, cooperatively or otherwise.)
         let timeoutNanoseconds: UInt64 = 100_000_000  // 100ms
         let start = DispatchTime.now().uptimeNanoseconds
 
         let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: timeoutNanoseconds) {
-            // Simulates a wait() call that never returns (stalled XPC exit
-            // acknowledgement) by sleeping far longer than the timeout.
-            try await Task.sleep(nanoseconds: 60_000_000_000)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
+                    continuation.resume()
+                }
+            }
             return 0
         }
 

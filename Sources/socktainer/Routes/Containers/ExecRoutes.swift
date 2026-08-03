@@ -257,6 +257,29 @@ struct ExecRoute: RouteCollection {
         case unresolved
     }
 
+    /// Single-assignment race result: whichever of `wait()`/timeout finishes
+    /// first reports here, and late/duplicate reports are silently dropped.
+    /// Kept separate from `waitForExitOutcome`'s own task group because a
+    /// non-cooperative `wait()` (one that doesn't observe cancellation) must
+    /// not keep the caller suspended — an actor-backed continuation can be
+    /// resumed by the winner without the loser's task ever being awaited.
+    private actor ExitOutcomeRace {
+        private var continuation: CheckedContinuation<ExecWaitOutcome, Never>?
+        private var outcome: ExecWaitOutcome?
+
+        func resolve(_ result: ExecWaitOutcome) {
+            guard outcome == nil else { return }
+            outcome = result
+            continuation?.resume(returning: result)
+            continuation = nil
+        }
+
+        func awaitOutcome() async -> ExecWaitOutcome {
+            if let outcome { return outcome }
+            return await withCheckedContinuation { continuation = $0 }
+        }
+    }
+
     /// Races `wait` (typically `process.wait()`) against a fixed timeout so a
     /// stalled Apple Container XPC exit acknowledgement can never hang the
     /// caller forever. Every exec-start path (detached, chunked-stream, and
@@ -266,23 +289,33 @@ struct ExecRoute: RouteCollection {
     /// that cleanup can be conditioned on an XPC call that sometimes never
     /// resolves (issue #8: the hijacked path awaited `process.wait()` with no
     /// timeout at all, so a stalled wait left the channel open forever).
+    ///
+    /// `wait()` runs as an unstructured `Task`, not a `TaskGroup` child: a
+    /// structured child that never observes cancellation would keep the
+    /// enclosing group (and this function) suspended until it finally
+    /// finishes. Racing via `ExitOutcomeRace` instead lets this function
+    /// return the moment the timeout fires; the stalled `wait()` task is
+    /// cancelled (a no-op if it ignores cancellation) and left to finish or
+    /// not on its own, unobserved.
     static func waitForExitOutcome(
         timeoutNanoseconds: UInt64,
         wait: @escaping @Sendable () async throws -> Int32
     ) async -> ExecWaitOutcome {
-        await withTaskGroup(of: ExecWaitOutcome.self) { group in
-            group.addTask {
-                if let code = try? await wait() { return .observed(code) }
-                return .unresolved
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                return .unresolved
-            }
-            let result = await group.next() ?? .unresolved
-            group.cancelAll()
-            return result
+        let race = ExitOutcomeRace()
+
+        let waitTask = Task<Void, Never> {
+            let outcome = (try? await wait()).map(ExecWaitOutcome.observed) ?? .unresolved
+            await race.resolve(outcome)
         }
+        let timeoutTask = Task<Void, Never> {
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            await race.resolve(.unresolved)
+        }
+
+        let outcome = await race.awaitOutcome()
+        waitTask.cancel()
+        timeoutTask.cancel()
+        return outcome
     }
 
     static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
