@@ -251,6 +251,40 @@ struct ExecRoute: RouteCollection {
         }
     }
 
+    /// Outcome of racing an exec process's exit against a bounded fallback.
+    enum ExecWaitOutcome: Equatable {
+        case observed(Int32)
+        case unresolved
+    }
+
+    /// Races `wait` (typically `process.wait()`) against a fixed timeout so a
+    /// stalled Apple Container XPC exit acknowledgement can never hang the
+    /// caller forever. Every exec-start path (detached, chunked-stream, and
+    /// hijacked/TCP-upgrade) needs this: each has cleanup that must run once
+    /// the process is known to be done — recording the exit code, unblocking
+    /// a waiting stream/inspect, or closing the hijacked channel — and none of
+    /// that cleanup can be conditioned on an XPC call that sometimes never
+    /// resolves (issue #8: the hijacked path awaited `process.wait()` with no
+    /// timeout at all, so a stalled wait left the channel open forever).
+    static func waitForExitOutcome(
+        timeoutNanoseconds: UInt64,
+        wait: @escaping @Sendable () async throws -> Int32
+    ) async -> ExecWaitOutcome {
+        await withTaskGroup(of: ExecWaitOutcome.self) { group in
+            group.addTask {
+                if let code = try? await wait() { return .observed(code) }
+                return .unresolved
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                return .unresolved
+            }
+            let result = await group.next() ?? .unresolved
+            group.cancelAll()
+            return result
+        }
+    }
+
     static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let execId = req.parameters.get("id") else {
@@ -357,22 +391,8 @@ struct ExecRoute: RouteCollection {
                     // the code and broadcast exec_die; if the wait stalls or errors without
                     // an observed exit, record a sentinel so GET /exec/{id}/json stops
                     // reporting Running: true, but broadcast no exec_die.
-                    enum ExecExit {
-                        case observed(Int32)
-                        case unresolved
-                    }
-                    let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                        g.addTask {
-                            if let code = try? await process.wait() { return .observed(code) }
-                            return .unresolved
-                        }
-                        g.addTask {
-                            try? await Task.sleep(nanoseconds: 60_000_000_000)
-                            return .unresolved
-                        }
-                        let result = await g.next() ?? .unresolved
-                        g.cancelAll()
-                        return result
+                    let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 60_000_000_000) {
+                        try await process.wait()
                     }
                     switch outcome {
                     case .observed(let code):
@@ -456,22 +476,8 @@ struct ExecRoute: RouteCollection {
                         // and broadcast exec_die; if it stalls/errors with no observed exit,
                         // record a sentinel so GET /exec/{id}/json leaves Running, but emit no
                         // exec_die (no death was observed).
-                        enum ExecExit {
-                            case observed(Int32)
-                            case unresolved
-                        }
-                        let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                            g.addTask {
-                                if let code = try? await process.wait() { return .observed(code) }
-                                return .unresolved
-                            }
-                            g.addTask {
-                                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                                return .unresolved
-                            }
-                            let result = await g.next() ?? .unresolved
-                            g.cancelAll()
-                            return result
+                        let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 10_000_000_000) {
+                            try await process.wait()
                         }
                         await ProcessRegistry.shared.remove(id: execId)
                         switch outcome {
@@ -775,15 +781,26 @@ struct ExecRoute: RouteCollection {
 
                     // Process monitor with proper cleanup
                     group.addTask {
-                        // moby emits `exec_die` only on an observed real exit. If wait()
-                        // throws, record a synthetic exit code so the exec leaves the
-                        // Running state (GET /exec/{id}/json), but broadcast no exec_die —
-                        // no clean exit was observed.
-                        let observedCode: Int32? = try? await process.wait()
-                        await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
+                        // moby emits `exec_die` only on an observed real exit. Race the
+                        // exit against a 10s XPC-stall fallback, mirroring the detached
+                        // and chunked-stream paths — Apple Container's XPC sometimes
+                        // never acknowledges exec process exit, and awaiting process.wait()
+                        // with no bound left the channel.close() below unreachable,
+                        // hanging any client waiting on EOF (issue #8). On an observed
+                        // exit, record the code and broadcast exec_die; if it stalls with
+                        // no observed exit, record a sentinel so GET /exec/{id}/json
+                        // leaves Running, but emit no exec_die (no death was observed) —
+                        // the channel still closes either way.
+                        let outcome = await ExecRoute.waitForExitOutcome(timeoutNanoseconds: 10_000_000_000) {
+                            try await process.wait()
+                        }
                         await ProcessRegistry.shared.remove(id: execId)
-                        if let observedCode {
-                            await broadcastExecEvent("exec_die", exitCode: observedCode)
+                        switch outcome {
+                        case .observed(let code):
+                            await ExecManager.shared.setExitCode(id: execId, code: code)
+                            await broadcastExecEvent("exec_die", exitCode: code)
+                        case .unresolved:
+                            await ExecManager.shared.setExitCode(id: execId, code: -1)
                         }
 
                         // Give a small delay for any final output to be processed
