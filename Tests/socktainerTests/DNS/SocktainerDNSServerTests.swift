@@ -286,6 +286,48 @@ struct EmbeddedDNSImageTests {
         #expect(try Data(contentsOf: url) == data, "materialized file must match the embedded archive")
     }
 
+    @Test("embedded archive transport metadata is made loadable for the current platform")
+    func embeddedArchiveIsPreparedForStrictDockerLoad() throws {
+        let config = ContainerSystemConfig()
+        let canonical = try ClientImage.normalizeReference(
+            EmbeddedDNSImage.tag,
+            containerSystemConfig: config
+        )
+        let prepared = try EmbeddedDNSImage.prepareLoadableArchive(
+            canonicalTag: canonical
+        )
+        defer { try? FileManager.default.removeItem(at: prepared.directory) }
+        let independent = try EmbeddedDNSImage.prepareLoadableArchive(
+            canonicalTag: canonical
+        )
+        defer {
+            try? FileManager.default.removeItem(at: independent.directory)
+        }
+        #expect(prepared.directory != independent.directory)
+        #expect(prepared.archive != independent.archive)
+        let extracted = prepared.directory.appendingPathComponent("verified")
+        try ArchiveUtility.extract(
+            tarPath: prepared.archive,
+            to: extracted,
+            limits: .imageLoad,
+            transactional: true
+        )
+        let index = try JSONDecoder().decode(
+            Index.self,
+            from: Data(
+                contentsOf: extracted.appendingPathComponent("index.json")
+            )
+        )
+        let descriptor = try #require(index.manifests.first)
+
+        #expect(index.manifests.count == 1)
+        #expect(descriptor.platform == .current)
+        #expect(
+            descriptor.annotations?[AnnotationKeys.containerizationImageName]
+                == canonical
+        )
+    }
+
     @Test("EmbeddedDNSImage.tag matches SocktainerDNSImage.reference")
     func tagMatchesPackageReference() {
         #expect(EmbeddedDNSImage.tag == SocktainerDNSImage.reference)

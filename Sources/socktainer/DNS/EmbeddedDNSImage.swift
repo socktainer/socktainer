@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerPersistence
+import ContainerizationOCI
 import Foundation
 import Logging
 import SocktainerDNSImage
@@ -114,8 +115,15 @@ enum EmbeddedDNSImage {
         imageClient: any EmbeddedDNSImageService
     ) async throws -> ClientImage {
         log.info("[dns-embedded] importing embedded DNS forwarder image")
+        let prepared = try prepareLoadableArchive(
+            canonicalTag: try ClientImage.normalizeReference(
+                tag,
+                containerSystemConfig: containerSystemConfig
+            )
+        )
+        defer { try? FileManager.default.removeItem(at: prepared.directory) }
         let loaded = try await imageClient.load(
-            tarballPath: try SocktainerDNSImage.archiveURL(),
+            tarballPath: prepared.archive,
             platform: .current,
             appleContainerAppSupportUrl: appSupportURL,
             logger: log
@@ -128,7 +136,106 @@ enum EmbeddedDNSImage {
         return tagged.image
     }
 
+    /// Buildah's embedded single-manifest OCI archive carries architecture in
+    /// its config blob but omits the optional platform/name fields on the
+    /// top-level descriptor. Docker load archives normally include both. Add
+    /// those transport annotations in a private copy so the general image-load
+    /// path can remain strict about platformless, untagged user archives.
+    static func prepareLoadableArchive(
+        canonicalTag: String
+    ) throws -> (archive: URL, directory: URL) {
+        let directory =
+            try RequestBodyFileWriter
+            .createSecureTemporaryDirectory()
+        do {
+            // The dependency's archiveURL() uses a predictable process-shared
+            // temporary path. Production, staged QA, and an overlapping upgrade
+            // must each consume the bytes compiled into their own executable.
+            let sourceArchive = directory.appendingPathComponent(
+                "bundled-dns.tar.gz"
+            )
+            try SocktainerDNSImage.archiveData.write(
+                to: sourceArchive,
+                options: .atomic
+            )
+            let layout = directory.appendingPathComponent("layout")
+            try ArchiveUtility.extract(
+                tarPath: sourceArchive,
+                to: layout,
+                limits: .imageLoad,
+                transactional: true
+            )
+            let indexURL = layout.appendingPathComponent("index.json")
+            var index = try JSONDecoder().decode(
+                Index.self,
+                from: BoundedFileReader.readImageMetadata(
+                    relativePath: "index.json",
+                    under: layout
+                )
+            )
+            guard index.manifests.count == 1 else {
+                throw EmbeddedDNSError.invalidArchive
+            }
+            var descriptor = index.manifests[0]
+            let manifest = try JSONDecoder().decode(
+                Manifest.self,
+                from: readEmbeddedBlob(
+                    descriptor.digest,
+                    under: layout
+                )
+            )
+            let config = try JSONDecoder().decode(
+                ContainerizationOCI.Image.self,
+                from: readEmbeddedBlob(
+                    manifest.config.digest,
+                    under: layout
+                )
+            )
+            let platform = Platform(
+                arch: config.architecture,
+                os: config.os,
+                variant: config.variant
+            )
+            guard platform == .current else {
+                throw EmbeddedDNSError.unsupportedPlatform(platform)
+            }
+            descriptor.platform = platform
+            var annotations = descriptor.annotations ?? [:]
+            annotations[AnnotationKeys.containerizationImageName] = canonicalTag
+            annotations[AnnotationKeys.containerdImageName] = canonicalTag
+            annotations[AnnotationKeys.openContainersImageName] = canonicalTag
+            descriptor.annotations = annotations
+            index.manifests = [descriptor]
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(index).write(
+                to: indexURL,
+                options: .atomic
+            )
+            let archive = directory.appendingPathComponent("embedded-dns.tar")
+            try ArchiveUtility.create(tarPath: archive, from: layout)
+            return (archive, directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    private static func readEmbeddedBlob(
+        _ digest: String,
+        under layout: URL
+    ) throws -> Data {
+        guard DockerImageReferenceSemantics.isBareSHA256Identifier(digest)
+        else { throw EmbeddedDNSError.invalidArchive }
+        return try BoundedFileReader.readImageMetadata(
+            relativePath: "blobs/sha256/\(digest.dropFirst("sha256:".count))",
+            under: layout
+        )
+    }
+
     enum EmbeddedDNSError: Error {
         case importReturnedNoImage
+        case invalidArchive
+        case unsupportedPlatform(Platform)
     }
 }
