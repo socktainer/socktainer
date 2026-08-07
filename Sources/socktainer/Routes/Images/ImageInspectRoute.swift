@@ -11,9 +11,19 @@ struct RESTImageInspectQuery: Vapor.Content {
 
 struct ImageInspectRoute: RouteCollection {
     let systemConfig: ContainerSystemConfig
+    let identityResolver: ImageIdentityResolver
+
+    init(systemConfig: ContainerSystemConfig, identityResolver: ImageIdentityResolver? = nil) {
+        self.systemConfig = systemConfig
+        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json", use: ImageInspectRoute.handler(systemConfig: systemConfig))
+        try routes.registerVersionedRoute(
+            .GET,
+            pattern: "/images/{name:.*}/json",
+            use: ImageInspectRoute.handler(systemConfig: systemConfig, identityResolver: identityResolver)
+        )
     }
 }
 
@@ -124,28 +134,43 @@ extension ImageInspectRoute {
         return try platformOrThrow(platformString)
     }
 
-    static func handler(systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> RESTImageInspect {
-        { req in
+    static func handler(
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil
+    ) -> @Sendable (Request) async throws -> RESTImageInspect {
+        let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        return { req in
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
             let query = try req.query.decode(RESTImageInspectQuery.self)
-            let requestedPlatform = try inspectPlatformOrThrow(query.platform)
-            let includeManifests = (query.manifests ?? false) && requestedPlatform == nil
+            let explicitlyRequestedPlatform = try inspectPlatformOrThrow(query.platform)
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
 
-            let image: ClientImage
+            let resolved: ResolvedImageIdentity
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
-            } catch {
+                resolved = try await resolver.resolve(refOrId)
+            } catch let error as ImageIdentityResolutionError {
                 // Docker phrasing ("No such image: <ref>") is load-bearing: docker-py
                 // only maps a 404 to ImageNotFound when the message contains
                 // "no such image"; otherwise callers' `except ImageNotFound` (which
                 // triggers an auto-pull, e.g. MiniStack's Lambda RIE image) is skipped.
+                if case .ambiguous = error {
+                    throw Abort(.conflict, reason: "conflict: \(refOrId) is an ambiguous image ID")
+                }
                 throw Abort(.notFound, reason: "No such image: \(refOrId)")
             }
+            let image = resolved.image
+            if let explicit = explicitlyRequestedPlatform,
+                let implied = resolved.impliedPlatform,
+                explicit != implied
+            {
+                throw Abort(.notFound, reason: "Image '\(refOrId)' does not provide platform '\(explicit.description)'")
+            }
+            let requestedPlatform = explicitlyRequestedPlatform ?? resolved.impliedPlatform
+            let includeManifests = (query.manifests ?? false) && requestedPlatform == nil
 
             let containers = includeManifests ? try await ContainerClient().list() : []
             let imageIndex = try await image.index()
@@ -292,8 +317,14 @@ extension ImageInspectRoute {
                         appSupportURL: appleContainerAppSupportUrl
                     ),
                     Manifests: includeManifests ? manifestSummaries : nil,
-                    RepoTags: [image.reference],
-                    RepoDigests: repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
+                    RepoTags: resolved.references,
+                    RepoDigests: Array(
+                        Set(
+                            resolved.references.compactMap {
+                                repoDigestReference(name: $0, digest: image.descriptor.digest)
+                            })
+                    )
+                    .sorted(),
                     Parent: "",
                     Comment: selectedVariant.config.history?.last?.comment ?? "",
                     Created: selectedVariant.config.created,

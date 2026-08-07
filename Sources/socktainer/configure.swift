@@ -34,9 +34,13 @@ func configure(_ app: Application) async throws {
         systemConfig = ContainerSystemConfig()
     }
 
-    let containerClient = ClientContainerService()
+    let imageIdentityResolver = ImageIdentityResolver(
+        systemConfig: systemConfig,
+        appSupportURL: appleContainerAppSupportUrl
+    )
+    let containerClient = ClientContainerService(imageReferenceResolver: imageIdentityResolver)
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
-    let imageClient = ClientImageService(containerSystemConfig: systemConfig)
+    let imageClient = ClientImageService(containerSystemConfig: systemConfig, identityResolver: imageIdentityResolver)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClient = ClientVolumeService()
@@ -66,7 +70,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerAttachRoute(client: containerClient))
     try app.register(collection: ContainerAttachWSRoute(client: containerClient))
     try app.register(collection: ContainerChangesRoute())
-    try app.register(collection: ContainerCreateRoute(client: containerClient, systemConfig: systemConfig))
+    try app.register(collection: ContainerCreateRoute(client: containerClient, systemConfig: systemConfig, identityResolver: imageIdentityResolver))
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute(containerClient: containerClient, archiveClient: archiveClient))
     try app.register(collection: ContainerInspectRoute(client: containerClient))
@@ -88,14 +92,14 @@ func configure(_ app: Application) async throws {
 
     // /images
     try app.register(collection: ImageDeleteRoute(client: imageClient))
-    try app.register(collection: ImageHistoryRoute(systemConfig: systemConfig))
+    try app.register(collection: ImageHistoryRoute(systemConfig: systemConfig, identityResolver: imageIdentityResolver))
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
     try app.register(collection: ImageCreateRoute(client: imageClient))
     try app.register(collection: ImagePushRoute(client: imageClient))
     try app.register(collection: ImageSearchRoute())
-    try app.register(collection: ImageInspectRoute(systemConfig: systemConfig))
-    try app.register(collection: ImageTagRoute(systemConfig: systemConfig))
+    try app.register(collection: ImageInspectRoute(systemConfig: systemConfig, identityResolver: imageIdentityResolver))
+    try app.register(collection: ImageTagRoute(systemConfig: systemConfig, identityResolver: imageIdentityResolver))
     try app.register(collection: ImagesGetRoute(client: imageClient))
     try app.register(collection: ImagesLoadRoute(client: imageClient))
 

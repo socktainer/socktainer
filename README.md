@@ -22,6 +22,7 @@
       - [Pre Release](#pre-release)
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
+    - [Docker builds and Buildx](#docker-builds-and-buildx)
     - [Volume sync mode](#volume-sync-mode)
     - [VM memory](#vm-memory)
     - [Volume compatibility — Postgres](#volume-compatibility--postgres)
@@ -132,7 +133,21 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ## Requirements 📋
 
 - **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 0.6.0**
+- **Apple Container 1.2.1** (client and server versions must match the SDK version
+  used to build Socktainer)
+
+Verify both before starting Socktainer:
+
+```bash
+container --version
+container system status
+```
+
+Apple Container's XPC and Swift API schemas can change between patch releases.
+Socktainer keeps those version-specific calls behind one compatibility boundary and
+fails startup on a mismatch instead of risking opaque XPC failures. Every normal
+Socktainer startup performs this check and prints the client/server versions; use
+`--no-check-compatibility` only for deliberate diagnostics.
 
 ---
 
@@ -169,22 +184,54 @@ Download from socktainer [releases](https://github.com/socktainer/socktainer/rel
 
 Refer to **Quick Start** above for immediate usage examples.
 
+### Docker builds and Buildx
+
+Socktainer supports the standard Buildx `docker-container` driver. The driver runs
+an unmodified `moby/buildkit` helper through Socktainer and preserves Dockerfile,
+BuildKit cache, secret, SSH, exporter, and `--load` semantics.
+
+Create a builder once and select it:
+
+```bash
+docker buildx create --name socktainer --driver docker-container --use
+docker buildx inspect --bootstrap
+```
+
+The same builder supports the usual build workflows:
+
+```bash
+docker buildx build --platform linux/arm64 --load -t example:dev .
+BUILDX_BUILDER=socktainer docker build -t example:dev .
+BUILDX_BUILDER=socktainer docker compose build
+```
+
+The Buildx `docker` driver is not available because its `/grpc` endpoint requires
+Moby's embedded BuildKit protocol, while Apple Container exposes a different native
+builder service. Select the `docker-container` builder explicitly when another
+Docker context has previously selected a different builder.
+
+Registry credential helpers named in `~/.docker/config.json` must be installed and
+available on `PATH`. A stale `credsStore` entry causes BuildKit registry requests to
+fail before Socktainer is involved; fix the helper or use a dedicated Docker config
+that contains only the settings needed for this runtime.
+
 ### Volume sync mode
 
-Named volumes default to `nosync` — guest `fsync()` calls are not flushed to the
-host disk on demand, matching Colima's behavior and giving ~1.5× speedup for
-write-heavy workloads (postgres WAL, Kafka, Redis AOF).
+Named volumes default to `fsync`, so guest `fsync()` calls are flushed to the host
+disk. This is the safe default for databases, write-ahead logs, and other durable
+state.
 
-**Tradeoff:** data written to a volume since the last OS page-cache flush could be
-lost if the **host** (Mac) crashes or loses power. In a dev environment this is
-acceptable; data is safe across normal `docker stop` / host restarts.
+`nosync` remains available as an explicit performance opt-in. It can be faster for
+write-heavy disposable workloads, but data since the last host page-cache flush can
+be lost if the Mac crashes or loses power. Do not use `nosync` for durable database
+volumes.
 
 **Override globally** — apply the same mode to all named volumes (bind mounts and anonymous volumes are not affected):
 
 ```bash
-socktainer --volume-sync=fsync   # honor guest fsyncs (durable)
+socktainer --volume-sync=fsync   # default: honor guest fsyncs (durable)
 socktainer --volume-sync=full    # fully synchronous writes (slowest)
-socktainer --volume-sync=nosync  # default
+socktainer --volume-sync=nosync  # explicit unsafe performance mode
 ```
 
 **Override per volume** — `docker volume create -o sync=<mode>` persists the
@@ -193,6 +240,7 @@ choice for that volume regardless of the global flag:
 ```bash
 docker volume create -o sync=fsync my-pgdata
 docker run -v my-pgdata:/var/lib/postgresql/data postgres
+docker volume inspect my-pgdata --format '{{index .Options "sync"}}' # fsync
 ```
 
 Or using Docker Compose with `driver_opts`:
@@ -212,6 +260,9 @@ volumes:
 ```
 
 Valid modes: `nosync` · `fsync` · `full`
+
+`docker compose down` preserves named volumes; `docker compose down -v`
+intentionally deletes them.
 
 ### VM memory
 
@@ -362,7 +413,10 @@ Ownership rules:
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
-- `docker run --privileged` is **not supported** — Apple Container has no privileged mode. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) instead; `--privileged` is currently ignored rather than granting all capabilities.
+- `docker run --privileged` maps to all Linux capabilities because stock BuildKit's
+  `docker-container` driver requires that capability set. Apple Container still
+  provides VM isolation and has no exact equivalent for Docker's remaining
+  privileged-mode behavior (such as broad host-device access).
 - `docker run --cpus` is honored, but Apple Container allocates a **whole vCPU count** to each container's VM rather than throttling a shared kernel's CFS quota. A fractional value is floored to the nearest whole core (minimum 1) — e.g. `--cpus=1.5` gets 1 vCPU, `--cpus=0.5` still gets 1. `--cpu-shares` (relative weighting) and `--cpu-period`/`--cpu-quota` have no equivalent and are not applied.
 - Bind-mounting `/var/run/docker.sock` (e.g. `-v /var/run/docker.sock:/var/run/docker.sock`, used by tools like Supabase's `vector` log collector) is **transparently relayed** to socktainer's own Docker-compatible API, rather than dropped. This matches Docker's own behavior for the same bind mount, and carries the same well-known risk: **any container that requests this mount gets full control of every other container socktainer manages**, not just itself — the same exposure Docker itself has always had with this idiom, not something new to socktainer. This scales with the number of containers that request the mount, since each gets its own fully-privileged, independent connection.
 - `docker export` streams the container's root filesystem; exporting a running container yields a volatile snapshot, same as Docker. One visible difference: the tar contains **no `/.dockerenv`** — Docker's daemon fabricates that file inside every container at start, Apple Container does not. Tools that probe `/.dockerenv` to detect "am I inside a container" won't find it in filesystems exported from socktainer.

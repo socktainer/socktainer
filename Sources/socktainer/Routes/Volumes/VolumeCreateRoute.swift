@@ -3,7 +3,7 @@ import Vapor
 
 /// Route collection for the Docker `POST /volumes/create` endpoint.
 struct VolumeCreateRoute: RouteCollection {
-    let client: ClientVolumeService
+    let client: any ClientVolumeProtocol
 
     /// Registers the `POST /volumes/create` route on the given builder.
     func boot(routes: RoutesBuilder) throws {
@@ -24,6 +24,16 @@ struct VolumeCreateRoute: RouteCollection {
         let originalLabels = createRequest.Labels ?? [:]
         guard !LabelNormalization.containsReservedKey(originalLabels) else {
             throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
+        }
+        guard
+            !originalLabels.keys.contains(where: {
+                LabelNormalization.sanitizeKey($0) == Filesystem.SyncMode.socktainerLabel
+            })
+        else {
+            throw Abort(
+                .badRequest,
+                reason: "Label key '\(Filesystem.SyncMode.socktainerLabel)' is reserved for internal use"
+            )
         }
         var labels = LabelNormalization.sanitize(originalLabels)
         if let mapping = LabelNormalization.buildMapping(originalLabels) {

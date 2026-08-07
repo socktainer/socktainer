@@ -75,6 +75,55 @@ struct ImageDeleteDanglingResponseTests {
         #expect(items.compactMap(\.Deleted).isEmpty)
     }
 
+    @Test("force is forwarded and every removed tag is returned", arguments: ["force=1", "force=true"])
+    func forceForwarding(forceQuery: String) async throws {
+        let mock = ForceRecordingImageMock(
+            result: ImageDeletionResult(
+                untagged: "docker.io/library/demo:latest",
+                additionalUntagged: ["docker.io/library/demo:v1"],
+                digest: "sha256:ddd444",
+                deletedDigest: "sha256:ddd444"
+            ))
+        var items: [ImageDeleteResponseItem] = []
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ImageDeleteRoute(client: mock))
+
+            try await app.testing().test(.DELETE, "/v1.51/images/sha256:ddd444?\(forceQuery)") { res async throws in
+                #expect(res.status == .ok)
+                items = try JSONDecoder().decode([ImageDeleteResponseItem].self, from: Data(buffer: res.body))
+            }
+        }
+
+        #expect(await mock.recordedForces == [true])
+        #expect(items.compactMap(\.Untagged) == ["docker.io/library/demo:latest", "docker.io/library/demo:v1"])
+        #expect(items.compactMap(\.Deleted) == ["sha256:ddd444"])
+    }
+
+    @Test("force defaults to false when omitted")
+    func forceDefaultsToFalse() async throws {
+        let mock = ForceRecordingImageMock(
+            result: ImageDeletionResult(
+                untagged: "docker.io/library/demo:latest",
+                digest: "sha256:ddd444",
+                deletedDigest: nil
+            ))
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ImageDeleteRoute(client: mock))
+
+            try await app.testing().test(.DELETE, "/v1.51/images/demo:latest") { response async in
+                #expect(response.status == .ok)
+            }
+        }
+
+        #expect(await mock.recordedForces == [false])
+    }
+
     // MARK: - Helpers
 
     private static func deleteImage(result: ImageDeletionResult, ref: String) async throws -> [ImageDeleteResponseItem] {
@@ -92,6 +141,39 @@ struct ImageDeleteDanglingResponseTests {
             }
         }
         return items
+    }
+}
+
+private actor ForceRecordingImageMock: ClientImageProtocol {
+    let result: ImageDeletionResult
+    private(set) var recordedForces: [Bool] = []
+
+    init(result: ImageDeletionResult) { self.result = result }
+
+    func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
+    func delete(id: String) async throws -> ImageDeletionResult { result }
+    func delete(id: String, force: Bool) async throws -> ImageDeletionResult {
+        recordedForces.append(force)
+        return result
+    }
+    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+    func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
+        ([], 0)
+    }
+    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+        URL(fileURLWithPath: "/dev/null")
+    }
+    func importImage(
+        tarPath: URL, repo: String?, tag: String?, message: String?, changes: [String], platform: Platform,
+        appleContainerAppSupportUrl: URL, logger: Logger
+    ) async throws -> (reference: String?, digest: String) {
+        (nil, "sha256:0000000000000000000000000000000000000000000000000000000000000000")
     }
 }
 

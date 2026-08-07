@@ -88,6 +88,33 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
+    @Test("ancestor digest expands to every stored reference for that image")
+    func ancestorIdentityExpansion() async throws {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        let resolver = StubImageReferenceResolver(
+            referencesByIdentifier: [
+                digest: ["docker.io/library/alpine:3.22", "docker.io/library/alpine:latest"]
+            ])
+        let filters = await ClientContainerService.resolvingAncestorFilters(
+            ["ancestor": [digest]], with: resolver)
+        let containers = [
+            try makeSnapshot(id: "a", image: "docker.io/library/alpine:latest"),
+            try makeSnapshot(id: "b", image: "docker.io/library/nginx:latest"),
+        ]
+
+        let result = ClientContainerService.applyFilters(containers, filters: filters)
+
+        #expect(result.map(\.id) == ["a"])
+        #expect(filters["ancestor"] == [digest, "docker.io/library/alpine:3.22", "docker.io/library/alpine:latest"])
+    }
+
+    @Test("unresolvable ancestor preserves the original filter value")
+    func ancestorResolutionFailurePreservesInput() async {
+        let filters = await ClientContainerService.resolvingAncestorFilters(
+            ["ancestor": ["legacy:latest"]], with: StubImageReferenceResolver(referencesByIdentifier: [:]))
+        #expect(filters["ancestor"] == ["legacy:latest"])
+    }
+
     // MARK: - unknown key
 
     @Test("unknown filter key is ignored — all containers pass")
@@ -254,6 +281,17 @@ struct ContainerFilterTests {
         let result = ClientContainerService.applyFilters(
             containers, filters: ["status": ["running"], "label": ["env=prod"]])
         #expect(result.map(\.id) == ["a"])
+    }
+}
+
+private struct StubImageReferenceResolver: ImageReferenceResolving {
+    let referencesByIdentifier: [String: [String]]
+
+    func references(for identifier: String) async throws -> [String] {
+        guard let references = referencesByIdentifier[identifier] else {
+            throw ImageIdentityResolutionError.notFound(identifier)
+        }
+        return references
     }
 }
 

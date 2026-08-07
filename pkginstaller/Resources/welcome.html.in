@@ -14,8 +14,8 @@
     
     <h3>Installation Details</h3>
     <p>The socktainer binary will be installed to <code>__INSTALL_PREFIX__/bin/socktainer</code></p>
-    <p>The installation directory will be automatically added to your system PATH.</p>
-    <p>After installation, open a new terminal and use socktainer from anywhere.</p>
+    <p>When PATH installation is enabled, the installation directory is added to the system PATH.</p>
+    <p>Otherwise, invoke Socktainer using the full installation path shown above.</p>
     
     <p><strong>Click Continue to proceed with the installation.</strong></p>
 </div>

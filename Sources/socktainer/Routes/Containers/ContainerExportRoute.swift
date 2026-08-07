@@ -34,9 +34,38 @@ struct ContainerExportRoute: RouteCollection {
                 throw Abort(.notFound, reason: "No such container: \(reference)")
             }
 
-            let tarPath: URL
             do {
-                tarPath = try await archiveClient.exportRootfs(containerId: container.id)
+                return try await ContainerFilesystemOperationLock.shared.withLock(containerID: container.id) {
+                    guard let current = try await containerClient.getContainer(id: container.id) else {
+                        throw Abort(.notFound, reason: "No such container: \(reference)")
+                    }
+                    let tarPath = try await archiveClient.exportRootfs(containerId: current.id)
+
+                    let broadcaster = req.application.storage[EventBroadcasterKey.self]
+                    let response: Response
+                    do {
+                        response = try await req.fileio.asyncStreamFile(at: tarPath.path) { result in
+                            try? FileManager.default.removeItem(at: tarPath)
+                            // moby logs the export event only once the copy completed.
+                            if case .success = result, let broadcaster {
+                                await broadcaster.broadcast(
+                                    DockerEvent.simpleEvent(
+                                        id: DockerContainerID.hexId(for: current),
+                                        type: "container",
+                                        status: "export",
+                                        image: current.configuration.image.reference,
+                                        name: current.id,
+                                        labels: LabelNormalization.restore(current.configuration.labels)
+                                    ))
+                            }
+                        }
+                    } catch {
+                        try? FileManager.default.removeItem(at: tarPath)
+                        throw error
+                    }
+                    response.headers.contentType = HTTPMediaType(type: "application", subType: "octet-stream")
+                    return response
+                }
             } catch let error as ClientArchiveError {
                 switch error {
                 case .rootfsNotFound:
@@ -46,30 +75,6 @@ struct ContainerExportRoute: RouteCollection {
                 }
             }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]
-            let response: Response
-            do {
-                response = try await req.fileio.asyncStreamFile(at: tarPath.path) { result in
-                    try? FileManager.default.removeItem(at: tarPath)
-                    // moby logs the export event only once the copy completed.
-                    if case .success = result, let broadcaster {
-                        await broadcaster.broadcast(
-                            DockerEvent.simpleEvent(
-                                id: DockerContainerID.hexId(for: container),
-                                type: "container",
-                                status: "export",
-                                image: container.configuration.image.reference,
-                                name: container.id,
-                                labels: LabelNormalization.restore(container.configuration.labels)
-                            ))
-                    }
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: tarPath)
-                throw error
-            }
-            response.headers.contentType = HTTPMediaType(type: "application", subType: "octet-stream")
-            return response
         }
     }
 }

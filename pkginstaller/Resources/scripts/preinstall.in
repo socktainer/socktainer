@@ -10,10 +10,11 @@ if [ -d "__INSTALL_PREFIX__" ]; then
     rm -rf "__INSTALL_PREFIX__"
 fi
 
-# Remove any existing PATH entries
-if [ -f "/etc/paths.d/socktainer" ]; then
+# Remove this package's existing PATH entry. This also handles reinstalling with
+# PATH installation disabled after an earlier package enabled it.
+if [ -f "/etc/paths.d/__PATHS_D_NAME__" ]; then
     echo "Removing existing PATH configuration..."
-    rm -f "/etc/paths.d/socktainer"
+    rm -f "/etc/paths.d/__PATHS_D_NAME__"
 fi
 
 # Ensure the target directory exists

@@ -11,12 +11,14 @@ if [ -f "__INSTALL_PREFIX__/bin/socktainer" ]; then
     # Make sure it's executable
     chmod +x "__INSTALL_PREFIX__/bin/socktainer"
     
-    # Add to system PATH by creating paths.d entry
-    if [ ! -d "/etc/paths.d" ]; then
-        mkdir -p /etc/paths.d
+    # Add to system PATH when requested. Isolated QA packages can disable this.
+    if [ "__INSTALL_PATHS_D__" = "1" ]; then
+        if [ ! -d "/etc/paths.d" ]; then
+            mkdir -p /etc/paths.d
+        fi
+        echo "__INSTALL_PREFIX__/bin" > "/etc/paths.d/__PATHS_D_NAME__"
+        echo "✅ Added __INSTALL_PREFIX__/bin to system PATH"
     fi
-    echo "__INSTALL_PREFIX__/bin" > /etc/paths.d/socktainer
-    echo "✅ Added __INSTALL_PREFIX__/bin to system PATH"
     
     echo ""
     echo "🚀 Quick start:"

@@ -3,16 +3,16 @@
     <title>Socktainer __VERSION__</title>
     <welcome file="welcome.html"/>
     <conclusion file="conclusion.html"/>
-    <pkg-ref id="io.github.socktainer"/>
+    <pkg-ref id="__PACKAGE_IDENTIFIER__"/>
     <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
     <choices-outline>
         <line choice="default">
-            <line choice="io.github.socktainer"/>
+            <line choice="__PACKAGE_IDENTIFIER__"/>
         </line>
     </choices-outline>
     <choice id="default"/>
-    <choice id="io.github.socktainer" visible="false">
-        <pkg-ref id="io.github.socktainer"/>
+    <choice id="__PACKAGE_IDENTIFIER__" visible="false">
+        <pkg-ref id="__PACKAGE_IDENTIFIER__"/>
     </choice>
-    <pkg-ref id="io.github.socktainer" version="__VERSION__" onConclusion="none">socktainer.pkg</pkg-ref>
+    <pkg-ref id="__PACKAGE_IDENTIFIER__" version="__VERSION__" onConclusion="none">socktainer.pkg</pkg-ref>
 </installer-gui-script>

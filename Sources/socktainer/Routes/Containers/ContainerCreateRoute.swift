@@ -12,9 +12,28 @@ import Vapor
 struct ContainerCreateRoute: RouteCollection {
     let client: ClientContainerProtocol
     let systemConfig: ContainerSystemConfig
+    let identityResolver: ImageIdentityResolver
+
+    init(
+        client: ClientContainerProtocol,
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil
+    ) {
+        self.client = client
+        self.systemConfig = systemConfig
+        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/create", use: ContainerCreateRoute.handler(client: client, systemConfig: systemConfig))
+        try routes.registerVersionedRoute(
+            .POST,
+            pattern: "/containers/create",
+            use: ContainerCreateRoute.handler(
+                client: client,
+                systemConfig: systemConfig,
+                identityResolver: identityResolver
+            )
+        )
     }
 
 }
@@ -55,8 +74,27 @@ struct CreateContainerRequest: Content {
 }
 
 extension ContainerCreateRoute {
-    static func handler(client: ClientContainerProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response {
-        { req in
+    /// Docker's privileged mode grants the complete Linux capability set and
+    /// supersedes per-capability additions/removals. Apple Container expresses
+    /// that contract as `capAdd = ["ALL"]`; this is required by nested runtimes
+    /// such as BuildKit's runc-native worker (mount(2) needs CAP_SYS_ADMIN).
+    static func resolveCapabilities(hostConfig: HostConfig?) throws -> (capAdd: [String], capDrop: [String]) {
+        if hostConfig?.Privileged == true {
+            return (["ALL"], [])
+        }
+        return try Parser.capabilities(
+            capAdd: hostConfig?.CapAdd ?? [],
+            capDrop: hostConfig?.CapDrop ?? []
+        )
+    }
+
+    static func handler(
+        client: ClientContainerProtocol,
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil
+    ) -> @Sendable (Request) async throws -> Response {
+        let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        return { req in
             let query = try req.query.decode(ContainerCreateQuery.self)
 
             let containerName = query.name
@@ -98,9 +136,7 @@ extension ContainerCreateRoute {
 
             let normalizedCapabilities: (capAdd: [String], capDrop: [String])
             do {
-                normalizedCapabilities = try Parser.capabilities(
-                    capAdd: body.HostConfig?.CapAdd ?? [],
-                    capDrop: body.HostConfig?.CapDrop ?? [])
+                normalizedCapabilities = try ContainerCreateRoute.resolveCapabilities(hostConfig: body.HostConfig)
             } catch {
                 throw Abort(.badRequest, reason: "invalid capability: \(error)")
             }
@@ -145,14 +181,29 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "invalid container name: \(id)")
             }
 
+            let hasExplicitPlatform = query.platform?.isEmpty == false
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
 
-            // Check if image exists locally
+            // Resolve Docker names and all OCI identities to Apple's canonical stored
+            // reference before calling its reference-only fetch API.
+            let resolvedImage: ResolvedImageIdentity
             do {
-                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: systemConfig)
+                resolvedImage = try await resolver.resolve(body.Image)
             } catch {
                 throw ContainerCreateRoute.imageExistenceError(error, image: body.Image)
+            }
+            let appleImageReference = resolvedImage.reference
+            if let impliedPlatform = resolvedImage.impliedPlatform {
+                if hasExplicitPlatform && requestedPlatform != impliedPlatform {
+                    throw Abort(
+                        .notFound,
+                        reason: "No such image: \(body.Image) for platform \(requestedPlatform.description)"
+                    )
+                }
+                if !hasExplicitPlatform {
+                    requestedPlatform = impliedPlatform
+                }
             }
 
             // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
@@ -163,7 +214,7 @@ extension ContainerCreateRoute {
             var img: ClientImage
             do {
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: appleImageReference,
                     platform: requestedPlatform,
                     containerSystemConfig: systemConfig
                 )
@@ -183,7 +234,7 @@ extension ContainerCreateRoute {
                 let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
                 req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: appleImageReference,
                     platform: amd64,
                     containerSystemConfig: systemConfig
                 )
@@ -626,12 +677,12 @@ extension ContainerCreateRoute {
                         VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
                     }
 
-                    // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
+                    // Per-volume sync label wins; fall back to global --volume-sync (default: fsync).
                     let syncMode =
                         volume.labels[Filesystem.SyncMode.socktainerLabel]
                         .flatMap { Filesystem.SyncMode(rawString: $0) }
                         ?? req.application.storage[VolumeSyncModeKey.self]
-                        ?? .nosync
+                        ?? .fsync
                     let volumeMount = Filesystem.volume(
                         name: parsed.name,
                         format: volume.format,
@@ -722,6 +773,14 @@ extension ContainerCreateRoute {
     /// Extracted as a pure function so the mapping can be asserted in unit tests without
     /// driving Apple Container APIs.
     static func imageExistenceError(_ error: Error, image: String) -> Error {
+        if let resolutionError = error as? ImageIdentityResolutionError {
+            switch resolutionError {
+            case .ambiguous:
+                return Abort(.conflict, reason: "conflict: \(image) is an ambiguous image ID")
+            case .notFound, .nonRunnable:
+                return Abort(.notFound, reason: "No such image: \(image)")
+            }
+        }
         if let containerError = error as? ContainerizationError, containerError.code == .notFound {
             return Abort(.notFound, reason: "No such image: \(image)")
         }

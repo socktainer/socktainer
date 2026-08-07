@@ -17,6 +17,40 @@ import Testing
 @Suite("ClientImageService — delete reference normalization")
 struct ImageDeleteRouteTests {
 
+    @Test("digest deletion with multiple tags conflicts unless force is set")
+    func multipleTagDigestRequiresForce() throws {
+        #expect(throws: ClientImageError.self) {
+            try ClientImageService.deletionReferences(
+                kind: .root,
+                resolvedReference: "docker.io/library/demo:latest",
+                allReferences: ["docker.io/library/demo:v1", "docker.io/library/demo:latest"],
+                requestedID: "sha256:abc123",
+                force: false
+            )
+        }
+
+        let forced = try ClientImageService.deletionReferences(
+            kind: .root,
+            resolvedReference: "docker.io/library/demo:latest",
+            allReferences: ["docker.io/library/demo:v1", "docker.io/library/demo:latest"],
+            requestedID: "sha256:abc123",
+            force: true
+        )
+        #expect(forced == ["docker.io/library/demo:latest", "docker.io/library/demo:v1"])
+    }
+
+    @Test("force on an explicit tag removes only that tag")
+    func forceTagDoesNotRemoveSiblingTags() throws {
+        let references = try ClientImageService.deletionReferences(
+            kind: .reference,
+            resolvedReference: "docker.io/library/demo:v1",
+            allReferences: ["docker.io/library/demo:v1", "docker.io/library/demo:latest"],
+            requestedID: "demo:v1",
+            force: true
+        )
+        #expect(references == ["docker.io/library/demo:v1"])
+    }
+
     // MARK: - Fake image store
 
     /// In-memory stand-in for Apple Container's image persistence layer.

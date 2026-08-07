@@ -20,16 +20,19 @@ extension ImageDeleteRoute {
             guard let imageRef = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
+            let force = MobyBool.queryValue(req.query["force"] as String?)
 
             let result: ImageDeletionResult
             do {
-                result = try await client.delete(id: imageRef)
+                result = try await client.delete(id: imageRef, force: force)
             } catch let error as ClientImageError {
                 switch error {
                 case .notFound(let id):
                     throw Abort(.notFound, reason: "No such image: \(id)")
                 case .digestReferenceNotAllowed(let repo):
                     throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
+                case .conflict(let message):
+                    throw Abort(.conflict, reason: message)
                 }
             }
 
@@ -50,14 +53,16 @@ extension ImageDeleteRoute {
             // kept for refs imported verbatim from foreign tarball annotations.
             // A pull-by-digest ref (repo@sha256:…) is NOT dangling and keeps its
             // Untagged record, as in moby.
-            let isDangling = result.untagged.hasPrefix("untagged@") || result.untagged.contains("<none>")
+            let visibleUntagged = result.untaggedReferences.filter {
+                !$0.hasPrefix("untagged@") && !$0.contains("<none>")
+            }
 
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                if !isDangling {
+                for untagged in visibleUntagged {
                     await broadcaster.broadcast(
                         DockerEvent.make(
                             type: "image", action: "untag", actorID: result.digest,
-                            attributes: ["name": result.untagged]))
+                            attributes: ["name": untagged]))
                 }
                 if let digest = result.deletedDigest {
                     await broadcaster.broadcast(
@@ -71,8 +76,8 @@ extension ImageDeleteRoute {
             //   {Untagged} for the tag that was removed (omitted for dangling images)
             //   {Deleted}  for the image layers freed (only when the last reference was removed)
             var deleteResponse: [ImageDeleteResponseItem] = []
-            if !isDangling {
-                deleteResponse.append(ImageDeleteResponseItem(Deleted: nil, Untagged: result.untagged))
+            for untagged in visibleUntagged {
+                deleteResponse.append(ImageDeleteResponseItem(Deleted: nil, Untagged: untagged))
             }
             if let digest = result.deletedDigest {
                 deleteResponse.append(ImageDeleteResponseItem(Deleted: digest, Untagged: nil))

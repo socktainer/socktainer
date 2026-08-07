@@ -3,8 +3,8 @@ import Testing
 
 @testable import socktainer
 
-/// Verifies volume sync mode behaviour: nosync by default (global), overridable
-/// per-volume via `docker volume create -o sync=fsync <name>`.
+/// Verifies durable volume sync behaviour: fsync by default (global), overridable
+/// per-volume only when the caller explicitly requests another mode.
 ///
 /// nosync skips per-write fsyncs to the host disk, matching Colima's effective
 /// behavior and giving ~1.5x speedup for write-heavy workloads (postgres WAL,
@@ -96,19 +96,19 @@ struct VolumeNosyncTests {
             ("NOSYNC", .nosync), ("FSYNC", .fsync),  // case-insensitive
         ]
         for (input, expected) in cases {
-            let resolved = Filesystem.SyncMode(rawString: input) ?? .nosync
+            let resolved = Filesystem.SyncMode(rawString: input) ?? .fsync
             #expect(resolved == expected, "'\(input)' should resolve to \(expected)")
         }
     }
 
-    @Test("Invalid --volume-sync value falls back to nosync and emits warning")
-    func invalidCliVolumeSyncFallsBackToNosync() {
+    @Test("Invalid --volume-sync value falls back to fsync and emits warning")
+    func invalidCliVolumeSyncFallsBackToFsync() {
         var warnings: [String] = []
         let resolved = Filesystem.SyncMode.resolve(from: "fsynk") { warnings.append($0) }
-        #expect(resolved == .nosync)
+        #expect(resolved == .fsync)
         #expect(warnings.count == 1)
         #expect(warnings.first?.contains("fsynk") == true)
-        #expect(warnings.first?.contains("nosync") == true)
+        #expect(warnings.first?.contains("fsync") == true)
     }
 
     @Test("Valid --volume-sync value does not emit warning")
@@ -155,5 +155,24 @@ struct VolumeNosyncTests {
             labelValue.flatMap { Filesystem.SyncMode(rawString: $0) }
             ?? globalDefault
         #expect(resolved == .fsync)
+    }
+
+    @Test("Docker volume metadata round-trips sync and hides its internal label")
+    func dockerMetadataRoundTrip() {
+        let stored = VolumeConfiguration(
+            name: "pgdata",
+            source: "/tmp/pgdata",
+            labels: [
+                Filesystem.SyncMode.socktainerLabel: "fsync",
+                "purpose": "database",
+            ],
+            options: ["size": "10G"]
+        )
+
+        let volume = ClientVolumeService.convert(stored)
+        #expect(volume.Options["sync"] == "fsync")
+        #expect(volume.Options["size"] == "10G")
+        #expect(volume.Labels?["purpose"] == "database")
+        #expect(volume.Labels?[Filesystem.SyncMode.socktainerLabel] == nil)
     }
 }

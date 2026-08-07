@@ -3,7 +3,7 @@ SHELL := bash
 
 # Configuration variables
 BUILD_VERSION ?= 0.0.0-dev
-PKG_NAME := socktainer-installer.pkg
+PKG_NAME ?= socktainer-installer.pkg
 APPLE_APPLICATION_ID ?= -
 APPLE_PRODUCT_ID ?= mock
 NO_CODESIGN ?= 1
@@ -12,6 +12,9 @@ NOTARIZE_USERNAME ?=
 NOTARIZE_PASSWORD ?=
 NOTARIZE_TEAM ?=
 INSTALL_PREFIX ?= /opt/socktainer
+PACKAGE_IDENTIFIER ?= io.github.socktainer
+PATHS_D_NAME ?= socktainer
+INSTALL_PATHS_D ?= 1
 SIGNING_KEYCHAIN ?=
 
 # Directory structure
@@ -35,27 +38,43 @@ $(SCRIPTS_DIR): | $(BUILD_DIR)
 	@mkdir -p $(SCRIPTS_DIR)
 
 .PHONY: setup
-setup: $(BUILD_DIR) $(RESOURCES_DIR) $(SCRIPTS_DIR)
+setup: validate-config $(BUILD_DIR) $(RESOURCES_DIR) $(SCRIPTS_DIR)
 	@echo "Setting up installer directory structure..."
 	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin
 	@mkdir -p $(OUT_DIR)
 	@mkdir -p $(TMP_DIR)
 
+.PHONY: validate-config
+validate-config:
+	@case "$(INSTALL_PREFIX)" in /opt/*) ;; *) echo "Error: INSTALL_PREFIX must be a child of /opt"; exit 1 ;; esac
+	@case "$(INSTALL_PREFIX)" in \
+		*//*|*/|*/.|*/..|*/./*|*/../*) echo "Error: INSTALL_PREFIX contains an unsafe path component"; exit 1 ;; \
+		*) ;; \
+	esac
+	@printf '%s' "$(INSTALL_PREFIX)" | grep -Eq '^/opt/[A-Za-z0-9._/-]+$$' \
+		|| { echo "Error: INSTALL_PREFIX contains unsafe characters"; exit 1; }
+	@printf '%s' "$(PACKAGE_IDENTIFIER)" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$$' \
+		|| { echo "Error: invalid PACKAGE_IDENTIFIER"; exit 1; }
+	@printf '%s' "$(PATHS_D_NAME)" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$$' \
+		|| { echo "Error: invalid PATHS_D_NAME"; exit 1; }
+	@case "$(INSTALL_PATHS_D)" in 0|1) ;; *) echo "Error: INSTALL_PATHS_D must be 0 or 1"; exit 1 ;; esac
+
 .PHONY: resources
 resources: setup $(BUILD_DIR)/Distribution $(RESOURCES_DIR)/welcome.html $(RESOURCES_DIR)/conclusion.html
 
-$(BUILD_DIR)/Distribution: Resources/Distribution.in | $(BUILD_DIR)
+$(BUILD_DIR)/Distribution: Resources/Distribution.in FORCE | $(BUILD_DIR)
 	@echo "Generating Distribution file..."
 	@sed -e 's|__VERSION__|$(BUILD_VERSION)|g' \
-	     -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' $< > $@
+	     -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' \
+	     -e 's|__PACKAGE_IDENTIFIER__|$(PACKAGE_IDENTIFIER)|g' $< > $@
 	@echo "Generated Distribution file (size: $$(wc -c < $@) bytes)"
 
-$(RESOURCES_DIR)/welcome.html: Resources/welcome.html.in | $(RESOURCES_DIR)
+$(RESOURCES_DIR)/welcome.html: Resources/welcome.html.in FORCE | $(RESOURCES_DIR)
 	@echo "Generating welcome.html..."
 	@sed -e 's|__VERSION__|$(BUILD_VERSION)|g' \
 	     -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' $< > $@
 
-$(RESOURCES_DIR)/conclusion.html: Resources/conclusion.html.in | $(RESOURCES_DIR)
+$(RESOURCES_DIR)/conclusion.html: Resources/conclusion.html.in FORCE | $(RESOURCES_DIR)
 	@echo "Generating conclusion.html..."
 	@sed -e 's|__VERSION__|$(BUILD_VERSION)|g' \
 	     -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' $< > $@
@@ -63,42 +82,52 @@ $(RESOURCES_DIR)/conclusion.html: Resources/conclusion.html.in | $(RESOURCES_DIR
 .PHONY: scripts
 scripts: setup $(SCRIPTS_DIR)/preinstall $(SCRIPTS_DIR)/postinstall
 
-$(SCRIPTS_DIR)/preinstall: Resources/scripts/preinstall.in | $(SCRIPTS_DIR)
+$(SCRIPTS_DIR)/preinstall: Resources/scripts/preinstall.in FORCE | $(SCRIPTS_DIR)
 	@echo "Generating preinstall script..."
-	@sed -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' $< > $@
+	@sed -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' \
+	     -e 's|__PATHS_D_NAME__|$(PATHS_D_NAME)|g' \
+	     -e 's|__INSTALL_PATHS_D__|$(INSTALL_PATHS_D)|g' $< > $@
 	@chmod +x $@
 
-$(SCRIPTS_DIR)/postinstall: Resources/scripts/postinstall.in | $(SCRIPTS_DIR)
+$(SCRIPTS_DIR)/postinstall: Resources/scripts/postinstall.in FORCE | $(SCRIPTS_DIR)
 	@echo "Generating postinstall script..."
-	@sed -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' $< > $@
+	@sed -e 's|__INSTALL_PREFIX__|$(INSTALL_PREFIX)|g' \
+	     -e 's|__VERSION__|$(BUILD_VERSION)|g' \
+	     -e 's|__PATHS_D_NAME__|$(PATHS_D_NAME)|g' \
+	     -e 's|__INSTALL_PATHS_D__|$(INSTALL_PATHS_D)|g' $< > $@
 	@chmod +x $@
+
+.PHONY: prepare-root
+prepare-root: setup
+	@rm -rf "$(PACKAGE_ROOT)"
+	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin"
 
 .PHONY: copy-binary
-copy-binary: setup
+copy-binary: prepare-root
 	@echo "Copying socktainer binary..."
 	@if [ ! -f "../.build/release/socktainer" ]; then \
 		echo "Error: socktainer binary not found. Run 'make release' in the parent directory first."; \
 		exit 1; \
 	fi
-	@cp ../.build/release/socktainer $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/
-	@chmod +x $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer
+	@cp ../.build/release/socktainer "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
+	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"
 
 .PHONY: sign-binary
 sign-binary: copy-binary
 	@if [ "$(NO_CODESIGN)" != "1" ] && [ "$(APPLE_APPLICATION_ID)" != "-" ]; then \
 		echo "Signing binary..."; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
-			$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer; \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"; \
 	fi
 
 .PHONY: component-pkg
 component-pkg: sign-binary scripts
 	@echo "Creating component package..."
-	@pkgbuild --root $(PACKAGE_ROOT) \
-		--identifier io.github.socktainer \
+	@pkgbuild --root "$(PACKAGE_ROOT)" \
+		--identifier "$(PACKAGE_IDENTIFIER)" \
 		--version $(BUILD_VERSION) \
 		--install-location / \
-		--scripts $(SCRIPTS_DIR) \
+		--scripts "$(SCRIPTS_DIR)" \
 		--ownership preserve \
 		$(OUT_DIR)/socktainer.pkg
 
@@ -176,6 +205,9 @@ help:
 	@echo "  APPLE_ID_PASSWORD=<pass>  - App-specific password for notarization"
 	@echo "  APPLE_TEAM_ID=<team_id>   - Team ID for notarization"
 	@echo "  INSTALL_PREFIX=/path      - Installation prefix (default: $(INSTALL_PREFIX))"
+	@echo "  PACKAGE_IDENTIFIER=id     - Package receipt identifier (default: $(PACKAGE_IDENTIFIER))"
+	@echo "  PATHS_D_NAME=name         - /etc/paths.d entry name (default: $(PATHS_D_NAME))"
+	@echo "  INSTALL_PATHS_D=0         - Skip modifying /etc/paths.d (useful for isolated QA)"
 	@echo ""
 	@echo "Example signed build:"
 	@echo "  make APPLE_APPLICATION_ID='Developer ID Application: Your Name' \\"
@@ -199,7 +231,7 @@ help:
 clean-legacy:
 	@echo "Cleaning legacy files from old build system..."
 	@rm -f Distribution welcome.html conclusion.html
-	@rm -rf Resources root tmp
+	@rm -rf root tmp
 	@rm -f scripts/preinstall scripts/postinstall
 	@echo "Legacy files cleaned. Only source templates (.in files) remain."
 
@@ -208,3 +240,5 @@ clean: clean-legacy
 	@echo "Cleaning installer build files..."
 	@rm -rf $(BUILD_DIR) $(OUT_DIR) $(TMP_DIR)
 
+.PHONY: FORCE
+FORCE:

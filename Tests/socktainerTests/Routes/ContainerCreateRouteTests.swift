@@ -111,6 +111,57 @@ struct ContainerCreateRouteTests {
     }
 }
 
+@Suite("ContainerCreateRoute — privileged capabilities")
+struct ContainerPrivilegedCapabilitiesTests {
+    @Test("Privileged grants ALL capabilities and supersedes CapDrop")
+    func privilegedGrantsAllCapabilities() throws {
+        let hostConfig = try JSONDecoder().decode(
+            HostConfig.self,
+            from: Data(#"{"Privileged":true,"CapDrop":["SYS_ADMIN"]}"#.utf8)
+        )
+
+        let capabilities = try ContainerCreateRoute.resolveCapabilities(hostConfig: hostConfig)
+
+        #expect(capabilities.capAdd == ["ALL"])
+        #expect(capabilities.capDrop.isEmpty)
+    }
+
+    @Test("Non-privileged requests retain normalized capability semantics")
+    func nonPrivilegedNormalizesCapabilities() throws {
+        let hostConfig = try JSONDecoder().decode(
+            HostConfig.self,
+            from: Data(#"{"CapAdd":["sys_admin"],"CapDrop":["net_raw"]}"#.utf8)
+        )
+
+        let capabilities = try ContainerCreateRoute.resolveCapabilities(hostConfig: hostConfig)
+
+        #expect(capabilities.capAdd == ["CAP_SYS_ADMIN"])
+        #expect(capabilities.capDrop == ["CAP_NET_RAW"])
+    }
+}
+
+@Suite("ContainerCreateRoute — image identity errors")
+struct ContainerCreateImageIdentityErrorTests {
+    @Test("a missing resolver identity maps to Docker's 404 error")
+    func missingImageIsNotFound() {
+        let mapped = ContainerCreateRoute.imageExistenceError(
+            ImageIdentityResolutionError.notFound("missing"),
+            image: "missing"
+        )
+        let abort = mapped as? Abort
+        #expect(abort?.status == .notFound)
+        #expect(abort?.reason == "No such image: missing")
+    }
+
+    @Test("backend failures are not disguised as missing images")
+    func backendFailureIsPreserved() {
+        let backend = NSError(domain: "AppleImageStore", code: 42)
+        let mapped = ContainerCreateRoute.imageExistenceError(backend, image: "example")
+        #expect((mapped as NSError).domain == "AppleImageStore")
+        #expect((mapped as NSError).code == 42)
+    }
+}
+
 // MARK: - Env-var rewrite helpers
 
 @Suite("ContainerCreateRoute — 127.0.0.1 gateway rewrite")

@@ -123,7 +123,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+        let rootfsPath = try await StoppedContainerBundleMaterializer.shared.materializeIfNeeded(
+            containerID: containerId,
+            appSupportPath: appSupportPath
+        )
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
@@ -181,7 +184,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// container's mounted layer. The export runs detached because it is
     /// synchronous I/O that can take minutes for large filesystems.
     func exportRootfs(containerId: String) async throws -> URL {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+        let rootfsPath = try await StoppedContainerBundleMaterializer.shared.materializeIfNeeded(
+            containerID: containerId,
+            appSupportPath: appSupportPath
+        )
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
         }
@@ -219,7 +225,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
             return
         }
 
-        let rootfsPath = getRootfsPath(containerId: container.id)
+        let rootfsPath = try await StoppedContainerBundleMaterializer.shared.materializeIfNeeded(
+            containerID: container.id,
+            appSupportPath: appSupportPath
+        )
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: container.id)

@@ -21,6 +21,77 @@ struct CustomImageDetail: Decodable {
 }
 
 extension ImageListRoute {
+    struct ImageIdentityGroup {
+        let image: ClientImage
+        let references: [String]
+    }
+
+    static func groupByIdentity(_ images: [ClientImage]) -> [ImageIdentityGroup] {
+        var groupOrder: [String] = []
+        var imagesByDigest: [String: [ClientImage]] = [:]
+
+        for image in images {
+            if imagesByDigest[image.digest] == nil {
+                groupOrder.append(image.digest)
+            }
+            imagesByDigest[image.digest, default: []].append(image)
+        }
+
+        return groupOrder.compactMap { digest in
+            guard let matchingImages = imagesByDigest[digest] else { return nil }
+            let orderedImages = matchingImages.sorted { $0.reference < $1.reference }
+            guard let representative = orderedImages.first else { return nil }
+            return ImageIdentityGroup(
+                image: representative,
+                references: Array(Set(orderedImages.map(\.reference))).sorted()
+            )
+        }
+    }
+
+    private static func repoDigestReference(name: String, digest: String) -> String {
+        if let reference = try? Reference.parse(name) {
+            return "\(reference.name)@\(digest)"
+        }
+
+        if let atIndex = name.firstIndex(of: "@") {
+            return "\(name[..<atIndex])@\(digest)"
+        }
+
+        return "\(name)@\(digest)"
+    }
+
+    static func repositoryMetadata(
+        references: [String],
+        rootDigest: String,
+        includeDigests: Bool
+    ) -> (tags: [String], digests: [String]) {
+        let tags = Array(Set(references.filter { !$0.isEmpty })).sorted()
+        guard includeDigests else { return (tags, []) }
+
+        let digests = Array(
+            Set(
+                tags.map {
+                    repoDigestReference(name: $0, digest: rootDigest)
+                }
+            )
+        ).sorted()
+        return (tags, digests)
+    }
+
+    private static func prioritizedManifests(_ manifests: [Descriptor]) -> [Descriptor] {
+        let primaryPlatform = requestedOrDefaultPlatform(nil)
+        return manifests.enumerated().sorted { left, right in
+            if preferredPlatformMatches(
+                left.element.platform,
+                over: right.element.platform,
+                preferredPlatform: primaryPlatform
+            ) {
+                return true
+            }
+            return left.offset < right.offset
+        }.map(\.element)
+    }
+
     private static func makeOCIDescriptor(
         from descriptor: Descriptor,
         appSupportURL: URL? = nil,
@@ -71,7 +142,8 @@ extension ImageListRoute {
             let includeDigests = query.digests ?? false
             var imagesSummaries: [RESTImageSummary] = []
 
-            for image in images {
+            for group in groupByIdentity(images) {
+                let image = group.image
                 let imageIndex = try await image.index()
                 let manifests = imageIndex.manifests
                 var manifestSummaries: [ImageManifestSummary] = []
@@ -79,8 +151,9 @@ extension ImageListRoute {
                 var size: Int64 = 0
                 var labels: [String: String] = [:]
                 var foundUsableManifest = false
+                var dockerImageID: String?
 
-                for descriptor in manifests {
+                for descriptor in prioritizedManifests(manifests) {
                     if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
                         referenceType == "attestation-manifest"
                     {
@@ -149,18 +222,25 @@ extension ImageListRoute {
                         created = Int(AppleContainerTimestampResolver.unixTimestampSeconds(config.created))
                         size = totalSize
                         labels = config.config?.labels ?? [:]
+                        dockerImageID = manifest?.config.digest
                         foundUsableManifest = true
                     }
                 }
 
-                let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
-                let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference }
+                let repositoryMetadata = repositoryMetadata(
+                    references: group.references,
+                    rootDigest: image.descriptor.digest,
+                    includeDigests: includeDigests
+                )
+                let references = Set(group.references)
+                let containersUsingImage = containers.filter {
+                    references.contains($0.configuration.image.reference)
+                }
                 let summary = RESTImageSummary(
-                    Id: image.digest,
+                    Id: dockerImageID ?? image.digest,
                     ParentId: "",
-                    RepoTags: repoTags,
-                    RepoDigests: repoDigests,
+                    RepoTags: repositoryMetadata.tags,
+                    RepoDigests: repositoryMetadata.digests,
                     Created: created,
                     Size: size,
                     SharedSize: -1,

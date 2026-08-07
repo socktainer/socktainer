@@ -129,17 +129,27 @@ struct ClientVolumeService: ClientVolumeProtocol {
         return Self.convert(result)
     }
 
-    private static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
-        Volume(
+    static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
+        var labels = LabelNormalization.restore(v.labels)
+        var options = v.options
+
+        // Apple Container does not understand Socktainer's sync driver option, so it is
+        // persisted in an internal label. Reconstruct Docker's public metadata on every
+        // response and keep the implementation label out of `docker volume inspect`.
+        if let sync = labels.removeValue(forKey: Filesystem.SyncMode.socktainerLabel) {
+            options["sync"] = sync
+        }
+
+        return Volume(
             Name: v.name,
             Driver: v.driver,
             Mountpoint: v.source,
             CreatedAt: ISO8601DateFormatter().string(from: v.creationDate),
             Status: nil,  // we have no mechanism to report status for the time being
-            Labels: LabelNormalization.restore(v.labels),
+            Labels: labels,
             Scope: "local",  // Assuming local for now
             ClusterVolume: nil,
-            Options: v.options,
+            Options: options,
             UsageData: VolumeUsageData()
         )
     }

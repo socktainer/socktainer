@@ -7,6 +7,16 @@ import Testing
 @Suite("Apple Container version check")
 struct AppleContainerVersionCheckTests {
 
+    @Test("the compatibility boundary extracts and accepts the compiled SDK patch version")
+    func compiledSDKVersion() {
+        #expect(
+            AppleContainerCompatibility.isCompatible(
+                apiServerVersion: "container-apiserver version \(getAppleContainerVersion()) (build: release)"
+            )
+        )
+        #expect(AppleContainerCompatibility.semanticVersion(in: "no version") == nil)
+    }
+
     @Test("interrupted connections report the Apple Container service as unavailable")
     func interruptedConnection() async {
         let error = await capturedError {

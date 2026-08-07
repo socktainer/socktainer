@@ -98,11 +98,39 @@ enum ClientContainerError: Error {
 
 struct ClientContainerService: ClientContainerProtocol {
     private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
+    private let imageReferenceResolver: (any ImageReferenceResolving)?
+
+    init(imageReferenceResolver: (any ImageReferenceResolving)? = nil) {
+        self.imageReferenceResolver = imageReferenceResolver
+    }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
         let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+        let resolvedFilters = await Self.resolvingAncestorFilters(filters, with: imageReferenceResolver)
+        return Self.applyFilters(running, filters: resolvedFilters, allContainers: allContainers)
+    }
+
+    /// Expand Docker image identifiers (config/manifest/index digests and short
+    /// IDs) to the stored references recorded in container configurations.
+    /// Preserve the caller's spelling too, so pre-index and legacy snapshots
+    /// whose image reference was not normalized continue to match.
+    static func resolvingAncestorFilters(
+        _ filters: [String: [String]],
+        with resolver: (any ImageReferenceResolving)?
+    ) async -> [String: [String]] {
+        guard let resolver, let ancestors = filters["ancestor"] else { return filters }
+        var expanded: [String] = []
+        for ancestor in ancestors {
+            if !expanded.contains(ancestor) { expanded.append(ancestor) }
+            guard let references = try? await resolver.references(for: ancestor) else { continue }
+            for reference in references where !expanded.contains(reference) {
+                expanded.append(reference)
+            }
+        }
+        var resolved = filters
+        resolved["ancestor"] = expanded
+        return resolved
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
@@ -273,8 +301,13 @@ struct ClientContainerService: ClientContainerProtocol {
             return
         }
 
-        try await VMLifecycleAdmission.shared.withSlot {
-            try await self.startInternal(container: container)
+        try await ContainerFilesystemOperationLock.shared.withLock(containerID: container.id) {
+            guard let current = try await self.getContainer(id: container.id), current.status != .running else {
+                return
+            }
+            try await VMLifecycleAdmission.shared.withSlot {
+                try await self.startInternal(container: current)
+            }
         }
     }
 

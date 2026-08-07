@@ -9,7 +9,7 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, help: "Show version")
     var version: Bool = false
 
-    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility and exit")
+    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility on startup")
     var checkCompatibility: Bool = true
 
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
@@ -18,9 +18,9 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Option(
         name: .long,
         help:
-            "Sync mode for named volumes: nosync (default, ~1.5x faster for write-heavy workloads), fsync (honors guest fsyncs for durability), full (fully synchronous writes). Override per-volume with: docker volume create -o sync=fsync <name>"
+            "Sync mode for named volumes: fsync (default, honors guest fsyncs for durability), full (fully synchronous writes), nosync (unsafe on host crash; opt-in only). Override per-volume with: docker volume create -o sync=fsync <name>"
     )
-    var volumeSync: String = "nosync"
+    var volumeSync: String = "fsync"
 }
 
 // Parse CLI before starting the app

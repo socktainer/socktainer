@@ -28,7 +28,7 @@ extension Filesystem.SyncMode {
         }
     }
 
-    /// Resolves a sync mode from a CLI string, falling back to nosync and calling
+    /// Resolves a sync mode from a CLI string, falling back to fsync and calling
     /// `warn` with a message when the value is unrecognised. Injectable for testing.
     static func resolve(
         from string: String,
@@ -37,7 +37,7 @@ extension Filesystem.SyncMode {
         if let mode = Filesystem.SyncMode(rawString: string) {
             return mode
         }
-        warn("warning: unknown --volume-sync value '\(string)', falling back to nosync")
-        return .nosync
+        warn("warning: unknown --volume-sync value '\(string)', falling back to fsync")
+        return .fsync
     }
 }

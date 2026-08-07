@@ -438,28 +438,31 @@ extension BuildRoute {
         }()
 
         // Build configuration
-        let config = ContainerBuild.Builder.BuildConfig(
-            buildID: buildID,
-            contentStore: RemoteContentStoreClient(),
-            buildArgs: buildArgs,
-            // TODO: Implement secrets once integration with buildkit materializes
-            secrets: [:],
-            contextDir: contextDir,
-            dockerfile: dockerfileData,
-            dockerignore: nil,
-            labels: labels,
-            noCache: noCache,
-            platforms: [Platform](platforms),
-            terminal: nil,  // No terminal for API
-            tags: [imageName],
-            target: target,
-            quiet: quiet,
-            exports: exports,
-            cacheIn: [],
-            cacheOut: [],
-            pull: pull,
-            containerSystemConfig: systemConfig
-        )
+        let config = AppleContainerCompatibility.makeBuildConfig(
+            .init(
+                buildID: buildID,
+                contentStore: RemoteContentStoreClient(),
+                buildArgs: buildArgs,
+                // TODO: Implement secrets once integration with buildkit materializes
+                secrets: [:],
+                // Docker's classic Build API does not carry an SSH forwarding endpoint.
+                // Buildx SSH mounts use the standards-compatible docker-container driver.
+                ssh: "",
+                contextDir: contextDir,
+                dockerfile: dockerfileData,
+                dockerignore: nil,
+                labels: labels,
+                noCache: noCache,
+                platforms: [Platform](platforms),
+                tags: [imageName],
+                target: target,
+                quiet: quiet,
+                exports: exports,
+                cacheIn: [],
+                cacheOut: [],
+                pull: pull,
+                containerSystemConfig: systemConfig
+            ))
 
         sendStreamMessage(" ---> Starting build process")
 

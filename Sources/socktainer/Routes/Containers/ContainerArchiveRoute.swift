@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import Vapor
 
@@ -21,6 +22,22 @@ struct ContainerArchivePutQuery: Content {
 struct ContainerArchiveRoute: RouteCollection {
     let containerClient: ClientContainerProtocol
     let archiveClient: ClientArchiveProtocol
+
+    static func withLockedContainer<T: Sendable>(
+        reference: String,
+        containerClient: ClientContainerProtocol,
+        operation: @Sendable (ContainerSnapshot) async throws -> T
+    ) async throws -> T {
+        guard let resolved = try await containerClient.getContainer(id: reference) else {
+            throw Abort(.notFound, reason: "No such container: \(reference)")
+        }
+        return try await ContainerFilesystemOperationLock.shared.withLock(containerID: resolved.id) {
+            guard let current = try await containerClient.getContainer(id: resolved.id) else {
+                throw Abort(.notFound, reason: "No such container: \(reference)")
+            }
+            return try await operation(current)
+        }
+    }
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
@@ -52,33 +69,30 @@ struct ContainerArchiveRoute: RouteCollection {
 
             let query = try req.query.decode(ContainerArchiveGetQuery.self)
 
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
-
             do {
-                let (tarData, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
+                return try await withLockedContainer(reference: id, containerClient: containerClient) { container in
+                    let (tarData, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
 
-                // Create the path stat header (base64 encoded JSON)
-                let statJson = try JSONEncoder().encode(stat)
-                let statBase64 = statJson.base64EncodedString()
+                    // Create the path stat header (base64 encoded JSON)
+                    let statJson = try JSONEncoder().encode(stat)
+                    let statBase64 = statJson.base64EncodedString()
 
-                var headers = HTTPHeaders()
-                headers.add(name: .contentType, value: "application/x-tar")
-                headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
+                    var headers = HTTPHeaders()
+                    headers.add(name: .contentType, value: "application/x-tar")
+                    headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
 
-                // moby emits "archive-path" on a successful GET (daemon/archive_unix.go);
-                // HEAD emits nothing.
-                if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                    await broadcaster.broadcast(DockerEvent.containerEvent("archive-path", container: container))
+                    // moby emits "archive-path" on a successful GET (daemon/archive_unix.go);
+                    // HEAD emits nothing.
+                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                        await broadcaster.broadcast(DockerEvent.containerEvent("archive-path", container: container))
+                    }
+
+                    return Response(
+                        status: .ok,
+                        headers: headers,
+                        body: .init(data: tarData)
+                    )
                 }
-
-                return Response(
-                    status: .ok,
-                    headers: headers,
-                    body: .init(data: tarData)
-                )
             } catch let error as ClientArchiveError {
                 switch error {
                 case .pathNotFound:
@@ -103,11 +117,6 @@ struct ContainerArchiveRoute: RouteCollection {
             }
 
             let query = try req.query.decode(ContainerArchivePutQuery.self)
-
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
 
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             let tarPath = tempDir.appendingPathComponent("archive.tar")
@@ -151,20 +160,22 @@ struct ContainerArchiveRoute: RouteCollection {
             }
 
             do {
-                try await archiveClient.putArchive(
-                    container: container,
-                    path: query.path,
-                    tarPath: tarPath,
-                    noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false
-                )
+                return try await withLockedContainer(reference: id, containerClient: containerClient) { container in
+                    try await archiveClient.putArchive(
+                        container: container,
+                        path: query.path,
+                        tarPath: tarPath,
+                        noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false
+                    )
 
-                // moby emits "extract-to-dir" after a successful extraction
-                // (daemon/archive_unix.go).
-                if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                    await broadcaster.broadcast(DockerEvent.containerEvent("extract-to-dir", container: container))
+                    // moby emits "extract-to-dir" after a successful extraction
+                    // (daemon/archive_unix.go).
+                    if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                        await broadcaster.broadcast(DockerEvent.containerEvent("extract-to-dir", container: container))
+                    }
+
+                    return Response(status: .ok)
                 }
-
-                return Response(status: .ok)
             } catch let error as ClientArchiveError {
                 switch error {
                 case .pathNotFound:
@@ -192,22 +203,19 @@ struct ContainerArchiveRoute: RouteCollection {
 
             let query = try req.query.decode(ContainerArchiveGetQuery.self)
 
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
-
             do {
-                let (_, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
+                return try await withLockedContainer(reference: id, containerClient: containerClient) { container in
+                    let (_, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
 
-                // Create the path stat header (base64 encoded JSON)
-                let statJson = try JSONEncoder().encode(stat)
-                let statBase64 = statJson.base64EncodedString()
+                    // Create the path stat header (base64 encoded JSON)
+                    let statJson = try JSONEncoder().encode(stat)
+                    let statBase64 = statJson.base64EncodedString()
 
-                var headers = HTTPHeaders()
-                headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
+                    var headers = HTTPHeaders()
+                    headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
 
-                return Response(status: .ok, headers: headers)
+                    return Response(status: .ok, headers: headers)
+                }
             } catch let error as ClientArchiveError {
                 switch error {
                 case .pathNotFound:

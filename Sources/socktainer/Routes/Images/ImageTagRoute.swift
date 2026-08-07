@@ -4,10 +4,16 @@ import Vapor
 
 struct ImageTagRoute: RouteCollection {
     let systemConfig: ContainerSystemConfig
+    let identityResolver: ImageIdentityResolver
+
+    init(systemConfig: ContainerSystemConfig, identityResolver: ImageIdentityResolver? = nil) {
+        self.systemConfig = systemConfig
+        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag") { [systemConfig] req in
-            try await ImageTagRoute.handler(req, systemConfig: systemConfig)
+        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag") { [systemConfig, identityResolver] req in
+            try await ImageTagRoute.handler(req, systemConfig: systemConfig, identityResolver: identityResolver)
         }
     }
 }
@@ -18,7 +24,12 @@ struct RESTImageTagQuery: Vapor.Content {
 }
 
 extension ImageTagRoute {
-    static func handler(_ req: Request, systemConfig: ContainerSystemConfig) async throws -> Response {
+    static func handler(
+        _ req: Request,
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil
+    ) async throws -> Response {
+        let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
         guard let sourceImageName = req.parameters.get("name") else {
             throw Abort(.badRequest, reason: "Missing image name parameter")
         }
@@ -38,13 +49,17 @@ extension ImageTagRoute {
 
         let sourceImage: ClientImage
         do {
-            sourceImage = try await ClientImage.get(reference: sourceImageName, containerSystemConfig: systemConfig)
-        } catch {
+            sourceImage = try await resolver.resolve(sourceImageName).image
+        } catch let error as ImageIdentityResolutionError {
+            if case .ambiguous = error {
+                throw Abort(.conflict, reason: "conflict: \(sourceImageName) is an ambiguous image ID")
+            }
             throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
         }
 
         do {
             _ = try await sourceImage.tag(new: targetReference)
+            try await resolver.refresh()
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 // moby's tag event uses the image digest as Actor.ID and the new
                 // reference as the `name` attribute (no `image`/`from` for image events).

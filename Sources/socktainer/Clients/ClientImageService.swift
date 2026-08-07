@@ -14,13 +14,26 @@ import TerminalProgress
 ///   - `deletedDigest` — the sha256 of image layers freed (only when the last tag was removed)
 struct ImageDeletionResult {
     let untagged: String  // normalized tag that was untagged
+    let additionalUntagged: [String]
     let digest: String  // sha256 of the image the removed tag referenced
     let deletedDigest: String?  // sha256 if the image layers were garbage-collected
+
+    init(untagged: String, additionalUntagged: [String] = [], digest: String, deletedDigest: String?) {
+        self.untagged = untagged
+        self.additionalUntagged = additionalUntagged
+        self.digest = digest
+        self.deletedDigest = deletedDigest
+    }
+
+    var untaggedReferences: [String] {
+        [untagged] + additionalUntagged
+    }
 }
 
 protocol ClientImageProtocol: Sendable {
     func list(includeSystemImages: Bool) async throws -> [ClientImage]
     func delete(id: String) async throws -> ImageDeletionResult
+    func delete(id: String, force: Bool) async throws -> ImageDeletionResult
     func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
         PullProgress, Error
     >
@@ -47,6 +60,10 @@ extension ClientImageProtocol {
         try await list(includeSystemImages: false)
     }
 
+    func delete(id: String, force: Bool) async throws -> ImageDeletionResult {
+        try await delete(id: id)
+    }
+
     /// Store-reference → digest map used to shape save/load events like moby's, whose
     /// Actor.ID is the image digest. References the store cannot resolve fall back to
     /// the reference itself at the emission site.
@@ -58,6 +75,7 @@ extension ClientImageProtocol {
 enum ClientImageError: Error {
     case notFound(id: String)
     case digestReferenceNotAllowed(repo: String)
+    case conflict(String)
 }
 
 enum PullProgress: Sendable {
@@ -142,9 +160,14 @@ struct LiveImageDeletionStore: ImageDeletionStore {
 
 struct ClientImageService: ClientImageProtocol {
     private let containerSystemConfig: ContainerSystemConfig
+    private let identityResolver: ImageIdentityResolver
 
-    init(containerSystemConfig: ContainerSystemConfig) {
+    init(
+        containerSystemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil
+    ) {
         self.containerSystemConfig = containerSystemConfig
+        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: containerSystemConfig)
     }
 
     // Workaround for narrowing an unspecified push from all platforms to a single platform available.
@@ -200,10 +223,63 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func delete(id: String) async throws -> ImageDeletionResult {
-        try await Self.delete(
-            id: id,
-            containerSystemConfig: containerSystemConfig
+        try await delete(id: id, force: false)
+    }
+
+    func delete(id: String, force: Bool) async throws -> ImageDeletionResult {
+        let resolved: ResolvedImageIdentity
+        do {
+            resolved = try await identityResolver.resolve(id)
+        } catch let error as ImageIdentityResolutionError {
+            if case .ambiguous = error {
+                throw ClientImageError.conflict("conflict: (id) is an ambiguous image ID")
+            }
+            throw ClientImageError.notFound(id: id)
+        }
+        let references = try Self.deletionReferences(
+            kind: resolved.kind,
+            resolvedReference: resolved.reference,
+            allReferences: resolved.references,
+            requestedID: id,
+            force: force
         )
+        guard let firstReference = references.first else {
+            throw ClientImageError.notFound(id: id)
+        }
+
+        var results: [ImageDeletionResult] = []
+        for reference in references {
+            results.append(
+                try await Self.delete(
+                    id: reference,
+                    containerSystemConfig: containerSystemConfig
+                ))
+        }
+        try await identityResolver.refresh()
+        return ImageDeletionResult(
+            untagged: results.first?.untagged ?? firstReference,
+            additionalUntagged: results.dropFirst().flatMap(\.untaggedReferences),
+            digest: results.first?.digest ?? resolved.image.digest,
+            deletedDigest: results.compactMap(\.deletedDigest).last
+        )
+    }
+
+    static func deletionReferences(
+        kind: ImageIdentityKind,
+        resolvedReference: String,
+        allReferences: [String],
+        requestedID: String,
+        force: Bool
+    ) throws -> [String] {
+        if kind == .reference {
+            return [resolvedReference]
+        }
+        if allReferences.count > 1, !force {
+            throw ClientImageError.conflict(
+                "conflict: unable to delete \(requestedID) - image is referenced by multiple tags"
+            )
+        }
+        return force ? allReferences.sorted() : [resolvedReference]
     }
 
     /// Deletes an image by reference, normalizing the key via `imageStore`.
@@ -307,6 +383,7 @@ struct ClientImageService: ClientImageProtocol {
                     )
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
                     continuation.yield(.message("Image digest: \(image.digest)"))
+                    try await identityResolver.refresh()
                     continuation.finish()
                 } catch {
                     // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
@@ -328,6 +405,7 @@ struct ClientImageService: ClientImageProtocol {
                             try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
                             logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
                             continuation.yield(.message("Image digest: \(fallbackImage.digest)"))
+                            try await identityResolver.refresh()
                             continuation.finish()
                         } catch let fallbackError {
                             logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
@@ -345,17 +423,20 @@ struct ClientImageService: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let normalizedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
+        let resolved: ResolvedImageIdentity
+        do {
+            resolved = try await identityResolver.resolve(reference)
+        } catch let error as ImageIdentityResolutionError {
+            if case .ambiguous = error {
+                throw ClientImageError.conflict("conflict: (reference) is an ambiguous image ID")
+            }
+            throw ClientImageError.notFound(id: reference)
+        }
+        let normalizedReference = resolved.reference
 
         logger.info("Pushing image reference: \(normalizedReference)")
 
-        let image: ClientImage
-        do {
-            image = try await ClientImage.get(reference: normalizedReference, containerSystemConfig: containerSystemConfig)
-        } catch {
-            logger.error("Image not found: \(normalizedReference)")
-            throw ClientImageError.notFound(id: normalizedReference)
-        }
+        let image = resolved.image
 
         logger.debug("Image reference from ClientImage: \(image.reference)")
 
@@ -664,7 +745,7 @@ struct ClientImageService: ClientImageProtocol {
         }
 
         logger.info("Successfully loaded \(images.count) image(s) from tarball")
-
+        try await identityResolver.refresh()
         return loadedImages
     }
 
@@ -673,11 +754,14 @@ struct ClientImageService: ClientImageProtocol {
 
         for reference in references {
             do {
-                let image = try await ClientImage.get(reference: reference, containerSystemConfig: containerSystemConfig)
-                logger.debug("Image exists: \(image.reference)")
-                resolvedRefs.append(image.reference)
-            } catch {
+                let resolved = try await identityResolver.resolve(reference)
+                logger.debug("Image exists: \(resolved.reference)")
+                resolvedRefs.append(resolved.reference)
+            } catch let error as ImageIdentityResolutionError {
                 logger.error("Image not found: \(reference)")
+                if case .ambiguous = error {
+                    throw ClientImageError.conflict("conflict: \(reference) is an ambiguous image ID")
+                }
                 throw ClientImageError.notFound(id: reference)
             }
         }
@@ -779,6 +863,7 @@ struct ClientImageService: ClientImageProtocol {
         }
 
         logger.info("Imported image \(image.reference) (\(image.digest))")
+        try await identityResolver.refresh()
         return (reference, image.digest)
     }
 

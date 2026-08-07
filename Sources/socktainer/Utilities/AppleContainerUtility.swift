@@ -18,19 +18,6 @@ public func stripSubnetFromIP(_ ipAddress: String?) -> String? {
 /// Utility for checking Apple Container daemon version compatibility
 public struct AppleContainerVersionCheck {
 
-    /// Extracts a semantic version (e.g., 0.6.0) from a longer version string
-    private static func extractSemver(from text: String) -> String? {
-        // Look for the first occurrence of X.Y.Z
-        let pattern = "\\b\\d+\\.\\d+\\.\\d+\\b"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(location: 0, length: text.utf16.count)
-        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
-        if let range = Range(match.range, in: text) {
-            return String(text[range])
-        }
-        return nil
-    }
-
     /// Error types for version checking
     public enum VersionCheckError: Error, LocalizedError, Equatable {
         case incompatibleVersion(detected: String, expected: String)
@@ -63,11 +50,11 @@ public struct AppleContainerVersionCheck {
         do {
             // Attempt to get version from Apple Container daemon
             let serverVersionFull = try await fetchAPIServerVersion()
-            let serverVersion = extractSemver(from: serverVersionFull) ?? serverVersionFull
+            let serverVersion = AppleContainerCompatibility.semanticVersion(in: serverVersionFull) ?? serverVersionFull
 
             // Check if client and server versions are compatible
-            let requiredVersion = getAppleContainerVersion()
-            if requiredVersion != serverVersion {
+            let requiredVersion = AppleContainerCompatibility.sdkVersion
+            if !AppleContainerCompatibility.isCompatible(apiServerVersion: serverVersionFull) {
                 throw VersionCheckError.incompatibleVersion(detected: serverVersion, expected: requiredVersion)
             }
 
