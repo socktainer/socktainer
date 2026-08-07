@@ -193,7 +193,8 @@ BuildKit cache, secret, SSH, exporter, and `--load` semantics.
 Create a builder once and select it:
 
 ```bash
-docker buildx create --name socktainer --driver docker-container --use
+docker buildx create --name socktainer --driver docker-container \
+  --driver-opt default-load=true --use
 docker buildx inspect --bootstrap
 ```
 
