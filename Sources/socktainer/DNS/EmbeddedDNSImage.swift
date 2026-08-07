@@ -30,25 +30,38 @@ enum EmbeddedDNSImage {
     /// Returns the freshly-tagged handle directly: a get-by-tag right after tagging can miss on a cold store.
     static func ensure(
         containerSystemConfig: ContainerSystemConfig,
-        appSupportURL: URL
+        appSupportURL: URL,
+        imageClient: ClientImageService
     ) async throws -> ClientImage {
-        if let image = try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig) {
+        let canonicalTag = try ClientImage.normalizeReference(
+            tag,
+            containerSystemConfig: containerSystemConfig
+        )
+        if let image = try? await imageClient.list(includeSystemImages: true)
+            .first(where: { $0.reference == canonicalTag })
+        {
             return image
         }
         return try await ImportGate.shared.ensureOnce {
-            if let image = try? await ClientImage.get(reference: tag, containerSystemConfig: containerSystemConfig) {
+            if let image = try? await imageClient.list(includeSystemImages: true)
+                .first(where: { $0.reference == canonicalTag })
+            {
                 return image
             }
-            return try await importAndTag(containerSystemConfig: containerSystemConfig, appSupportURL: appSupportURL)
+            return try await importAndTag(
+                containerSystemConfig: containerSystemConfig,
+                appSupportURL: appSupportURL,
+                imageClient: imageClient
+            )
         }
     }
 
     private static func importAndTag(
         containerSystemConfig: ContainerSystemConfig,
-        appSupportURL: URL
+        appSupportURL: URL,
+        imageClient: ClientImageService
     ) async throws -> ClientImage {
         log.info("[dns-embedded] importing embedded DNS forwarder image")
-        let imageClient = ClientImageService(containerSystemConfig: containerSystemConfig)
         let loaded = try await imageClient.load(
             tarballPath: try SocktainerDNSImage.archiveURL(),
             platform: .current,
@@ -58,10 +71,9 @@ enum EmbeddedDNSImage {
         guard let loadedRef = loaded.first else {
             throw EmbeddedDNSError.importReturnedNoImage
         }
-        let loadedImage = try await ClientImage.get(reference: loadedRef, containerSystemConfig: containerSystemConfig)
-        let tagged = try await loadedImage.tag(new: tag)
+        let tagged = try await imageClient.tag(source: loadedRef, target: tag)
         log.info("[dns-embedded] DNS forwarder image ready: \(tag)")
-        return tagged
+        return tagged.image
     }
 
     enum EmbeddedDNSError: Error {

@@ -5,15 +5,32 @@ import Vapor
 struct ImageTagRoute: RouteCollection {
     let systemConfig: ContainerSystemConfig
     let identityResolver: ImageIdentityResolver
+    let tagger: any ImageTaggingProtocol
 
-    init(systemConfig: ContainerSystemConfig, identityResolver: ImageIdentityResolver? = nil) {
+    init(
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil,
+        tagger: (any ImageTaggingProtocol)? = nil
+    ) {
+        let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
         self.systemConfig = systemConfig
-        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        self.identityResolver = resolver
+        self.tagger =
+            tagger
+            ?? ClientImageService(
+                containerSystemConfig: systemConfig,
+                identityResolver: resolver
+            )
     }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag") { [systemConfig, identityResolver] req in
-            try await ImageTagRoute.handler(req, systemConfig: systemConfig, identityResolver: identityResolver)
+        try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag") { [systemConfig, identityResolver, tagger] req in
+            try await ImageTagRoute.handler(
+                req,
+                systemConfig: systemConfig,
+                identityResolver: identityResolver,
+                tagger: tagger
+            )
         }
     }
 }
@@ -27,9 +44,16 @@ extension ImageTagRoute {
     static func handler(
         _ req: Request,
         systemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        tagger: (any ImageTaggingProtocol)? = nil
     ) async throws -> Response {
         let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        let imageTagger =
+            tagger
+            ?? ClientImageService(
+                containerSystemConfig: systemConfig,
+                identityResolver: resolver
+            )
         guard let sourceImageName = req.parameters.get("name") else {
             throw Abort(.badRequest, reason: "Missing image name parameter")
         }
@@ -47,28 +71,25 @@ extension ImageTagRoute {
             return try ClientImage.normalizeReference(repo, containerSystemConfig: systemConfig)
         }()
 
-        let sourceImage: ClientImage
         do {
-            sourceImage = try await resolver.resolve(sourceImageName).image
-        } catch let error as ImageIdentityResolutionError {
-            if case .ambiguous = error {
-                throw Abort(.conflict, reason: "conflict: \(sourceImageName) is an ambiguous image ID")
-            }
-            throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
-        }
-
-        do {
-            _ = try await sourceImage.tag(new: targetReference)
-            try await resolver.refresh()
+            let tagged = try await imageTagger.tag(
+                source: sourceImageName,
+                target: targetReference
+            )
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 // moby's tag event uses the image digest as Actor.ID and the new
                 // reference as the `name` attribute (no `image`/`from` for image events).
                 await broadcaster.broadcast(
                     DockerEvent.make(
-                        type: "image", action: "tag", actorID: sourceImage.digest,
+                        type: "image", action: "tag",
+                        actorID: tagged.dockerConfigDigest,
                         attributes: ["name": targetReference]))
             }
             return Response(status: .created)
+        } catch ClientImageError.notFound {
+            throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
+        } catch ClientImageError.conflict(let message) {
+            throw Abort(.conflict, reason: message)
         } catch {
             req.logger.error("Failed to tag image: \(error)")
             throw Abort(.internalServerError, reason: "Failed to tag image: \(error.localizedDescription)")

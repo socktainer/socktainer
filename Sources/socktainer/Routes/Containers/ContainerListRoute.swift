@@ -10,14 +10,33 @@ struct ContainerListQuery: Content {
 
 struct ContainerListRoute: RouteCollection {
     let client: ClientContainerProtocol
+    let imageMetadataProvider: any ContainerImageMetadataProviding
+
+    init(
+        client: ClientContainerProtocol,
+        imageMetadataProvider: any ContainerImageMetadataProviding = StoredContainerImageMetadataProvider()
+    ) {
+        self.client = client
+        self.imageMetadataProvider = imageMetadataProvider
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/containers/json", use: ContainerListRoute.handler(client: client))
+        try routes.registerVersionedRoute(
+            .GET,
+            pattern: "/containers/json",
+            use: ContainerListRoute.handler(
+                client: client,
+                imageMetadataProvider: imageMetadataProvider
+            )
+        )
     }
 }
 
 extension ContainerListRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> [RESTContainerSummary] {
+    static func handler(
+        client: ClientContainerProtocol,
+        imageMetadataProvider: any ContainerImageMetadataProviding = StoredContainerImageMetadataProvider()
+    ) -> @Sendable (Request) async throws -> [RESTContainerSummary] {
         { req in
             let query = try req.query.decode(ContainerListQuery.self)
             let limit = query.limit ?? 0
@@ -116,6 +135,9 @@ extension ContainerListRoute {
                 }
 
                 let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(createdDate)
+                let imageMetadata = await imageMetadataProvider.metadata(
+                    for: container
+                )
 
                 let mobyState = container.status.mobyState
                 // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
@@ -145,15 +167,15 @@ extension ContainerListRoute {
                 let summary = RESTContainerSummary(
                     Id: DockerContainerID.hexId(for: container),
                     Names: ["/" + container.id],
-                    Image: container.configuration.image.reference,
-                    ImageID: container.configuration.image.digest,
+                    Image: imageMetadata.displayReference,
+                    ImageID: imageMetadata.configDigest,
                     ImageManifestDescriptor: nil,
                     Command: ([container.configuration.initProcess.executable] + container.configuration.initProcess.arguments).joined(separator: " "),
                     Created: createdTimestamp,
                     Ports: ports,
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container
                     SizeRootFs: nil,  // there is no mechanism to retrieve this value from apple container
-                    Labels: LabelNormalization.restore(container.configuration.labels),
+                    Labels: ContainerImageIdentity.dockerLabels(for: container),
                     State: mobyState,
                     Status: statusStr,
                     HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),

@@ -5,8 +5,25 @@ import Vapor
 
 struct ContainerInspectRoute: RouteCollection {
     let client: ClientContainerProtocol
+    let imageMetadataProvider: any ContainerImageMetadataProviding
+
+    init(
+        client: ClientContainerProtocol,
+        imageMetadataProvider: any ContainerImageMetadataProviding = StoredContainerImageMetadataProvider()
+    ) {
+        self.client = client
+        self.imageMetadataProvider = imageMetadataProvider
+    }
+
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/json", use: ContainerInspectRoute.handler(client: client))
+        try routes.registerVersionedRoute(
+            .GET,
+            pattern: "/containers/{id}/json",
+            use: ContainerInspectRoute.handler(
+                client: client,
+                imageMetadataProvider: imageMetadataProvider
+            )
+        )
     }
 }
 
@@ -45,7 +62,10 @@ extension ContainerInspectRoute {
         )
     }
 
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> RESTContainerInspect {
+    static func handler(
+        client: ClientContainerProtocol,
+        imageMetadataProvider: any ContainerImageMetadataProviding = StoredContainerImageMetadataProvider()
+    ) -> @Sendable (Request) async throws -> RESTContainerInspect {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
@@ -54,6 +74,7 @@ extension ContainerInspectRoute {
             guard let container = try await client.getContainer(id: id) else {
                 throw Abort(.notFound, reason: "Container not found")
             }
+            let imageMetadata = await imageMetadataProvider.metadata(for: container)
 
             let exposedPorts = Dictionary(
                 uniqueKeysWithValues:
@@ -91,7 +112,11 @@ extension ContainerInspectRoute {
                 Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,
                 Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
-                Image: container.configuration.image.reference,
+                // Apple stores an exact runtime lease key. Docker preserves the
+                // original create spelling separately under Config.Image.
+                Image: ContainerImageIdentity.requestedReference(
+                    for: container
+                ),
                 Volumes: nil,  // Could be derived from mounts if needed
                 WorkingDir: container.configuration.initProcess.workingDirectory.isEmpty ? nil : container.configuration.initProcess.workingDirectory,
                 Entrypoint: [container.configuration.initProcess.executable],
@@ -99,7 +124,7 @@ extension ContainerInspectRoute {
                 MacAddress: nil,  // no mechanism to derive this value
                 OnBuild: nil,  // no mechanism to derive this value
                 Labels: {
-                    let restored = LabelNormalization.restore(container.configuration.labels)
+                    let restored = ContainerImageIdentity.dockerLabels(for: container)
                     return restored.isEmpty ? nil : restored
                 }(),
                 StopSignal: container.configuration.stopSignal,
@@ -188,7 +213,9 @@ extension ContainerInspectRoute {
                 Path: container.configuration.initProcess.executable,
                 Args: container.configuration.initProcess.arguments,
                 State: containerState,
-                Image: container.configuration.image.reference,
+                // Docker's top-level Image is the immutable image
+                // configuration digest, consistent with ImageID in list/df.
+                Image: imageMetadata.configDigest,
                 ResolvConfPath: "/etc/resolv.conf",
                 HostnamePath: "/etc/hostname",
                 HostsPath: "/etc/hosts",

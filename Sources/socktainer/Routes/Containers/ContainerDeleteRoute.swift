@@ -26,11 +26,15 @@ extension ContainerDeleteRoute {
             let snapshot = try? await client.getContainer(id: id)
             let cached = await ContainerInfoCache.shared.get(id: id)
 
-            let eventImage = snapshot?.configuration.image.reference ?? cached?.image ?? ""
+            let eventImage =
+                snapshot.map {
+                    ContainerImageIdentity.requestedReference(for: $0)
+                } ?? cached?.image ?? ""
             let eventName = snapshot?.id ?? cached?.nativeId ?? id
             let eventLabels =
-                snapshot.map { LabelNormalization.restore($0.configuration.labels) }
-                ?? cached?.labels ?? [:]
+                snapshot.map {
+                    ContainerImageIdentity.dockerLabels(for: $0)
+                } ?? cached?.labels ?? [:]
             // Use the canonical 64-char Docker ID so the destroy event matches the id
             // carried by create/start/die — derived from the snapshot, then the cache,
             // falling back to the request reference only when neither is available.
@@ -78,7 +82,8 @@ extension ContainerDeleteRoute {
                     let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
-                        labels: cached?.labels ?? LabelNormalization.restore(container.configuration.labels),
+                        labels: cached?.labels
+                            ?? ContainerImageIdentity.dockerLabels(for: container),
                         cachedIP: cached?.ip ?? containerIP,
                         dnsServer: dnsServer
                     )

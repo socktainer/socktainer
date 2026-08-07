@@ -47,9 +47,15 @@ extension ContainerPruneRoute {
                             id: containerID,
                             type: "container",
                             status: "destroy",
-                            image: snapshot?.configuration.image.reference ?? "",
+                            image: snapshot.map {
+                                ContainerImageIdentity.requestedReference(
+                                    for: $0
+                                )
+                            } ?? "",
                             name: snapshot?.id ?? containerID,
-                            labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:])))
+                            labels: snapshot.map {
+                                ContainerImageIdentity.dockerLabels(for: $0)
+                            } ?? [:]))
                 }
                 // The aggregate prune event carries an empty Actor.ID and the bytes reclaimed.
                 await broadcaster.broadcast(

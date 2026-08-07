@@ -1,3 +1,4 @@
+import ContainerizationOCI
 import Foundation
 
 /// Watches a stopped-then-attached container's process to completion: resolves its exit
@@ -22,7 +23,8 @@ enum ContainerProcessExitMonitor {
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?,
         outputFlushGraceNs: UInt64 = ContainerProcessExitMonitor.outputFlushGraceNs,
-        exitCodeRetryDelayNs: UInt64 = 100_000_000
+        exitCodeRetryDelayNs: UInt64 = 100_000_000,
+        fallbackRootDescriptor: Descriptor? = nil
     ) async -> Int32 {
         let code = await ContainerExitCodeStore.resolveExitCode(retryDelayNs: exitCodeRetryDelayNs, wait: wait)
         await ProcessRegistry.shared.remove(id: nativeId)
@@ -43,7 +45,8 @@ enum ContainerProcessExitMonitor {
                 fallbackImage: fallbackImage,
                 fallbackLabels: fallbackLabels,
                 dnsServer: dnsServer,
-                broadcaster: broadcaster
+                broadcaster: broadcaster,
+                fallbackRootDescriptor: fallbackRootDescriptor
             )
         }
         return code

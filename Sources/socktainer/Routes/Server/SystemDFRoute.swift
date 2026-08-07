@@ -45,6 +45,104 @@ struct ClientImageLayerDiskUsageProvider: ImageLayerDiskUsageProviding {
     }
 }
 
+struct DockerImageSummaryMetadata: Sendable {
+    let configDigest: String
+    let identityDigests: Set<String>
+    let created: Int
+    let size: Int64
+    let labels: [String: String]
+    let configRows: [String: ImageListRoute.DockerConfigRowMetadata]
+
+    init(
+        configDigest: String,
+        identityDigests: Set<String>,
+        created: Int,
+        size: Int64,
+        labels: [String: String],
+        configRows: [String: ImageListRoute.DockerConfigRowMetadata] = [:]
+    ) {
+        self.configDigest = configDigest
+        self.identityDigests = identityDigests
+        self.created = created
+        self.size = size
+        self.labels = labels
+        self.configRows = configRows
+    }
+}
+
+protocol DockerImageSummaryMetadataProviding: Sendable {
+    func metadata(for image: ClientImage) async throws -> DockerImageSummaryMetadata
+}
+
+struct LiveDockerImageSummaryMetadataProvider:
+    DockerImageSummaryMetadataProviding
+{
+    let runnableImageSelector: RunnableImageSelector
+
+    init(
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
+    ) {
+        self.runnableImageSelector = runnableImageSelector
+    }
+
+    func metadata(for image: ClientImage) async throws -> DockerImageSummaryMetadata {
+        let descriptors = try await runnableImageSelector.descriptors(
+            for: image
+        )
+        let selectedVariant = runnableImageSelector.selectVariant(
+            from: descriptors,
+            requestedPlatform: nil
+        )
+        let dockerImageID =
+            selectedVariant?.manifest.config.digest
+            ?? image.digest
+        let created = Int(
+            AppleContainerTimestampResolver.unixTimestampSeconds(
+                selectedVariant?.config.created
+            )
+        )
+        var configRows: [String: ImageListRoute.DockerConfigRowMetadata] = [:]
+        for descriptor in descriptors {
+            guard let variant = descriptor.runnableVariant else { continue }
+            let configDigest = variant.manifest.config.digest
+            if configRows[configDigest] == nil {
+                configRows[configDigest] = .init(
+                    created: Int(
+                        AppleContainerTimestampResolver.unixTimestampSeconds(
+                            variant.config.created
+                        )
+                    ),
+                    size: variant.totalSize,
+                    labels: variant.config.config?.labels ?? [:],
+                    containers: 0,
+                    manifestDigests: [variant.descriptor.digest]
+                )
+            } else if let existing = configRows[configDigest] {
+                configRows[configDigest] = .init(
+                    created: existing.created,
+                    size: existing.size,
+                    labels: existing.labels,
+                    containers: existing.containers,
+                    manifestDigests: existing.manifestDigests.union([
+                        variant.descriptor.digest
+                    ])
+                )
+            }
+        }
+        return DockerImageSummaryMetadata(
+            configDigest: dockerImageID,
+            identityDigests: RunnableImageSelector.dockerIdentityDigests(
+                rootDigest: image.digest,
+                descriptors: descriptors
+            ),
+            created: created,
+            size: selectedVariant?.totalSize ?? 0,
+            labels: selectedVariant?.config.config?.labels ?? [:],
+            configRows: configRows
+        )
+    }
+}
+
 struct SystemDFRoute: RouteCollection {
     let imageClient: ClientImageProtocol
     let containerClient: ClientContainerProtocol
@@ -52,6 +150,31 @@ struct SystemDFRoute: RouteCollection {
     let builderClient: ClientBuilderProtocol
     let diskUsageProvider: ContainerDiskUsageProviding
     let imageLayerDiskUsageProvider: ImageLayerDiskUsageProviding
+    let imageInventoryProvider: (any ImageStoreInventoryProviding)?
+    let imageMetadataProvider: any ContainerImageMetadataProviding
+    let imageSummaryMetadataProvider: any DockerImageSummaryMetadataProviding
+
+    init(
+        imageClient: ClientImageProtocol,
+        containerClient: ClientContainerProtocol,
+        volumeClient: ClientVolumeProtocol,
+        builderClient: ClientBuilderProtocol,
+        diskUsageProvider: ContainerDiskUsageProviding,
+        imageLayerDiskUsageProvider: ImageLayerDiskUsageProviding,
+        imageInventoryProvider: (any ImageStoreInventoryProviding)? = nil,
+        imageMetadataProvider: any ContainerImageMetadataProviding = StoredContainerImageMetadataProvider(),
+        imageSummaryMetadataProvider: any DockerImageSummaryMetadataProviding = LiveDockerImageSummaryMetadataProvider()
+    ) {
+        self.imageClient = imageClient
+        self.containerClient = containerClient
+        self.volumeClient = volumeClient
+        self.builderClient = builderClient
+        self.diskUsageProvider = diskUsageProvider
+        self.imageLayerDiskUsageProvider = imageLayerDiskUsageProvider
+        self.imageInventoryProvider = imageInventoryProvider
+        self.imageMetadataProvider = imageMetadataProvider
+        self.imageSummaryMetadataProvider = imageSummaryMetadataProvider
+    }
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.GET, pattern: "/system/df", use: handler)
@@ -62,23 +185,56 @@ struct SystemDFRoute: RouteCollection {
         let requestedTypes = Set(query.type ?? [])
         let includeAll = requestedTypes.isEmpty
 
-        async let images = imageClient.list(includeSystemImages: true)
         async let containers = containerClient.list(showAll: true, filters: [:])
         async let volumes = volumeClient.list(filters: nil, logger: req.logger)
 
-        let (allImages, allContainers, allVolumes) = try await (images, containers, volumes)
-        let usageByImageReference = Dictionary(grouping: allContainers, by: \.configuration.image.reference).mapValues(\.count)
+        let inventory: ImageStoreInventory
+        if let imageInventoryProvider {
+            inventory = try await imageInventoryProvider.imageStoreInventory(
+                includeSystemImages: true
+            )
+        } else {
+            let images = try await imageClient.list(includeSystemImages: true)
+            inventory = ImageStoreInventory(
+                images: images,
+                physicalReferencesByRootDigest: Dictionary(
+                    grouping: images,
+                    by: \.digest
+                ).mapValues { Set($0.map(\.reference)) }
+            )
+        }
+        let (allContainers, allVolumes) = try await (containers, volumes)
+        let allImages = inventory.images
+        let usageByImageDigest = ContainerImageIdentity.usageByRootDigest(allContainers)
+        var usageByRootAndConfig: [String: [String: Int]] = [:]
+        for container in allContainers {
+            let metadata = await imageMetadataProvider.metadata(for: container)
+            usageByRootAndConfig[metadata.rootDigest, default: [:]][
+                metadata.configDigest,
+                default: 0
+            ] += 1
+        }
 
         let imageSummaries: [RESTImageSummary]?
         if includeAll || requestedTypes.contains("image") {
-            imageSummaries = try await Self.buildImageSummaries(images: allImages, usageByImageReference: usageByImageReference)
+            imageSummaries = try await Self.buildImageSummaries(
+                images: allImages,
+                usageByImageDigest: usageByImageDigest,
+                usageByRootAndConfig: usageByRootAndConfig,
+                metadataProvider: imageSummaryMetadataProvider,
+                tagSelections: inventory.tagConfigSelections
+            )
         } else {
             imageSummaries = nil
         }
 
         let containerSummaries: [RESTContainerSummary]?
         if includeAll || requestedTypes.contains("container") {
-            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers, diskUsageProvider: diskUsageProvider)
+            containerSummaries = try await Self.buildContainerSummaries(
+                containers: allContainers,
+                diskUsageProvider: diskUsageProvider,
+                imageMetadataProvider: imageMetadataProvider
+            )
         } else {
             containerSummaries = nil
         }
@@ -92,7 +248,10 @@ struct SystemDFRoute: RouteCollection {
 
         let layersSize: Int64?
         if includeAll || requestedTypes.contains("image") {
-            let activeReferences = Set(allContainers.map(\.configuration.image.reference))
+            let activeReferences = ContainerImageIdentity.activeStoreReferences(
+                physicalReferencesByRootDigest: inventory.physicalReferencesByRootDigest,
+                containers: allContainers
+            )
             let usage = try await imageLayerDiskUsageProvider.calculateDiskUsage(activeReferences: activeReferences)
             layersSize = Int64(clamping: usage.totalSize)
         } else {
@@ -137,79 +296,106 @@ struct SystemDFRoute: RouteCollection {
 extension SystemDFRoute {
     fileprivate static func buildImageSummaries(
         images: [ClientImage],
-        usageByImageReference: [String: Int]
+        usageByImageDigest: [String: Int],
+        usageByRootAndConfig: [String: [String: Int]] = [:],
+        metadataProvider: any DockerImageSummaryMetadataProviding,
+        tagSelections: [DockerTagConfigSelection] = []
     ) async throws -> [RESTImageSummary] {
-        try await withThrowingTaskGroup(of: RESTImageSummary.self) { group in
-            for image in images {
+        let selectionsByRoot = Dictionary(
+            grouping: tagSelections,
+            by: \.rootDigest
+        )
+        return try await withThrowingTaskGroup(
+            of: (
+                String,
+                RESTImageSummary,
+                [String: ImageListRoute.DockerConfigRowMetadata]
+            ).self
+        ) { group in
+            for identityGroup in ImageListRoute.groupByIdentity(images) {
                 group.addTask {
-                    let manifests = try await image.index().manifests
-                    var created = 0
-                    var totalSize: Int64 = 0
-                    var labels: [String: String] = [:]
-                    var foundUsableManifest = false
+                    let image = identityGroup.image
+                    let imageMetadata = try await metadataProvider.metadata(
+                        for: image
+                    )
 
-                    for descriptor in manifests {
-                        if descriptor.annotations?["vnd.docker.reference.type"] == "attestation-manifest" {
-                            continue
-                        }
+                    let repositoryMetadata = ImageListRoute.repositoryMetadata(
+                        references: identityGroup.references,
+                        rootDigest: image.digest,
+                        includeDigests: true,
+                        validRepositoryDigests: imageMetadata.identityDigests
+                    )
+                    let containerCount = usageByImageDigest[image.digest] ?? 0
 
-                        let manifestSize: Int64
-                        if let platform = descriptor.platform {
-                            do {
-                                let config = try await image.config(for: platform)
-                                let manifest = try await image.manifest(for: platform)
-                                manifestSize = descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
-                                totalSize += manifestSize
-                                if !foundUsableManifest {
-                                    created = Int(AppleContainerTimestampResolver.unixTimestampSeconds(config.created))
-                                    labels = config.config?.labels ?? [:]
-                                    foundUsableManifest = true
-                                }
-                                continue
-                            } catch {
-                            }
-                        }
-
-                        totalSize += descriptor.size
+                    let configRows = imageMetadata.configRows.map { config, metadata in
+                        (
+                            config,
+                            ImageListRoute.DockerConfigRowMetadata(
+                                created: metadata.created,
+                                size: metadata.size,
+                                labels: metadata.labels,
+                                containers: usageByRootAndConfig[image.digest]?[
+                                    config
+                                ] ?? 0,
+                                manifestDigests: metadata.manifestDigests
+                            )
+                        )
+                    }.reduce(into: [String: ImageListRoute.DockerConfigRowMetadata]()) {
+                        $0[$1.0] = $1.1
                     }
 
-                    let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                    let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
-                    let containerCount = usageByImageReference[image.reference] ?? 0
-
-                    return RESTImageSummary(
-                        Id: image.digest,
-                        ParentId: "",
-                        RepoTags: repoTags,
-                        RepoDigests: repoDigests,
-                        Created: created,
-                        Size: totalSize,
-                        SharedSize: 0,
-                        Labels: labels,
-                        Containers: containerCount,
-                        Manifests: nil,
-                        Descriptor: nil
+                    return (
+                        image.digest,
+                        RESTImageSummary(
+                            Id: imageMetadata.configDigest,
+                            ParentId: "",
+                            RepoTags: repositoryMetadata.tags,
+                            RepoDigests: repositoryMetadata.digests,
+                            Created: imageMetadata.created,
+                            Size: imageMetadata.size,
+                            SharedSize: 0,
+                            Labels: imageMetadata.labels,
+                            Containers: containerCount,
+                            Manifests: nil,
+                            Descriptor: nil
+                        ), configRows
                     )
                 }
             }
 
             var summaries: [RESTImageSummary] = []
-            for try await summary in group {
-                summaries.append(summary)
+            for try await (rootDigest, summary, configRows) in group {
+                summaries.append(
+                    contentsOf: ImageListRoute.splitSummary(
+                        summary,
+                        rootSelections: selectionsByRoot[rootDigest] ?? [],
+                        metadataByConfig: configRows
+                    )
+                )
             }
-            return summaries
+            return ImageListRoute.mergeByDockerImageID(summaries).sorted {
+                ($0.RepoTags.first ?? $0.Id) < ($1.RepoTags.first ?? $1.Id)
+            }
         }
     }
 
     fileprivate static func buildContainerSummaries(
         containers: [ContainerSnapshot],
-        diskUsageProvider: ContainerDiskUsageProviding
+        diskUsageProvider: ContainerDiskUsageProviding,
+        imageMetadataProvider: any ContainerImageMetadataProviding
     ) async throws -> [RESTContainerSummary] {
         try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
             for container in containers {
                 group.addTask {
                     let size = try await diskUsageProvider.diskUsage(id: container.id)
-                    return containerSummary(from: container, size: Int64(clamping: size))
+                    let imageMetadata = await imageMetadataProvider.metadata(
+                        for: container
+                    )
+                    return containerSummary(
+                        from: container,
+                        size: Int64(clamping: size),
+                        imageMetadata: imageMetadata
+                    )
                 }
             }
 
@@ -265,7 +451,11 @@ extension SystemDFRoute {
         }
     }
 
-    fileprivate static func containerSummary(from container: ContainerSnapshot, size: Int64) -> RESTContainerSummary {
+    fileprivate static func containerSummary(
+        from container: ContainerSnapshot,
+        size: Int64,
+        imageMetadata: DockerContainerImageMetadata
+    ) -> RESTContainerSummary {
         let ports = container.configuration.publishedPorts.map { port in
             ContainerPort(
                 IP: port.hostAddress.description,
@@ -327,15 +517,15 @@ extension SystemDFRoute {
         return RESTContainerSummary(
             Id: DockerContainerID.hexId(for: container),
             Names: ["/" + container.id],
-            Image: container.configuration.image.reference,
-            ImageID: container.configuration.image.digest,
+            Image: imageMetadata.displayReference,
+            ImageID: imageMetadata.configDigest,
             ImageManifestDescriptor: nil,
             Command: ([container.configuration.initProcess.executable] + container.configuration.initProcess.arguments).joined(separator: " "),
             Created: createdTimestamp,
             Ports: ports,
             SizeRw: size,
             SizeRootFs: size,
-            Labels: LabelNormalization.restore(container.configuration.labels),
+            Labels: ContainerImageIdentity.dockerLabels(for: container),
             State: container.status.mobyState,
             Status: container.status.mobyState,
             HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),

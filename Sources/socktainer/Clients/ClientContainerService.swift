@@ -99,38 +99,118 @@ enum ClientContainerError: Error {
 struct ClientContainerService: ClientContainerProtocol {
     private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
     private let imageReferenceResolver: (any ImageReferenceResolving)?
+    private let imageLeaseReconciler: any ContainerImageLeaseReconciling
 
-    init(imageReferenceResolver: (any ImageReferenceResolving)? = nil) {
+    init(
+        imageReferenceResolver: (any ImageReferenceResolving)? = nil,
+        imageLeaseReconciler: any ContainerImageLeaseReconciling =
+            RegisteredContainerImageLeaseReconciler()
+    ) {
         self.imageReferenceResolver = imageReferenceResolver
+        self.imageLeaseReconciler = imageLeaseReconciler
     }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
         let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        let resolvedFilters = await Self.resolvingAncestorFilters(filters, with: imageReferenceResolver)
-        return Self.applyFilters(running, filters: resolvedFilters, allContainers: allContainers)
+        let resolvedAncestors = await Self.resolveAncestorFilter(
+            filters["ancestor"],
+            with: imageReferenceResolver
+        )
+        return Self.applyFilters(
+            running,
+            filters: filters,
+            allContainers: allContainers,
+            resolvedAncestors: resolvedAncestors
+        )
     }
 
-    /// Expand Docker image identifiers (config/manifest/index digests and short
-    /// IDs) to the stored references recorded in container configurations.
-    /// Preserve the caller's spelling too, so pre-index and legacy snapshots
-    /// whose image reference was not normalized continue to match.
-    static func resolvingAncestorFilters(
-        _ filters: [String: [String]],
-        with resolver: (any ImageReferenceResolving)?
-    ) async -> [String: [String]] {
-        guard let resolver, let ancestors = filters["ancestor"] else { return filters }
-        var expanded: [String] = []
-        for ancestor in ancestors {
-            if !expanded.contains(ancestor) { expanded.append(ancestor) }
-            guard let references = try? await resolver.references(for: ancestor) else { continue }
-            for reference in references where !expanded.contains(reference) {
-                expanded.append(reference)
+    struct ResolvedAncestorFilter: Sendable {
+        struct Identity: Sendable {
+            let rootDigests: Set<String>
+            let legacyReferences: Set<String>
+            let dockerConfigDigest: String
+            let wholeRoot: Bool
+
+            init(
+                rootDigests: Set<String>,
+                legacyReferences: Set<String>,
+                dockerConfigDigest: String = "",
+                wholeRoot: Bool = true
+            ) {
+                self.rootDigests = rootDigests
+                self.legacyReferences = legacyReferences
+                self.dockerConfigDigest = dockerConfigDigest
+                self.wholeRoot = wholeRoot
             }
         }
-        var resolved = filters
-        resolved["ancestor"] = expanded
-        return resolved
+
+        let identities: [Identity]
+        let unresolvedReferences: Set<String>
+
+        func matches(_ snapshot: ContainerSnapshot) -> Bool {
+            let digest = snapshot.configuration.image.digest
+            if !digest.isEmpty {
+                return identities.contains {
+                    ContainerImageIdentity.matches(
+                        snapshot,
+                        rootDigests: $0.rootDigests,
+                        configDigest: $0.dockerConfigDigest,
+                        wholeRoot: $0.wholeRoot
+                    )
+                }
+            }
+            // Old snapshots without an immutable descriptor can only be matched
+            // by their retained spelling. Never take this fallback for a modern
+            // snapshot: after tag replacement that spelling names a new root.
+            let requested = ContainerImageIdentity.requestedReference(
+                for: snapshot
+            )
+            return unresolvedReferences.contains(requested)
+                || identities.contains {
+                    $0.legacyReferences.contains(requested)
+                }
+        }
+    }
+
+    static func resolveAncestorFilter(
+        _ ancestors: [String]?,
+        with resolver: (any ImageReferenceResolving)?
+    ) async -> ResolvedAncestorFilter? {
+        guard let ancestors else { return nil }
+        guard let resolver else {
+            return ResolvedAncestorFilter(
+                identities: [],
+                unresolvedReferences: Set(ancestors)
+            )
+        }
+
+        var identities: [ResolvedAncestorFilter.Identity] = []
+        var unresolved: Set<String> = []
+        for ancestor in ancestors {
+            do {
+                let resolved = try await resolver.identity(for: ancestor)
+                identities.append(
+                    .init(
+                        rootDigests: resolved.rootDigests,
+                        legacyReferences: Set(resolved.references + [ancestor]),
+                        dockerConfigDigest: resolved.dockerConfigDigest,
+                        wholeRoot: resolved.wholeRoot
+                    )
+                )
+            } catch let error as ImageIdentityResolutionError {
+                if case .ambiguous = error {
+                    continue
+                }
+                unresolved.insert(ancestor)
+            } catch {
+                unresolved.insert(ancestor)
+            }
+        }
+        return ResolvedAncestorFilter(
+            identities: identities,
+            unresolvedReferences: unresolved
+        )
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
@@ -147,7 +227,8 @@ struct ClientContainerService: ClientContainerProtocol {
     static func applyFilters(
         _ containers: [ContainerSnapshot],
         filters: [String: [String]],
-        allContainers: [ContainerSnapshot] = []
+        allContainers: [ContainerSnapshot] = [],
+        resolvedAncestors: ResolvedAncestorFilter? = nil
     ) -> [ContainerSnapshot] {
         let referencePool = allContainers.isEmpty ? containers : allContainers
         var result = containers
@@ -162,7 +243,15 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             case "label":
                 result = result.filter { container in
-                    let labels = container.configuration.labels
+                    // Filter the same public label view returned by Docker
+                    // inspect/list. Reading Apple's stored labels directly
+                    // would make Socktainer-owned image attribution metadata
+                    // externally discoverable through `label=` filters even
+                    // though those labels are intentionally hidden from every
+                    // Docker response.
+                    let labels = ContainerImageIdentity.dockerLabels(
+                        for: container
+                    )
                     return values.allSatisfy { labelFilter in
                         guard let eqIdx = labelFilter.firstIndex(of: "=") else {
                             return LabelNormalization.filterContainsKey(labelFilter, in: labels)
@@ -181,7 +270,15 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "ancestor":
-                result = result.filter { values.contains($0.configuration.image.reference) }
+                if let resolvedAncestors {
+                    result = result.filter { resolvedAncestors.matches($0) }
+                } else {
+                    result = result.filter {
+                        values.contains(
+                            ContainerImageIdentity.requestedReference(for: $0)
+                        )
+                    }
+                }
             case "before":
                 result = result.filter { container in
                     for beforeId in values {
@@ -407,6 +504,9 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.withClient { try await $0.delete(id: container.id) }
+        await imageLeaseReconciler.reconcile(
+            rootDescriptor: container.configuration.image.descriptor
+        )
     }
 
     // Poll until the container is no longer running, then return the real exit
@@ -539,6 +639,9 @@ struct ClientContainerService: ClientContainerProtocol {
             do {
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
                 deletedIds.append(container.id)
+                await imageLeaseReconciler.reconcile(
+                    rootDescriptor: container.configuration.image.descriptor
+                )
             } catch {
                 continue
             }

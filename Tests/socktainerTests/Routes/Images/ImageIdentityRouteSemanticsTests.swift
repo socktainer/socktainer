@@ -25,6 +25,79 @@ struct ImageIdentityRouteSemanticsTests {
         )
     }
 
+    @Test("same-root constrained tags are reported under their selected config IDs")
+    func constrainedTagsSplitInventoryRows() {
+        let root = Self.digest("1")
+        let armConfig = Self.digest("2")
+        let amdConfig = Self.digest("3")
+        let summary = RESTImageSummary(
+            Id: armConfig,
+            ParentId: "",
+            RepoTags: [
+                "docker.io/library/example:arm64",
+                "docker.io/library/example:amd64",
+            ],
+            RepoDigests: [],
+            Created: 1,
+            Size: 2,
+            SharedSize: -1,
+            Labels: [:],
+            Containers: 0,
+            Manifests: nil,
+            Descriptor: nil
+        )
+
+        let rows = ImageListRoute.splitSummary(
+            summary,
+            rootSelections: [
+                .init(
+                    reference: "docker.io/library/example:arm64",
+                    rootDigest: root,
+                    configDigest: armConfig
+                ),
+                .init(
+                    reference: "docker.io/library/example:amd64",
+                    rootDigest: root,
+                    configDigest: amdConfig
+                ),
+            ],
+            metadataByConfig: [
+                armConfig: .init(
+                    created: 10,
+                    size: 20,
+                    labels: ["arch": "arm64"],
+                    containers: 1,
+                    manifestDigests: [Self.digest("4")]
+                ),
+                amdConfig: .init(
+                    created: 30,
+                    size: 40,
+                    labels: ["arch": "amd64"],
+                    containers: 0,
+                    manifestDigests: [Self.digest("5")]
+                ),
+            ]
+        )
+
+        #expect(rows.count == 2)
+        #expect(
+            Dictionary(uniqueKeysWithValues: rows.map { ($0.Id, $0.RepoTags) })
+                == [
+                    armConfig: ["docker.io/library/example:arm64"],
+                    amdConfig: ["docker.io/library/example:amd64"],
+                ]
+        )
+        let rowsByID = Dictionary(uniqueKeysWithValues: rows.map { ($0.Id, $0) })
+        #expect(rowsByID[armConfig]?.Created == 10)
+        #expect(rowsByID[armConfig]?.Size == 20)
+        #expect(rowsByID[armConfig]?.Labels == ["arch": "arm64"])
+        #expect(rowsByID[armConfig]?.Containers == 1)
+        #expect(rowsByID[amdConfig]?.Created == 30)
+        #expect(rowsByID[amdConfig]?.Size == 40)
+        #expect(rowsByID[amdConfig]?.Labels == ["arch": "amd64"])
+        #expect(rowsByID[amdConfig]?.Containers == 0)
+    }
+
     @Test("history uses the platform implied by a manifest or config identity")
     func historyUsesImpliedPlatform() throws {
         let arm64 = Platform(arch: "arm64", os: "linux", variant: nil)
@@ -95,8 +168,54 @@ struct ImageIdentityRouteSemanticsTests {
         #expect(groups[1].references == ["docker.io/library/other:latest"])
     }
 
-    @Test("image list emits one root repo digest per repository across aggregated tags")
-    func listAggregatesRepositoryDigests() {
+    @Test("an anonymous lease-only row attributes its stopped container without exposing a tag")
+    func listAttributesLeaseOnlyContainer() {
+        let root = Self.digest("8")
+        let descriptor = Descriptor(
+            mediaType: MediaTypes.index,
+            digest: root,
+            size: 100
+        )
+        let anonymous = Self.image(reference: root, digest: root)
+        let container = ContainerSnapshot(
+            configuration: ContainerConfiguration(
+                id: "lease-only-container",
+                image: ImageDescription(
+                    reference: ContainerImageLease.reference(for: root),
+                    descriptor: descriptor
+                ),
+                process: ProcessConfiguration(
+                    executable: "/bin/true",
+                    arguments: [],
+                    environment: [],
+                    workingDirectory: "/",
+                    terminal: false,
+                    user: .id(uid: 0, gid: 0)
+                )
+            ),
+            status: .stopped,
+            networks: []
+        )
+        let group = ImageListRoute.groupByIdentity([anonymous])
+        let metadata = ImageListRoute.repositoryMetadata(
+            references: group[0].references,
+            rootDigest: root,
+            includeDigests: true
+        )
+
+        #expect(group.count == 1)
+        #expect(metadata.tags.isEmpty)
+        #expect(metadata.digests.isEmpty)
+        #expect(
+            ImageListRoute.containerCount(
+                usingRootDigest: root,
+                in: [container]
+            ) == 1
+        )
+    }
+
+    @Test("local tags do not synthesize unproven repository digests")
+    func listDoesNotSynthesizeRepositoryDigests() {
         let root = Self.digest("d")
         let metadata = ImageListRoute.repositoryMetadata(
             references: [
@@ -116,12 +235,7 @@ struct ImageIdentityRouteSemanticsTests {
                 "ghcr.io/acme/example:mirror",
             ]
         )
-        #expect(
-            metadata.digests == [
-                "docker.io/library/example@\(root)",
-                "ghcr.io/acme/example@\(root)",
-            ]
-        )
+        #expect(metadata.digests.isEmpty)
     }
 
     @Test("image list omits repo digests unless requested")
@@ -134,5 +248,90 @@ struct ImageIdentityRouteSemanticsTests {
 
         #expect(metadata.tags == ["docker.io/library/example:latest"])
         #expect(metadata.digests.isEmpty)
+    }
+
+    @Test("image list never exposes internal or bare digest references as tags")
+    func listHidesInternalReferences() {
+        let root = Self.digest("f")
+        let metadata = ImageListRoute.repositoryMetadata(
+            references: [
+                "docker.io/library/example:latest",
+                "moby-dangling@\(root)",
+                "untagged@\(root)",
+                "<none>:<none>",
+                root,
+            ],
+            rootDigest: root,
+            includeDigests: true
+        )
+
+        #expect(metadata.tags == ["docker.io/library/example:latest"])
+        #expect(metadata.digests.isEmpty)
+    }
+
+    @Test("digest-only stored references remain exact repository digests")
+    func listPreservesDigestOnlyReferences() {
+        let root = Self.digest("1")
+        let storedDigest = Self.digest("2")
+        let exactReference =
+            "docker.io/library/example@\(storedDigest)"
+        let metadata = ImageListRoute.repositoryMetadata(
+            references: [
+                exactReference,
+                "moby-dangling@\(root)",
+                "untagged@\(root)",
+                root,
+            ],
+            rootDigest: root,
+            includeDigests: true,
+            validRepositoryDigests: [root, storedDigest]
+        )
+
+        #expect(metadata.tags.isEmpty)
+        #expect(metadata.digests == [exactReference])
+    }
+
+    @Test("stored repo digests remain real associations beside local tags")
+    func listKeepsOnlyStoredRepositoryDigests() {
+        let root = Self.digest("3")
+        let storedDigest = Self.digest("4")
+        let exactReference = "ghcr.io/acme/example@\(storedDigest)"
+        let metadata = ImageListRoute.repositoryMetadata(
+            references: [
+                "docker.io/library/example:latest",
+                exactReference,
+            ],
+            rootDigest: root,
+            includeDigests: true,
+            validRepositoryDigests: [root, storedDigest]
+        )
+
+        #expect(metadata.digests == [exactReference])
+    }
+
+    @Test("stored repo digests outside the image identity graph are hidden")
+    func listRejectsUnrelatedStoredRepositoryDigest() {
+        let root = Self.digest("5")
+        let manifest = Self.digest("6")
+        let unrelated = Self.digest("7")
+        let metadata = ImageListRoute.repositoryMetadata(
+            references: [
+                "docker.io/library/example@\(manifest)",
+                "docker.io/library/example@\(unrelated)",
+                "moby-dangling@\(root)",
+                "untagged@\(root)",
+                unrelated,
+            ],
+            rootDigest: root,
+            includeDigests: true,
+            validRepositoryDigests: [root, manifest]
+        )
+
+        #expect(metadata.tags.isEmpty)
+        #expect(
+            metadata.digests == [
+                "docker.io/library/example@\(manifest)"
+            ]
+        )
     }
 }

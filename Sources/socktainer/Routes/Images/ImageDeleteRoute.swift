@@ -47,14 +47,14 @@ extension ImageDeleteRoute {
             // only "delete" is emitted and returned for them. Verified against
             // moby v28.5.2 source.
             //
-            // In this stack a dangling image is stored as "untagged@<digest>" (the
-            // sentinel LocalOCILayoutClient assigns when a loaded tarball has no
-            // RepoTags — the analogue of moby's "moby-dangling@" name). "<none>" is
-            // kept for refs imported verbatim from foreign tarball annotations.
+            // In this stack a dangling image uses the internal
+            // "moby-dangling@<digest>" retention key, the legacy
+            // "untagged@<digest>" load sentinel, or a "<none>" reference imported
+            // verbatim from foreign tarball annotations. None is a Docker tag.
             // A pull-by-digest ref (repo@sha256:…) is NOT dangling and keeps its
             // Untagged record, as in moby.
             let visibleUntagged = result.untaggedReferences.filter {
-                !$0.hasPrefix("untagged@") && !$0.contains("<none>")
+                !ClientImageService.isDockerDanglingReference($0)
             }
 
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {

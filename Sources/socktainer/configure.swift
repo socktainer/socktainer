@@ -34,19 +34,47 @@ func configure(_ app: Application) async throws {
         systemConfig = ContainerSystemConfig()
     }
 
+    let imageMutationCoordinator = ImageMutationCoordinator()
     let imageIdentityResolver = ImageIdentityResolver(
         systemConfig: systemConfig,
-        appSupportURL: appleContainerAppSupportUrl
+        appSupportURL: appleContainerAppSupportUrl,
+        mutationCoordinator: imageMutationCoordinator
     )
-    let containerClient = ClientContainerService(imageReferenceResolver: imageIdentityResolver)
+    let imageLeaseReconciler = LiveContainerImageLeaseReconciler(
+        mutationCoordinator: imageMutationCoordinator,
+        identityResolver: imageIdentityResolver
+    )
+    await ContainerImageLeaseReconcilerRegistry.shared.configure(
+        imageLeaseReconciler
+    )
+    let containerClient = ClientContainerService(
+        imageReferenceResolver: imageIdentityResolver,
+        imageLeaseReconciler: imageLeaseReconciler
+    )
+    let containerImageMetadataProvider = CanonicalContainerImageMetadataProvider(
+        resolver: imageIdentityResolver
+    )
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
-    let imageClient = ClientImageService(containerSystemConfig: systemConfig, identityResolver: imageIdentityResolver)
+    let imageClient = ClientImageService(
+        containerSystemConfig: systemConfig,
+        identityResolver: imageIdentityResolver,
+        mutationCoordinator: imageMutationCoordinator
+    )
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClient = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
+    let builderClient = ClientBuilderService(
+        appSupportURL: appleContainerAppSupportUrl,
+        containerSystemConfig: systemConfig,
+        imageResolver: LiveBuilderImageIdentityResolver(
+            resolver: imageIdentityResolver
+        ),
+        imageClient: imageClient,
+        imageMutationCoordinator: imageMutationCoordinator,
+        imageLeaseReconciler: imageLeaseReconciler
+    )
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -70,12 +98,29 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerAttachRoute(client: containerClient))
     try app.register(collection: ContainerAttachWSRoute(client: containerClient))
     try app.register(collection: ContainerChangesRoute())
-    try app.register(collection: ContainerCreateRoute(client: containerClient, systemConfig: systemConfig, identityResolver: imageIdentityResolver))
+    try app.register(
+        collection: ContainerCreateRoute(
+            client: containerClient,
+            systemConfig: systemConfig,
+            identityResolver: imageIdentityResolver,
+            appSupportURL: appleContainerAppSupportUrl
+        )
+    )
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute(containerClient: containerClient, archiveClient: archiveClient))
-    try app.register(collection: ContainerInspectRoute(client: containerClient))
+    try app.register(
+        collection: ContainerInspectRoute(
+            client: containerClient,
+            imageMetadataProvider: containerImageMetadataProvider
+        )
+    )
     try app.register(collection: ContainerKillRoute(client: containerClient))
-    try app.register(collection: ContainerListRoute(client: containerClient))
+    try app.register(
+        collection: ContainerListRoute(
+            client: containerClient,
+            imageMetadataProvider: containerImageMetadataProvider
+        )
+    )
     try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerPauseRoute())
     try app.register(collection: ContainerPruneRoute(client: containerClient))
@@ -99,7 +144,13 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ImagePushRoute(client: imageClient))
     try app.register(collection: ImageSearchRoute())
     try app.register(collection: ImageInspectRoute(systemConfig: systemConfig, identityResolver: imageIdentityResolver))
-    try app.register(collection: ImageTagRoute(systemConfig: systemConfig, identityResolver: imageIdentityResolver))
+    try app.register(
+        collection: ImageTagRoute(
+            systemConfig: systemConfig,
+            identityResolver: imageIdentityResolver,
+            tagger: imageClient
+        )
+    )
     try app.register(collection: ImagesGetRoute(client: imageClient))
     try app.register(collection: ImagesLoadRoute(client: imageClient))
 
@@ -130,7 +181,16 @@ func configure(_ app: Application) async throws {
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
-    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig))
+    try app.register(
+        collection: BuildRoute(
+            client: containerClient,
+            builderClient: builderClient,
+            systemConfig: systemConfig,
+            imageClient: imageClient,
+            appleContainerAppSupportURL: appleContainerAppSupportUrl,
+            imageMutationCoordinator: imageMutationCoordinator
+        )
+    )
     try app.register(collection: DistributionJsonRoute(systemConfig: systemConfig))
 
     // --- plugin routes ---
@@ -185,7 +245,9 @@ func configure(_ app: Application) async throws {
         collection: SystemDFRoute(
             imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient,
             diskUsageProvider: ContainerClientDiskUsageProvider(),
-            imageLayerDiskUsageProvider: ClientImageLayerDiskUsageProvider()
+            imageLayerDiskUsageProvider: ClientImageLayerDiskUsageProvider(),
+            imageInventoryProvider: imageClient,
+            imageMetadataProvider: containerImageMetadataProvider
         ))
     try app.register(collection: VersionRoute())
 
@@ -208,7 +270,12 @@ func configure(_ app: Application) async throws {
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
     app.storage[SocktainerDNSServerKey.self] = dnsServer
 
-    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
+    let dnsManager = NetworkDNSManager(
+        appSupportURL: appleContainerAppSupportUrl,
+        dnsPort: resolvedDNSPort,
+        containerSystemConfig: systemConfig,
+        imageClient: imageClient
+    )
     app.storage[NetworkDNSManagerKey.self] = dnsManager
 
     // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and

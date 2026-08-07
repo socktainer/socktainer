@@ -12,17 +12,27 @@ struct RESTImageInspectQuery: Vapor.Content {
 struct ImageInspectRoute: RouteCollection {
     let systemConfig: ContainerSystemConfig
     let identityResolver: ImageIdentityResolver
+    let runnableImageSelector: RunnableImageSelector
 
-    init(systemConfig: ContainerSystemConfig, identityResolver: ImageIdentityResolver? = nil) {
+    init(
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil,
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
+    ) {
         self.systemConfig = systemConfig
         self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        self.runnableImageSelector = runnableImageSelector
     }
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
             .GET,
             pattern: "/images/{name:.*}/json",
-            use: ImageInspectRoute.handler(systemConfig: systemConfig, identityResolver: identityResolver)
+            use: ImageInspectRoute.handler(
+                systemConfig: systemConfig,
+                identityResolver: identityResolver,
+                runnableImageSelector: runnableImageSelector
+            )
         )
     }
 }
@@ -62,68 +72,8 @@ extension ImageInspectRoute {
             annotations: descriptor.annotations,
             data: extras?.data,
             platform: platform,
-            artifactType: extras?.artifactType
+            artifactType: extras?.artifactType ?? descriptor.artifactType
         )
-    }
-
-    private static func prioritizedManifests(_ manifests: [Descriptor]) -> [Descriptor] {
-        let primaryPlatform = requestedOrDefaultPlatform(nil)
-
-        return manifests.enumerated().sorted { leftManifest, rightManifest in
-            let leftPlatform = leftManifest.element.platform
-            let rightPlatform = rightManifest.element.platform
-
-            if preferredPlatformMatches(
-                leftPlatform,
-                over: rightPlatform,
-                preferredPlatform: primaryPlatform
-            ) {
-                return true
-            }
-
-            return leftManifest.offset < rightManifest.offset
-        }.map(\.element)
-    }
-
-    private static func repoDigestReference(name: String, digest: String?) -> String? {
-        guard let digest, !digest.isEmpty, !name.isEmpty else {
-            return nil
-        }
-
-        if let reference = try? Reference.parse(name) {
-            return "\(reference.name)@\(digest)"
-        }
-
-        if let atIndex = name.firstIndex(of: "@") {
-            return "\(name[..<atIndex])@\(digest)"
-        }
-
-        return "\(name)@\(digest)"
-    }
-
-    private struct ImageVariant {
-        let platform: Platform
-        let config: ContainerizationOCI.Image
-        let size: Int64
-    }
-
-    private static func prioritizeVariants(_ variants: [ImageVariant]) -> [ImageVariant] {
-        let hostPlatform = requestedOrDefaultPlatform(nil)
-
-        return variants.enumerated().sorted { leftVariant, rightVariant in
-            let leftPlatform = leftVariant.element.platform
-            let rightPlatform = rightVariant.element.platform
-
-            if preferredPlatformMatches(
-                leftPlatform,
-                over: rightPlatform,
-                preferredPlatform: hostPlatform
-            ) {
-                return true
-            }
-
-            return leftVariant.offset < rightVariant.offset
-        }.map(\.element)
     }
 
     private static func inspectPlatformOrThrow(_ platformString: String?) throws -> Platform? {
@@ -136,7 +86,8 @@ extension ImageInspectRoute {
 
     static func handler(
         systemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
     ) -> @Sendable (Request) async throws -> RESTImageInspect {
         let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
         return { req in
@@ -173,64 +124,40 @@ extension ImageInspectRoute {
             let includeManifests = (query.manifests ?? false) && requestedPlatform == nil
 
             let containers = includeManifests ? try await ContainerClient().list() : []
-            let imageIndex = try await image.index()
-            let manifests = imageIndex.manifests
-
-            var variants: [ImageVariant] = []
-            for descriptor in manifests {
-                guard let platform = descriptor.platform,
-                    descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
-                else {
-                    continue
-                }
-                do {
-                    let config = try await image.config(for: platform)
-                    let manifest = try await image.manifest(for: platform)
-                    let variantSize = descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
-                    variants.append(ImageVariant(platform: platform, config: config, size: variantSize))
-                } catch {
-                    continue
-                }
-            }
-
-            let availablePlatforms = Set(variants.map(\.platform))
+            let resolvedDescriptors =
+                try await runnableImageSelector
+                .descriptors(for: image)
             var manifestSummaries: [ImageManifestSummary] = []
-            let containerIDs =
-                containers
-                .filter { $0.configuration.image.reference == image.reference }
-                .map(\.id)
-
-            for descriptor in manifests {
-                let kind: String
-                if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
-                    referenceType == "attestation-manifest"
-                {
-                    kind = "attestation"
-                } else {
-                    kind = "image"
-                }
-
+            for resolvedDescriptor
+                in runnableImageSelector
+                .descriptorsInDeterministicPreferenceOrder(
+                    resolvedDescriptors
+                )
+            {
+                let descriptor = resolvedDescriptor.descriptor
+                let kind =
+                    resolvedDescriptor.kind == .artifact
+                    ? "attestation" : "image"
                 let platform = descriptor.platform
-                let manifest: ContainerizationOCI.Manifest?
-                let available: Bool
-
-                if let platform {
-                    do {
-                        manifest = try await image.manifest(for: platform)
-                        available = availablePlatforms.contains(platform)
-                    } catch {
-                        manifest = nil
-                        available = false
-                    }
-                } else {
-                    manifest = nil
-                    available = false
-                }
-
-                let contentSize = (manifest?.config.size ?? 0) + (manifest?.layers.reduce(0) { $0 + $1.size } ?? 0)
-                let totalSize = descriptor.size + contentSize
+                let available =
+                    resolvedDescriptor.kind == .artifact
+                    ? resolvedDescriptor.documentAvailable
+                    : resolvedDescriptor.runnableVariant != nil
+                let contentSize = resolvedDescriptor.contentSize
+                let totalSize = resolvedDescriptor.totalSize
 
                 if includeManifests {
+                    let containerIDs =
+                        resolvedDescriptor.runnableVariant.map {
+                            variant in
+                            containers.filter {
+                                ContainerImageIdentity.matches(
+                                    $0,
+                                    rootDigests: resolved.rootDigests,
+                                    configDigest: variant.manifest.config.digest
+                                )
+                            }.map(\.id)
+                        } ?? []
                     let unpackedSize =
                         kind == "image"
                         ? AppleContainerSnapshotResolver.unpackedSize(
@@ -266,22 +193,21 @@ extension ImageInspectRoute {
                                 ) : nil,
                             AttestationData: kind == "attestation"
                                 ? .init(
-                                    For: descriptor.annotations?["vnd.docker.reference.digest"] ?? ""
+                                    For: resolvedDescriptor
+                                        .artifactSubjectDigest ?? ""
                                 ) : nil
                         )
                     )
                 }
             }
 
-            let selectedVariant =
-                if let requestedPlatform {
-                    variants.first(where: { $0.platform == requestedPlatform })
-                } else {
-                    prioritizeVariants(variants).first
-                }
+            let selectedVariant = runnableImageSelector.selectVariant(
+                from: resolvedDescriptors,
+                requestedPlatform: requestedPlatform,
+                identityConstraint: resolved.variantConstraint
+            )
 
             if let selectedVariant {
-                let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
                     ImageConfig(
                         User: ociConfig.user,
@@ -300,31 +226,20 @@ extension ImageInspectRoute {
                     )
                 }
 
-                let selectedDescriptor = manifests.first { descriptor in
-                    descriptor.platform == selectedVariant.platform
-                        && descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
-                }
-
                 let rootFS = RootFS(
                     rootfsType: selectedVariant.config.rootfs.type,
                     Layers: selectedVariant.config.rootfs.diffIDs
                 )
 
                 let summary = RESTImageInspect(
-                    Id: selectedManifest?.config.digest ?? image.digest,
+                    Id: selectedVariant.manifest.config.digest,
                     Descriptor: makeOCIDescriptor(
                         from: image.descriptor,
                         appSupportURL: appleContainerAppSupportUrl
                     ),
                     Manifests: includeManifests ? manifestSummaries : nil,
                     RepoTags: resolved.references,
-                    RepoDigests: Array(
-                        Set(
-                            resolved.references.compactMap {
-                                repoDigestReference(name: $0, digest: image.descriptor.digest)
-                            })
-                    )
-                    .sorted(),
+                    RepoDigests: resolved.repositoryDigests,
                     Parent: "",
                     Comment: selectedVariant.config.history?.last?.comment ?? "",
                     Created: selectedVariant.config.created,
@@ -335,13 +250,11 @@ extension ImageInspectRoute {
                     Variant: selectedVariant.config.variant,
                     Os: selectedVariant.config.os,
                     OsVersion: selectedVariant.config.osVersion,
-                    Size: selectedVariant.size,
-                    GraphDriver: selectedDescriptor.map {
-                        AppleContainerImageStoreResolver.graphDriver(
-                            appSupportURL: appleContainerAppSupportUrl,
-                            descriptor: $0
-                        )
-                    } ?? nil,
+                    Size: selectedVariant.totalSize,
+                    GraphDriver: AppleContainerImageStoreResolver.graphDriver(
+                        appSupportURL: appleContainerAppSupportUrl,
+                        descriptor: selectedVariant.descriptor
+                    ),
                     RootFS: rootFS,
                     // Docker's schema allows Metadata.LastTagTime, but Apple's image
                     // reference store only persists `reference -> descriptor` in state.json.

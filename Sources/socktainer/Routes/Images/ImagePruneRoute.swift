@@ -32,16 +32,18 @@ extension ImagePruneRoute {
         do {
             let result = try await client.prune(filters: parsedFilters, logger: logger)
 
-            // moby emits per-image `untag`/`delete` events for prune (NOT an aggregate "prune"
-            // event — that exists for containers/networks/volumes but not images): an `untag`
-            // per removed reference (Actor.ID = digest) and a `delete` per freed digest.
-            // Unlike ImageDeleteRoute, prune does not special-case dangling images here.
+            // moby emits an `untag` only for real Docker references and a
+            // `delete` when the last physical root reference is gone. Internal
+            // dangling/lease keys are implementation details and must never
+            // escape through either the event stream or API response.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 for item in result.results {
-                    await broadcaster.broadcast(
-                        DockerEvent.make(
-                            type: "image", action: "untag", actorID: item.digest,
-                            attributes: ["name": item.untagged]))
+                    for untagged in Self.visibleUntaggedReferences(item) {
+                        await broadcaster.broadcast(
+                            DockerEvent.make(
+                                type: "image", action: "untag", actorID: item.digest,
+                                attributes: ["name": untagged]))
+                    }
                     if let digest = item.deletedDigest {
                         await broadcaster.broadcast(
                             DockerEvent.make(
@@ -55,7 +57,14 @@ extension ImagePruneRoute {
             // per freed digest.
             var imagesDeleted: [RESTImageDeletedItem] = []
             for item in result.results {
-                imagesDeleted.append(RESTImageDeletedItem(Deleted: nil, Untagged: item.untagged))
+                for untagged in Self.visibleUntaggedReferences(item) {
+                    imagesDeleted.append(
+                        RESTImageDeletedItem(
+                            Deleted: nil,
+                            Untagged: untagged
+                        )
+                    )
+                }
                 if let digest = item.deletedDigest {
                     imagesDeleted.append(RESTImageDeletedItem(Deleted: digest, Untagged: nil))
                 }
@@ -67,6 +76,14 @@ extension ImagePruneRoute {
         } catch {
             req.logger.error("Failed to prune images: \(error)")
             throw Abort(.internalServerError, reason: "Failed to prune images: \(error.localizedDescription)")
+        }
+    }
+
+    static func visibleUntaggedReferences(
+        _ result: ImageDeletionResult
+    ) -> [String] {
+        result.untaggedReferences.filter {
+            !ClientImageService.isDockerDanglingReference($0)
         }
     }
 }

@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
 import ContainerizationError
+import ContainerizationOCI
 import Foundation
 import Logging
 import Testing
@@ -109,6 +110,24 @@ struct ContainerCreateRouteTests {
             }
         }
     }
+
+    @Test("an invalid platform query returns 400 before image resolution")
+    func invalidPlatformIsBadRequest() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST,
+                "/v1.51/containers/create?name=bad-platform&platform=%7Bnot-json",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string:
+                        #"{"Image":"socktainer-nonexistent-test-image:missing"}"#
+                )
+            ) { response async in
+                #expect(response.status == .badRequest)
+                #expect(response.body.string.contains("invalid platform"))
+            }
+        }
+    }
 }
 
 @Suite("ContainerCreateRoute — privileged capabilities")
@@ -142,6 +161,33 @@ struct ContainerPrivilegedCapabilitiesTests {
 
 @Suite("ContainerCreateRoute — image identity errors")
 struct ContainerCreateImageIdentityErrorTests {
+    @Test("Apple metadata retains the exact physical lease and Docker spelling is separate")
+    func requestedImageIdentityRoundTrips() {
+        let requestedConfig = "sha256:" + String(repeating: "c", count: 64)
+        let rootDigest = "sha256:" + String(repeating: "1", count: 64)
+        let leased = ClientImage(
+            description: ImageDescription(
+                reference: ContainerImageLease.reference(
+                    for: rootDigest
+                ),
+                descriptor: Descriptor(
+                    mediaType: MediaTypes.index,
+                    digest: rootDigest,
+                    size: 123
+                )
+            )
+        )
+
+        let persisted = ContainerCreateRoute.imageDescriptionForContainer(
+            leasedImage: leased
+        )
+
+        #expect(persisted.reference == leased.reference)
+        #expect(persisted.descriptor.digest == rootDigest)
+        #expect(persisted.descriptor == leased.descriptor)
+        #expect(requestedConfig != persisted.reference)
+    }
+
     @Test("a missing resolver identity maps to Docker's 404 error")
     func missingImageIsNotFound() {
         let mapped = ContainerCreateRoute.imageExistenceError(
@@ -153,12 +199,47 @@ struct ContainerCreateImageIdentityErrorTests {
         #expect(abort?.reason == "No such image: missing")
     }
 
+    @Test("an ambiguous resolver identity maps to Docker's 409 conflict error")
+    func ambiguousImageIsConflict() {
+        let mapped = ContainerCreateRoute.imageExistenceError(
+            ImageIdentityResolutionError.ambiguous("abc123"),
+            image: "abc123"
+        )
+        let abort = mapped as? Abort
+        #expect(abort?.status == .conflict)
+        #expect(abort?.reason == "conflict: abc123 is an ambiguous image ID")
+    }
+
     @Test("backend failures are not disguised as missing images")
     func backendFailureIsPreserved() {
         let backend = NSError(domain: "AppleImageStore", code: 42)
         let mapped = ContainerCreateRoute.imageExistenceError(backend, image: "example")
         #expect((mapped as NSError).domain == "AppleImageStore")
         #expect((mapped as NSError).code == 42)
+    }
+
+    @Test("only an implicit host-default platform permits Rosetta fallback")
+    func fallbackPolicyTracksPlatformAuthority() {
+        let implied = Platform(arch: "arm64", os: "linux")
+
+        #expect(
+            ContainerCreateRoute.platformFallbackPolicy(
+                hasExplicitPlatform: false,
+                impliedPlatform: nil
+            ) == .allowRosetta
+        )
+        #expect(
+            ContainerCreateRoute.platformFallbackPolicy(
+                hasExplicitPlatform: true,
+                impliedPlatform: nil
+            ) == .strict
+        )
+        #expect(
+            ContainerCreateRoute.platformFallbackPolicy(
+                hasExplicitPlatform: false,
+                impliedPlatform: implied
+            ) == .strict
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationOCI
 import Foundation
 import Logging
 import Vapor
@@ -11,7 +12,7 @@ struct ContainerStartRoute: RouteCollection {
     }
 }
 
-struct ContainerStartQuery: Content {
+struct ContainerStartQuery: Vapor.Content {
     /// Override the key sequence for detaching a container
     let detachKeys: String?
 }
@@ -88,9 +89,10 @@ extension ContainerStartRoute {
                 await ContainerInfoCache.shared.set(
                     hexId: eventId,
                     nativeId: snap.id,
-                    image: snap.configuration.image.reference,
-                    labels: LabelNormalization.restore(snap.configuration.labels),
-                    ip: containerIP
+                    image: ContainerImageIdentity.requestedReference(for: snap),
+                    labels: ContainerImageIdentity.dockerLabels(for: snap),
+                    ip: containerIP,
+                    rootDescriptor: snap.configuration.image.descriptor
                 )
             }
 
@@ -115,9 +117,13 @@ extension ContainerStartRoute {
                 id: eventId,
                 type: "container",
                 status: "start",
-                image: metadataSnapshot?.configuration.image.reference ?? "",
+                image: metadataSnapshot.map {
+                    ContainerImageIdentity.requestedReference(for: $0)
+                } ?? "",
                 name: metadataSnapshot?.id ?? id,
-                labels: LabelNormalization.restore(metadataSnapshot?.configuration.labels ?? [:])
+                labels: metadataSnapshot.map {
+                    ContainerImageIdentity.dockerLabels(for: $0)
+                } ?? [:]
             )
             await broadcaster.broadcast(event)
 
@@ -129,9 +135,10 @@ extension ContainerStartRoute {
                 await ContainerStartRoute.armRestartObserver(
                     nativeId: snap.id,
                     eventId: eventId,
-                    image: snap.configuration.image.reference,
+                    image: ContainerImageIdentity.requestedReference(for: snap),
                     name: snap.id,
-                    labels: LabelNormalization.restore(snap.configuration.labels),
+                    labels: ContainerImageIdentity.dockerLabels(for: snap),
+                    rootDescriptor: snap.configuration.image.descriptor,
                     ip: ContainerStartRoute.dnsAttachmentIP(in: startedSnapshot),
                     refreshCache: false,
                     restartPolicy: restartPolicy,
@@ -157,6 +164,7 @@ extension ContainerStartRoute {
         image: String,
         name: String,
         labels: [String: String],
+        rootDescriptor: Descriptor,
         broadcaster: EventBroadcaster,
         dnsServer: SocktainerDNSServer?,
         healthManager: HealthCheckManager?,
@@ -210,7 +218,8 @@ extension ContainerStartRoute {
                     fallbackImage: image,
                     fallbackLabels: labels,
                     dnsServer: dnsServer,
-                    broadcaster: broadcaster
+                    broadcaster: broadcaster,
+                    fallbackRootDescriptor: rootDescriptor
                 )
                 await ContainerRestartState.shared.reset(id: nativeId)
                 return
@@ -294,6 +303,7 @@ extension ContainerStartRoute {
                 image: image,
                 name: name,
                 labels: labels,
+                rootDescriptor: rootDescriptor,
                 ip: ContainerStartRoute.dnsAttachmentIP(in: restartedSnapshot),
                 refreshCache: restartedSnapshot != nil,
                 restartPolicy: restartPolicy,
@@ -322,6 +332,7 @@ extension ContainerStartRoute {
         image: String,
         name: String,
         labels: [String: String],
+        rootDescriptor: Descriptor,
         ip: String?,
         refreshCache: Bool,
         restartPolicy: RestartPolicy?,
@@ -333,7 +344,14 @@ extension ContainerStartRoute {
         logger: Logger
     ) async {
         if refreshCache {
-            await ContainerInfoCache.shared.set(hexId: eventId, nativeId: nativeId, image: image, labels: labels, ip: ip)
+            await ContainerInfoCache.shared.set(
+                hexId: eventId,
+                nativeId: nativeId,
+                image: image,
+                labels: labels,
+                ip: ip,
+                rootDescriptor: rootDescriptor
+            )
         }
 
         // A restart's internal stop step (ClientContainerService.restart) marks the container
@@ -343,6 +361,7 @@ extension ContainerStartRoute {
 
         ContainerStartRoute.observeExit(
             nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,
+            rootDescriptor: rootDescriptor,
             broadcaster: broadcaster, dnsServer: dnsServer, healthManager: healthManager,
             restartPolicy: restartPolicy, client: client, logger: logger, generation: generation
         )

@@ -194,7 +194,18 @@ struct ContainerCreateEventTests {
 
     @Test("create event carries canonical hex ID and image/name/label attributes")
     func createEventShape() async throws {
-        let snapshot = makeSnapshot(nativeId: "create-native", image: "redis:7", labels: ["app": "cache"])
+        let rootDigest = "sha256:" + String(repeating: "e", count: 64)
+        let runtimeReference = ContainerImageLease.reference(for: rootDigest)
+        let snapshot = makeSnapshot(
+            nativeId: "create-native",
+            image: runtimeReference,
+            labels: [
+                "app": "cache",
+                ContainerImageIdentity.requestedReferenceLabel: "redis:7",
+                ContainerImageIdentity.configDigestLabel:
+                    "sha256:" + String(repeating: "f", count: 64),
+            ]
+        )
         let event = ContainerCreateRoute.makeCreateEvent(for: snapshot)
 
         #expect(event.Type == "container")
@@ -206,6 +217,12 @@ struct ContainerCreateEventTests {
         #expect(event.Actor.Attributes["image"] == "redis:7")
         #expect(event.Actor.Attributes["name"] == "create-native")
         #expect(event.Actor.Attributes["app"] == "cache")
+        #expect(
+            event.Actor.Attributes[
+                ContainerImageIdentity.requestedReferenceLabel
+            ] == nil
+        )
+        #expect(!event.from.contains("socktainer-runtime@"))
     }
 }
 

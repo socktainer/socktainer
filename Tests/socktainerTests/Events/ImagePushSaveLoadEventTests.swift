@@ -104,6 +104,85 @@ struct ImagePushSaveLoadEventTests {
         #expect(event?.Actor.ID == "ghost:latest")
     }
 
+    @Test("docker save emits the identity captured with the exported archive")
+    func saveUsesAtomicArchiveIdentity() async throws {
+        let exportedConfig = "sha256:" + String(repeating: "c", count: 64)
+        let laterConfig = "sha256:" + String(repeating: "d", count: 64)
+        let client = FakeImageClient(
+            images: [
+                makeClientImage(reference: "example:latest", digest: laterConfig)
+            ],
+            savedActorIDs: [exportedConfig]
+        )
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "save" { return event }
+            return nil
+        }
+
+        try await withImageApp(client: client, broadcaster: broadcaster) { app in
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/example:latest/get"
+            ) { response async in
+                #expect(response.status == .ok)
+            }
+        }
+
+        let event = await withTimeout(captureTask)
+        captureTask.cancel()
+        #expect(event?.Actor.ID == exportedConfig)
+    }
+
+    @Test("docker save removes its private export only after the response stream completes")
+    func saveCleansUpCompletedStream() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let client = FakeImageClient(saveDirectory: tempDir)
+
+        try await withImageApp(
+            client: client,
+            broadcaster: EventBroadcaster()
+        ) { app in
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/example:latest/get"
+            ) { response async in
+                #expect(response.status == .ok)
+                #expect(response.body.string == "fake-saved-tarball")
+            }
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: tempDir.path))
+    }
+
+    @Test("docker save removes its export when response setup fails")
+    func saveCleansUpResponseSetupFailure() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let client = FakeImageClient(
+            saveDirectory: tempDir,
+            saveWritesTarball: false
+        )
+
+        try await withImageApp(
+            client: client,
+            broadcaster: EventBroadcaster()
+        ) { app in
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/example:latest/get"
+            ) { response async in
+                #expect(response.status == .internalServerError)
+            }
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: tempDir.path))
+    }
+
     @Test("docker load broadcasts one 'load' per loaded image with the digest as Actor.ID")
     func loadEmitsPerImage() async throws {
         let alpineDigest = "sha256:" + String(repeating: "b", count: 64)
@@ -139,6 +218,38 @@ struct ImagePushSaveLoadEventTests {
         // Resolvable reference → digest; unresolvable → the reference itself.
         #expect(events.first?.Actor.ID == alpineDigest)
         #expect(events.last?.Actor.ID == "docker.io/library/busybox:latest")
+    }
+
+    @Test("docker load emits identities captured by the completed import")
+    func loadUsesAtomicArchiveIdentity() async throws {
+        let importedConfig = "sha256:" + String(repeating: "e", count: 64)
+        let laterConfig = "sha256:" + String(repeating: "f", count: 64)
+        let reference = "docker.io/library/example:latest"
+        let client = FakeImageClient(
+            images: [makeClientImage(reference: reference, digest: laterConfig)],
+            loadedImages: [reference],
+            loadedActorIDs: [importedConfig]
+        )
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "load" { return event }
+            return nil
+        }
+
+        try await withImageApp(client: client, broadcaster: broadcaster) { app in
+            try await app.testing().test(
+                .POST,
+                "/v1.51/images/load",
+                body: ByteBuffer(data: Data("fake-tarball".utf8))
+            ) { response async in
+                #expect(response.status == .ok)
+            }
+        }
+
+        let event = await withTimeout(captureTask)
+        captureTask.cancel()
+        #expect(event?.Actor.ID == importedConfig)
     }
 }
 
@@ -185,10 +296,16 @@ private func makeClientImage(reference: String, digest: String) -> ClientImage {
     )
 }
 
-private struct FakeImageClient: ClientImageProtocol {
+private struct FakeImageClient: ClientImageProtocol, ImageSavingWithIdentity,
+    ImageLoadingWithIdentity
+{
     var images: [ClientImage] = []
     var loadedImages: [String] = []
+    var loadedActorIDs: [String]?
     var failPushStream = false
+    var saveDirectory: URL?
+    var saveWritesTarball = true
+    var savedActorIDs: [String]?
 
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { images }
 
@@ -196,7 +313,7 @@ private struct FakeImageClient: ClientImageProtocol {
         ImageDeletionResult(untagged: id, digest: "sha256:abc", deletedDigest: nil)
     }
 
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
         AsyncThrowingStream { $0.finish() }
     }
 
@@ -223,15 +340,58 @@ private struct FakeImageClient: ClientImageProtocol {
         (repo, "sha256:" + String(repeating: "a", count: 64))
     }
 
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
         loadedImages
     }
 
+    func loadWithIdentities(
+        tarballPath: URL,
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> LoadedImageArchive {
+        let byReference = Dictionary(
+            uniqueKeysWithValues: images.map { ($0.reference, $0.digest) }
+        )
+        return LoadedImageArchive(
+            references: loadedImages,
+            actorIDs: loadedActorIDs
+                ?? loadedImages.map { byReference[$0] ?? $0 }
+        )
+    }
+
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let tempDir =
+            saveDirectory
+            ?? FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tarball = tempDir.appendingPathComponent("images.tar")
-        try Data("fake-saved-tarball".utf8).write(to: tarball)
+        if saveWritesTarball {
+            try Data("fake-saved-tarball".utf8).write(to: tarball)
+        }
         return tarball
+    }
+
+    func saveWithIdentities(
+        references: [String],
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> SavedImageArchive {
+        let url = try await save(
+            references: references,
+            platform: platform,
+            appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+            logger: logger
+        )
+        let byReference = Dictionary(
+            uniqueKeysWithValues: images.map { ($0.reference, $0.digest) }
+        )
+        return SavedImageArchive(
+            url: url,
+            actorIDs: savedActorIDs
+                ?? references.map { byReference[$0] ?? $0 }
+        )
     }
 }

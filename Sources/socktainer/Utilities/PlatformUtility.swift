@@ -6,6 +6,15 @@ import Vapor
 
 public typealias Platform = ContainerizationOCI.Platform
 
+/// Whether a host-default arm64 request may transparently select an amd64
+/// image for Rosetta. Explicit Docker `--platform` values and platform-bound
+/// image identities are strict; only an implicit host-default request may
+/// broaden selection.
+enum PlatformFallbackPolicy: Sendable, Equatable {
+    case strict
+    case allowRosetta
+}
+
 public func currentPlatform() -> Platform {
     Platform.current
 }

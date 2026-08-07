@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerPersistence
+import ContainerResource
 import Containerization
 import ContainerizationOCI
 import Foundation
@@ -17,12 +18,20 @@ struct ImageDeletionResult {
     let additionalUntagged: [String]
     let digest: String  // sha256 of the image the removed tag referenced
     let deletedDigest: String?  // sha256 if the image layers were garbage-collected
+    let reclaimedBytes: Int64
 
-    init(untagged: String, additionalUntagged: [String] = [], digest: String, deletedDigest: String?) {
+    init(
+        untagged: String,
+        additionalUntagged: [String] = [],
+        digest: String,
+        deletedDigest: String?,
+        reclaimedBytes: Int64 = 0
+    ) {
         self.untagged = untagged
         self.additionalUntagged = additionalUntagged
         self.digest = digest
         self.deletedDigest = deletedDigest
+        self.reclaimedBytes = reclaimedBytes
     }
 
     var untaggedReferences: [String] {
@@ -34,14 +43,20 @@ protocol ClientImageProtocol: Sendable {
     func list(includeSystemImages: Bool) async throws -> [ClientImage]
     func delete(id: String) async throws -> ImageDeletionResult
     func delete(id: String, force: Bool) async throws -> ImageDeletionResult
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
+    func pull(
+        image: String,
+        tag: String?,
+        platform: Platform,
+        fallbackPolicy: PlatformFallbackPolicy,
+        logger: Logger
+    ) async throws -> AsyncThrowingStream<
         PullProgress, Error
     >
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64)
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String]
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL
     func importImage(
         tarPath: URL,
@@ -53,6 +68,61 @@ protocol ClientImageProtocol: Sendable {
         appleContainerAppSupportUrl: URL,
         logger: Logger
     ) async throws -> (reference: String?, digest: String)
+}
+
+protocol ImageTaggingProtocol: Sendable {
+    func tag(source: String, target: String) async throws -> ImageTaggingResult
+}
+
+protocol ImageConfigIdentityProviding: Sendable {
+    func configDigestsByReference() async -> [String: String]
+    func configDigest(for reference: String) async -> String?
+}
+
+struct SavedImageArchive: Sendable {
+    let url: URL
+    let actorIDs: [String]
+}
+
+struct LoadedImageArchive: Sendable {
+    let references: [String]
+    let actorIDs: [String]
+}
+
+protocol ImageLoadingWithIdentity: Sendable {
+    func loadWithIdentities(
+        tarballPath: URL,
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> LoadedImageArchive
+}
+
+/// Returns the archive and the immutable Docker config identities captured in
+/// the same store read epoch. This prevents a concurrent retag after export
+/// from changing which image a completed save event attributes.
+protocol ImageSavingWithIdentity: Sendable {
+    func saveWithIdentities(
+        references: [String],
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> SavedImageArchive
+}
+
+struct DockerTagConfigSelection: Sendable, Equatable {
+    let reference: String
+    let rootDigest: String
+    let configDigest: String
+}
+
+protocol DockerTagConfigSelectionProviding: Sendable {
+    func dockerTagConfigSelections() async -> [DockerTagConfigSelection]
+}
+
+struct ImageTaggingResult: Sendable {
+    let image: ClientImage
+    let dockerConfigDigest: String
 }
 
 extension ClientImageProtocol {
@@ -68,7 +138,12 @@ extension ClientImageProtocol {
     /// Actor.ID is the image digest. References the store cannot resolve fall back to
     /// the reference itself at the emission site.
     func digestsByReference() async -> [String: String] {
-        ((try? await list()) ?? []).reduce(into: [:]) { $0[$1.reference] = $1.digest }
+        if let provider = self as? any ImageConfigIdentityProviding {
+            return await provider.configDigestsByReference()
+        }
+        return ((try? await list()) ?? []).reduce(into: [:]) {
+            $0[$1.reference] = $1.digest
+        }
     }
 }
 
@@ -82,6 +157,16 @@ enum PullProgress: Sendable {
     case message(String)
     case downloading(current: Int64, total: Int64)
     case extracting(current: Int64, total: Int64)
+}
+
+private struct ImageReplacementOutcome<Value: Sendable>: Sendable {
+    let value: Value
+    let assignments: [CanonicalImageAssignment]
+}
+
+private struct PulledImageIdentity: Sendable {
+    let image: ClientImage
+    let dockerConfigDigest: String
 }
 
 actor PullByteCounter {
@@ -158,46 +243,267 @@ struct LiveImageDeletionStore: ImageDeletionStore {
     }
 }
 
-struct ClientImageService: ClientImageProtocol {
+struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
+    ImageConfigIdentityProviding,
+    ImageSavingWithIdentity,
+    ImageLoadingWithIdentity,
+    DockerTagConfigSelectionProviding,
+    ImageStoreInventoryProviding
+{
     private let containerSystemConfig: ContainerSystemConfig
     private let identityResolver: ImageIdentityResolver
+    private let mutationCoordinator: ImageMutationCoordinator
+    private let referenceStore: any ImageReferenceStore
+    private let referenceManager: CanonicalImageReferenceManager
+    private let referenceConstraintStore: ImageReferenceConstraintStore
+    private let archiveLoader: any ImageArchiveLoading
+    private let imagePuller: any ImagePulling
+    private let imagePusher: any ImagePushing
+    private let runnableImageSelector: RunnableImageSelector
+    private let containerInventoryProvider: any ContainerSnapshotInventoryProviding
+    private let imageLeaseReservations: ContainerImageLeaseReservationRegistry
 
     init(
         containerSystemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        mutationCoordinator: ImageMutationCoordinator? = nil,
+        referenceStore: any ImageReferenceStore = LiveImageReferenceStore(),
+        archiveLoader: any ImageArchiveLoading = LiveImageArchiveLoader(),
+        imagePuller: any ImagePulling = LiveImagePuller(),
+        imagePusher: any ImagePushing = LiveImagePusher(),
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector(),
+        containerInventoryProvider: any ContainerSnapshotInventoryProviding =
+            LiveContainerSnapshotInventoryProvider(),
+        imageLeaseReservations: ContainerImageLeaseReservationRegistry = .shared
     ) {
+        let coordinator = mutationCoordinator ?? identityResolver?.mutationCoordinator ?? ImageMutationCoordinator()
         self.containerSystemConfig = containerSystemConfig
-        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: containerSystemConfig)
+        self.mutationCoordinator = coordinator
+        self.identityResolver =
+            identityResolver
+            ?? ImageIdentityResolver(
+                systemConfig: containerSystemConfig,
+                mutationCoordinator: coordinator
+            )
+        self.referenceStore = referenceStore
+        self.referenceManager = CanonicalImageReferenceManager(
+            systemConfig: containerSystemConfig,
+            store: referenceStore
+        )
+        self.referenceConstraintStore =
+            self.identityResolver
+            .referenceConstraintStore
+        self.archiveLoader = archiveLoader
+        self.imagePuller = imagePuller
+        self.imagePusher = imagePusher
+        self.runnableImageSelector = runnableImageSelector
+        self.containerInventoryProvider = containerInventoryProvider
+        self.imageLeaseReservations = imageLeaseReservations
+    }
+
+    private func replacingImages<Value: Sendable>(
+        targeting references: [String],
+        operation: @Sendable @escaping () async throws -> ImageReplacementOutcome<Value>,
+        afterCommit: (@Sendable (Value) async -> Value)? = nil
+    ) async throws -> Value {
+        try await mutationCoordinator.performMutation { [self] in
+            // Cancel any catalog hydration that began before this writer was
+            // admitted. Writer-side lookups must rebuild from this mutation's
+            // starting state, never consume an intermediate reader snapshot.
+            await identityResolver.invalidate()
+            var prepared: PreparedImageReplacement?
+            var constraintTransaction: ImageReferenceConstraintTransaction?
+            do {
+                try await referenceConstraintStore.reconcile(
+                    currentRootByReference:
+                        try await referenceManager.currentOwnerDigests()
+                )
+                let replacement = try await referenceManager.prepareToReplace(
+                    references
+                )
+                prepared = replacement
+                // Preservation may span several Apple store writes. Do not
+                // begin the potentially expensive XPC operation after its
+                // request was cancelled while those writes were in flight.
+                try Task.checkCancellation()
+                let outcome = try await operation()
+                // Some Apple XPC calls complete successfully even after the
+                // caller is cancelled. Treat cancellation observed before the
+                // canonical-key commit as an operation failure so rollback
+                // restores the previous owner.
+                try Task.checkCancellation()
+                let transaction = try await referenceConstraintStore.prepare(
+                    outcome.assignments.compactMap { assignment in
+                        guard
+                            let canonical = referenceManager.canonicalTag(
+                                assignment.targetReference
+                            )
+                        else {
+                            return nil
+                        }
+                        return ImageReferenceConstraintAssignment(
+                            reference: canonical,
+                            rootDigest: assignment.image.digest,
+                            constraint: assignment.variantConstraint
+                        )
+                    }
+                )
+                constraintTransaction = transaction
+                try await referenceManager.commit(
+                    outcome.assignments,
+                    prepared: replacement
+                )
+                // The journal already makes the committed selector visible. A
+                // failure to compact it must not turn a successful image/tag
+                // mutation into a misleading retryable API error.
+                try? await referenceConstraintStore.commit(transaction)
+                await identityResolver.invalidate()
+                if let afterCommit {
+                    return await afterCommit(outcome.value)
+                }
+                return outcome.value
+            } catch {
+                if let prepared {
+                    await referenceManager.rollbackUncancelled(prepared)
+                }
+                if constraintTransaction != nil,
+                    let owners =
+                        try? await referenceManager
+                        .currentOwnerDigests()
+                {
+                    try? await referenceConstraintStore.reconcile(
+                        currentRootByReference: owners
+                    )
+                }
+                await identityResolver.invalidate()
+                throw error
+            }
+        }
+    }
+
+    func tag(source: String, target: String) async throws -> ImageTaggingResult {
+        guard let canonicalTarget = referenceManager.canonicalTag(target) else {
+            throw ClientImageError.notFound(id: target)
+        }
+        return try await mutationCoordinator.performMutation { [self] in
+            await identityResolver.invalidate()
+            try await referenceConstraintStore.reconcile(
+                currentRootByReference:
+                    try await referenceManager.currentOwnerDigests()
+            )
+            let resolved: ResolvedImageIdentity
+            do {
+                resolved = try await identityResolver.resolveDuringMutation(source)
+            } catch let error as ImageIdentityResolutionError {
+                if case .ambiguous = error {
+                    throw ClientImageError.conflict("conflict: \(source) is an ambiguous image ID")
+                }
+                throw ClientImageError.notFound(id: source)
+            }
+            let owners = try await referenceManager.currentOwnerDigests()
+            let plannedAssignment = ImageReferenceConstraintAssignment(
+                reference: canonicalTarget,
+                rootDigest: resolved.image.digest,
+                constraint: resolved.variantConstraint
+            )
+            let transaction = try await referenceConstraintStore.prepare([
+                plannedAssignment
+            ])
+
+            // When the logical target already owns this root, changing its OCI
+            // selector is the entire Docker-visible mutation. The sidecar's
+            // atomic file replacement is the commit point; rewriting Apple's
+            // identical root cannot provide a crash witness and is unnecessary.
+            if owners[canonicalTarget] == resolved.image.digest {
+                try await referenceConstraintStore.commit(transaction)
+                // Ownership is unchanged, but normalize a legacy familiar or
+                // annotation-only Apple key so future exact store operations
+                // (notably push) have a canonical registry-qualified source.
+                let replacement = try await referenceManager.prepareToReplace([
+                    canonicalTarget
+                ])
+                try await referenceManager.commit(
+                    [
+                        CanonicalImageAssignment(
+                            targetReference: canonicalTarget,
+                            image: resolved.image,
+                            variantConstraint: resolved.variantConstraint
+                        )
+                    ],
+                    prepared: replacement
+                )
+                await identityResolver.invalidate()
+                return ImageTaggingResult(
+                    image: resolved.image,
+                    dockerConfigDigest: resolved.dockerConfigDigest
+                )
+            }
+
+            var prepared: PreparedImageReplacement?
+            do {
+                let replacement = try await referenceManager.prepareToReplace([
+                    canonicalTarget
+                ])
+                prepared = replacement
+                try Task.checkCancellation()
+                let tagged = try await referenceManager.tagExact(
+                    sourceReference: resolved.reference,
+                    targetReference: canonicalTarget
+                )
+                try Task.checkCancellation()
+                try await referenceManager.commit(
+                    [
+                        CanonicalImageAssignment(
+                            targetReference: canonicalTarget,
+                            image: tagged,
+                            variantConstraint: resolved.variantConstraint
+                        )
+                    ],
+                    prepared: replacement
+                )
+                try? await referenceConstraintStore.commit(transaction)
+                await identityResolver.invalidate()
+                return ImageTaggingResult(
+                    image: tagged,
+                    dockerConfigDigest: resolved.dockerConfigDigest
+                )
+            } catch {
+                if let prepared {
+                    await referenceManager.rollbackUncancelled(prepared)
+                }
+                if let currentOwners =
+                    try? await referenceManager
+                    .currentOwnerDigests()
+                {
+                    try? await referenceConstraintStore.reconcile(
+                        currentRootByReference: currentOwners
+                    )
+                }
+                await identityResolver.invalidate()
+                throw error
+            }
+        }
     }
 
     // Workaround for narrowing an unspecified push from all platforms to a single platform available.
     // This avoids container push failures caused by missing blobs for non local platforms.
-    private func resolvedPushPlatform(for image: ClientImage, requestedPlatform: Platform?, logger: Logger) async throws -> Platform? {
+    func resolvedPushPlatform(for image: ClientImage, requestedPlatform: Platform?, logger: Logger) async throws -> Platform? {
         guard requestedPlatform == nil else {
             return requestedPlatform
         }
 
-        let manifests = try await image.index().manifests
-        var availablePlatforms: [Platform] = []
-
-        for descriptor in manifests {
-            if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
-                referenceType == "attestation-manifest"
-            {
-                continue
-            }
-
-            guard let platform = descriptor.platform else {
-                continue
-            }
-
-            do {
-                _ = try await image.manifest(for: platform)
-                availablePlatforms.append(platform)
-            } catch {
-                logger.debug("Skipping unavailable platform \(platform.description) for push of \(image.reference): \(error)")
-            }
+        let descriptors = try await runnableImageSelector.descriptors(
+            for: image
+        )
+        // A platform-filtered Apple push omits descriptors outside that
+        // platform, including standard unknown/unknown attestations. Preserve
+        // the complete OCI graph whenever artifacts are attached.
+        if descriptors.contains(where: { $0.kind == .artifact }) {
+            return nil
         }
+        let availablePlatforms = Array(
+            Set(descriptors.compactMap(\.runnableVariant?.platform))
+        )
 
         if availablePlatforms.count == 1 {
             return availablePlatforms[0]
@@ -207,19 +513,127 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func list(includeSystemImages: Bool = false) async throws -> [ClientImage] {
-        let allImages = try await ClientImage.list()
-        guard !includeSystemImages else {
-            return allImages
+        try await mutationCoordinator.stableRead {
+            try await listUncoordinated(includeSystemImages: includeSystemImages)
         }
-        // filter out infra images
-        // also filter images based on digests
-        let filteredImages = allImages.filter { img in
-            let ref = img.reference.trimmingCharacters(in: .whitespacesAndNewlines)
-            let isDigest = ref.contains("@sha256:")
-            let isInfra = Utility.isInfraImage(name: ref, builderImage: containerSystemConfig.build.image, initImage: containerSystemConfig.vminit.image)
-            return isDigest || !isInfra
+    }
+
+    func configDigestsByReference() async -> [String: String] {
+        guard let images = try? await list() else { return [:] }
+        var result: [String: String] = [:]
+        for image in images {
+            if let resolved = try? await identityResolver.resolve(
+                image.reference
+            ) {
+                result[image.reference] = resolved.dockerConfigDigest
+            }
         }
-        return filteredImages
+        return result
+    }
+
+    func configDigest(for reference: String) async -> String? {
+        try? await identityResolver.resolve(reference).dockerConfigDigest
+    }
+
+    func dockerTagConfigSelections() async -> [DockerTagConfigSelection] {
+        guard let images = try? await list() else { return [] }
+        var result: [DockerTagConfigSelection] = []
+        for image in images {
+            guard
+                let canonical = referenceManager.canonicalTag(
+                    image.reference
+                ), let resolved = try? await identityResolver.resolve(canonical)
+            else { continue }
+            result.append(
+                .init(
+                    reference: canonical,
+                    rootDigest: resolved.image.digest,
+                    configDigest: resolved.dockerConfigDigest
+                )
+            )
+        }
+        return result
+    }
+
+    func imageStoreInventory(
+        includeSystemImages: Bool
+    ) async throws -> ImageStoreInventory {
+        try await mutationCoordinator.stableRead { [self] in
+            try await imageStoreInventoryUncoordinated(
+                includeSystemImages: includeSystemImages
+            )
+        }
+    }
+
+    private func listUncoordinated(
+        includeSystemImages: Bool
+    ) async throws -> [ClientImage] {
+        try await imageStoreInventoryUncoordinated(
+            includeSystemImages: includeSystemImages
+        ).images
+    }
+
+    private func imageStoreInventoryUncoordinated(
+        includeSystemImages: Bool
+    ) async throws -> ImageStoreInventory {
+        let physicalImages = try await referenceStore.list()
+        let containers =
+            (try? await containerInventoryProvider.containers())
+            ?? []
+        let activeLeaseRoots = Set(
+            ContainerImageIdentity.usageByRootDigest(containers).keys
+        ).union(await imageLeaseReservations.reservedRootDigests())
+        let allImages = referenceManager.dockerVisibleImages(
+            physicalImages,
+            activeLeaseRootDigests: activeLeaseRoots
+        )
+        let visibleImages: [ClientImage]
+        if includeSystemImages {
+            visibleImages = allImages
+        } else {
+            visibleImages = allImages.filter { image in
+                let reference = image.reference.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                let isDigest = reference.contains("@sha256:")
+                let isInfra = Utility.isInfraImage(
+                    name: reference,
+                    builderImage: containerSystemConfig.build.image,
+                    initImage: containerSystemConfig.vminit.image
+                )
+                return isDigest || !isInfra
+            }
+        }
+
+        let physicalReferences = Dictionary(
+            grouping: physicalImages,
+            by: \.digest
+        ).mapValues { images in
+            Set(images.map(\.reference).filter { !$0.isEmpty })
+        }
+        var tagSelections: [DockerTagConfigSelection] = []
+        for image in visibleImages {
+            guard
+                let canonical = referenceManager.canonicalTag(
+                    image.reference
+                ),
+                let resolved =
+                    try? await identityResolver
+                    .resolveDuringMutation(canonical)
+            else { continue }
+            tagSelections.append(
+                .init(
+                    reference: canonical,
+                    rootDigest: resolved.image.digest,
+                    configDigest: resolved.dockerConfigDigest
+                )
+            )
+        }
+        return ImageStoreInventory(
+            images: visibleImages,
+            physicalReferencesByRootDigest: physicalReferences,
+            tagConfigSelections: tagSelections
+        )
     }
 
     func delete(id: String) async throws -> ImageDeletionResult {
@@ -227,40 +641,425 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func delete(id: String, force: Bool) async throws -> ImageDeletionResult {
+        try await mutationCoordinator.performMutation { [self] in
+            await identityResolver.invalidate()
+            do {
+                let result = try await deleteDuringMutation(id: id, force: force)
+                await identityResolver.invalidate()
+                return result
+            } catch {
+                await identityResolver.invalidate()
+                throw error
+            }
+        }
+    }
+
+    private func deleteDuringMutation(id: String, force: Bool) async throws -> ImageDeletionResult {
         let resolved: ResolvedImageIdentity
         do {
-            resolved = try await identityResolver.resolve(id)
+            resolved = try await identityResolver.resolveDuringMutation(id)
         } catch let error as ImageIdentityResolutionError {
             if case .ambiguous = error {
-                throw ClientImageError.conflict("conflict: (id) is an ambiguous image ID")
+                throw ClientImageError.conflict("conflict: \(id) is an ambiguous image ID")
             }
             throw ClientImageError.notFound(id: id)
         }
-        let references = try Self.deletionReferences(
-            kind: resolved.kind,
+        let logicalReferences = Array(
+            Set(resolved.references.compactMap(referenceManager.canonicalTag))
+        ).sorted()
+        let selectedRepositoryDigest = resolved.selectedStoreReference.flatMap {
+            Self.repositoryDigestStoreReference($0) ? $0 : nil
+        }
+        let deletionKind: ImageIdentityKind =
+            selectedRepositoryDigest == nil ? resolved.kind : .reference
+        _ = try Self.deletionReferences(
+            kind: deletionKind,
             resolvedReference: resolved.reference,
-            allReferences: resolved.references,
+            allReferences: logicalReferences,
             requestedID: id,
             force: force
         )
+        let canonicalTarget = referenceManager.canonicalTag(id)
+        let removesFinalDockerReference = Self.deletionRemovesFinalDockerReference(
+            kind: deletionKind,
+            resolvedReference: resolved.reference,
+            canonicalTarget: canonicalTarget,
+            selectedRepositoryDigest: selectedRepositoryDigest,
+            logicalReferences: logicalReferences,
+            storeReferences: resolved.storeReferences
+        )
+        let ownerRoots = resolved.rootDigests
+        let allContainers = try await containerInventoryProvider.containers()
+        let deletesWholeRoot =
+            deletionKind == .root
+            && resolved.variantConstraint == .unconstrained
+        // Docker conflict semantics are scoped to the selected config (except
+        // an unconstrained root deletion), while physical retention is scoped
+        // to the whole OCI root. A multi-platform/multi-config root can have a
+        // container using config B while config A is deleted legitimately.
+        let containersUsingSelectedIdentity = allContainers.filter {
+            ContainerImageIdentity.matches(
+                $0,
+                rootDigests: ownerRoots,
+                configDigest: resolved.dockerConfigDigest,
+                wholeRoot: deletesWholeRoot
+            )
+        }
+        let containersUsingOwnerRoots = allContainers.filter {
+            ownerRoots.contains($0.configuration.image.digest)
+        }
+        var reservedRoots: Set<String> = []
+        for root in ownerRoots
+        where await imageLeaseReservations.isReserved(
+            rootDigest: root
+        ) {
+            reservedRoots.insert(root)
+        }
+        let rootHasCreateReservation = !reservedRoots.isEmpty
+        if removesFinalDockerReference {
+            let immutableIDDeletion = deletionKind != .reference
+            if immutableIDDeletion,
+                let runningContainer = containersUsingSelectedIdentity.first(where: {
+                    $0.status == .running || $0.status == .stopping
+                })
+            {
+                throw Self.imageInUseConflict(
+                    requestedID: id,
+                    container: runningContainer,
+                    forceCannotOverride: true
+                )
+            }
+            if immutableIDDeletion, rootHasCreateReservation {
+                throw Self.imageReservedByCreateConflict(
+                    requestedID: id,
+                    forceCannotOverride: true
+                )
+            }
+            if !force {
+                if let container = containersUsingSelectedIdentity.first {
+                    throw Self.imageInUseConflict(
+                        requestedID: id,
+                        container: container,
+                        forceCannotOverride: false
+                    )
+                }
+                if rootHasCreateReservation {
+                    throw Self.imageReservedByCreateConflict(
+                        requestedID: id,
+                        forceCannotOverride: false
+                    )
+                }
+            }
+        }
+
+        var references: [String]
+        let responseReferences: [String]
+        if let selectedRepositoryDigest {
+            // A named digest is a reference association even though it selects
+            // manifest/config identity for inspect and container creation.
+            // Remove only the exact store key and retain sibling tags.
+            references = [selectedRepositoryDigest]
+            responseReferences = [selectedRepositoryDigest]
+        } else if resolved.kind == .reference,
+            let canonicalTarget
+        {
+            // Retire every physical spelling of the one logical Docker tag.
+            // Preserve displaced roots before removing their stale keys so a
+            // later refresh cannot resurrect the tag from historical aliases.
+            _ = try await referenceManager.prepareToRemove(
+                canonicalTarget,
+                currentOwnerDigest: resolved.image.digest
+            )
+            references = try await referenceManager.physicalReferences(
+                claiming: canonicalTarget
+            )
+            responseReferences = [canonicalTarget]
+        } else if resolved.kind == .reference {
+            references = [resolved.reference]
+            responseReferences = [resolved.reference]
+        } else {
+            // Deleting by OCI root/manifest/config ID removes the Docker-visible
+            // tags owned by that root, not merely Apple's representative key.
+            // Retire each logical tag first so a stale familiar key on a displaced
+            // root cannot reclaim ownership after the exact canonical key is gone.
+            var claimingReferences: [String] = []
+            for canonicalTarget in logicalReferences {
+                guard
+                    let owner = resolved.owners.first(where: {
+                        $0.references.contains(canonicalTarget)
+                    })
+                else { continue }
+                _ = try await referenceManager.prepareToRemove(
+                    canonicalTarget,
+                    currentOwnerDigest: owner.image.digest
+                )
+                claimingReferences.append(
+                    contentsOf: try await referenceManager.physicalReferences(
+                        claiming: canonicalTarget
+                    )
+                )
+            }
+
+            let claimingSet = Set(claimingReferences)
+            var immutableOwnerReferences: [String] = []
+            for owner in resolved.owners {
+                let physical = try await referenceManager.physicalReferences(
+                    forDigest: owner.image.digest
+                )
+                let selectedRepositoryDigests = Self.repositoryDigests(
+                    ownedBy: owner,
+                    selectedBy: resolved
+                )
+                let selectedPhysical = physical.filter {
+                    claimingSet.contains($0)
+                        || selectedRepositoryDigests.contains($0)
+                }
+                immutableOwnerReferences.append(contentsOf: selectedPhysical)
+
+                let remainingRealReference = physical.contains { reference in
+                    !selectedPhysical.contains(reference)
+                        && !DockerImageReferenceSemantics.isInternalReference(
+                            reference
+                        )
+                }
+                if !remainingRealReference {
+                    immutableOwnerReferences.append(
+                        contentsOf: physical.filter {
+                            DockerImageReferenceSemantics.isInternalReference(
+                                $0
+                            )
+                        }
+                    )
+                }
+            }
+            references = Self.uniqueReferencesPreservingOrder(
+                immutableOwnerReferences + claimingReferences
+            )
+            responseReferences =
+                logicalReferences.isEmpty
+                ? Array(references.prefix(1))
+                : logicalReferences
+        }
         guard let firstReference = references.first else {
             throw ClientImageError.notFound(id: id)
         }
 
-        var results: [ImageDeletionResult] = []
-        for reference in references {
-            results.append(
-                try await Self.delete(
-                    id: reference,
-                    containerSystemConfig: containerSystemConfig
-                ))
+        if !containersUsingOwnerRoots.isEmpty || rootHasCreateReservation {
+            // `prepareToRemove` deliberately retires redundant dangling markers
+            // for ordinary image deletion. An in-use root is different: Apple
+            // resolves the exact immutable lease again when a stopped container
+            // restarts. Reacquire it after canonical-tag preparation and exclude
+            // it from deletion so both the content and the runtime key survive.
+            let leaseManager = LiveContainerImageLeaseManager(
+                store: referenceStore
+            )
+            for owner in resolved.owners
+            where containersUsingOwnerRoots.contains(where: {
+                $0.configuration.image.digest == owner.image.digest
+            }) || reservedRoots.contains(owner.image.digest) {
+                let ownerIdentity = ResolvedImageIdentity(
+                    image: owner.image,
+                    reference: owner.image.reference,
+                    references: owner.references,
+                    storeReferences: owner.storeReferences,
+                    repositoryDigests: owner.repositoryDigests,
+                    selectedStoreReference: nil,
+                    kind: resolved.kind,
+                    variantConstraint: resolved.variantConstraint,
+                    owners: [owner],
+                    dockerConfigDigest: resolved.dockerConfigDigest
+                )
+                let lease = try await leaseManager.acquire(for: ownerIdentity)
+                references.removeAll { $0 == lease.reference }
+            }
         }
-        try await identityResolver.refresh()
+
+        for reference in references {
+            try await deleteExactReference(reference)
+        }
+        let reclaimedBytes =
+            (try? await referenceStore.cleanUpOrphanedBlobs()).map {
+                Int64(clamping: $0)
+            } ?? 0
+        // Deletion has committed at this point. A transient observation failure
+        // must not turn a successful untag into an API error whose retry becomes
+        // a confusing 404. Conservatively report no reclaimed digest when the
+        // remaining-reference check is unavailable.
+        let currentOwnerStillReferenced =
+            (try? await referenceStore.list().contains {
+                ownerRoots.contains($0.digest)
+            }) ?? true
         return ImageDeletionResult(
-            untagged: results.first?.untagged ?? firstReference,
-            additionalUntagged: results.dropFirst().flatMap(\.untaggedReferences),
-            digest: results.first?.digest ?? resolved.image.digest,
-            deletedDigest: results.compactMap(\.deletedDigest).last
+            untagged: responseReferences.first ?? firstReference,
+            additionalUntagged: Array(responseReferences.dropFirst()),
+            digest: resolved.dockerConfigDigest,
+            deletedDigest: currentOwnerStillReferenced
+                ? nil : resolved.dockerConfigDigest,
+            reclaimedBytes: currentOwnerStillReferenced ? 0 : reclaimedBytes
+        )
+    }
+
+    /// Internal preservation keys intentionally have no resolver alias. Prune
+    /// already holds the image mutation lock and has an immutable physical-row
+    /// snapshot, so validate that exact key/root pair immediately before removal
+    /// instead of routing it back through Docker's public identity namespace.
+    private func deleteExactPhysicalImageDuringMutation(
+        _ image: ClientImage
+    ) async throws -> ImageDeletionResult {
+        let dockerConfigDigest = await ContainerImageIdentity.configDigest(
+            for: image,
+            runnableImageSelector: runnableImageSelector
+        )
+        guard
+            try await referenceStore.list().contains(where: {
+                $0.reference == image.reference && $0.digest == image.digest
+            })
+        else {
+            throw ClientImageError.notFound(id: image.reference)
+        }
+        try await referenceStore.delete(reference: image.reference)
+        let reclaimedBytes =
+            (try? await referenceStore.cleanUpOrphanedBlobs()).map {
+                Int64(clamping: $0)
+            } ?? 0
+        let rootStillReferenced =
+            (try? await referenceStore.list().contains {
+                $0.digest == image.digest
+            }) ?? true
+        return ImageDeletionResult(
+            untagged: image.reference,
+            digest: dockerConfigDigest,
+            deletedDigest: rootStillReferenced ? nil : dockerConfigDigest,
+            reclaimedBytes: rootStillReferenced ? 0 : reclaimedBytes
+        )
+    }
+
+    /// Delete the exact physical key selected by the canonical resolver. Calling
+    /// Apple's `ClientImage.get` here is unsafe because it prefers historical
+    /// name annotations and can select a displaced `moby-dangling` root.
+    private func deleteExactReference(_ reference: String) async throws {
+        guard try await referenceStore.list().contains(where: { $0.reference == reference }) else {
+            throw ClientImageError.notFound(id: reference)
+        }
+        try await referenceStore.delete(reference: reference)
+    }
+
+    private static func uniqueReferencesPreservingOrder(_ references: [String]) -> [String] {
+        var seen: Set<String> = []
+        return references.filter { seen.insert($0).inserted }
+    }
+
+    private static func repositoryDigestStoreReference(
+        _ reference: String
+    ) -> Bool {
+        guard !DockerImageReferenceSemantics.isBareSHA256Identifier(reference),
+            !ContainerImageLease.isReference(reference),
+            !reference.hasPrefix("moby-dangling@sha256:"),
+            !reference.hasPrefix("untagged@sha256:"),
+            let parsed = try? Reference.parse(reference),
+            parsed.digest != nil
+        else {
+            return false
+        }
+        return true
+    }
+
+    private static func repositoryDigests(
+        ownedBy owner: ResolvedImageOwner,
+        selectedBy identity: ResolvedImageIdentity
+    ) -> Set<String> {
+        let selectedDigest: String?
+        switch identity.variantConstraint {
+        case .exactManifest(let manifestDigest, _):
+            selectedDigest = manifestDigest
+        case .descendantOfIndex(let indexDigest):
+            selectedDigest = indexDigest
+        case .unconstrained:
+            selectedDigest =
+                identity.kind == .root
+                ? owner.image.digest : nil
+        }
+        guard let selectedDigest else { return [] }
+        let canonical =
+            selectedDigest.hasPrefix("sha256:")
+            ? selectedDigest : "sha256:\(selectedDigest)"
+        return Set(
+            owner.repositoryDigests.filter { reference in
+                guard let parsed = try? Reference.parse(reference),
+                    let digest = parsed.digest
+                else { return false }
+                let value =
+                    digest.hasPrefix("sha256:")
+                    ? digest : "sha256:\(digest)"
+                return value == canonical
+            })
+    }
+
+    static func deletionRemovesFinalDockerReference(
+        kind: ImageIdentityKind,
+        resolvedReference: String,
+        canonicalTarget: String?,
+        selectedRepositoryDigest: String?,
+        logicalReferences: [String],
+        storeReferences: [String]
+    ) -> Bool {
+        let logicalTags = Set(logicalReferences)
+        let physicalRepositoryDigests = Set(
+            storeReferences.filter(repositoryDigestStoreReference)
+        )
+
+        if let selectedRepositoryDigest {
+            return logicalTags.isEmpty
+                && physicalRepositoryDigests.subtracting([
+                    selectedRepositoryDigest
+                ]).isEmpty
+        }
+
+        if kind == .reference {
+            if let canonicalTarget {
+                return logicalTags.subtracting([canonicalTarget]).isEmpty
+                    && physicalRepositoryDigests.isEmpty
+            }
+            return logicalTags.isEmpty
+                && physicalRepositoryDigests.subtracting([
+                    resolvedReference
+                ]).isEmpty
+        }
+
+        // Root, manifest, and config deletion remove every tag and physical
+        // repository-digest association owned by the selected OCI root.
+        return true
+    }
+
+    private static func imageInUseConflict(
+        requestedID: String,
+        container: ContainerSnapshot,
+        forceCannotOverride: Bool
+    ) -> ClientImageError {
+        let state: String
+        switch container.status {
+        case .running, .stopping:
+            state = "running"
+        case .stopped, .unknown:
+            state = "stopped"
+        }
+        let forcePhrase =
+            forceCannotOverride
+            ? "cannot be forced" : "must be forced"
+        return .conflict(
+            "conflict: unable to delete \(requestedID) (\(forcePhrase)) - image is being used by \(state) container \(container.id)"
+        )
+    }
+
+    private static func imageReservedByCreateConflict(
+        requestedID: String,
+        forceCannotOverride: Bool
+    ) -> ClientImageError {
+        let forcePhrase =
+            forceCannotOverride
+            ? "cannot be forced" : "must be forced"
+        return .conflict(
+            "conflict: unable to delete \(requestedID) (\(forcePhrase)) - image is being used by an in-progress container create"
         )
     }
 
@@ -309,7 +1108,10 @@ struct ClientImageService: ClientImageProtocol {
         // Free orphaned blobs — mirrors Apple Container's own `container image rm`.
         // Use try? so a GC failure does not fail the delete: the tag is already gone
         // and returning an error here would cause the client to retry a completed operation.
-        _ = try? await imageStore.cleanUpOrphanedBlobs()
+        let reclaimedBytes =
+            (try? await imageStore.cleanUpOrphanedBlobs()).map {
+                Int64(clamping: $0)
+            } ?? 0
 
         // Check remaining refs AFTER deletion to avoid a TOCTOU race: two concurrent
         // deletes checking before either delete would both see isLastRef=false and
@@ -321,11 +1123,18 @@ struct ClientImageService: ClientImageProtocol {
         return ImageDeletionResult(
             untagged: normalizedRef,
             digest: digest,
-            deletedDigest: wasLastRef ? digest : nil
+            deletedDigest: wasLastRef ? digest : nil,
+            reclaimedBytes: wasLastRef ? reclaimedBytes : 0
         )
     }
 
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<
+    func pull(
+        image: String,
+        tag: String?,
+        platform: Platform,
+        fallbackPolicy: PlatformFallbackPolicy,
+        logger: Logger
+    ) async throws -> AsyncThrowingStream<
         PullProgress, Error
     > {
         let reference = try {
@@ -348,74 +1157,98 @@ struct ClientImageService: ClientImageProtocol {
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield(.message("Trying to pull \(reference)"))
-            Task {
+            let task = Task {
                 do {
-                    let byteCounter = PullByteCounter()
-                    let image = try await ClientImage.pull(
-                        reference: reference,
-                        platform: platform,
-                        containerSystemConfig: containerSystemConfig,
-                        progressUpdate: { progressEvents in
-                            for event in progressEvents {
-                                switch event {
-                                case .setDescription(let description),
-                                    .setSubDescription(let description),
-                                    .custom(let description):
-                                    continuation.yield(.message(description))
-                                default:
-                                    break
+                    let pulled = try await replacingImages(
+                        targeting: [reference],
+                        operation: {
+                            var pulled: ClientImage
+                            do {
+                                let byteCounter = PullByteCounter()
+                                let unpackCounter = PullByteCounter()
+                                pulled = try await imagePuller.pullAndUnpack(
+                                    reference: reference,
+                                    platform: platform,
+                                    containerSystemConfig: containerSystemConfig,
+                                    downloadProgress: { progressEvents in
+                                        for event in progressEvents {
+                                            switch event {
+                                            case .setDescription(let description),
+                                                .setSubDescription(let description),
+                                                .custom(let description):
+                                                continuation.yield(.message(description))
+                                            default:
+                                                break
+                                            }
+                                        }
+                                        if let bytes = await byteCounter.apply(progressEvents) {
+                                            continuation.yield(.downloading(current: bytes.current, total: bytes.total))
+                                        }
+                                    },
+                                    unpackProgress: { progressEvents in
+                                        continuation.yield(.message("Unpacking image"))
+                                        if let bytes = await unpackCounter.apply(progressEvents) {
+                                            continuation.yield(.extracting(current: bytes.current, total: bytes.total))
+                                        }
+                                    }
+                                )
+                                logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
+                            } catch {
+                                // On arm64 hosts: if the image has no arm64 variant,
+                                // fall back to amd64 (Rosetta) inside the same tag
+                                // replacement transaction.
+                                let errMsg = String(describing: error)
+                                guard fallbackPolicy == .allowRosetta,
+                                    platform.architecture == "arm64",
+                                    errMsg.contains("does not support required platforms")
+                                else {
+                                    throw error
                                 }
+                                let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
+                                logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
+                                continuation.yield(.message("linux/arm64 not available — retrying with linux/amd64 (Rosetta)"))
+                                pulled = try await imagePuller.pullAndUnpack(
+                                    reference: reference,
+                                    platform: amd64,
+                                    containerSystemConfig: containerSystemConfig,
+                                    downloadProgress: nil,
+                                    unpackProgress: nil
+                                )
+                                logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
                             }
-                            if let bytes = await byteCounter.apply(progressEvents) {
-                                continuation.yield(.downloading(current: bytes.current, total: bytes.total))
-                            }
-                        }
+                            return ImageReplacementOutcome(
+                                value: PulledImageIdentity(
+                                    image: pulled,
+                                    dockerConfigDigest: pulled.digest
+                                ),
+                                assignments: [
+                                    CanonicalImageAssignment(
+                                        targetReference: reference,
+                                        image: pulled
+                                    )
+                                ]
+                            )
+                        },
+                        afterCommit: { [identityResolver] pulled in
+                            PulledImageIdentity(
+                                image: pulled.image,
+                                dockerConfigDigest: (try? await identityResolver
+                                    .resolveDuringMutation(reference))?
+                                    .dockerConfigDigest
+                                    ?? pulled.image.digest
+                            )
+                        })
+                    continuation.yield(
+                        .message("Image digest: \(pulled.dockerConfigDigest)")
                     )
-                    continuation.yield(.message("Unpacking image"))
-                    let unpackCounter = PullByteCounter()
-                    try await image.unpack(
-                        platform: platform,
-                        progressUpdate: { progressEvents in
-                            if let bytes = await unpackCounter.apply(progressEvents) {
-                                continuation.yield(.extracting(current: bytes.current, total: bytes.total))
-                            }
-                        }
-                    )
-                    logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
-                    continuation.yield(.message("Image digest: \(image.digest)"))
-                    try await identityResolver.refresh()
                     continuation.finish()
                 } catch {
-                    // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
-                    // Apple Container enables Rosetta automatically when the container platform is amd64.
-                    let errMsg = String(describing: error)
-                    if platform.architecture == "arm64",
-                        errMsg.contains("does not support required platforms")
-                    {
-                        let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
-                        logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
-                        continuation.yield(.message("linux/arm64 not available — retrying with linux/amd64 (Rosetta)"))
-                        do {
-                            let fallbackImage = try await ClientImage.pull(
-                                reference: reference,
-                                platform: amd64,
-                                containerSystemConfig: containerSystemConfig,
-                                progressUpdate: nil
-                            )
-                            try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
-                            logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
-                            continuation.yield(.message("Image digest: \(fallbackImage.digest)"))
-                            try await identityResolver.refresh()
-                            continuation.finish()
-                        } catch let fallbackError {
-                            logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
-                            continuation.finish(throwing: fallbackError)
-                        }
-                    } else {
-                        logger.error("Failed to pull image \(reference): \(error)")
-                        continuation.finish(throwing: error)
-                    }
+                    logger.error("Failed to pull image \(reference): \(error)")
+                    continuation.finish(throwing: error)
                 }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -423,103 +1256,226 @@ struct ClientImageService: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let resolved: ResolvedImageIdentity
-        do {
-            resolved = try await identityResolver.resolve(reference)
-        } catch let error as ImageIdentityResolutionError {
-            if case .ambiguous = error {
-                throw ClientImageError.conflict("conflict: (reference) is an ambiguous image ID")
-            }
-            throw ClientImageError.notFound(id: reference)
-        }
-        let normalizedReference = resolved.reference
-
-        logger.info("Pushing image reference: \(normalizedReference)")
-
-        let image = resolved.image
-
-        logger.debug("Image reference from ClientImage: \(image.reference)")
-
-        let effectivePlatform = try await resolvedPushPlatform(for: image, requestedPlatform: platform, logger: logger)
-
-        return AsyncThrowingStream { continuation in
-            let platformDesc = effectivePlatform?.description ?? "default"
-            logger.info("Starting to push image \(normalizedReference) for platform \(platformDesc)")
-            logger.info("Retrieved image object with reference: \(image.reference)")
-            continuation.yield("Trying to push \(normalizedReference)")
-            Task {
-                do {
-                    try await image.push(
-                        platform: effectivePlatform,
-                        scheme: .auto,
-                        containerSystemConfig: containerSystemConfig,
-                        progressUpdate: { progressEvents in
-                            for event in progressEvents {
-                                switch event {
-                                case .setDescription(let description),
-                                    .setSubDescription(let description),
-                                    .setItemsName(let description),
-                                    .custom(let description):
-                                    continuation.yield(description)
-                                case .addTotalSize(let size),
-                                    .setTotalSize(let size),
-                                    .addSize(let size),
-                                    .setSize(let size):
-                                    let humanReadableSize = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-                                    continuation.yield("Uploaded \(humanReadableSize)")
-                                case .addTotalItems(let items),
-                                    .setTotalItems(let items),
-                                    .addItems(let items),
-                                    .setItems(let items):
-                                    continuation.yield("Pushing \(items) layer\(items == 1 ? "" : "s")")
-                                default:
-                                    break
+        let output = AsyncThrowingStream<String, Error>.makeStream()
+        let ready = AsyncThrowingStream<Void, Error>.makeStream()
+        let task = Task {
+            do {
+                let pushReference: String
+                if let canonical = referenceManager.canonicalTag(reference) {
+                    // Apple push performs an exact store lookup and also requires
+                    // a registry host. Reconcile a pre-existing familiar or
+                    // annotation-only key before the non-idempotent registry
+                    // operation; the canonical key then remains Docker's sole
+                    // local owner after the push finishes.
+                    _ = try await tag(source: reference, target: canonical)
+                    pushReference = canonical
+                } else {
+                    pushReference = reference
+                }
+                try await mutationCoordinator.withMutationExcluded { [self] in
+                    do {
+                        let resolved: ResolvedImageIdentity
+                        do {
+                            resolved = try await identityResolver.resolve(pushReference)
+                        } catch let error as ImageIdentityResolutionError {
+                            if case .ambiguous = error {
+                                throw ClientImageError.conflict(
+                                    "conflict: \(pushReference) is an ambiguous image ID"
+                                )
+                            }
+                            throw ClientImageError.notFound(id: pushReference)
+                        }
+                        let normalizedReference = resolved.reference
+                        let image = resolved.image
+                        if resolved.variantConstraint != .unconstrained {
+                            if let platform,
+                                let implied = resolved.impliedPlatform,
+                                implied != platform
+                            {
+                                throw ClientImageError.conflict(
+                                    "conflict: image \(pushReference) selects \(implied.description), not requested platform \(platform.description)"
+                                )
+                            }
+                            // Apple's push API accepts only a stored root plus an
+                            // optional platform. It cannot name an exact manifest
+                            // when sibling manifests share a platform, nor a
+                            // nested-index boundary. Broadening here would push a
+                            // different Docker image than the tag denotes.
+                            throw ClientImageError.conflict(
+                                "conflict: pushing an exact manifest or nested-index image identity is not supported by Apple Container 1.2.1"
+                            )
+                        }
+                        let effectivePlatform = try await resolvedPushPlatform(
+                            for: image,
+                            requestedPlatform: platform,
+                            logger: logger
+                        )
+                        ready.continuation.yield(())
+                        ready.continuation.finish()
+                        let platformDescription =
+                            effectivePlatform?.description
+                            ?? "default"
+                        logger.info(
+                            "Starting to push image \(normalizedReference) for platform \(platformDescription)"
+                        )
+                        output.continuation.yield(
+                            "Trying to push \(normalizedReference)"
+                        )
+                        try await imagePusher.push(
+                            image: image,
+                            platform: effectivePlatform,
+                            scheme: .auto,
+                            containerSystemConfig: containerSystemConfig,
+                            progressUpdate: { progressEvents in
+                                for event in progressEvents {
+                                    switch event {
+                                    case .setDescription(let description),
+                                        .setSubDescription(let description),
+                                        .setItemsName(let description),
+                                        .custom(let description):
+                                        output.continuation.yield(description)
+                                    case .addTotalSize(let size),
+                                        .setTotalSize(let size),
+                                        .addSize(let size),
+                                        .setSize(let size):
+                                        let readableSize = ByteCountFormatter.string(
+                                            fromByteCount: size,
+                                            countStyle: .file
+                                        )
+                                        output.continuation.yield(
+                                            "Uploaded \(readableSize)"
+                                        )
+                                    case .addTotalItems(let items),
+                                        .setTotalItems(let items),
+                                        .addItems(let items),
+                                        .setItems(let items):
+                                        output.continuation.yield(
+                                            "Pushing \(items) layer\(items == 1 ? "" : "s")"
+                                        )
+                                    default:
+                                        break
+                                    }
                                 }
                             }
-                        }
-                    )
-                    logger.info("Successfully pushed image \(normalizedReference) for platform \(platformDesc)")
-                    continuation.yield("Successfully pushed \(normalizedReference)")
-                    continuation.finish()
-                } catch {
-                    logger.error("Failed to push image \(normalizedReference): \(error)")
-
-                    // Check if this is a "notFound: Content with digest" error (missing layer data)
-                    let errorDescription = String(describing: error)
-                    if errorDescription.contains("notFound") && errorDescription.contains("Content with digest") {
-                        let message =
-                            "Failed to push image: One or more layers are missing from the image store. "
-                            + "This is a known limitation of Apple's Containerization framework when working with tagged images. "
-                            + "The tag metadata exists but the underlying layer data is not properly linked. " + "Original error: \(errorDescription)"
-                        continuation.yield(message)
-                    } else {
-                        continuation.yield(String(describing: error))
+                        )
+                        logger.info(
+                            "Successfully pushed image \(normalizedReference) for platform \(platformDescription)"
+                        )
+                        output.continuation.yield(
+                            "Successfully pushed \(normalizedReference)"
+                        )
+                    } catch {
+                        throw error
                     }
-                    continuation.finish(throwing: error)
                 }
+                output.continuation.finish()
+            } catch {
+                logger.error("Failed to push image \(reference): \(error)")
+                ready.continuation.finish(throwing: error)
+
+                let errorDescription = String(describing: error)
+                if errorDescription.contains("notFound")
+                    && errorDescription.contains("Content with digest")
+                {
+                    let message =
+                        "Failed to push image: One or more layers are missing from the image store. "
+                        + "This is a known limitation of Apple's Containerization framework when working with tagged images. "
+                        + "The tag metadata exists but the underlying layer data is not properly linked. "
+                        + "Original error: \(errorDescription)"
+                    output.continuation.yield(message)
+                } else {
+                    output.continuation.yield(errorDescription)
+                }
+                output.continuation.finish(throwing: error)
+            }
+        }
+        output.continuation.onTermination = { @Sendable _ in
+            task.cancel()
+        }
+
+        var readyIterator = ready.stream.makeAsyncIterator()
+        let readiness: Void?
+        do {
+            readiness = try await withTaskCancellationHandler {
+                try await readyIterator.next()
+            } onCancel: {
+                // The output stream has not been returned yet, so its
+                // onTermination callback cannot cancel this unstructured task.
+                // Forward request cancellation through the readiness handshake.
+                task.cancel()
+            }
+            try Task.checkCancellation()
+        } catch {
+            task.cancel()
+            throw error
+        }
+        guard readiness != nil else {
+            task.cancel()
+            throw ClientImageError.notFound(id: reference)
+        }
+        return output.stream
+    }
+
+    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
+        try await mutationCoordinator.performMutation { [self] in
+            await identityResolver.invalidate()
+            do {
+                let result = try await pruneDuringMutation(
+                    filters: filters,
+                    logger: logger
+                )
+                await identityResolver.invalidate()
+                return result
+            } catch {
+                await identityResolver.invalidate()
+                throw error
             }
         }
     }
 
-    func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
-        let allImages = try await list()
+    private func pruneDuringMutation(
+        filters: [String: [String]],
+        logger: Logger
+    ) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
+        var allImages = try await listUncoordinated(
+            includeSystemImages: false
+        )
+        // Runtime leases are deliberately hidden from Docker image listing.
+        // Prune still owns reconciliation of orphan leases left by a crashed or
+        // failed container create, so merge those exact physical rows into this
+        // internal inventory without publishing them through list/inspect.
+        let visiblePhysicalReferences = Set(allImages.map(\.reference))
+        allImages.append(
+            contentsOf: try await referenceStore.list().filter {
+                ContainerImageLease.isReference($0.reference)
+                    && !visiblePhysicalReferences.contains($0.reference)
+            }
+        )
         var imagesToDelete: [ClientImage] = []
 
-        let allContainers = try await ContainerClient().list()
-        let imagesInUse = Set(allContainers.map { $0.configuration.image.reference })
+        let allContainers = try await containerInventoryProvider.containers()
+        let reservedRoots = await imageLeaseReservations.reservedRootDigests()
+        let imagesInUse = Set(
+            ContainerImageIdentity.usageByRootDigest(allContainers).keys
+        ).union(reservedRoots)
 
         for image in allImages {
             var shouldDelete = false
             let reference = image.reference
 
-            do {
-                _ = try await image.index()
+            let isRuntimeLease = ContainerImageLease.isReference(reference)
 
-                if imagesInUse.contains(reference) {
+            do {
+                if imagesInUse.contains(image.digest) {
                     continue
                 }
 
-                let isDangling = reference.contains("<none>") || reference.contains("@sha256:")
+                // A lease with no owning container is a crash/failed-create
+                // orphan. Reconcile it as dangling content by exact physical
+                // identity; active leases were excluded by the root check above.
+                let isDangling =
+                    isRuntimeLease
+                    || Self.isDockerDanglingReference(reference)
 
                 if let danglingFilters = filters["dangling"] {
                     if let danglingValue = danglingFilters.first {
@@ -535,19 +1491,26 @@ struct ClientImageService: ClientImageProtocol {
                 }
 
                 var imageConfig: ContainerizationOCI.Image?
-                if shouldDelete && (filters["label"] != nil || filters["until"] != nil) {
-                    // Get the config for the first available platform
-                    let manifests = try await image.index().manifests
-
-                    for descriptor in manifests {
-                        guard let platform = descriptor.platform else { continue }
-
-                        do {
-                            imageConfig = try await image.config(for: platform)
-                            break
-                        } catch {
-                            continue
-                        }
+                let requiresConfig =
+                    filters["label"] != nil || filters["until"] != nil
+                if shouldDelete && requiresConfig {
+                    let descriptors =
+                        try await runnableImageSelector
+                        .descriptors(for: image)
+                    imageConfig =
+                        runnableImageSelector.selectVariant(
+                            from: descriptors,
+                            requestedPlatform: nil
+                        )?.config
+                    shouldDelete = Self.pruneCandidateHasRequiredConfig(
+                        shouldDelete,
+                        requiresConfig: true,
+                        hasRunnableConfig: imageConfig != nil
+                    )
+                    if !shouldDelete {
+                        logger.warning(
+                            "Skipping config-filtered prune of \(reference): no runnable image config is available"
+                        )
                     }
                 }
 
@@ -636,33 +1599,34 @@ struct ClientImageService: ClientImageProtocol {
             do {
                 let reference = image.reference
 
-                // Calculate candidate size before deletion (manifest data unavailable after).
-                // Only credited to spaceReclaimed when delete confirms the layers were freed.
-                var candidateSize: Int64 = 0
-                let manifests = try await image.index().manifests
-                for descriptor in manifests {
-                    if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
-                        referenceType == "attestation-manifest"
-                    {
-                        continue
-                    }
-                    guard let platform = descriptor.platform else { continue }
-                    do {
-                        let manifest = try await image.manifest(for: platform)
-                        candidateSize += descriptor.size + manifest.config.size + manifest.layers.reduce(0) { $0 + $1.size }
-                    } catch { continue }
-                }
-
                 // Capture the per-image untag/delete result so the route can emit moby-faithful
                 // per-image events. moby's image prune emits an `untag` per removed reference and
                 // a `delete` per freed digest — never an aggregate "prune" event.
-                let result = try await delete(id: reference)
-                results.append(result)
-                // Only count reclaimed bytes when layers were actually garbage-collected
-                // (deletedDigest non-nil). An untag-only result frees no disk space.
-                if result.deletedDigest != nil {
-                    spaceReclaimed += candidateSize
+                let result: ImageDeletionResult
+                if Self.isPrunableInternalDanglingReference(reference)
+                    || ContainerImageLease.isReference(reference)
+                {
+                    result = try await deleteExactPhysicalImageDuringMutation(
+                        image
+                    )
+                } else {
+                    let current =
+                        try await identityResolver
+                        .resolveDuringMutation(reference)
+                    guard current.image.digest == image.digest else {
+                        logger.info(
+                            "Skipping prune of \(reference): tag moved from \(image.digest) to \(current.image.digest)"
+                        )
+                        continue
+                    }
+                    result = try await deleteDuringMutation(
+                        id: reference,
+                        force: false
+                    )
                 }
+                await identityResolver.invalidate()
+                results.append(result)
+                spaceReclaimed += result.reclaimedBytes
             } catch {
                 logger.warning("Failed to delete image \(image.reference): \(error)")
             }
@@ -671,20 +1635,57 @@ struct ClientImageService: ClientImageProtocol {
         return (results, spaceReclaimed)
     }
 
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+    static func pruneCandidateHasRequiredConfig(
+        _ selected: Bool,
+        requiresConfig: Bool,
+        hasRunnableConfig: Bool
+    ) -> Bool {
+        selected && (!requiresConfig || hasRunnableConfig)
+    }
 
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    static func isDockerDanglingReference(_ reference: String) -> Bool {
+        ContainerImageLease.isReference(reference)
+            || isPrunableInternalDanglingReference(reference)
+    }
+
+    private static func isPrunableInternalDanglingReference(
+        _ reference: String
+    ) -> Bool {
+        reference.hasPrefix("moby-dangling@sha256:")
+            || reference.hasPrefix("untagged@sha256:")
+            || reference.hasPrefix("<none>")
+    }
+
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
+        try await loadWithIdentities(
+            tarballPath: tarballPath,
+            platform: platform,
+            appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+            logger: logger
+        ).references
+    }
+
+    func loadWithIdentities(
+        tarballPath: URL,
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> LoadedImageArchive {
+        let tempDir =
+            try RequestBodyFileWriter
+            .createSecureTemporaryDirectory()
 
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
         let extractedPath = tempDir.appendingPathComponent("extracted")
-        try FileManager.default.createDirectory(at: extractedPath, withIntermediateDirectories: true)
-
-        try ArchiveUtility.extract(tarPath: tarballPath, to: extractedPath)
+        try ArchiveUtility.extract(
+            tarPath: tarballPath,
+            to: extractedPath,
+            limits: .imageLoad,
+            transactional: true
+        )
 
         // `docker buildx build --load`, the containerd "docker" exporter, and
         // `docker save` on modern Docker emit a tarball that is already a valid
@@ -702,7 +1703,11 @@ struct ClientImageService: ClientImageProtocol {
 
         if hasOCILayout {
             ociLayoutPath = extractedPath
-            try OCILayoutPruner.pruneManifestsWithMissingBlobs(at: ociLayoutPath, logger: logger)
+            try OCILayoutPruner.pruneManifestsWithMissingBlobs(
+                at: ociLayoutPath,
+                platform: platform,
+                logger: logger
+            )
         } else {
             ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
             try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
@@ -718,62 +1723,422 @@ struct ClientImageService: ClientImageProtocol {
         // common base layer) then collide with "File exists" in the ingest dir.
         // Loading one descriptor at a time gives each import a fresh session.
         let indexURL = ociLayoutPath.appendingPathComponent("index.json")
-        var index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
-        let descriptors = index.manifests
+        let index = try JSONDecoder().decode(
+            Index.self,
+            from: BoundedFileReader.readImageMetadata(
+                relativePath: "index.json",
+                under: ociLayoutPath
+            )
+        )
+        var descriptors = index.manifests
 
         guard !descriptors.isEmpty else {
             throw OCILayoutPruner.PruneError.nothingLoadable
         }
 
-        var images: [Containerization.Image] = []
-        for descriptor in descriptors {
-            index.manifests = [descriptor]
-            try JSONEncoder().encode(index).write(to: indexURL)
-            images +=
-                try await imageStore.load(
-                    from: ociLayoutPath,
-                    progress: { progressEvents in
-                        for event in progressEvents {
-                            logger.debug("Load progress event: \(event.event) = \(event.value)")
-                        }
-                    })
-        }
+        // Canonicalize every top-level name before Apple registers it. A valid
+        // OCI archive may expose one tag on several platform manifests (plus
+        // BuildKit attestations); fold that coherent set into one index root.
+        // Two descriptors competing for the same platform remain a conflict.
+        let canonicalized = try canonicalLoadDescriptors(
+            descriptors,
+            in: ociLayoutPath
+        )
+        descriptors = canonicalized.descriptors
+        let descriptorTargets = canonicalized.targets
+        let targetReferences = descriptorTargets.compactMap { $0 }
 
-        let loadedImages = images.map { $0.reference }
-        for image in loadedImages {
+        let canonicalDescriptors = descriptors
+        let canonicalDescriptorTargets = descriptorTargets
+        let baseIndex = index
+        let loadedArchive = try await replacingImages(
+            targeting: targetReferences,
+            operation: {
+                var assignments: [CanonicalImageAssignment] = []
+                var loadedReferences: [String] = []
+                for (offset, descriptor) in canonicalDescriptors.enumerated() {
+                    var descriptorIndex = baseIndex
+                    descriptorIndex.manifests = [descriptor]
+                    try JSONEncoder().encode(descriptorIndex).write(to: indexURL, options: .atomic)
+                    let descriptorArchive = tempDir.appendingPathComponent("descriptor-\(offset).tar")
+                    let result: ImageArchiveLoadResult
+                    do {
+                        try ArchiveUtility.create(
+                            tarPath: descriptorArchive,
+                            from: ociLayoutPath
+                        )
+                        // A multi-tag archive is imported one descriptor at a time
+                        // because Apple's ingest session cannot accept shared blobs
+                        // twice. Retain only the archive currently crossing the XPC
+                        // boundary; otherwise N descriptors accumulate N complete
+                        // copies of the OCI layout until the entire load returns.
+                        defer {
+                            try? FileManager.default.removeItem(
+                                at: descriptorArchive
+                            )
+                        }
+                        result = try await archiveLoader.load(
+                            ociLayoutPath: ociLayoutPath,
+                            archivePath: descriptorArchive
+                        )
+                    }
+                    guard result.rejectedMembers.isEmpty else {
+                        throw ArchiveUtilityError.rejectedArchiveEntries(result.rejectedMembers)
+                    }
+                    guard let primaryImage = result.images.first else {
+                        throw ClientImageError.notFound(
+                            id: canonicalDescriptorTargets[offset] ?? descriptor.digest
+                        )
+                    }
+                    if let target = canonicalDescriptorTargets[offset] {
+                        assignments.append(
+                            CanonicalImageAssignment(
+                                targetReference: target,
+                                image: primaryImage
+                            )
+                        )
+                        loadedReferences.append(target)
+                    } else {
+                        loadedReferences.append(contentsOf: result.images.map(\.reference))
+                    }
+                }
+
+                return ImageReplacementOutcome(
+                    value: LoadedImageArchive(
+                        references: loadedReferences,
+                        actorIDs: []
+                    ),
+                    assignments: assignments
+                )
+            },
+            afterCommit: { [identityResolver] archive in
+                var actorIDs: [String] = []
+                for reference in archive.references {
+                    actorIDs.append(
+                        (try? await identityResolver.resolveDuringMutation(
+                            reference
+                        ).dockerConfigDigest) ?? reference
+                    )
+                }
+                return LoadedImageArchive(
+                    references: archive.references,
+                    actorIDs: actorIDs
+                )
+            })
+        for image in loadedArchive.references {
             logger.info("Loaded image: \(image)")
         }
 
-        logger.info("Successfully loaded \(images.count) image(s) from tarball")
-        try await identityResolver.refresh()
-        return loadedImages
+        logger.info("Successfully loaded \(loadedArchive.references.count) image(s) from tarball")
+        return loadedArchive
+    }
+
+    private static func reference(from descriptor: Descriptor) -> String {
+        let annotations = descriptor.annotations ?? [:]
+        return annotations[AnnotationKeys.containerizationImageName]
+            ?? annotations[AnnotationKeys.containerdImageName]
+            ?? annotations[AnnotationKeys.openContainersImageName]
+            ?? "untagged@\(descriptor.digest)"
+    }
+
+    private static func setImageReference(_ reference: String, on descriptor: inout Descriptor) {
+        var annotations = descriptor.annotations ?? [:]
+        annotations[AnnotationKeys.containerizationImageName] = reference
+        annotations[AnnotationKeys.containerdImageName] = reference
+        annotations[AnnotationKeys.openContainersImageName] = reference
+        descriptor.annotations = annotations
+    }
+
+    private func canonicalLoadDescriptors(
+        _ descriptors: [Descriptor],
+        in ociLayoutPath: URL
+    ) throws -> (descriptors: [Descriptor], targets: [String?]) {
+        var groups: [String: [Descriptor]] = [:]
+        for descriptor in descriptors {
+            let original = Self.reference(from: descriptor)
+            guard let canonical = referenceManager.canonicalTag(original) else {
+                continue
+            }
+            groups[canonical, default: []].append(descriptor)
+        }
+
+        var emittedTargets: Set<String> = []
+        var canonicalDescriptors: [Descriptor] = []
+        var targets: [String?] = []
+        for descriptor in descriptors {
+            let original = Self.reference(from: descriptor)
+            guard let canonical = referenceManager.canonicalTag(original) else {
+                if try OCILayoutPruner.containsCoherentRunnableImage(
+                    for: descriptor,
+                    in: ociLayoutPath
+                ) {
+                    canonicalDescriptors.append(descriptor)
+                    targets.append(nil)
+                }
+                continue
+            }
+            guard emittedTargets.insert(canonical).inserted,
+                let grouped = groups[canonical]
+            else {
+                continue
+            }
+
+            var descriptorsByDigest: [String: [Descriptor]] = [:]
+            var unique: [Descriptor] = []
+            for member in grouped {
+                let memberArtifact = try OCILayoutPruner.artifactMetadata(
+                    for: member,
+                    in: ociLayoutPath
+                )
+                if let existing = descriptorsByDigest[member.digest] {
+                    let existingArtifacts = try existing.map {
+                        try OCILayoutPruner.artifactMetadata(
+                            for: $0,
+                            in: ociLayoutPath
+                        )
+                    }
+                    if zip(existing, existingArtifacts).contains(where: {
+                        Self.sameLoadSemantics(
+                            $0.0,
+                            member,
+                            leftArtifact: $0.1,
+                            rightArtifact: memberArtifact
+                        )
+                    }) {
+                        continue
+                    }
+                    // OCI descriptors may reuse one artifact manifest for
+                    // multiple subjects by carrying the subject association in
+                    // descriptor annotations. Those are distinct attestations,
+                    // not competing image roots. Runnable descriptors sharing a
+                    // digest but claiming different platforms remain invalid.
+                    guard memberArtifact.isArtifact,
+                        existingArtifacts.allSatisfy(\.isArtifact)
+                    else {
+                        throw ClientImageError.conflict(
+                            "conflict: archive contains multiple images for tag \(canonical)"
+                        )
+                    }
+                }
+                descriptorsByDigest[member.digest, default: []].append(member)
+                unique.append(member)
+            }
+            var canonicalDescriptor: Descriptor
+            if unique.count == 1, let only = unique.first {
+                canonicalDescriptor = only
+            } else {
+                canonicalDescriptor = try Self.synthesizedIndexDescriptor(
+                    for: unique,
+                    target: canonical,
+                    in: ociLayoutPath
+                )
+            }
+            guard
+                try OCILayoutPruner.containsCoherentRunnableImage(
+                    for: canonicalDescriptor,
+                    in: ociLayoutPath
+                )
+            else {
+                throw ClientImageError.conflict(
+                    "conflict: archive contains no coherent runnable image for tag \(canonical)"
+                )
+            }
+            Self.setImageReference(canonical, on: &canonicalDescriptor)
+            canonicalDescriptors.append(canonicalDescriptor)
+            targets.append(canonical)
+        }
+        guard !canonicalDescriptors.isEmpty else {
+            throw ClientImageError.conflict(
+                "conflict: archive contains no coherent runnable image"
+            )
+        }
+        return (canonicalDescriptors, targets)
+    }
+
+    private static func synthesizedIndexDescriptor(
+        for descriptors: [Descriptor],
+        target: String,
+        in ociLayoutPath: URL
+    ) throws -> Descriptor {
+        let manifestsOnly = descriptors.allSatisfy {
+            $0.mediaType == MediaTypes.imageManifest
+                || $0.mediaType == MediaTypes.dockerManifest
+        }
+        let described = try descriptors.map {
+            (
+                descriptor: $0,
+                artifact: try OCILayoutPruner.artifactMetadata(
+                    for: $0,
+                    in: ociLayoutPath
+                )
+            )
+        }
+        let runnable = described.filter { !$0.artifact.isArtifact }
+        let attestations = described.filter(\.artifact.isArtifact)
+        var platforms: Set<Platform> = []
+        let coherentRunnableSet = runnable.allSatisfy { described in
+            guard let platform = described.descriptor.platform else {
+                return false
+            }
+            return platforms.insert(platform).inserted
+        }
+        let runnableDigests = Set(runnable.map(\.descriptor.digest))
+        let coherentAttestations = attestations.allSatisfy { described in
+            guard let subject = described.artifact.subjectDigest else {
+                return false
+            }
+            return runnableDigests.contains(subject)
+        }
+        guard manifestsOnly,
+            !runnable.isEmpty,
+            coherentRunnableSet,
+            coherentAttestations
+        else {
+            throw ClientImageError.conflict(
+                "conflict: archive contains multiple images for tag \(target)"
+            )
+        }
+
+        // Apple's platform lookup returns the first descriptor with a matching
+        // platform and does not exclude OCI artifacts. Canonical roots loaded
+        // through Socktainer therefore keep runnable manifests before their
+        // attestations, with stable ordering inside both groups. Reporting and
+        // identity still use exact digests and never rely on this order.
+        let canonicalMembers =
+            runnable.map(\.descriptor).sorted(
+                by: Self.stableLoadDescriptorOrder
+            )
+            + attestations.map(\.descriptor).sorted(
+                by: Self.stableLoadDescriptorOrder
+            )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(Index(manifests: canonicalMembers))
+        let digest = "sha256:" + data.sha256Hex()
+        let blobURL =
+            ociLayoutPath
+            .appendingPathComponent("blobs/sha256")
+            .appendingPathComponent(String(digest.dropFirst("sha256:".count)))
+        try data.write(to: blobURL, options: .atomic)
+        return Descriptor(
+            mediaType: MediaTypes.index,
+            digest: digest,
+            size: Int64(data.count)
+        )
+    }
+
+    private static func sameLoadSemantics(
+        _ left: Descriptor,
+        _ right: Descriptor,
+        leftArtifact: OCILayoutPruner.ArtifactMetadata,
+        rightArtifact: OCILayoutPruner.ArtifactMetadata
+    ) -> Bool {
+        left.mediaType == right.mediaType
+            && left.platform == right.platform
+            && left.artifactType == right.artifactType
+            && left.annotations?["vnd.docker.reference.type"]
+                == right.annotations?["vnd.docker.reference.type"]
+            && left.annotations?["vnd.docker.reference.digest"]
+                == right.annotations?["vnd.docker.reference.digest"]
+            && leftArtifact == rightArtifact
+    }
+
+    private static func stableLoadDescriptorOrder(
+        _ left: Descriptor,
+        _ right: Descriptor
+    ) -> Bool {
+        let leftPlatform = left.platform?.description ?? ""
+        let rightPlatform = right.platform?.description ?? ""
+        if leftPlatform != rightPlatform {
+            return leftPlatform < rightPlatform
+        }
+        let leftSubject =
+            left.annotations?["vnd.docker.reference.digest"] ?? ""
+        let rightSubject =
+            right.annotations?["vnd.docker.reference.digest"] ?? ""
+        if leftSubject != rightSubject {
+            return leftSubject < rightSubject
+        }
+        return left.digest < right.digest
     }
 
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
-        var resolvedRefs: [String] = []
-
-        for reference in references {
-            do {
-                let resolved = try await identityResolver.resolve(reference)
-                logger.debug("Image exists: \(resolved.reference)")
-                resolvedRefs.append(resolved.reference)
-            } catch let error as ImageIdentityResolutionError {
-                logger.error("Image not found: \(reference)")
-                if case .ambiguous = error {
-                    throw ClientImageError.conflict("conflict: \(reference) is an ambiguous image ID")
-                }
-                throw ClientImageError.notFound(id: reference)
-            }
-        }
-
-        return try await exportTarball(resolvedReferences: resolvedRefs, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: logger)
+        try await saveWithIdentities(
+            references: references,
+            platform: platform,
+            appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+            logger: logger
+        ).url
     }
 
-    func exportTarball(resolvedReferences: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+    func saveWithIdentities(
+        references: [String],
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> SavedImageArchive {
+        try await mutationCoordinator.withMutationExcluded { [self] in
+            var resolvedReferences: [String] = []
+            var constraints: [RunnableImageIdentityConstraint] = []
+            var actorIDs: [String] = []
+
+            for reference in references {
+                do {
+                    let resolved = try await identityResolver.resolve(reference)
+                    if let platform, let implied = resolved.impliedPlatform,
+                        implied != platform
+                    {
+                        throw ClientImageError.conflict(
+                            "conflict: image \(reference) selects \(implied.description), not requested platform \(platform.description)"
+                        )
+                    }
+                    logger.debug("Image exists: \(resolved.reference)")
+                    resolvedReferences.append(resolved.reference)
+                    constraints.append(resolved.variantConstraint)
+                    actorIDs.append(resolved.dockerConfigDigest)
+                } catch let error as ImageIdentityResolutionError {
+                    logger.error("Image not found: \(reference)")
+                    if case .ambiguous = error {
+                        throw ClientImageError.conflict(
+                            "conflict: \(reference) is an ambiguous image ID"
+                        )
+                    }
+                    throw ClientImageError.notFound(id: reference)
+                }
+            }
+
+            let url = try await exportTarball(
+                resolvedReferences: resolvedReferences,
+                platform: platform,
+                constraints: constraints,
+                appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+                logger: logger
+            )
+            return SavedImageArchive(url: url, actorIDs: actorIDs)
+        }
+    }
+
+    func exportTarball(
+        resolvedReferences: [String],
+        platform: Platform?,
+        constraints: [RunnableImageIdentityConstraint]? = nil,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> URL {
         let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: tempDir,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var handedOffToResponse = false
+        defer {
+            if !handedOffToResponse {
+                try? FileManager.default.removeItem(at: tempDir)
+            }
+        }
 
         let exportPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
@@ -782,8 +2147,16 @@ struct ClientImageService: ClientImageProtocol {
             try await imageStore.save(
                 references: resolvedReferences,
                 out: exportPath,
-                platform: platform
+                platform: constraints == nil ? platform : nil
             )
+            if let constraints {
+                try OCILayoutPruner.selectExactIdentities(
+                    at: exportPath,
+                    constraints: constraints,
+                    platform: platform,
+                    logger: logger
+                )
+            }
         } catch {
             let errorDescription = String(describing: error)
             logger.error("Failed to export images: \(errorDescription)")
@@ -816,14 +2189,15 @@ struct ClientImageService: ClientImageProtocol {
 
         logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
+        handedOffToResponse = true
         return tarballPath
     }
 
     /// `docker import`: synthesizes a single-layer OCI image from `tarPath` (the
     /// raw `fromSrc=-` request body) and loads it into the image store the same
     /// way `load()` does. Returns the registered reference (nil if untagged) and
-    /// the digest `imageStore.load` assigned — the same "id" concept `list`/
-    /// `delete`/`load` already use elsewhere in this file.
+    /// the OCI config digest Docker exposes as the local image ID. Apple's
+    /// internal index/root digest remains an implementation detail.
     func importImage(
         tarPath: URL,
         repo: String?,
@@ -846,7 +2220,7 @@ struct ClientImageService: ClientImageProtocol {
         let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
 
-        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+        let synthesizedIdentity = try ContainerImageUtility.buildSingleLayerOCILayout(
             tarPath: tarPath,
             ociLayoutPath: ociLayoutPath,
             platform: platform,
@@ -856,15 +2230,32 @@ struct ClientImageService: ClientImageProtocol {
             logger: logger
         )
 
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
-        let images = try await imageStore.load(from: ociLayoutPath, progress: nil)
-        guard let image = images.first else {
-            throw ClientImageError.notFound(id: reference ?? "imported image")
+        let archivePath = tempDir.appendingPathComponent("import-image.tar")
+        try ArchiveUtility.create(tarPath: archivePath, from: ociLayoutPath)
+        let image = try await replacingImages(targeting: reference.map { [$0] } ?? []) {
+            let result = try await archiveLoader.load(
+                ociLayoutPath: ociLayoutPath,
+                archivePath: archivePath
+            )
+            guard result.rejectedMembers.isEmpty else {
+                throw ArchiveUtilityError.rejectedArchiveEntries(result.rejectedMembers)
+            }
+            guard let image = result.images.first else {
+                throw ClientImageError.notFound(id: reference ?? "imported image")
+            }
+            return ImageReplacementOutcome(
+                value: image,
+                assignments: reference.map {
+                    [CanonicalImageAssignment(targetReference: $0, image: image)]
+                } ?? []
+            )
         }
 
         logger.info("Imported image \(image.reference) (\(image.digest))")
-        try await identityResolver.refresh()
-        return (reference, image.digest)
+        return (
+            reference,
+            "sha256:\(synthesizedIdentity.configDigest)"
+        )
     }
 
     /// Mirrors moby's `httputils.RepoTagReference`: empty repo means an

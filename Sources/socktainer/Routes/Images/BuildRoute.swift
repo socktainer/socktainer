@@ -6,6 +6,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import ContainerizationOS
+import Darwin
 import DataCompression
 import Foundation
 import NIO
@@ -17,15 +18,43 @@ struct BuildRoute: RouteCollection {
     let client: ClientContainerProtocol
     let builderClient: ClientBuilderProtocol
     let systemConfig: ContainerSystemConfig
+    let imageClient: any ClientImageProtocol
+    let appleContainerAppSupportURL: URL
+    let imageMutationCoordinator: ImageMutationCoordinator
 
-    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) {
+    init(
+        client: ClientContainerProtocol,
+        builderClient: ClientBuilderProtocol,
+        systemConfig: ContainerSystemConfig,
+        imageClient: (any ClientImageProtocol)? = nil,
+        appleContainerAppSupportURL: URL? = nil,
+        imageMutationCoordinator: ImageMutationCoordinator =
+            ImageMutationCoordinator()
+    ) {
         self.client = client
         self.builderClient = builderClient
         self.systemConfig = systemConfig
+        self.imageClient = imageClient ?? ClientImageService(containerSystemConfig: systemConfig)
+        self.appleContainerAppSupportURL =
+            appleContainerAppSupportURL
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Application Support/com.apple.container")
+        self.imageMutationCoordinator = imageMutationCoordinator
     }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient, systemConfig: systemConfig))
+        try routes.registerVersionedRoute(
+            .POST,
+            pattern: "/build",
+            use: BuildRoute.handler(
+                client: client,
+                builderClient: builderClient,
+                systemConfig: systemConfig,
+                imageClient: imageClient,
+                appleContainerAppSupportURL: appleContainerAppSupportURL,
+                imageMutationCoordinator: imageMutationCoordinator
+            )
+        )
 
     }
 
@@ -72,6 +101,78 @@ struct RESTBuildQuery: Vapor.Content {
 }
 
 extension BuildRoute {
+    static func builtImageID(
+        loadedReferences: [String],
+        capturedActorIDs: [String],
+        identities: [String: String],
+        fallback: String
+    ) -> String {
+        capturedActorIDs.first
+            ?? loadedReferences.compactMap { identities[$0] }.first
+            ?? fallback
+    }
+
+    /// Classic `/build` requests are disk-backed, but still need a finite
+    /// compressed-input ceiling. Sixteen GiB accommodates unusually large
+    /// monorepo contexts while preventing one client from streaming until the
+    /// builder volume is exhausted. Expanded members have a separate 64-GiB
+    /// ceiling in `ArchiveUtility.ExtractionLimits.buildContext`.
+    private static let maxBuildContextBodySize = 16 * 1024 * 1024 * 1024
+    private static let maxDockerfileSize = 16 * 1024 * 1024
+    /// Owns all response-side resources. The managed response stream awaits
+    /// this function, so it cannot outlive the channel callback. Disconnects
+    /// propagate as cancellation; ordinary build failures remain Docker JSON
+    /// error frames and end the response normally.
+    static func produceBuildResponse(
+        stagingRoot: URL,
+        writer: any AsyncBodyStreamWriter,
+        logger: Logger,
+        heartbeatInterval: Duration =
+            DisconnectCoupledResponseStream.defaultHeartbeatInterval,
+        operation: @Sendable @escaping (any AsyncBodyStreamWriter) async throws -> Void
+    ) async throws {
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        do {
+            try await DisconnectCoupledResponseStream.run(
+                writer: writer,
+                heartbeatInterval: heartbeatInterval,
+                operation: operation
+            )
+        } catch DisconnectCoupledResponseStream.ProducerError.clientDisconnected {
+            logger.debug("Build client disconnected; cancelling build")
+            throw CancellationError()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.error("Build failed: \(error)")
+
+            let errorMessage =
+                error is ContainerizationError
+                ? "\(error)" : error.localizedDescription
+            let errorResponse: [String: Any] = [
+                "errorDetail": ["message": errorMessage],
+                "error": errorMessage,
+            ]
+
+            if let jsonData = try? JSONSerialization.data(
+                withJSONObject: errorResponse
+            ), let jsonString = String(data: jsonData, encoding: .utf8) {
+                try await writer.write(
+                    .buffer(ByteBuffer(string: jsonString + "\n"))
+                )
+            } else {
+                let fallbackError = """
+                    {"errorDetail":{"message":"Build failed"},"error":"Build failed"}
+
+                    """
+                try await writer.write(
+                    .buffer(ByteBuffer(string: fallbackError))
+                )
+            }
+        }
+    }
+
     /// Parses a Docker API build query parameter (`buildargs` or `labels`).
     ///
     /// The Docker Engine API sends these as a JSON-encoded `{"KEY":"VALUE"}` map.
@@ -82,6 +183,130 @@ extension BuildRoute {
             let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
         else { return [] }
         return dict.map { "\($0.key)=\($0.value)" }
+    }
+
+    static func parseBuildPlatforms(_ value: String) throws -> Set<Platform> {
+        if value.isEmpty {
+            return [
+                Platform(
+                    arch: Arch.hostArchitecture().rawValue,
+                    os: "linux"
+                )
+            ]
+        }
+        do {
+            return [try Platform(from: value)]
+        } catch {
+            throw Abort(.badRequest, reason: "invalid platform: \(value)")
+        }
+    }
+
+    /// Reads a Dockerfile through a no-follow descriptor chain rooted in the
+    /// staged context. Lexical normalization alone is insufficient because an
+    /// archive may contain a symlink whose target leaves the extraction root.
+    static func readDockerfile(
+        named name: String,
+        in contextDirectory: String
+    ) throws -> Data {
+        guard !name.isEmpty,
+            !name.hasPrefix("/"),
+            !name.utf8.contains(0)
+        else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "Dockerfile path must be relative to the build context"
+            )
+        }
+
+        var components: [String] = []
+        for component in name.split(
+            separator: "/",
+            omittingEmptySubsequences: true
+        ) {
+            if component == "." { continue }
+            guard component != ".." else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "Dockerfile path escapes the build context: \(name)"
+                )
+            }
+            components.append(String(component))
+        }
+        guard !components.isEmpty else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "Dockerfile path must name a regular file"
+            )
+        }
+
+        var fileDescriptor = open(
+            contextDirectory,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard fileDescriptor >= 0 else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "build context is not a readable directory"
+            )
+        }
+        defer { close(fileDescriptor) }
+
+        for (index, component) in components.enumerated() {
+            let isFinal = index == components.count - 1
+            let flags =
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+                | (isFinal ? 0 : O_DIRECTORY)
+            let nextDescriptor = openat(
+                fileDescriptor,
+                component,
+                flags
+            )
+            guard nextDescriptor >= 0 else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "Dockerfile is missing or leaves the build context: \(name)"
+                )
+            }
+            close(fileDescriptor)
+            fileDescriptor = nextDescriptor
+        }
+
+        var status = stat()
+        guard fstat(fileDescriptor, &status) == 0,
+            status.st_mode & S_IFMT == S_IFREG,
+            status.st_size >= 0,
+            status.st_size <= Int64(maxDockerfileSize)
+        else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "Dockerfile must be a regular file no larger than \(maxDockerfileSize) bytes"
+            )
+        }
+
+        var result = Data()
+        result.reserveCapacity(Int(status.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            try Task.checkCancellation()
+            let bytesRead = buffer.withUnsafeMutableBytes {
+                read(fileDescriptor, $0.baseAddress, $0.count)
+            }
+            guard bytesRead >= 0 else {
+                throw ContainerizationError(
+                    .unknown,
+                    message: "failed to read Dockerfile: \(name)"
+                )
+            }
+            guard bytesRead > 0 else { break }
+            guard result.count <= maxDockerfileSize - bytesRead else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "Dockerfile exceeds the \(maxDockerfileSize)-byte limit"
+                )
+            }
+            result.append(contentsOf: buffer.prefix(bytesRead))
+        }
+        return result
     }
 
     /// Appends a zero-filled end-of-archive terminator to a received build
@@ -106,8 +331,74 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
-    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
-    {
+    struct StagedBuildContext: Sendable {
+        let rootDirectory: URL
+        let contextDirectory: URL
+        let bodyBytes: Int
+    }
+
+    /// Stages one classic Build API context in a mode-0700 directory. The
+    /// returned root belongs to the caller and must be removed after the build;
+    /// every error/cancellation path is cleaned here before it escapes.
+    static func stageBuildContext<Chunks: AsyncSequence>(
+        _ chunks: Chunks,
+        in parent: URL,
+        maxBodyBytes: Int = maxBuildContextBodySize,
+        extractionLimits: ArchiveUtility.ExtractionLimits = .buildContext
+    ) async throws -> StagedBuildContext
+    where Chunks.Element == ByteBuffer {
+        try FileManager.default.createDirectory(
+            at: parent,
+            withIntermediateDirectories: true
+        )
+        let root =
+            try RequestBodyFileWriter
+            .createSecureTemporaryDirectory(in: parent)
+        var completed = false
+        defer {
+            if !completed {
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+
+        let tarPath = root.appendingPathComponent("context.tar")
+        let bodyBytes = try await RequestBodyFileWriter.write(
+            chunks,
+            to: tarPath,
+            maxBytes: maxBodyBytes,
+            kind: "build context"
+        )
+        guard bodyBytes > 0 else {
+            throw Abort(
+                .badRequest,
+                reason: "build context body is required"
+            )
+        }
+
+        try appendTarTerminator(to: tarPath)
+        let contextDirectory = root.appendingPathComponent("context")
+        try ArchiveUtility.extract(
+            tarPath: tarPath,
+            to: contextDirectory,
+            limits: extractionLimits,
+            transactional: true
+        )
+        completed = true
+        return StagedBuildContext(
+            rootDirectory: root,
+            contextDirectory: contextDirectory,
+            bodyBytes: bodyBytes
+        )
+    }
+
+    static func handler(
+        client: ClientContainerProtocol,
+        builderClient: ClientBuilderProtocol,
+        systemConfig: ContainerSystemConfig,
+        imageClient: any ClientImageProtocol,
+        appleContainerAppSupportURL: URL,
+        imageMutationCoordinator: ImageMutationCoordinator
+    ) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
 
@@ -130,7 +421,50 @@ extension BuildRoute {
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
             let platform = query.platform!
+            let platforms = try Self.parseBuildPlatforms(platform)
             let memory = query.memory ?? 2_048_000_000  // 2GB default
+
+            let declaredBodyLength =
+                req.headers.first(
+                    name: .contentLength
+                ).flatMap(Int.init) ?? 0
+            let hasBody =
+                req.body.data != nil || declaredBodyLength > 0
+                || req.headers.first(name: "transfer-encoding")?
+                    .lowercased() == "chunked"
+            guard hasBody else {
+                throw Abort(
+                    .badRequest,
+                    reason: "build context body is required"
+                )
+            }
+
+            let appSupportDir =
+                appleContainerAppSupportURL
+                .appendingPathComponent("builder", isDirectory: true)
+            let staged: StagedBuildContext
+            do {
+                staged = try await Self.stageBuildContext(
+                    req.body,
+                    in: appSupportDir
+                )
+            } catch {
+                if error is CancellationError || error is Abort {
+                    throw error
+                }
+                req.logger.error("Failed to stage build context: \(error)")
+                throw Abort(
+                    .badRequest,
+                    reason: "Failed to extract tar archive: \(error.localizedDescription)"
+                )
+            }
+            let tempContextDir = staged.rootDirectory
+            var responseOwnsContext = false
+            defer {
+                if !responseOwnsContext {
+                    try? FileManager.default.removeItem(at: tempContextDir)
+                }
+            }
 
             do {
                 try await builderClient.ensureReachable(
@@ -139,185 +473,49 @@ extension BuildRoute {
                     logger: req.logger
                 )
             } catch {
-                throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
+                throw Abort(
+                    .serviceUnavailable,
+                    reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)"
+                )
             }
-
-            // Extract tar archive from request body and unpack to temporary directory
-            let contextDir: String
-            let buildUUID = UUID().uuidString
-            let appSupportDir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-                .appendingPathComponent("com.apple.container/builder")
-            let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
-
-            do {
-                // Create temporary directory for build context
-                try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
-
-                // Check if we have a request body to process
-                let hasBody = req.body.data != nil || req.headers.first(name: "transfer-encoding")?.lowercased() == "chunked"
-
-                if hasBody {
-
-                    // Write the body data to a temporary tar file using streaming
-                    let tarPath = tempContextDir.appendingPathComponent("context.tar")
-                    var fileHandle: FileHandle?
-                    var totalBytesWritten = 0
-
-                    do {
-                        // Create the tar file and open file handle for writing
-                        FileManager.default.createFile(atPath: tarPath.path, contents: nil)
-                        fileHandle = try FileHandle(forWritingTo: tarPath)
-
-                        // Stream the body directly to the tar file without loading into memory
-                        if let bodyData = req.body.data {
-                            // Direct body data available
-                            let data = Data(buffer: bodyData)
-                            try fileHandle?.write(contentsOf: data)
-                            totalBytesWritten = data.count
-                        } else {
-                            var chunkCount = 0
-                            for try await var chunk in req.body {
-                                guard let data = chunk.readData(length: chunk.readableBytes) else {
-                                    continue
-                                }
-                                chunkCount += 1
-                                try fileHandle?.write(contentsOf: data)
-                                totalBytesWritten += data.count
-                            }
-                        }
-
-                        try fileHandle?.synchronize()
-                        try fileHandle?.close()
-                        fileHandle = nil
-                    } catch {
-                        // Clean up file handle and partial tar file on error
-                        try? fileHandle?.close()
-                        try? FileManager.default.removeItem(at: tarPath)
-                        req.logger.error("Failed to stream body to tar file: \(error)")
-                        throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
-                    }
-
-                    if totalBytesWritten > 0 {
-                        guard FileManager.default.fileExists(atPath: tarPath.path),
-                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
-                            let fileSize = fileAttributes[.size] as? Int64,
-                            fileSize > 0
-                        else {
-                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
-                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
-                        }
-
-                        // `docker compose build` (classic builder) streams a build
-                        // context whose final tar entry is not padded out to a 512-byte
-                        // block and which omits the end-of-archive marker. The Docker
-                        // daemon's Go tar reader tolerates this, but libarchive treats
-                        // the short final block as a truncated archive and aborts
-                        // extraction. Append a terminator of zero bytes so the last
-                        // entry's block is completed and a valid end-of-archive marker
-                        // is present. Trailing zeros after a well-formed archive are
-                        // ignored, so this is safe for already-terminated contexts too.
-                        try Self.appendTarTerminator(to: tarPath)
-
-                        // Extract the tar archive
-                        let extractDir = tempContextDir.appendingPathComponent("context")
-                        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
-
-                        do {
-                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
-                        } catch {
-                            req.logger.error("Tar extraction failed: \(error)")
-
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
-                        }
-                        contextDir = extractDir.path
-                    } else {
-                        req.logger.warning("No data received in request body")
-                        contextDir = "."
-                    }
-                } else {
-                    // No body provided, use current directory as fallback
-                    req.logger.warning("No build context provided in request body, using current directory as fallback")
-                    contextDir = "."
-                }
-            } catch {
-                // Clean up on error
-                try? FileManager.default.removeItem(at: tempContextDir)
-                throw error
-            }
+            let contextDir = staged.contextDirectory.path
 
             let buildArgs = BuildRoute.parseBuildQueryParam(query.buildargs)
             let labels = BuildRoute.parseBuildQueryParam(query.labels)
 
-            // Create streaming response for build output
-            let body = Response.Body { writer in
-                Task.detached {
-                    do {
-                        try await BuildRoute.performBuild(
-                            dockerfile: dockerfile,
-                            contextDir: contextDir,
-                            targetImageName: targetImageName,
-                            buildArgs: buildArgs,
-                            labels: labels,
-                            noCache: noCache,
-                            pull: pull,
-                            target: target,
-                            platform: platform,
-                            memory: memory,
-                            quiet: quiet,
-                            builderClient: builderClient,
-                            systemConfig: systemConfig,
-                            writer: writer,
-                            logger: req.logger
-                        )
-
-                        // Clean up temporary context directory if it was created
-                        if contextDir != "." {
-                            try? FileManager.default.removeItem(at: tempContextDir)
-                        }
-                    } catch {
-                        req.logger.error("Build failed: \(error)")
-
-                        // Extract error message - prioritize ContainerizationError message
-                        let errorMessage: String
-                        if error is ContainerizationError {
-                            // Use string interpolation to get ContainerizationError's description
-                            errorMessage = "\(error)"
-                        } else {
-                            errorMessage = error.localizedDescription
-                        }
-
-                        // Docker API compliant error response
-                        let errorDetail: [String: Any] = [
-                            "message": errorMessage
-                        ]
-
-                        let errorResponse: [String: Any] = [
-                            "errorDetail": errorDetail,
-                            "error": errorMessage,
-                        ]
-
-                        if let jsonData = try? JSONSerialization.data(withJSONObject: errorResponse),
-                            let jsonString = String(data: jsonData, encoding: .utf8)
-                        {
-                            _ = writer.write(.buffer(ByteBuffer(string: jsonString + "\n")))
-                        } else {
-                            let fallbackError = """
-                                {"errorDetail":{"message":"Build failed"},"error":"Build failed"}
-
-                                """
-                            _ = writer.write(.buffer(ByteBuffer(string: fallbackError)))
-                        }
-
-                        // Clean up temporary context directory on error
-                        if contextDir != "." {
-                            try? FileManager.default.removeItem(at: tempContextDir)
-                        }
-                        _ = writer.write(.end)
-                    }
+            // Vapor owns and awaits this producer. The build is therefore a
+            // child of the response stream instead of an unstructured task.
+            let logger = req.logger
+            let body = Response.Body(managedAsyncStream: { writer in
+                try await BuildRoute.produceBuildResponse(
+                    stagingRoot: tempContextDir,
+                    writer: writer,
+                    logger: logger
+                ) { writer in
+                    try await BuildRoute.performBuild(
+                        dockerfile: dockerfile,
+                        contextDir: contextDir,
+                        targetImageName: targetImageName,
+                        buildArgs: buildArgs,
+                        labels: labels,
+                        noCache: noCache,
+                        pull: pull,
+                        target: target,
+                        platforms: platforms,
+                        memory: memory,
+                        quiet: quiet,
+                        builderClient: builderClient,
+                        systemConfig: systemConfig,
+                        imageClient: imageClient,
+                        appleContainerAppSupportURL: appleContainerAppSupportURL,
+                        imageMutationCoordinator: imageMutationCoordinator,
+                        writer: writer,
+                        logger: logger
+                    )
                 }
-            }
+            })
 
-            return Response(
+            let response = Response(
                 status: .ok,
                 headers: [
                     "Content-Type": "application/json",
@@ -325,6 +523,8 @@ extension BuildRoute {
                 ],
                 body: body
             )
+            responseOwnsContext = true
+            return response
         }
     }
 
@@ -337,81 +537,61 @@ extension BuildRoute {
         noCache: Bool,
         pull: Bool,
         target: String,
-        platform: String,
+        platforms: Set<Platform>,
         memory: Int,
         quiet: Bool,
         builderClient: ClientBuilderProtocol,
         systemConfig: ContainerSystemConfig,
-        writer: BodyStreamWriter,
+        imageClient: any ClientImageProtocol,
+        appleContainerAppSupportURL: URL,
+        imageMutationCoordinator: ImageMutationCoordinator,
+        writer: any AsyncBodyStreamWriter,
         logger: Logger
     ) async throws {
 
         // Helper function to send Docker API compliant streaming messages
-        @Sendable func sendStreamMessage(_ message: String) {
+        @Sendable func sendStreamMessage(_ message: String) async throws {
             // Preserve the original message with its formatting
             let streamResponse: [String: Any] = ["stream": message + "\n"]
             if let jsonData = try? JSONSerialization.data(withJSONObject: streamResponse),
                 let jsonString = String(data: jsonData, encoding: .utf8)
             {
-                let result = writer.write(.buffer(ByteBuffer(string: jsonString + "\n")))
-
-                // Log write failures for debugging but don't crash
-                result.whenFailure { error in
-                    logger.debug("BuildRoute: Write failed - \(error)")
-                }
-            }
-        }
-
-        func sendProgressMessage(id: String, status: String, progressDetail: [String: Any]? = nil) {
-            var response: [String: Any] = [
-                "id": id,
-                "status": status,
-            ]
-            if let detail = progressDetail {
-                response["progressDetail"] = detail
-            }
-
-            if let jsonData = try? JSONSerialization.data(withJSONObject: response),
-                let jsonString = String(data: jsonData, encoding: .utf8)
-            {
-                let result = writer.write(.buffer(ByteBuffer(string: jsonString + "\n")))
-                result.whenFailure { error in
-                    logger.debug("BuildRoute: Progress message write failed - \(error)")
-                }
+                try await writer.write(
+                    .buffer(ByteBuffer(string: jsonString + "\n"))
+                )
             }
         }
 
         // Send initial build started message
-        sendStreamMessage("Step 1/1 : Starting build for \(targetImageName)")
+        try await sendStreamMessage(
+            "Step 1/1 : Starting build for \(targetImageName)"
+        )
 
         let timeout: Duration = .seconds(300)
 
-        sendStreamMessage(" ---> Connecting to build daemon")
-
-        let builder = try await builderClient.connect(
-            timeout: timeout,
-            retryInterval: .seconds(1),
-            logger: logger
+        try await sendStreamMessage(" ---> Reading Dockerfile")
+        logger.info("Reading Dockerfile \(dockerfile) from staged build context")
+        let dockerfileData = try Self.readDockerfile(
+            named: dockerfile,
+            in: contextDir
         )
-        sendStreamMessage(" ---> Successfully connected to builder")
 
-        // resolve the full path to the Dockerfile
-        sendStreamMessage(" ---> Reading Dockerfile")
-        let dockerfilePath = URL(fileURLWithPath: contextDir).appendingPathComponent(dockerfile).path
-        logger.info("Reading Dockerfile at path: \(dockerfilePath)")
-
-        guard let dockerfileData = try? Data(contentsOf: URL(filePath: dockerfilePath)) else {
-            throw ContainerizationError(.invalidArgument, message: "Dockerfile does not exist at path: \(dockerfilePath)")
-        }
-
-        sendStreamMessage(" ---> Setting up build environment")
+        try await sendStreamMessage(" ---> Setting up build environment")
 
         // Setup temp directory - must use the builder export path that's mounted in buildkit container
-        let builderExportPath = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            .appendingPathComponent("com.apple.container/builder")
+        let builderExportPath =
+            appleContainerAppSupportURL
+            .appendingPathComponent("builder", isDirectory: true)
         let buildID = UUID().uuidString
         let tempURL = builderExportPath.appendingPathComponent(buildID)
-        try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
+        try FileManager.default.createDirectory(
+            at: tempURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // Keep `out.tar` until image loading has completely consumed it, then
+        // remove the whole per-build export on success, error, or cancellation.
+        defer { try? FileManager.default.removeItem(at: tempURL) }
 
         // Validate and normalize image name
         let imageName: String = try {
@@ -428,14 +608,6 @@ extension BuildRoute {
             }
             return exp
         }
-
-        // Parse platforms
-        let platforms: Set<Platform> = {
-            guard platform.isEmpty else {
-                return [try! Platform(from: platform)]
-            }
-            return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
-        }()
 
         // Build configuration
         let config = AppleContainerCompatibility.makeBuildConfig(
@@ -464,14 +636,30 @@ extension BuildRoute {
                 containerSystemConfig: systemConfig
             ))
 
-        sendStreamMessage(" ---> Starting build process")
+        try await sendStreamMessage(" ---> Connecting to build daemon")
+        let builderSession = try await builderClient.connect(
+            timeout: timeout,
+            retryInterval: .seconds(1),
+            logger: logger
+        )
+        try await sendStreamMessage(" ---> Successfully connected to builder")
+        try await sendStreamMessage(" ---> Starting build process")
 
-        // Run build directly without output capture
-        try await builder.build(config)
+        // Apple image GC computes its keep-set solely from registered image
+        // roots. ContainerBuild stages context and intermediate OCI objects in
+        // the same remote content store before the final OCI export is rooted.
+        // Exclude delete/prune GC for that vulnerable phase; release the lock
+        // before `imageClient.load`, which is itself a coordinated mutation.
+        try await BuilderSessionLifecycle.withSession(builderSession) {
+            session in
+            try await imageMutationCoordinator.withMutationExcluded {
+                try await session.build(config)
+            }
+        }
 
-        sendStreamMessage(" ---> Build process completed")
+        try await sendStreamMessage(" ---> Build process completed")
 
-        sendStreamMessage(" ---> Build completed, processing image")
+        try await sendStreamMessage(" ---> Build completed, processing image")
 
         // Load and unpack the built image
         let destPath = tempURL.appendingPathComponent("out.tar")
@@ -487,18 +675,52 @@ extension BuildRoute {
             }
             throw ContainerizationError(.unknown, message: "Build completed but no output image found at \(destPath.path)")
         }
-        sendStreamMessage(" ---> Loading built image")
+        try await sendStreamMessage(" ---> Loading built image")
 
-        let loaded = try await ClientImage.load(from: destPath.absolutePath())
-
-        for image in loaded.images {
-            sendStreamMessage(" ---> Unpacking image layers")
-            try await image.unpack(platform: nil, progressUpdate: { _ in })
+        let loadedReferences: [String]
+        let capturedActorIDs: [String]
+        if let identityLoadingClient =
+            imageClient as? any ImageLoadingWithIdentity
+        {
+            let loaded = try await identityLoadingClient.loadWithIdentities(
+                tarballPath: destPath,
+                platform: platforms.first ?? .current,
+                appleContainerAppSupportUrl: appleContainerAppSupportURL,
+                logger: logger
+            )
+            loadedReferences = loaded.references
+            capturedActorIDs = loaded.actorIDs
+        } else {
+            loadedReferences = try await imageClient.load(
+                tarballPath: destPath,
+                platform: platforms.first ?? .current,
+                appleContainerAppSupportUrl: appleContainerAppSupportURL,
+                logger: logger
+            )
+            capturedActorIDs = []
         }
+        guard !loadedReferences.isEmpty else {
+            throw ContainerizationError(
+                .notFound,
+                message: "builder output did not contain a loadable image"
+            )
+        }
+        try await sendStreamMessage(
+            " ---> Loaded \(loadedReferences.joined(separator: ", "))"
+        )
 
-        // Send success message in Docker API format
-        sendStreamMessage("Successfully built \(imageName)")
+        // Docker's classic build stream reports the immutable image config ID,
+        // not the requested tag or Apple's index/root descriptor.
+        let identities =
+            capturedActorIDs.isEmpty
+            ? await imageClient.digestsByReference() : [:]
+        let builtID = builtImageID(
+            loadedReferences: loadedReferences,
+            capturedActorIDs: capturedActorIDs,
+            identities: identities,
+            fallback: imageName
+        )
+        try await sendStreamMessage("Successfully built \(builtID)")
 
-        _ = writer.write(.end)
     }
 }

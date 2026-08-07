@@ -211,6 +211,31 @@ Moby's embedded BuildKit protocol, while Apple Container exposes a different nat
 builder service. Select the `docker-container` builder explicitly when another
 Docker context has previously selected a different builder.
 
+`default-load=true` is a supported prerequisite, not an optional optimization.
+Compose and `docker build` expect a successful build to replace the selected local
+tag. Without the driver option, an invocation that omits `--load` leaves its result
+only in the builder cache, exactly as Buildx documents for non-default drivers.
+
+### Image names, IDs, and repeated builds
+
+Docker has one owner for a normalized tag such as
+`docker.io/library/example:latest`. Apple Container stores exact OCI reference
+strings, so `example:latest` and its normalized spelling can otherwise coexist as
+different roots. Socktainer reconciles that mismatch at its image mutation
+boundary:
+
+- build/load, pull, import, and tag serialize changes to a Docker tag;
+- the normalized reference becomes the sole Docker-visible owner;
+- stale familiar spellings and legacy annotation-only owners are retired; and
+- displaced content remains addressable by its full OCI digest when it no longer
+  has another real tag.
+
+Inspect, create, remove, save, history, and tag accept Docker-emitted root,
+manifest, and config digests as well as names. True collisions—such as a digest
+prefix matching multiple roots—still return an ambiguity error rather than picking
+an arbitrary image. Internal digest-retention references are hidden from
+`RepoTags`, so removing a current tag cannot expose an older build under that name.
+
 Registry credential helpers named in `~/.docker/config.json` must be installed and
 available on `PATH`. A stale `credsStore` entry causes BuildKit registry requests to
 fail before Socktainer is involved; fix the helper or use a dedicated Docker config

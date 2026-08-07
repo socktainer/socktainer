@@ -32,6 +32,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
+        .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
         .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.2.0"),
     ],
     targets: [
@@ -48,11 +49,14 @@ let package = Package(
                 .product(name: "ContainerizationArchive", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),
                 .product(name: "ContainerizationExtras", package: "containerization"),
+                .product(name: "ContainerizationOS", package: "containerization"),
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "DataCompression", package: "DataCompression"),
+                .product(name: "libzstd", package: "zstd"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
+                "CFilteredStream",
                 "BuildInfo",
             ]
         ),
@@ -63,7 +67,16 @@ let package = Package(
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 .product(name: "VaporTesting", package: "vapor"),
+                .product(name: "libzstd", package: "zstd"),
             ],
+        ),
+        .target(
+            name: "CFilteredStream",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedLibrary("archive"),
+                .linkedLibrary("lzma"),
+            ]
         ),
         .target(
             name: "BuildInfo",

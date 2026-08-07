@@ -218,14 +218,16 @@ struct ExecRoute: RouteCollection {
 
             let id = await ExecManager.shared.create(config: config)
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                var attrs = LabelNormalization.restore(container.configuration.labels)
+                var attrs = ContainerImageIdentity.dockerLabels(for: container)
                 attrs["execID"] = id
                 // Docker formats the action as "exec_create: <command>" (action + ": " + cmd).
                 let event = DockerEvent.simpleEvent(
                     id: DockerContainerID.hexId(for: container),
                     type: "container",
                     status: "exec_create: \(config.cmd.joined(separator: " "))",
-                    image: container.configuration.image.reference,
+                    image: ContainerImageIdentity.requestedReference(
+                        for: container
+                    ),
                     name: container.id,
                     labels: attrs
                 )
@@ -295,9 +297,11 @@ struct ExecRoute: RouteCollection {
             // (after process.start() succeeds), so a failed exec emits no started event.
             let execBroadcaster = req.application.storage[EventBroadcasterKey.self]
             let execEventHexId = DockerContainerID.hexId(for: container)
-            let execEventImage = container.configuration.image.reference
+            let execEventImage = ContainerImageIdentity.requestedReference(
+                for: container
+            )
             let execEventName = container.id
-            let execEventLabels = LabelNormalization.restore(container.configuration.labels)
+            let execEventLabels = ContainerImageIdentity.dockerLabels(for: container)
             // Docker formats the action as "exec_start: <command>" (action + ": " + cmd).
             let execStartAction = "exec_start: \(config.cmd.joined(separator: " "))"
 

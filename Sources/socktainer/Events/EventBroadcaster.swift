@@ -84,9 +84,9 @@ extension DockerEvent {
             id: DockerContainerID.hexId(for: container),
             type: "container",
             status: action,
-            image: container.configuration.image.reference,
+            image: ContainerImageIdentity.requestedReference(for: container),
             name: container.id,
-            labels: LabelNormalization.restore(container.configuration.labels),
+            labels: ContainerImageIdentity.dockerLabels(for: container),
             extraAttributes: extraAttributes
         )
     }

@@ -5,6 +5,7 @@ import ContainerResource
 import Containerization
 import ContainerizationError
 import ContainerizationExtras
+import ContainerizationOCI
 import Foundation
 import Logging
 import Vapor
@@ -13,15 +14,53 @@ struct ContainerCreateRoute: RouteCollection {
     let client: ClientContainerProtocol
     let systemConfig: ContainerSystemConfig
     let identityResolver: ImageIdentityResolver
+    let imageLeaseManager: any ContainerImageLeasing
+    let imageLeaseReservations: ContainerImageLeaseReservationRegistry
+    let imageLeaseReconciler: any ContainerImageLeaseReconciling
+    let nativeContainerCreator: any NativeContainerCreating
+    let runnableImageSelector: RunnableImageSelector
+    let snapshotProvider: any RunnableImageSnapshotProviding
+    let rootFSMaterializer: ContainerRootFSMaterializer
 
     init(
         client: ClientContainerProtocol,
         systemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        appSupportURL: URL? = nil,
+        imageLeaseManager: any ContainerImageLeasing =
+            LiveContainerImageLeaseManager(),
+        imageLeaseReservations: ContainerImageLeaseReservationRegistry =
+            .shared,
+        imageLeaseReconciler: any ContainerImageLeaseReconciling =
+            RegisteredContainerImageLeaseReconciler(),
+        nativeContainerCreator: any NativeContainerCreating =
+            LiveNativeContainerCreator(),
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector(),
+        snapshotProvider: (any RunnableImageSnapshotProviding)? = nil
     ) {
+        let resolvedAppSupportURL =
+            appSupportURL ?? Self.defaultAppSupportURL()
         self.client = client
         self.systemConfig = systemConfig
-        self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        self.identityResolver =
+            identityResolver
+            ?? ImageIdentityResolver(
+                systemConfig: systemConfig,
+                appSupportURL: resolvedAppSupportURL
+            )
+        self.imageLeaseManager = imageLeaseManager
+        self.imageLeaseReservations = imageLeaseReservations
+        self.imageLeaseReconciler = imageLeaseReconciler
+        self.nativeContainerCreator = nativeContainerCreator
+        self.runnableImageSelector = runnableImageSelector
+        self.snapshotProvider =
+            snapshotProvider
+            ?? LiveRunnableImageSnapshotProvider(
+                appSupportURL: resolvedAppSupportURL
+            )
+        self.rootFSMaterializer = ContainerRootFSMaterializer(
+            appSupportURL: resolvedAppSupportURL
+        )
     }
 
     func boot(routes: RoutesBuilder) throws {
@@ -31,18 +70,30 @@ struct ContainerCreateRoute: RouteCollection {
             use: ContainerCreateRoute.handler(
                 client: client,
                 systemConfig: systemConfig,
-                identityResolver: identityResolver
+                identityResolver: identityResolver,
+                imageLeaseManager: imageLeaseManager,
+                imageLeaseReservations: imageLeaseReservations,
+                imageLeaseReconciler: imageLeaseReconciler,
+                nativeContainerCreator: nativeContainerCreator,
+                runnableImageSelector: runnableImageSelector,
+                snapshotProvider: snapshotProvider,
+                rootFSMaterializer: rootFSMaterializer
             )
         )
     }
 
 }
 
-struct ContainerCreateQuery: Content {
+struct PreparedRunnableImage: Sendable {
+    let variant: RunnableImageVariant
+    let snapshot: RunnableImageSnapshot
+}
+
+struct ContainerCreateQuery: Vapor.Content {
     var name: String?
     var platform: String?
 }
-struct CreateContainerRequest: Content {
+struct CreateContainerRequest: Vapor.Content {
     let Image: String
     let Hostname: String?
     let Domainname: String?
@@ -74,6 +125,14 @@ struct CreateContainerRequest: Content {
 }
 
 extension ContainerCreateRoute {
+    static func defaultAppSupportURL() -> URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(
+                "Library/Application Support/com.apple.container",
+                isDirectory: true
+            )
+    }
+
     /// Docker's privileged mode grants the complete Linux capability set and
     /// supersedes per-capability additions/removals. Apple Container expresses
     /// that contract as `capAdd = ["ALL"]`; this is required by nested runtimes
@@ -91,16 +150,38 @@ extension ContainerCreateRoute {
     static func handler(
         client: ClientContainerProtocol,
         systemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        imageLeaseManager: any ContainerImageLeasing =
+            LiveContainerImageLeaseManager(),
+        imageLeaseReservations: ContainerImageLeaseReservationRegistry =
+            .shared,
+        imageLeaseReconciler: any ContainerImageLeaseReconciling =
+            RegisteredContainerImageLeaseReconciler(),
+        nativeContainerCreator: any NativeContainerCreating =
+            LiveNativeContainerCreator(),
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector(),
+        snapshotProvider: (any RunnableImageSnapshotProviding)? = nil,
+        rootFSMaterializer: ContainerRootFSMaterializer? = nil
     ) -> @Sendable (Request) async throws -> Response {
-        let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        let appSupportURL = Self.defaultAppSupportURL()
+        let resolver =
+            identityResolver
+            ?? ImageIdentityResolver(
+                systemConfig: systemConfig,
+                appSupportURL: appSupportURL
+            )
+        let snapshotProvider =
+            snapshotProvider
+            ?? LiveRunnableImageSnapshotProvider(
+                appSupportURL: appSupportURL
+            )
+        let rootFSMaterializer =
+            rootFSMaterializer
+            ?? ContainerRootFSMaterializer(appSupportURL: appSupportURL)
         return { req in
             let query = try req.query.decode(ContainerCreateQuery.self)
 
             let containerName = query.name
-
-            // use platform "" if not provided
-            let containerPlatform = (query.platform?.isEmpty == false) ? query.platform! : "linux/\(Arch.hostArchitecture().rawValue)"
 
             // `collect()` with no max silently caps at Vapor's 1<<14 (16 KB)
             // default — `defaultMaxBodySize` is only consulted by Vapor's
@@ -121,6 +202,24 @@ extension ContainerCreateRoute {
             } catch {
                 // Malformed JSON is bad client input, not a server fault — 400, not 500.
                 throw Abort(.badRequest, reason: "Invalid JSON request body")
+            }
+
+            let originalLabels = body.Labels ?? [:]
+            if let reservedLabel = LabelNormalization.reservedKey(
+                in: originalLabels
+            ) {
+                throw Abort(
+                    .badRequest,
+                    reason: "Label key '\(reservedLabel)' is reserved for internal use"
+                )
+            }
+            if let reservedLabel = ContainerImageIdentity.reservedUserLabel(
+                in: originalLabels
+            ) {
+                throw Abort(
+                    .badRequest,
+                    reason: "Label key '\(reservedLabel)' is reserved for internal use"
+                )
             }
 
             req.logger.info("Creating container for image: \(body.Image)")
@@ -182,18 +281,63 @@ extension ContainerCreateRoute {
             }
 
             let hasExplicitPlatform = query.platform?.isEmpty == false
-            // Validate the requested platform only if provided
-            var requestedPlatform = try Platform(from: containerPlatform)
+            let explicitPlatform = hasExplicitPlatform ? query.platform : nil
+            var requestedPlatform: Platform
+            if let explicitPlatform {
+                do {
+                    requestedPlatform = try platformOrThrow(explicitPlatform)
+                } catch {
+                    throw Abort(
+                        .badRequest,
+                        reason: "invalid platform: \(explicitPlatform)"
+                    )
+                }
+            } else {
+                requestedPlatform = currentPlatform()
+            }
 
-            // Resolve Docker names and all OCI identities to Apple's canonical stored
-            // reference before calling its reference-only fetch API.
-            let resolvedImage: ResolvedImageIdentity
+            // Resolve the Docker identity and establish an immutable exact Apple
+            // reference in one coordinated mutation. A build may move the tag as
+            // soon as this closure returns; the digest-addressed lease deliberately
+            // remains bound to the selected root.
+            let requestedImageReference = body.Image
+            let resolvedAndLease:
+                (
+                    resolved: ResolvedImageIdentity,
+                    lease: ContainerImageLease,
+                    reservation: ContainerImageLeaseReservation
+                )
             do {
-                resolvedImage = try await resolver.resolve(body.Image)
+                resolvedAndLease = try await resolver.mutationCoordinator
+                    .performMutation {
+                        let resolved =
+                            try await resolver
+                            .resolveDuringMutation(requestedImageReference)
+                        let lease = try await imageLeaseManager.acquire(
+                            for: resolved
+                        )
+                        let reservation = await imageLeaseReservations.reserve(
+                            lease
+                        )
+                        await resolver.invalidate()
+                        return (resolved, lease, reservation)
+                    }
             } catch {
                 throw ContainerCreateRoute.imageExistenceError(error, image: body.Image)
             }
-            let appleImageReference = resolvedImage.reference
+            let resolvedImage = resolvedAndLease.resolved
+            let imageLease = resolvedAndLease.lease
+            let imageLeaseReservation = resolvedAndLease.reservation
+            let leaseConvergence = ContainerCreateLeaseConvergence(
+                rootDescriptor: imageLease.image.descriptor,
+                reservation: imageLeaseReservation,
+                reconciler: imageLeaseReconciler
+            )
+            defer {
+                Task.detached(priority: .utility) {
+                    await leaseConvergence.converge()
+                }
+            }
             if let impliedPlatform = resolvedImage.impliedPlatform {
                 if hasExplicitPlatform && requestedPlatform != impliedPlatform {
                     throw Abort(
@@ -205,46 +349,45 @@ extension ContainerCreateRoute {
                     requestedPlatform = impliedPlatform
                 }
             }
-
-            // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
-            // variant is available. Two cases handled:
-            //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
-            //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
-            // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
-            var img: ClientImage
-            do {
-                img = try await ClientImage.fetch(
-                    reference: appleImageReference,
-                    platform: requestedPlatform,
-                    containerSystemConfig: systemConfig
-                )
-                // Case 2: image exists locally but may have been pulled as amd64
-                if requestedPlatform.architecture == "arm64",
-                    (try? await img.config(for: requestedPlatform)) == nil
-                {
-                    throw ContainerizationError(.notFound, message: "no arm64 content")
-                }
-            } catch let fetchError
-                where requestedPlatform.architecture == "arm64"
-                && {
-                    let msg = String(describing: fetchError)
-                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
-                }()
-            {
-                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
-                req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
-                img = try await ClientImage.fetch(
-                    reference: appleImageReference,
-                    platform: amd64,
-                    containerSystemConfig: systemConfig
-                )
-                requestedPlatform = amd64
-            }
-
-            // Unpack a fetched image before use
-            try await img.getCreateSnapshot(
-                platform: requestedPlatform
+            let fallbackPolicy = Self.platformFallbackPolicy(
+                hasExplicitPlatform: hasExplicitPlatform,
+                impliedPlatform: resolvedImage.impliedPlatform
             )
+
+            // Resolve config and rootfs from the exact runnable manifest. Apple's
+            // public `config(for:)` / `getCreateSnapshot(platform:)` APIs are
+            // platform-first and can otherwise select a BuildKit attestation that
+            // advertises the same platform as its runnable subject.
+            let preparedImage: PreparedRunnableImage
+            let platformForPreparation = requestedPlatform
+            do {
+                // Descriptor/config hydration and exact snapshot unpack consume
+                // blobs reachable from the leased root. Exclude delete/prune for
+                // the entire operation so garbage collection cannot remove a
+                // manifest or layer between selection and unpack completion.
+                preparedImage = try await Self.withImageContentProtected(
+                    by: resolver.mutationCoordinator
+                ) {
+                    try await Self.prepareRunnableImage(
+                        image: imageLease.image,
+                        requestedPlatform: platformForPreparation,
+                        fallbackPolicy: fallbackPolicy,
+                        identityConstraint: resolvedImage.variantConstraint,
+                        selector: runnableImageSelector,
+                        snapshotProvider: snapshotProvider,
+                        logger: req.logger
+                    )
+                }
+            } catch let error as ContainerizationError
+                where error.code == .unsupported
+            {
+                throw Abort(
+                    .notFound,
+                    reason: "No such image: \(body.Image) for platform \(requestedPlatform.description)"
+                )
+            }
+            defer { preparedImage.snapshot.cleanup() }
+            requestedPlatform = preparedImage.variant.platform
 
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
@@ -256,7 +399,7 @@ extension ContainerCreateRoute {
             _ = try await initImage.getCreateSnapshot(
                 platform: .current)
 
-            let imageConfig = try await img.config(for: requestedPlatform).config
+            let imageConfig = preparedImage.variant.config.config
 
             let workingDirectory = imageConfig?.workingDir ?? "/"
 
@@ -375,7 +518,13 @@ extension ContainerCreateRoute {
                 user: finalUser,
             )
 
-            var containerConfiguration = ContainerConfiguration(id: id, image: img.description, process: processConfig)
+            var containerConfiguration = ContainerConfiguration(
+                id: id,
+                image: Self.imageDescriptionForContainer(
+                    leasedImage: imageLease.image
+                ),
+                process: processConfig
+            )
             containerConfiguration.platform = requestedPlatform
             containerConfiguration.stopSignal = requestedStopSignal
             containerConfiguration.shmSize = ContainerCreateRoute.shmSizeBytes(body.HostConfig?.ShmSize)
@@ -469,14 +618,14 @@ extension ContainerCreateRoute {
                 .map { settings in settings.compactMap(\.Aliases).flatMap { $0 }.filter { !$0.isEmpty } }
                 ?? []
 
-            let originalLabels = body.Labels ?? [:]
-            guard !LabelNormalization.containsReservedKey(originalLabels) else {
-                throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
-            }
             var containerLabels = LabelNormalization.sanitize(originalLabels)
             if let mapping = LabelNormalization.buildMapping(originalLabels) {
                 containerLabels[LabelNormalization.mappingKey] = mapping
             }
+            containerLabels[ContainerImageIdentity.requestedReferenceLabel] =
+                body.Image
+            containerLabels[ContainerImageIdentity.configDigestLabel] =
+                preparedImage.variant.manifest.config.digest
 
             // Persist the requested healthcheck across create → start so the
             // start route can launch the probe loop and inspect can return it
@@ -713,16 +862,114 @@ extension ContainerCreateRoute {
                 containerConfiguration.resources.cpus = ContainerCreateRoute.vCpus(fromNanoCpus: nanoCpus)
             }
 
-            let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
-            let container: ContainerSnapshot
+            let recoveredStagingBundles =
+                await rootFSMaterializer
+                .recoverStalePrivateStagingBundles(
+                    reservationRegistry: imageLeaseReservations
+                )
+            if recoveredStagingBundles > 0 {
+                req.logger.warning(
+                    "Recovered \(recoveredStagingBundles) stale private rootfs staging bundle(s)"
+                )
+            }
+
+            let preparedRootFS: PreparedContainerRootFS
             do {
-                let containerClient = ContainerClient()
-                try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
-                container = try await containerClient.get(id: containerConfiguration.id)
+                preparedRootFS = try rootFSMaterializer.materialize(
+                    snapshot: preparedImage.snapshot.filesystem,
+                    containerID: id,
+                    readOnly: containerConfiguration.readOnly,
+                    reservation: imageLeaseReservation
+                )
+            } catch ContainerRootFSMaterializationError
+                .containerBundleExists
+            {
+                let recovered = await Self.recoverStalePreCreateBundle(
+                    containerID: id,
+                    expectedConfiguration: containerConfiguration,
+                    rootFSMaterializer: rootFSMaterializer,
+                    reservationRegistry: imageLeaseReservations,
+                    nativeContainerCreator: nativeContainerCreator,
+                    logger: req.logger
+                )
+                guard recovered else {
+                    throw Abort(
+                        .conflict,
+                        reason: "Conflict. The container name \"/\(id)\" is already in use."
+                    )
+                }
+                preparedRootFS = try rootFSMaterializer.materialize(
+                    snapshot: preparedImage.snapshot.filesystem,
+                    containerID: id,
+                    readOnly: containerConfiguration.readOnly,
+                    reservation: imageLeaseReservation
+                )
+            }
+
+            let options = ContainerCreateOptions(
+                autoRemove: body.HostConfig?.AutoRemove ?? false,
+                rootFsOverride: preparedRootFS.filesystem
+            )
+            let finalContainerConfiguration = containerConfiguration
+            let container: ContainerSnapshot
+            let committer = NativeContainerCreateCommitter(
+                client: nativeContainerCreator,
+                mutationCoordinator: resolver.mutationCoordinator,
+                leaseManager: imageLeaseManager
+            )
+            switch await committer.commit(
+                configuration: finalContainerConfiguration,
+                options: options,
+                kernel: kernel,
+                lease: imageLease
+            ) {
+            case .committed(let committed):
+                container = committed
+                preparedRootFS.markCommitted()
+                await leaseConvergence.converge()
                 req.logger.debug("Container created successfully with ID: \(container.id)")
-            } catch {
+            case .definitivelyFailed(let error):
+                preparedRootFS.rollback()
                 req.logger.error("Failed to create container: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+            case .conflicting(let existing, let error):
+                // The bundle now belongs to a native container whose exact
+                // configuration differs. Never remove it; only clear our marker
+                // and let the combined lease reconciler retire our unused root.
+                preparedRootFS.markCommitted()
+                req.logger.error(
+                    "Container create returned \(error), and ID \(existing.id) now belongs to a different native configuration"
+                )
+                throw Abort(
+                    .conflict,
+                    reason: "Conflict. The container name \"/\(id)\" is already in use."
+                )
+            case .indeterminate(let error):
+                // The request was interrupted while Apple's service may still
+                // be finishing create. Keep both rootfs and the active lease
+                // reservation; a detached fresh-client loop converges only once
+                // commit or a safely stale absence is proven.
+                await leaseConvergence.handOff()
+                let logger = req.logger
+                Task.detached(priority: .utility) {
+                    await Self.settleIndeterminateCreate(
+                        expected: finalContainerConfiguration,
+                        options: options,
+                        kernel: kernel,
+                        lease: imageLease,
+                        preparedRootFS: preparedRootFS,
+                        rootDescriptor: imageLease.image.descriptor,
+                        reservation: imageLeaseReservation,
+                        committer: committer,
+                        leaseReconciler: imageLeaseReconciler,
+                        logger: logger
+                    )
+                }
+                req.logger.error("Container create outcome is indeterminate: \(error)")
+                throw Abort(
+                    .internalServerError,
+                    reason: "Failed to confirm container create: \(error)"
+                )
             }
 
             let hexId = DockerContainerID.hexId(for: container)
@@ -740,6 +987,250 @@ extension ContainerCreateRoute {
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
+        }
+    }
+
+    /// Apple's image description is an exact store key + descriptor pair, not a
+    /// carrier for Docker's original request spelling. The latter is persisted
+    /// separately in Socktainer-owned metadata.
+    static func imageDescriptionForContainer(
+        leasedImage: ClientImage
+    ) -> ImageDescription {
+        leasedImage.description
+    }
+
+    static func prepareRunnableImage(
+        image: ClientImage,
+        requestedPlatform: Platform,
+        fallbackPolicy: PlatformFallbackPolicy,
+        identityConstraint: RunnableImageIdentityConstraint = .unconstrained,
+        selector: RunnableImageSelector,
+        snapshotProvider: any RunnableImageSnapshotProviding,
+        logger: Logger
+    ) async throws -> PreparedRunnableImage {
+        let descriptors = try await selector.descriptors(for: image)
+        var selectedPlatform = requestedPlatform
+        var variant = selector.selectVariant(
+            from: descriptors,
+            requestedPlatform: selectedPlatform,
+            identityConstraint: identityConstraint
+        )
+
+        if variant == nil, fallbackPolicy == .allowRosetta,
+            selectedPlatform.architecture == "arm64"
+        {
+            let amd64 = Platform(
+                arch: "amd64",
+                os: selectedPlatform.os,
+                variant: nil
+            )
+            variant = selector.selectVariant(
+                from: descriptors,
+                requestedPlatform: amd64,
+                identityConstraint: identityConstraint
+            )
+            if variant != nil {
+                logger.info("\(image.reference) has no arm64 variant — falling back to amd64 (Rosetta)")
+                selectedPlatform = amd64
+            }
+        }
+
+        guard let variant else {
+            throw ContainerizationError(
+                .unsupported,
+                message: "platform \(selectedPlatform.description)"
+            )
+        }
+        let snapshot = try await snapshotProvider.snapshot(
+            for: image,
+            variant: variant,
+            descriptors: descriptors,
+            logger: logger
+        )
+        return PreparedRunnableImage(
+            variant: variant,
+            snapshot: snapshot
+        )
+    }
+
+    static func platformFallbackPolicy(
+        hasExplicitPlatform: Bool,
+        impliedPlatform: Platform?
+    ) -> PlatformFallbackPolicy {
+        hasExplicitPlatform || impliedPlatform != nil
+            ? .strict
+            : .allowRosetta
+    }
+
+    static func withImageContentProtected<T: Sendable>(
+        by mutationCoordinator: ImageMutationCoordinator,
+        operation: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        try await mutationCoordinator.withMutationExcluded(operation)
+    }
+
+    /// Converges an interrupted native create without inheriting HTTP-request
+    /// cancellation. Until the server publishes the exact configuration, the
+    /// active reservation prevents image prune from deleting the runtime lease.
+    /// An unlocked list absence is never treated as proof: the same exact create
+    /// is retried so Apple's create lock serializes it behind any in-flight first
+    /// request. Only a non-transport server failure after that admission permits
+    /// rollback; commit or a conflicting owner is preserved immediately.
+    static func settleIndeterminateCreate(
+        expected: ContainerConfiguration,
+        options: ContainerCreateOptions,
+        kernel: Kernel,
+        lease: ContainerImageLease,
+        preparedRootFS: PreparedContainerRootFS,
+        rootDescriptor: Descriptor,
+        reservation: ContainerImageLeaseReservation,
+        committer: NativeContainerCreateCommitter,
+        leaseReconciler: any ContainerImageLeaseReconciling,
+        logger: Logger,
+        retryDelay: Duration = .seconds(1)
+    ) async {
+        while true {
+            // Reissuing the same immutable ID/configuration is the only atomic
+            // way to settle an unlocked `list` absence. Apple's create service
+            // serializes by its container lock: this retry waits behind an
+            // in-flight first request, then either observes its exact commit or
+            // safely creates the container itself. It can never create two IDs.
+            let outcome = await committer.commit(
+                configuration: expected,
+                options: options,
+                kernel: kernel,
+                lease: lease
+            )
+            switch outcome {
+            case .committed:
+                preparedRootFS.markCommitted()
+                await leaseReconciler.reconcile(
+                    rootDescriptor: rootDescriptor,
+                    releasing: reservation
+                )
+                logger.info(
+                    "Reconciled interrupted create for container \(expected.id) as committed"
+                )
+                return
+            case .conflicting(let existing, let error):
+                preparedRootFS.markCommitted()
+                await leaseReconciler.reconcile(
+                    rootDescriptor: rootDescriptor,
+                    releasing: reservation
+                )
+                logger.error(
+                    "Interrupted create for \(expected.id) converged to conflicting native container \(existing.id) after \(error); preserved its bundle"
+                )
+                return
+            case .definitivelyFailed(let error):
+                preparedRootFS.rollback()
+                await leaseReconciler.reconcile(
+                    rootDescriptor: rootDescriptor,
+                    releasing: reservation
+                )
+                logger.warning(
+                    "Interrupted create retry for \(expected.id) definitively failed; rolled back its owned pre-create bundle: \(error)"
+                )
+                return
+            case .indeterminate:
+                break
+            }
+            try? await Task.sleep(for: retryDelay)
+        }
+    }
+
+    /// Recovers only a stale Socktainer-owned pre-create bundle. A native
+    /// container with the ID, an unavailable Apple service, a fresh marker, a
+    /// malformed/foreign directory, or an active in-process attempt all block
+    /// removal. This is intentionally conservative because the rootfs path is
+    /// also Apple's persisted container bundle.
+    static func recoverStalePreCreateBundle(
+        containerID: String,
+        expectedConfiguration: ContainerConfiguration,
+        rootFSMaterializer: ContainerRootFSMaterializer,
+        reservationRegistry: ContainerImageLeaseReservationRegistry,
+        nativeContainerCreator: any NativeContainerCreating,
+        logger: Logger,
+        staleAfter: TimeInterval = 10 * 60,
+        now: Date = Date()
+    ) async -> Bool {
+        let owned:
+            (
+                directory: URL,
+                ownership: PreparedContainerRootFS.Ownership
+            )
+        do {
+            guard
+                let candidate = try rootFSMaterializer.ownedPreCreateBundle(
+                    containerID: containerID
+                )
+            else {
+                return false
+            }
+            owned = candidate
+        } catch {
+            return false
+        }
+        guard
+            owned.ownership.createdAt
+                <= now.addingTimeInterval(
+                    -max(0, staleAfter)
+                )
+        else {
+            return false
+        }
+        // Apple persists one of these before a created container can survive
+        // daemon restart. API inventory may be temporarily empty while the
+        // service is booting; on-disk native state independently vetoes stale
+        // pre-create recovery.
+        let nativeConfigurationFiles = [
+            "runtime-configuration.json",
+            "config.json",
+        ]
+        guard
+            !nativeConfigurationFiles.contains(where: {
+                FileManager.default.fileExists(
+                    atPath: owned.directory.appendingPathComponent($0).path
+                )
+            })
+        else {
+            return false
+        }
+        guard
+            !(await reservationRegistry.isReserved(
+                id: owned.ownership.reservationID
+            ))
+        else {
+            return false
+        }
+
+        let nativeState = await NativeContainerCreateCommitter.reconcile(
+            expected: expectedConfiguration,
+            using: nativeContainerCreator,
+            attempts: 3,
+            delay: .milliseconds(50)
+        )
+        guard case .absent = nativeState else { return false }
+
+        do {
+            let recovered =
+                try rootFSMaterializer
+                .recoverStaleOwnedPreCreateBundle(
+                    containerID: containerID,
+                    ownership: owned.ownership,
+                    olderThan: now.addingTimeInterval(-max(0, staleAfter))
+                )
+            if recovered {
+                logger.warning(
+                    "Recovered stale Socktainer pre-create bundle for \(containerID)"
+                )
+            }
+            return recovered
+        } catch {
+            logger.warning(
+                "Failed to recover stale pre-create bundle for \(containerID): \(error)"
+            )
+            return false
         }
     }
 
@@ -849,9 +1340,9 @@ extension ContainerCreateRoute {
             id: DockerContainerID.hexId(for: container),
             type: "container",
             status: "create",
-            image: container.configuration.image.reference,
+            image: ContainerImageIdentity.requestedReference(for: container),
             name: container.id,
-            labels: LabelNormalization.restore(container.configuration.labels)
+            labels: ContainerImageIdentity.dockerLabels(for: container)
         )
     }
 

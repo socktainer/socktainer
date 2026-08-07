@@ -1,10 +1,16 @@
 import ContainerizationArchive
 import ContainerizationOCI
 import CryptoKit
+import Darwin
 import Foundation
 import Logging
 
 enum ContainerImageUtility {
+
+    struct SynthesizedLayoutIdentity: Sendable, Equatable {
+        let manifestDigest: String
+        let configDigest: String
+    }
 
     enum Error: Swift.Error {
         case invalidTarball(reason: String)
@@ -14,6 +20,20 @@ enum ContainerImageUtility {
     /// bounds the upload itself, so a small, extreme-ratio malicious layer
     /// can't expand past a reasonable ceiling before being rejected.
     private static let maxExpandedLayerSize = 8 * 1024 * 1024 * 1024
+
+    /// A root filesystem can legitimately contain far more entries than an
+    /// OCI envelope, especially for language dependency trees. Keep generous
+    /// headroom while independently bounding empty-header CPU/inode attacks
+    /// that fit under the expanded-byte ceiling.
+    private static let maxImportTarEntries = 250_000
+
+    /// A legacy `docker load` layer is already contained by the 64-GiB image
+    /// archive extraction budget. Use that same explicit ceiling when a
+    /// compressed layer has to be expanded to verify its Docker diffID; the
+    /// smaller `docker import` limit must not silently narrow load semantics.
+    private static let maxExpandedLoadLayerSize = Int(
+        ArchiveUtility.ExtractionLimits.imageLoad.maxExpandedBytes
+    )
 
     /// Tar pads every entry to a 512-byte boundary (a header block plus a
     /// content block rounded up), so counting only the bytes `entryReader.read`
@@ -31,13 +51,33 @@ enum ContainerImageUtility {
         ociLayoutPath: URL,
         logger: Logger
     ) async throws -> [String] {
-        let manifestPath = dockerFormatPath.appendingPathComponent("manifest.json")
-        guard FileManager.default.fileExists(atPath: manifestPath.path) else {
+        let archiveRoot = try DockerArchiveRoot(url: dockerFormatPath)
+        guard
+            let manifestData = try archiveRoot.readManifest(
+                maxBytes: 16 * 1024 * 1024
+            )
+        else {
             throw Error.invalidTarball(reason: "manifest.json not found")
         }
-
-        let manifestData = try Data(contentsOf: manifestPath)
         let dockerManifests = try JSONDecoder().decode([TarManifest].self, from: manifestData)
+
+        // Validate the cheap envelope invariants before authoring any OCI
+        // output. Content/member validation below is also fail-closed: no bad
+        // entry may be skipped to silently create a different archive image.
+        for dockerManifest in dockerManifests {
+            try Task.checkCancellation()
+            guard dockerManifest.config != nil else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive manifest entry is missing Config"
+                )
+            }
+            guard dockerManifest.layers != nil else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive manifest entry is missing Layers"
+                )
+            }
+            try validateDockerArchiveRepoTags(dockerManifest.repoTags ?? [])
+        }
 
         let blobsDir = ociLayoutPath.appendingPathComponent("blobs/sha256")
         try FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
@@ -49,65 +89,165 @@ enum ContainerImageUtility {
         var loadedImages: [String] = []
 
         for dockerManifest in dockerManifests {
-            guard let configFile = dockerManifest.config,
-                let layers = dockerManifest.layers
-            else {
-                continue
+            try Task.checkCancellation()
+            guard let configFile = dockerManifest.config else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive manifest entry is missing Config"
+                )
+            }
+            guard let layers = dockerManifest.layers else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive manifest entry is missing Layers"
+                )
             }
 
-            let configDigest = configFile.replacingOccurrences(of: ".json", with: "")
-            let configSrcPath = dockerFormatPath.appendingPathComponent(configFile)
+            let configMember = try DockerArchiveMember.config(configFile)
 
-            if FileManager.default.fileExists(atPath: configSrcPath.path) {
-                let (effectiveConfigDigest, configSize) = try resolveBlob(from: configSrcPath, claimedDigest: configDigest, in: blobsDir, logger: logger)
+            guard
+                let configBlob = try resolveBlob(
+                    member: configMember,
+                    archiveRoot: archiveRoot,
+                    in: blobsDir,
+                    logger: logger
+                )
+            else {
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive config \(configFile) is missing from the archive"
+                )
+            }
 
-                var layerDescriptors: [[String: Any]] = []
+            let effectiveConfigDigest = configBlob.digest
+            let configSize = configBlob.size
+            let importedConfigPath = blobsDir.appendingPathComponent(
+                effectiveConfigDigest
+            )
+            let imageConfig: DockerArchiveImagePlatform
+            do {
+                imageConfig = try imagePlatform(
+                    fromConfigAt: importedConfigPath
+                )
+            } catch let error as BoundedFileReadError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive config \(configFile) is not a valid image config"
+                )
+            }
+            guard let rootFS = imageConfig.rootFS else {
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive config \(configFile) is missing rootfs"
+                )
+            }
+            guard rootFS.type == "layers", let rawDiffIDs = rootFS.diffIDs else {
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive config \(configFile) has a malformed rootfs"
+                )
+            }
+            let expectedDiffIDs = try rawDiffIDs.enumerated().map {
+                try Task.checkCancellation()
+                return try validatedDockerArchiveDiffID(
+                    $0.element,
+                    configFile: configFile,
+                    index: $0.offset
+                )
+            }
+            guard expectedDiffIDs.count == layers.count else {
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive config \(configFile) has \(expectedDiffIDs.count) rootfs diff_id(s), but manifest.json lists \(layers.count) layer(s)"
+                )
+            }
+            let importedPlatform = platformDictionary(from: imageConfig)
 
-                for layer in layers {
-                    let layerDigest = layer.replacingOccurrences(of: "/layer.tar", with: "")
-                    let layerSrcPath = dockerFormatPath.appendingPathComponent(layer)
+            var layerDescriptors: [[String: Any]] = []
 
-                    if FileManager.default.fileExists(atPath: layerSrcPath.path) {
-                        let (effectiveLayerDigest, layerSize) = try resolveBlob(from: layerSrcPath, claimedDigest: layerDigest, in: blobsDir, logger: logger)
-                        layerDescriptors.append([
-                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                            "digest": "sha256:\(effectiveLayerDigest)",
-                            "size": layerSize,
-                        ])
-                    }
+            for (layerIndex, layer) in layers.enumerated() {
+                let layerMember = try DockerArchiveMember.layer(layer)
+
+                guard
+                    let layerBlob = try resolveBlob(
+                        member: layerMember,
+                        archiveRoot: archiveRoot,
+                        in: blobsDir,
+                        logger: logger
+                    )
+                else {
+                    throw Error.invalidTarball(
+                        reason:
+                            "docker-archive layer \(layer) is missing from the archive"
+                    )
                 }
+                let effectiveLayerDigest = layerBlob.digest
+                let layerSize = layerBlob.size
+                let importedLayerPath = blobsDir.appendingPathComponent(
+                    effectiveLayerDigest
+                )
+                let mediaType = try ociLayerMediaType(
+                    forDockerArchiveLayerAt: importedLayerPath
+                )
+                try validateDockerArchiveLayer(
+                    at: importedLayerPath,
+                    archiveMember: layer,
+                    expectedDiffID: expectedDiffIDs[layerIndex],
+                    temporaryParent: ociLayoutPath
+                )
+                layerDescriptors.append([
+                    "mediaType": mediaType,
+                    "digest": "sha256:\(effectiveLayerDigest)",
+                    "size": layerSize,
+                ])
+            }
 
-                let manifest: [String: Any] = [
-                    "schemaVersion": 2,
-                    "config": [
-                        "mediaType": "application/vnd.oci.image.config.v1+json",
-                        "digest": "sha256:\(effectiveConfigDigest)",
-                        "size": configSize,
-                    ],
-                    "layers": layerDescriptors,
-                ]
+            let manifest: [String: Any] = [
+                "schemaVersion": 2,
+                "config": [
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:\(effectiveConfigDigest)",
+                    "size": configSize,
+                ],
+                "layers": layerDescriptors,
+            ]
 
-                let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [])
-                let manifestDigest = manifestData.sha256Hex()
-                let manifestPath = blobsDir.appendingPathComponent(manifestDigest)
-                try manifestData.write(to: manifestPath)
+            let manifestData = try JSONSerialization.data(
+                withJSONObject: manifest,
+                options: [.sortedKeys]
+            )
+            let manifestDigest = manifestData.sha256Hex()
+            let manifestPath = blobsDir.appendingPathComponent(manifestDigest)
+            try manifestData.write(to: manifestPath)
 
-                var manifestDescriptor: [String: Any] = [
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:\(manifestDigest)",
-                    "size": manifestData.count,
-                ]
+            var manifestDescriptor: [String: Any] = [
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:\(manifestDigest)",
+                "size": manifestData.count,
+            ]
 
-                if let repoTags = dockerManifest.repoTags, let firstTag = repoTags.first {
-                    manifestDescriptor["annotations"] = [
-                        "org.opencontainers.image.ref.name": firstTag
-                    ]
-                }
+            if let importedPlatform {
+                manifestDescriptor["platform"] = importedPlatform
+            }
 
+            let repoTags = dockerManifest.repoTags ?? []
+            if repoTags.isEmpty {
                 indexManifests.append(manifestDescriptor)
-                loadedImages.append(contentsOf: dockerManifest.repoTags ?? [])
             } else {
-                logger.warning("Skipping \((dockerManifest.repoTags ?? []).joined(separator: ", ")): config \(configFile) missing from archive")
+                // A single docker-archive manifest may own several tags. OCI
+                // stores a reference on each top-level descriptor, so emit
+                // one descriptor per tag instead of silently keeping only
+                // the first RepoTags entry.
+                for repoTag in repoTags {
+                    var taggedDescriptor = manifestDescriptor
+                    taggedDescriptor["annotations"] = [
+                        "org.opencontainers.image.ref.name": repoTag
+                    ]
+                    indexManifests.append(taggedDescriptor)
+                }
+                loadedImages.append(contentsOf: repoTags)
             }
         }
 
@@ -117,7 +257,10 @@ enum ContainerImageUtility {
             "manifests": indexManifests,
         ]
 
-        let indexData = try JSONSerialization.data(withJSONObject: index, options: [.prettyPrinted])
+        let indexData = try JSONSerialization.data(
+            withJSONObject: index,
+            options: [.prettyPrinted, .sortedKeys]
+        )
         try indexData.write(to: ociLayoutPath.appendingPathComponent("index.json"))
 
         logger.debug("Created OCI layout at \(ociLayoutPath.path)")
@@ -130,25 +273,211 @@ enum ContainerImageUtility {
         return loadedImages
     }
 
+    private static func validateDockerArchiveRepoTags(
+        _ repoTags: [String]
+    ) throws {
+        for repoTag in repoTags {
+            try Task.checkCancellation()
+            do {
+                let reference = try Reference.parse(repoTag)
+                guard reference.tag != nil, reference.digest == nil else {
+                    throw Error.invalidTarball(
+                        reason:
+                            "docker-archive RepoTag must be a tagged image name: \(repoTag)"
+                    )
+                }
+            } catch let error as Error {
+                throw error
+            } catch {
+                throw Error.invalidTarball(
+                    reason: "invalid docker-archive RepoTag: \(repoTag)"
+                )
+            }
+        }
+    }
+
+    private struct DockerArchiveRootFS: Decodable {
+        let type: String?
+        let diffIDs: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case type
+            case diffIDs = "diff_ids"
+        }
+    }
+
+    private struct DockerArchiveImagePlatform: Decodable {
+        let architecture: String?
+        let os: String?
+        let variant: String?
+        let osVersion: String?
+        let osFeatures: [String]?
+        let rootFS: DockerArchiveRootFS?
+
+        enum CodingKeys: String, CodingKey {
+            case architecture
+            case os
+            case variant
+            case osVersion = "os.version"
+            case osFeatures = "os.features"
+            case rootFS = "rootfs"
+        }
+    }
+
+    /// Legacy docker-archive has no platform field in `manifest.json`; the
+    /// architecture lives in the referenced image config. Carry it onto the OCI
+    /// descriptor so several entries sharing one tag can be reconstructed as a
+    /// coherent multi-platform index during load.
+    private static func platformDictionary(
+        from config: DockerArchiveImagePlatform
+    ) -> [String: Any]? {
+        guard let architecture = config.architecture, !architecture.isEmpty,
+            let os = config.os, !os.isEmpty
+        else {
+            return nil
+        }
+
+        var platform: [String: Any] = [
+            "architecture": architecture,
+            "os": os,
+        ]
+        if let variant = config.variant, !variant.isEmpty {
+            platform["variant"] = variant
+        }
+        if let osVersion = config.osVersion, !osVersion.isEmpty {
+            platform["os.version"] = osVersion
+        }
+        if let osFeatures = config.osFeatures, !osFeatures.isEmpty {
+            platform["os.features"] = osFeatures
+        }
+        return platform
+    }
+
+    private static func imagePlatform(
+        fromConfigAt configURL: URL
+    ) throws -> DockerArchiveImagePlatform {
+        let configData = try BoundedFileReader.readImageMetadata(
+            relativePath: configURL.lastPathComponent,
+            under: configURL.deletingLastPathComponent()
+        )
+        return try JSONDecoder().decode(
+            DockerArchiveImagePlatform.self,
+            from: configData
+        )
+    }
+
+    private static func validatedDockerArchiveDiffID(
+        _ value: String,
+        configFile: String,
+        index: Int
+    ) throws -> String {
+        let prefix = "sha256:"
+        guard value.hasPrefix(prefix) else {
+            throw Error.invalidTarball(
+                reason:
+                    "docker-archive config \(configFile) has a non-sha256 rootfs diff_id at index \(index)"
+            )
+        }
+        let encoded = value.dropFirst(prefix.count)
+        guard encoded.utf8.count == 64,
+            encoded.utf8.allSatisfy({ byte in
+                (byte >= Character("0").asciiValue!
+                    && byte <= Character("9").asciiValue!)
+                    || (byte >= Character("a").asciiValue!
+                        && byte <= Character("f").asciiValue!)
+                    || (byte >= Character("A").asciiValue!
+                        && byte <= Character("F").asciiValue!)
+            })
+        else {
+            throw Error.invalidTarball(
+                reason:
+                    "docker-archive config \(configFile) has a malformed rootfs diff_id at index \(index)"
+            )
+        }
+        return prefix + encoded.lowercased()
+    }
+
+    private static func validateDockerArchiveLayer(
+        at layerURL: URL,
+        archiveMember: String,
+        expectedDiffID: String,
+        temporaryParent: URL
+    ) throws {
+        let prepared = try prepareImportSource(
+            at: layerURL,
+            temporaryParent: temporaryParent,
+            maxExpandedLayerSize: maxExpandedLoadLayerSize
+        )
+        defer { prepared.cleanUp() }
+
+        do {
+            try rejectForeignFormat(at: prepared.tarForValidation)
+            try validateTar(
+                at: prepared.tarForValidation,
+                maxExpandedLayerSize: maxExpandedLoadLayerSize,
+                maxEntries: maxImportTarEntries
+            )
+        } catch Error.invalidTarball(let reason) {
+            throw Error.invalidTarball(
+                reason:
+                    "invalid docker-archive layer \(archiveMember): \(reason)"
+            )
+        }
+        try Task.checkCancellation()
+        let actualDigest =
+            try prepared.exactDiffID
+            ?? FileHashing.sha256OfFile(
+                at: prepared.tarForValidation
+            ).digest
+        let actualDiffID = "sha256:\(actualDigest)"
+        guard actualDiffID == expectedDiffID else {
+            throw Error.invalidTarball(
+                reason:
+                    "docker-archive layer \(archiveMember) has diff_id \(actualDiffID), expected \(expectedDiffID)"
+            )
+        }
+    }
+
+    /// Docker's archive loader detects compression from the layer bytes. OCI
+    /// descriptors do not: the media type must match the stored blob or the
+    /// runtime will try the wrong decompressor when the image is unpacked.
+    private static func ociLayerMediaType(
+        forDockerArchiveLayerAt layerURL: URL
+    ) throws -> String {
+        switch try classifyLayerSource(at: layerURL) {
+        case .gzip:
+            return MediaTypes.imageLayerGzip
+        case .zstd:
+            return MediaTypes.imageLayerZstd
+        case .plainOrUnknown:
+            return MediaTypes.imageLayer
+        case .bzip2, .xz:
+            throw Error.invalidTarball(
+                reason:
+                    "docker-archive layers compressed with bzip2/xz cannot be represented by an OCI layer media type"
+            )
+        case .foreignFormat(let format):
+            throw Error.invalidTarball(
+                reason: "\(format) is not a supported docker-archive layer format"
+            )
+        }
+    }
+
     /// Builds a single-layer OCI image layout from an on-disk tar (the raw
     /// `docker import fromSrc=-` request body). Mirrors `convertDockerTarToOCI`'s
     /// digest/blob/manifest/index construction, but for a synthesized image
     /// rather than one converted from an existing docker-archive.
     ///
     /// A gzip/zstd-compressed body (detected by magic bytes) is stored as-is
-    /// with the matching layer media type; its diff_id is the digest of the
-    /// decompressed content, matching moby's passthrough-if-already-compressed
-    /// behavior. A plain tar is gzip-compressed before storage (moby never
-    /// stores an uncompressed layer). bzip2/xz bodies are reserialized to a
-    /// plain tar via `reserializeToPlainTar` and then gzip-compressed the same
-    /// way — content-faithful (round-trip verified against symlinks,
-    /// hardlinks, xattrs, and non-default permission bits), but the diff_id is
-    /// computed from the reserialized pax tar rather than moby's raw
-    /// decompressed byte stream, so it will not byte-match a real dockerd's
-    /// diff_id for the same bzip2/xz input even though the layer content is
-    /// identical.
+    /// with the matching layer media type. A plain, bzip2, or xz tar is stored
+    /// as gzip (moby never stores an uncompressed/bzip2/xz layer). For every
+    /// codec, diff_id is the digest of the exact raw decompressed tar stream —
+    /// including headers, PAX records, and padding — matching Docker rather
+    /// than hashing a lossy entry-level reserialization.
     ///
-    /// Returns the manifest digest (without the `sha256:` prefix).
+    /// Returns both content identities (without `sha256:` prefixes). Apple's
+    /// loader roots the manifest in an index, while Docker reports the config
+    /// digest as the local image ID.
     static func buildSingleLayerOCILayout(
         tarPath: URL,
         ociLayoutPath: URL,
@@ -157,10 +486,30 @@ enum ContainerImageUtility {
         message: String?,
         reference: String?,
         logger: Logger,
-        maxExpandedLayerSize: Int = ContainerImageUtility.maxExpandedLayerSize
-    ) throws -> String {
-        try rejectForeignFormat(at: tarPath)
-        try validateTar(at: tarPath, maxExpandedLayerSize: maxExpandedLayerSize)
+        maxExpandedLayerSize: Int = ContainerImageUtility.maxExpandedLayerSize,
+        maxTarEntries: Int = ContainerImageUtility.maxImportTarEntries
+    ) throws -> SynthesizedLayoutIdentity {
+        guard maxTarEntries >= 0 else {
+            throw Error.invalidTarball(reason: "tar entry limit cannot be negative")
+        }
+        try FileManager.default.createDirectory(
+            at: ociLayoutPath,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let preparedSource = try prepareImportSource(
+            at: tarPath,
+            temporaryParent: ociLayoutPath,
+            maxExpandedLayerSize: maxExpandedLayerSize
+        )
+        defer { preparedSource.cleanUp() }
+
+        try rejectForeignFormat(at: preparedSource.tarForValidation)
+        try validateTar(
+            at: preparedSource.tarForValidation,
+            maxExpandedLayerSize: maxExpandedLayerSize,
+            maxEntries: maxTarEntries
+        )
 
         let blobsDir = ociLayoutPath.appendingPathComponent("blobs/sha256")
         try FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
@@ -168,7 +517,11 @@ enum ContainerImageUtility {
         let ociLayout = "{\"imageLayoutVersion\": \"1.0.0\"}"
         try ociLayout.write(to: ociLayoutPath.appendingPathComponent("oci-layout"), atomically: true, encoding: .utf8)
 
-        let layer = try writeImportedLayerBlob(tarPath: tarPath, into: blobsDir, maxExpandedLayerSize: maxExpandedLayerSize)
+        let layer = try writeImportedLayerBlob(
+            tarPath: tarPath,
+            into: blobsDir,
+            preparedSource: preparedSource
+        )
 
         let createdAt = ISO8601DateFormatter().string(from: Date())
         var imageConfigDict: [String: Any] = [
@@ -191,7 +544,10 @@ enum ContainerImageUtility {
             imageConfigDict["variant"] = variant
         }
 
-        let configData = try JSONSerialization.data(withJSONObject: imageConfigDict, options: [])
+        let configData = try JSONSerialization.data(
+            withJSONObject: imageConfigDict,
+            options: [.sortedKeys]
+        )
         let configDigest = configData.sha256Hex()
         try configData.write(to: blobsDir.appendingPathComponent(configDigest))
 
@@ -211,7 +567,10 @@ enum ContainerImageUtility {
                 ]
             ],
         ]
-        let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [])
+        let manifestData = try JSONSerialization.data(
+            withJSONObject: manifest,
+            options: [.sortedKeys]
+        )
         let manifestDigest = manifestData.sha256Hex()
         try manifestData.write(to: blobsDir.appendingPathComponent(manifestDigest))
 
@@ -229,12 +588,140 @@ enum ContainerImageUtility {
             "mediaType": "application/vnd.oci.image.index.v1+json",
             "manifests": [manifestDescriptor],
         ]
-        let indexData = try JSONSerialization.data(withJSONObject: index, options: [.prettyPrinted])
+        let indexData = try JSONSerialization.data(
+            withJSONObject: index,
+            options: [.prettyPrinted, .sortedKeys]
+        )
         try indexData.write(to: ociLayoutPath.appendingPathComponent("index.json"))
 
         logger.info("Synthesized single-layer OCI image sha256:\(manifestDigest) from an imported tarball")
 
-        return manifestDigest
+        return SynthesizedLayoutIdentity(
+            manifestDigest: manifestDigest,
+            configDigest: configDigest
+        )
+    }
+
+    private struct PreparedImportSource {
+        let source: LayerSource
+        let tarForValidation: URL
+        let exactDiffID: String?
+        let temporaryDirectory: URL?
+
+        func cleanUp() {
+            guard let temporaryDirectory else { return }
+            try? FileManager.default.removeItem(at: temporaryDirectory)
+        }
+    }
+
+    /// Expand compressed input exactly once into a private, bounded staging
+    /// file. The same bytes are tar-validated, hashed for the OCI diffID, and
+    /// (for bzip2/xz) fed to the gzip encoder. This prevents each independent
+    /// operation from re-expanding an attacker-controlled stream and avoids
+    /// ContainerizationArchive 0.40.1's unbounded zstd temporary-file path.
+    private static func prepareImportSource(
+        at source: URL,
+        temporaryParent: URL,
+        maxExpandedLayerSize: Int
+    ) throws -> PreparedImportSource {
+        let layerSource = try classifyLayerSource(at: source)
+        guard
+            layerSource == .gzip || layerSource == .bzip2
+                || layerSource == .xz || layerSource == .zstd
+        else {
+            return PreparedImportSource(
+                source: layerSource,
+                tarForValidation: source,
+                exactDiffID: nil,
+                temporaryDirectory: nil
+            )
+        }
+
+        let temporaryDirectory =
+            temporaryParent
+            .appendingPathComponent(
+                "socktainer-compressed-import-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var completed = false
+        defer {
+            if !completed {
+                try? FileManager.default.removeItem(at: temporaryDirectory)
+            }
+        }
+
+        let expandedTar = temporaryDirectory.appendingPathComponent(
+            "layer.tar",
+            isDirectory: false
+        )
+        let expandedBytes: Int64
+        do {
+            switch layerSource {
+            case .gzip:
+                expandedBytes = try FilteredStreamDecoder.decompress(
+                    source: source,
+                    destination: expandedTar,
+                    compression: .gzip,
+                    maxBytes: Int64(maxExpandedLayerSize)
+                )
+            case .bzip2:
+                expandedBytes = try FilteredStreamDecoder.decompress(
+                    source: source,
+                    destination: expandedTar,
+                    compression: .bzip2,
+                    maxBytes: Int64(maxExpandedLayerSize)
+                )
+            case .xz:
+                expandedBytes = try FilteredStreamDecoder.decompress(
+                    source: source,
+                    destination: expandedTar,
+                    compression: .xz,
+                    maxBytes: Int64(maxExpandedLayerSize)
+                )
+            case .zstd:
+                expandedBytes = try ZstdStreamDecoder.decompress(
+                    source: source,
+                    destination: expandedTar,
+                    maxBytes: Int64(maxExpandedLayerSize)
+                )
+            case .plainOrUnknown, .foreignFormat:
+                preconditionFailure("uncompressed sources do not need staging")
+            }
+        } catch FilteredStreamDecoder.Error.exceedsCap,
+            ZstdStreamDecoder.Error.exceedsCap
+        {
+            throw Error.invalidTarball(
+                reason:
+                    "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit"
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw Error.invalidTarball(
+                reason: "failed to decompress compressed layer"
+            )
+        }
+
+        try Task.checkCancellation()
+        let expanded = try FileHashing.sha256OfFile(at: expandedTar)
+        guard expanded.size == expandedBytes else {
+            throw Error.invalidTarball(
+                reason: "compressed layer changed while being prepared"
+            )
+        }
+
+        completed = true
+        return PreparedImportSource(
+            source: layerSource,
+            tarForValidation: expandedTar,
+            exactDiffID: expanded.digest,
+            temporaryDirectory: temporaryDirectory
+        )
     }
 
     /// moby's own `docker import` only ever decompresses via a compression-filter
@@ -309,7 +796,7 @@ enum ContainerImageUtility {
         case .plainOrUnknown: filter = .none
         case .foreignFormat: return  // unreachable: handled above
         }
-        guard isRecognizedTarFamily(at: tarPath, filter: filter) else {
+        guard try isRecognizedTarFamily(at: tarPath, filter: filter) else {
             throw Error.invalidTarball(reason: "not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
         }
     }
@@ -326,10 +813,20 @@ enum ContainerImageUtility {
     /// import` accepts) cleanly hits EOF with no entry at all on every format —
     /// that has to be accepted too, so only a path-less entry counts as proof
     /// of a foreign format; a clean EOF is neutral, not a rejection.
-    private static func isRecognizedTarFamily(at tarPath: URL, filter: Filter) -> Bool {
+    private static func isRecognizedTarFamily(
+        at tarPath: URL,
+        filter: Filter
+    ) throws -> Bool {
         var attempted = false
         for format: ContainerizationArchive.Format in [.ustar, .gnutar, .pax, .paxRestricted] {
-            guard let reader = try? ArchiveReader(format: format, filter: filter, file: tarPath) else { continue }
+            try Task.checkCancellation()
+            guard
+                let reader = try? streamingTarReader(
+                    at: tarPath,
+                    format: format,
+                    filter: filter
+                )
+            else { continue }
             attempted = true
             var iterator = reader.makeStreamingIterator()
             guard let (entry, _) = iterator.next() else { continue }
@@ -339,50 +836,16 @@ enum ContainerImageUtility {
         return attempted
     }
 
-    /// Repackages an archive whose compression `ArchiveReader` can decompress
-    /// but `DataCompression` cannot (bzip2/xz/zstd) into a canonical
-    /// uncompressed tar, so the diff_id and stored blob reflect the real
-    /// content instead of the still-compressed bytes.
-    private static func reserializeToPlainTar(from source: URL, to destination: URL, maxExpandedLayerSize: Int) throws {
-        let reader = try ArchiveReader(file: source)
-        let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: destination)
-        var totalDecompressedBytes = 0
-        func enforceCap() throws {
-            guard totalDecompressedBytes <= maxExpandedLayerSize else {
-                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
-            }
-        }
-        var buffer = [UInt8](repeating: 0, count: 1 << 20)
-        for (entry, entryReader) in reader.makeStreamingIterator() {
-            totalDecompressedBytes += tarBlockSize
-            try enforceCap()
-            let transaction = writer.makeTransactionWriter()
-            try transaction.writeHeader(entry: entry)
-            var entryContentBytes = 0
-            while true {
-                let read = buffer.withUnsafeMutableBufferPointer { entryReader.read($0.baseAddress!, maxLength: $0.count) }
-                guard read > 0 else {
-                    if read < 0 { throw Error.invalidTarball(reason: "failed to read archive entry while repackaging") }
-                    break
-                }
-                entryContentBytes += read
-                totalDecompressedBytes += read
-                try enforceCap()
-                try buffer.withUnsafeBytes { try transaction.writeChunk(data: UnsafeRawBufferPointer(rebasing: $0.prefix(read))) }
-            }
-            totalDecompressedBytes += tarBlockPadding(forContentSize: entryContentBytes)
-            try enforceCap()
-            try transaction.finish()
-        }
-        try writer.finishEncoding()
-    }
-
     /// Rejects an empty body outright (a 0-byte "tar" would otherwise read back
     /// as zero archive entries — not an error `ArchiveReader` surfaces on its
     /// own) and confirms the remainder actually parses as an archive, so
     /// `docker import` of a non-tar or empty file fails cleanly instead of
     /// silently registering an unusable image.
-    private static func validateTar(at tarPath: URL, maxExpandedLayerSize: Int) throws {
+    private static func validateTar(
+        at tarPath: URL,
+        maxExpandedLayerSize: Int,
+        maxEntries: Int
+    ) throws {
         let attributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path)
         guard let size = attributes?[.size] as? UInt64, size > 0 else {
             throw Error.invalidTarball(reason: "empty request body")
@@ -390,7 +853,7 @@ enum ContainerImageUtility {
 
         let reader: ArchiveReader
         do {
-            reader = try ArchiveReader(file: tarPath)
+            reader = try streamingTarReader(at: tarPath)
         } catch {
             throw Error.invalidTarball(reason: "not a valid tar archive: \(error.localizedDescription)")
         }
@@ -402,11 +865,21 @@ enum ContainerImageUtility {
                 }
             }
             var buffer = [UInt8](repeating: 0, count: 1 << 16)
+            var entryCount = 0
             for (_, entryReader) in reader.makeStreamingIterator() {
+                try Task.checkCancellation()
+                guard entryCount < maxEntries else {
+                    throw Error.invalidTarball(
+                        reason:
+                            "tar archive exceeds the \(maxEntries)-entry limit"
+                    )
+                }
+                entryCount += 1
                 totalDecompressedBytes += tarBlockSize
                 try enforceCap()
                 var entryContentBytes = 0
                 while true {
+                    try Task.checkCancellation()
                     let read = buffer.withUnsafeMutableBufferPointer { entryReader.read($0.baseAddress!, maxLength: $0.count) }
                     guard read > 0 else {
                         if read < 0 {
@@ -423,8 +896,60 @@ enum ContainerImageUtility {
             }
         } catch let error as Error {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw Error.invalidTarball(reason: "not a valid tar archive: \(error.localizedDescription)")
+        }
+    }
+
+    /// The URL-based `ArchiveReader` initializers in ContainerizationArchive
+    /// 0.40.1 probe zstd by expanding it to an unbounded temporary file. Use
+    /// the public FileHandle initializer for the formats system libarchive can
+    /// stream. Zstd is bounded and staged by `prepareImportSource` before it
+    /// reaches this helper.
+    private static func streamingTarReader(
+        at source: URL,
+        format: ContainerizationArchive.Format = .paxRestricted,
+        filter explicitFilter: Filter? = nil
+    ) throws -> ArchiveReader {
+        let filter: Filter
+        if let explicitFilter {
+            filter = explicitFilter
+        } else {
+            switch try classifyLayerSource(at: source) {
+            case .gzip: filter = .gzip
+            case .bzip2: filter = .bzip2
+            case .xz: filter = .xz
+            case .plainOrUnknown: filter = .none
+            case .zstd:
+                throw Error.invalidTarball(
+                    reason: "zstd import source was not prepared"
+                )
+            case .foreignFormat(let format):
+                throw Error.invalidTarball(
+                    reason:
+                        "\(format) is not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported"
+                )
+            }
+        }
+
+        guard filter != .zstd else {
+            throw Error.invalidTarball(
+                reason: "zstd import source was not prepared"
+            )
+        }
+
+        let handle = try FileHandle(forReadingFrom: source)
+        do {
+            return try ArchiveReader(
+                format: format,
+                filter: filter,
+                fileHandle: handle
+            )
+        } catch {
+            try? handle.close()
+            throw error
         }
     }
 
@@ -435,24 +960,20 @@ enum ContainerImageUtility {
         let mediaType: String
     }
 
-    private static func writeImportedLayerBlob(tarPath: URL, into blobsDir: URL, maxExpandedLayerSize: Int) throws -> ImportedLayerBlob {
-        switch try classifyLayerSource(at: tarPath) {
+    private static func writeImportedLayerBlob(
+        tarPath: URL,
+        into blobsDir: URL,
+        preparedSource: PreparedImportSource
+    ) throws -> ImportedLayerBlob {
+        switch preparedSource.source {
         case .gzip:
-            // Stored as-is (unchanged from the request body): copied straight
-            // from `tarPath` and hashed by streaming the file in chunks. The
-            // diff_id is the decompressed content's hash — decompressed via
-            // `GzipStreamDecoder`, which never materializes the expanded
-            // content in memory, unlike `DataCompression.gunzip()`, so a
-            // small, highly-compressible malicious layer can't exhaust memory
-            // before `maxExpandedLayerSize` catches it mid-stream.
+            // Stored unchanged from the request body. Its exact decompressed
+            // tar digest was computed from the bounded staging file.
             let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
-            let diffID: String
-            do {
-                diffID = try GzipStreamDecoder.sha256OfDecompressedContent(at: tarPath, cap: maxExpandedLayerSize)
-            } catch GzipStreamDecoder.Error.exceedsCap {
-                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
-            } catch {
-                throw Error.invalidTarball(reason: "failed to decompress gzip layer")
+            guard let diffID = preparedSource.exactDiffID else {
+                throw Error.invalidTarball(
+                    reason: "gzip layer was not prepared for import"
+                )
             }
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
@@ -463,17 +984,15 @@ enum ContainerImageUtility {
                 mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
 
         case .zstd:
-            // Unlike gzip, zstd needs no in-memory pass at all: both the stored
-            // blob's digest and the decompressed diff_id are computed by
-            // streaming files in chunks, and storage is a plain file copy.
+            // `prepareImportSource` already expanded this stream once under the
+            // cap. Reuse that exact raw-byte digest rather than decoding a
+            // second time; the stored blob is still the original zstd bytes.
             let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
-            let decompressedPath = try ArchiveReader.decompressZstd(tarPath)
-            defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
-            let decompressedAttributes = try? FileManager.default.attributesOfItem(atPath: decompressedPath.path)
-            guard let decompressedSize = decompressedAttributes?[.size] as? UInt64, decompressedSize <= UInt64(maxExpandedLayerSize) else {
-                throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+            guard let diffID = preparedSource.exactDiffID else {
+                throw Error.invalidTarball(
+                    reason: "zstd layer was not prepared for import"
+                )
             }
-            let (diffID, _) = try FileHashing.sha256OfFile(at: decompressedPath)
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.copyItem(at: tarPath, to: destination)
@@ -486,12 +1005,16 @@ enum ContainerImageUtility {
             return try gzipCompressAndStore(plainTarPath: tarPath, into: blobsDir)
 
         case .bzip2, .xz:
-            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: tempDir) }
-            let plainPath = tempDir.appendingPathComponent("layer.tar")
-            try reserializeToPlainTar(from: tarPath, to: plainPath, maxExpandedLayerSize: maxExpandedLayerSize)
-            return try gzipCompressAndStore(plainTarPath: plainPath, into: blobsDir)
+            let stored = try gzipCompressAndStore(
+                plainTarPath: preparedSource.tarForValidation,
+                into: blobsDir
+            )
+            guard stored.diffID == preparedSource.exactDiffID else {
+                throw Error.invalidTarball(
+                    reason: "compressed layer changed while being stored"
+                )
+            }
+            return stored
 
         case .foreignFormat(let format):
             throw Error.invalidTarball(reason: "\(format) is not a supported docker import source; only a tar, optionally gzip/bzip2/xz/zstd-compressed, is supported")
@@ -517,21 +1040,328 @@ enum ContainerImageUtility {
             mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
     }
 
-    /// Copies a docker-archive blob into the content-addressed store (skipping if already
-    /// present), then returns the digest it actually hashes to and its byte count —
-    /// relocating it to its real digest when the claimed one is wrong, so the manifest
-    /// never references a blob that was moved out from under it. Config and layer blobs
-    /// share this path so the two can't drift (an earlier divergence lost the real digest).
-    private static func resolveBlob(from source: URL, claimedDigest: String, in blobsDir: URL, logger: Logger) throws -> (digest: String, size: Int) {
-        let destination = blobsDir.appendingPathComponent(claimedDigest)
-        if !FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.copyItem(at: source, to: destination)
+    private struct ResolvedDockerArchiveBlob {
+        let digest: String
+        let size: Int
+    }
+
+    private enum DockerArchiveMember {
+        case config(digest: String, filename: String)
+        case layer(digest: String, directory: String)
+
+        var claimedDigest: String {
+            switch self {
+            case .config(let digest, _), .layer(let digest, _): digest
+            }
         }
-        let (realDigest, size) = try FileHashing.sha256OfFile(at: destination)
-        guard realDigest != claimedDigest else { return (claimedDigest, size) }
-        logger.warning("Blob digest mismatch: expected \(claimedDigest), got \(realDigest)")
-        try moveBlob(from: destination, toDigest: realDigest, in: blobsDir)
-        return (realDigest, size)
+
+        var components: [String] {
+            switch self {
+            case .config(_, let filename): [filename]
+            case .layer(_, let directory): [directory, "layer.tar"]
+            }
+        }
+
+        static func config(_ value: String) throws -> DockerArchiveMember {
+            let suffix = ".json"
+            guard value.hasSuffix(suffix) else {
+                throw invalidPath(value)
+            }
+            let digest = String(value.dropLast(suffix.count))
+            guard isCanonicalSHA256Hex(digest), value == "\(digest).json" else {
+                throw invalidPath(value)
+            }
+            return .config(digest: digest, filename: value)
+        }
+
+        static func layer(_ value: String) throws -> DockerArchiveMember {
+            let components = value.split(
+                separator: "/",
+                omittingEmptySubsequences: false
+            )
+            guard components.count == 2,
+                components[1] == "layer.tar"
+            else {
+                throw invalidPath(value)
+            }
+            let digest = String(components[0])
+            guard isCanonicalSHA256Hex(digest),
+                value == "\(digest)/layer.tar"
+            else {
+                throw invalidPath(value)
+            }
+            return .layer(digest: digest, directory: digest)
+        }
+
+        private static func isCanonicalSHA256Hex(_ value: String) -> Bool {
+            let bytes = value.utf8
+            guard bytes.count == 64 else { return false }
+            return bytes.allSatisfy {
+                ($0 >= Character("0").asciiValue!
+                    && $0 <= Character("9").asciiValue!)
+                    || ($0 >= Character("a").asciiValue!
+                        && $0 <= Character("f").asciiValue!)
+            }
+        }
+
+        private static func invalidPath(_ value: String) -> Error {
+            Error.invalidTarball(
+                reason: "invalid docker-archive member path: \(value)"
+            )
+        }
+    }
+
+    /// Descriptor-anchored access to the extracted legacy docker-archive.
+    /// Every component is opened relative to this no-follow directory fd, and
+    /// final members must be single-link regular files. This closes both URL
+    /// traversal and link-swap/hardlink escapes without trusting a prior path
+    /// standardization check.
+    private final class DockerArchiveRoot {
+        private let descriptor: Int32
+
+        init(url: URL) throws {
+            descriptor = Darwin.open(
+                url.path,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+            )
+            guard descriptor >= 0 else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive root is not a safe directory"
+                )
+            }
+        }
+
+        deinit {
+            Darwin.close(descriptor)
+        }
+
+        func open(_ member: DockerArchiveMember) throws -> Int32? {
+            try openRegularFile(components: member.components)
+        }
+
+        func readManifest(maxBytes: Int) throws -> Data? {
+            guard
+                let manifestDescriptor = try openRegularFile(
+                    components: ["manifest.json"]
+                )
+            else {
+                return nil
+            }
+            defer { Darwin.close(manifestDescriptor) }
+
+            var result = Data()
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                try Task.checkCancellation()
+                let bytesRead = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(
+                        manifestDescriptor,
+                        bytes.baseAddress,
+                        bytes.count
+                    )
+                }
+                if bytesRead < 0, errno == EINTR { continue }
+                guard bytesRead >= 0 else {
+                    throw Error.invalidTarball(
+                        reason: "failed to read manifest.json"
+                    )
+                }
+                guard bytesRead > 0 else { break }
+                guard bytesRead <= maxBytes - result.count else {
+                    throw Error.invalidTarball(
+                        reason: "manifest.json exceeds the \(maxBytes)-byte limit"
+                    )
+                }
+                result.append(contentsOf: buffer.prefix(bytesRead))
+            }
+            return result
+        }
+
+        private func openRegularFile(
+            components: [String]
+        ) throws -> Int32? {
+            precondition(!components.isEmpty)
+            var parentDescriptor = descriptor
+            var ownedParentDescriptor: Int32?
+            defer {
+                if let ownedParentDescriptor {
+                    Darwin.close(ownedParentDescriptor)
+                }
+            }
+
+            for component in components.dropLast() {
+                let childDescriptor = Darwin.openat(
+                    parentDescriptor,
+                    component,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                        | O_NONBLOCK
+                )
+                if childDescriptor < 0, errno == ENOENT { return nil }
+                guard childDescriptor >= 0 else {
+                    throw Error.invalidTarball(
+                        reason: "docker-archive member has an unsafe parent"
+                    )
+                }
+                if let ownedParentDescriptor {
+                    Darwin.close(ownedParentDescriptor)
+                }
+                ownedParentDescriptor = childDescriptor
+                parentDescriptor = childDescriptor
+            }
+
+            let finalDescriptor = Darwin.openat(
+                parentDescriptor,
+                components.last!,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+            )
+            if finalDescriptor < 0, errno == ENOENT { return nil }
+            guard finalDescriptor >= 0 else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive member is not a safe file"
+                )
+            }
+
+            var metadata = stat()
+            guard Darwin.fstat(finalDescriptor, &metadata) == 0,
+                metadata.st_mode & S_IFMT == S_IFREG,
+                metadata.st_nlink == 1
+            else {
+                Darwin.close(finalDescriptor)
+                throw Error.invalidTarball(
+                    reason:
+                        "docker-archive member must be a single-link regular file"
+                )
+            }
+            return finalDescriptor
+        }
+    }
+
+    /// Copies a grammar-validated, no-follow docker-archive member into a
+    /// private temporary blob while hashing it. Only the computed lowercase
+    /// SHA-256 ever becomes a destination component; a manifest-controlled
+    /// claimed digest can neither escape `blobs/sha256` nor cause the source
+    /// (or an external canary reached through a link) to be moved/removed.
+    private static func resolveBlob(
+        member: DockerArchiveMember,
+        archiveRoot: DockerArchiveRoot,
+        in blobsDir: URL,
+        logger: Logger
+    ) throws -> ResolvedDockerArchiveBlob? {
+        guard let sourceDescriptor = try archiveRoot.open(member) else {
+            return nil
+        }
+        defer { Darwin.close(sourceDescriptor) }
+
+        let temporaryBlob = blobsDir.appendingPathComponent(
+            ".socktainer-copy-\(UUID().uuidString)"
+        )
+        let destinationDescriptor = Darwin.open(
+            temporaryBlob.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600
+        )
+        guard destinationDescriptor >= 0 else {
+            throw Error.invalidTarball(
+                reason: "failed to create imported image blob"
+            )
+        }
+        var destinationIsOpen = true
+        var keepTemporaryBlob = false
+        defer {
+            if destinationIsOpen {
+                Darwin.close(destinationDescriptor)
+            }
+            if !keepTemporaryBlob {
+                try? FileManager.default.removeItem(at: temporaryBlob)
+            }
+        }
+
+        var hasher = SHA256()
+        var size = 0
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        while true {
+            try Task.checkCancellation()
+            let bytesRead = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(
+                    sourceDescriptor,
+                    bytes.baseAddress,
+                    bytes.count
+                )
+            }
+            if bytesRead < 0, errno == EINTR {
+                continue
+            }
+            guard bytesRead >= 0 else {
+                throw Error.invalidTarball(
+                    reason: "failed to read docker-archive blob"
+                )
+            }
+            guard bytesRead > 0 else { break }
+            guard bytesRead <= Int.max - size else {
+                throw Error.invalidTarball(
+                    reason: "docker-archive blob is too large"
+                )
+            }
+
+            try buffer.withUnsafeBytes { bytes in
+                let content = UnsafeRawBufferPointer(
+                    rebasing: bytes.prefix(bytesRead)
+                )
+                hasher.update(bufferPointer: content)
+                try writeAll(
+                    content,
+                    to: destinationDescriptor
+                )
+            }
+            size += bytesRead
+        }
+
+        guard Darwin.close(destinationDescriptor) == 0 else {
+            destinationIsOpen = false
+            throw Error.invalidTarball(
+                reason: "failed to finish imported image blob"
+            )
+        }
+        destinationIsOpen = false
+
+        let realDigest = hasher.finalize().hexString
+        if realDigest != member.claimedDigest {
+            logger.warning(
+                "Blob digest mismatch: expected \(member.claimedDigest), got \(realDigest)"
+            )
+        }
+        try moveBlob(
+            from: temporaryBlob,
+            toDigest: realDigest,
+            in: blobsDir
+        )
+        keepTemporaryBlob = true
+        return ResolvedDockerArchiveBlob(
+            digest: realDigest,
+            size: size
+        )
+    }
+
+    private static func writeAll(
+        _ bytes: UnsafeRawBufferPointer,
+        to descriptor: Int32
+    ) throws {
+        guard let baseAddress = bytes.baseAddress else { return }
+        var written = 0
+        while written < bytes.count {
+            let result = Darwin.write(
+                descriptor,
+                baseAddress.advanced(by: written),
+                bytes.count - written
+            )
+            if result < 0, errno == EINTR { continue }
+            guard result > 0 else {
+                throw Error.invalidTarball(
+                    reason: "failed to write imported image blob"
+                )
+            }
+            written += result
+        }
     }
 
     /// Relocates a blob copied under a claimed digest to its real one. The store is
@@ -552,64 +1382,204 @@ enum ContainerImageUtility {
         resolvedRefs: [String],
         logger: Logger
     ) async throws -> [[String: Any]] {
-        let indexData = try Data(contentsOf: ociLayoutPath.appendingPathComponent("index.json"))
-        let index = try JSONDecoder().decode(OCILayoutIndex.self, from: indexData)
+        let indexData = try BoundedFileReader.readImageMetadata(
+            relativePath: "index.json",
+            under: ociLayoutPath
+        )
+        let index = try JSONDecoder().decode(Index.self, from: indexData)
 
         var dockerManifests: [[String: Any]] = []
+        let traversalBudget = DockerArchiveTraversalBudget()
 
         for (idx, descriptor) in index.manifests.enumerated() {
-            let descriptorDigest = descriptor.digest.replacingOccurrences(of: "sha256:", with: "")
-            let blobPath = ociLayoutPath.appendingPathComponent("blobs/sha256/\(descriptorDigest)")
-            let blobData = try Data(contentsOf: blobPath)
-
-            if descriptor.mediaType == "application/vnd.oci.image.index.v1+json" {
-                logger.debug("Found nested OCI index, processing manifests inside")
-                let nestedIndex = try JSONDecoder().decode(OCILayoutIndex.self, from: blobData)
-
-                for nestedDescriptor in nestedIndex.manifests {
-                    if nestedDescriptor.mediaType == "application/vnd.oci.image.manifest.v1+json" {
-                        let manifest = try processOCIManifest(
-                            descriptor: nestedDescriptor,
-                            ociLayoutPath: ociLayoutPath,
-                            dockerFormatPath: dockerFormatPath,
-                            repoTag: idx < resolvedRefs.count ? resolvedRefs[idx] : "unknown:latest",
-                            logger: logger
-                        )
-                        dockerManifests.append(manifest)
-                    }
-                }
-            } else if descriptor.mediaType == "application/vnd.oci.image.manifest.v1+json" {
-                let manifest = try processOCIManifest(
-                    descriptor: descriptor,
+            let reference = idx < resolvedRefs.count ? resolvedRefs[idx] : nil
+            let repoTags = dockerArchiveRepoTags(for: reference)
+            dockerManifests.append(
+                contentsOf: try processOCIDescriptor(
+                    descriptor,
                     ociLayoutPath: ociLayoutPath,
                     dockerFormatPath: dockerFormatPath,
-                    repoTag: idx < resolvedRefs.count ? resolvedRefs[idx] : "unknown:latest",
+                    repoTags: repoTags,
+                    state: DockerArchiveTraversalState(
+                        budget: traversalBudget
+                    ),
                     logger: logger
                 )
-                dockerManifests.append(manifest)
-            } else {
-                logger.warning("Skipping descriptor with unknown mediaType: \(descriptor.mediaType)")
-            }
+            )
         }
 
         return dockerManifests
     }
 
-    private static func processOCIManifest(
-        descriptor: OCILayoutDescriptor,
+    private static let maxDockerArchiveIndexDepth = 32
+    private static let maxDockerArchiveDescriptorVisits = 10_000
+
+    private struct OCIContentKey: Hashable {
+        let mediaType: String
+        let digest: String
+    }
+
+    private final class DockerArchiveTraversalBudget {
+        private var visits = 0
+
+        func recordVisit() throws {
+            visits += 1
+            guard visits <= maxDockerArchiveDescriptorVisits else {
+                throw Error.invalidTarball(
+                    reason:
+                        "OCI image graph exceeds \(maxDockerArchiveDescriptorVisits) descriptors"
+                )
+            }
+        }
+    }
+
+    /// The same nested index can be referenced many times in an OCI DAG. Keep
+    /// traversal state per exported root/tag so shared descendants are emitted
+    /// once without losing the same image under a second requested tag.
+    private final class DockerArchiveTraversalState {
+        let budget: DockerArchiveTraversalBudget
+        var expandedIndexes: Set<OCIContentKey> = []
+        var emittedManifests: Set<OCIContentKey> = []
+
+        init(budget: DockerArchiveTraversalBudget) {
+            self.budget = budget
+        }
+    }
+
+    private static func processOCIDescriptor(
+        _ descriptor: Descriptor,
         ociLayoutPath: URL,
         dockerFormatPath: URL,
-        repoTag: String,
+        repoTags: [String],
+        state: DockerArchiveTraversalState,
+        depth: Int = 0,
+        visiting: Set<String> = [],
         logger: Logger
-    ) throws -> [String: Any] {
-        let manifestDigest = descriptor.digest.replacingOccurrences(of: "sha256:", with: "")
-        let manifestPath = ociLayoutPath.appendingPathComponent("blobs/sha256/\(manifestDigest)")
-        let manifestData = try Data(contentsOf: manifestPath)
-        let manifest = try JSONDecoder().decode(OCILayoutManifest.self, from: manifestData)
+    ) throws -> [[String: Any]] {
+        try state.budget.recordVisit()
+        guard depth <= maxDockerArchiveIndexDepth else {
+            throw Error.invalidTarball(
+                reason: "OCI image index nesting exceeds \(maxDockerArchiveIndexDepth) levels"
+            )
+        }
 
-        let configDigest = manifest.config.digest.replacingOccurrences(of: "sha256:", with: "")
+        if isIndexMediaType(descriptor.mediaType) {
+            guard !isArtifactDescriptor(descriptor) else {
+                logger.debug(
+                    "Omitting attestation/artifact index \(descriptor.digest) from legacy docker-archive export"
+                )
+                return []
+            }
+            guard !visiting.contains(descriptor.digest) else {
+                throw Error.invalidTarball(
+                    reason: "OCI image index contains a cycle at \(descriptor.digest)"
+                )
+            }
+            let contentKey = OCIContentKey(
+                mediaType: descriptor.mediaType,
+                digest: descriptor.digest
+            )
+            guard state.expandedIndexes.insert(contentKey).inserted else {
+                return []
+            }
+            let blobData = try readOCIMetadata(
+                for: descriptor.digest,
+                in: ociLayoutPath
+            )
+            let nestedIndex = try JSONDecoder().decode(Index.self, from: blobData)
+            guard !isArtifactIndex(nestedIndex) else {
+                logger.debug(
+                    "Omitting OCI artifact index document \(descriptor.digest) from legacy docker-archive export"
+                )
+                return []
+            }
+            logger.debug(
+                "Found nested OCI index with \(nestedIndex.manifests.count) descriptor(s)"
+            )
+            var results: [[String: Any]] = []
+            for nested in nestedIndex.manifests {
+                results.append(
+                    contentsOf: try processOCIDescriptor(
+                        nested,
+                        ociLayoutPath: ociLayoutPath,
+                        dockerFormatPath: dockerFormatPath,
+                        repoTags: repoTags,
+                        state: state,
+                        depth: depth + 1,
+                        visiting: visiting.union([descriptor.digest]),
+                        logger: logger
+                    )
+                )
+            }
+            return results
+        }
+
+        guard isManifestMediaType(descriptor.mediaType) else {
+            logger.warning(
+                "Skipping descriptor with unsupported mediaType: \(descriptor.mediaType)"
+            )
+            return []
+        }
+        let contentKey = OCIContentKey(
+            mediaType: descriptor.mediaType,
+            digest: descriptor.digest
+        )
+        guard !state.emittedManifests.contains(contentKey) else {
+            return []
+        }
+        guard
+            let manifest = try processOCIManifest(
+                descriptor: descriptor,
+                ociLayoutPath: ociLayoutPath,
+                dockerFormatPath: dockerFormatPath,
+                repoTags: repoTags,
+                logger: logger
+            )
+        else {
+            return []
+        }
+        state.emittedManifests.insert(contentKey)
+        return [manifest]
+    }
+
+    private static func processOCIManifest(
+        descriptor: Descriptor,
+        ociLayoutPath: URL,
+        dockerFormatPath: URL,
+        repoTags: [String],
+        logger: Logger
+    ) throws -> [String: Any]? {
+        let manifestData = try readOCIMetadata(
+            for: descriptor.digest,
+            in: ociLayoutPath
+        )
+        let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
+
+        guard !isArtifact(descriptor: descriptor, manifest: manifest) else {
+            logger.debug(
+                "Omitting OCI attestation/artifact \(descriptor.digest) from legacy docker-archive export"
+            )
+            return nil
+        }
+
+        let configDigest = try digestComponents(manifest.config.digest).value
         let configFileName = "\(configDigest).json"
-        let configSrcPath = ociLayoutPath.appendingPathComponent("blobs/sha256/\(configDigest)")
+        let configSrcPath = try blobURL(
+            for: manifest.config.digest,
+            in: ociLayoutPath
+        )
+        let configPlatform = try imagePlatform(
+            fromConfigDigest: manifest.config.digest,
+            in: ociLayoutPath
+        )
+        guard configPlatform.architecture != "unknown",
+            configPlatform.os != "unknown"
+        else {
+            logger.debug(
+                "Omitting unknown-platform OCI artifact \(descriptor.digest) from legacy docker-archive export"
+            )
+            return nil
+        }
         let configDstPath = dockerFormatPath.appendingPathComponent(configFileName)
 
         if !FileManager.default.fileExists(atPath: configDstPath.path) {
@@ -618,14 +1588,17 @@ enum ContainerImageUtility {
 
         var layers: [String] = []
         for layer in manifest.layers {
-            let layerDigest = layer.digest.replacingOccurrences(of: "sha256:", with: "")
+            let layerDigest = try digestComponents(layer.digest).value
             let layerFileName = "\(layerDigest)/layer.tar"
             let layerDir = dockerFormatPath.appendingPathComponent(layerDigest)
 
             if !FileManager.default.fileExists(atPath: layerDir.path) {
                 try FileManager.default.createDirectory(at: layerDir, withIntermediateDirectories: true)
 
-                let layerSrcPath = ociLayoutPath.appendingPathComponent("blobs/sha256/\(layerDigest)")
+                let layerSrcPath = try blobURL(
+                    for: layer.digest,
+                    in: ociLayoutPath
+                )
                 let layerDstPath = layerDir.appendingPathComponent("layer.tar")
                 try FileManager.default.copyItem(at: layerSrcPath, to: layerDstPath)
             }
@@ -635,9 +1608,140 @@ enum ContainerImageUtility {
 
         return [
             "Config": configFileName,
-            "RepoTags": [repoTag],
+            "RepoTags": repoTags,
             "Layers": layers,
         ]
+    }
+
+    private static func dockerArchiveRepoTags(for reference: String?) -> [String] {
+        guard let reference, !reference.isEmpty,
+            !DockerImageReferenceSemantics.isInternalReference(reference),
+            reference.wholeMatch(
+                of: /[a-z0-9]+:[a-fA-F0-9]{32,}/
+            ) == nil,
+            let parsed = try? Reference.parse(reference),
+            parsed.digest == nil,
+            parsed.tag != nil
+        else {
+            return []
+        }
+        return [reference]
+    }
+
+    private static func isArtifact(
+        descriptor: Descriptor,
+        manifest: Manifest
+    ) -> Bool {
+        if isArtifactDescriptor(descriptor) || manifest.artifactType != nil
+            || manifest.subject != nil
+        {
+            return true
+        }
+        guard let platform = descriptor.platform else { return false }
+        return platform.os == "unknown"
+            || platform.architecture == "unknown"
+    }
+
+    private static func isArtifactDescriptor(_ descriptor: Descriptor) -> Bool {
+        if isAttestationDescriptor(descriptor)
+            || descriptor.artifactType != nil
+        {
+            return true
+        }
+        guard let platform = descriptor.platform else { return false }
+        return platform.os == "unknown"
+            || platform.architecture == "unknown"
+    }
+
+    private static func isArtifactIndex(_ index: Index) -> Bool {
+        index.artifactType != nil || index.subject != nil
+            || index.annotations?["vnd.docker.reference.type"]
+                == "attestation-manifest"
+    }
+
+    private static func isAttestationDescriptor(_ descriptor: Descriptor) -> Bool {
+        descriptor.annotations?["vnd.docker.reference.type"]
+            == "attestation-manifest"
+    }
+
+    private static func isIndexMediaType(_ mediaType: String) -> Bool {
+        mediaType == MediaTypes.index
+            || mediaType == MediaTypes.dockerManifestList
+    }
+
+    private static func isManifestMediaType(_ mediaType: String) -> Bool {
+        mediaType == MediaTypes.imageManifest
+            || mediaType == MediaTypes.dockerManifest
+    }
+
+    private static func digestComponents(
+        _ digest: String
+    ) throws -> (algorithm: String, value: String) {
+        guard
+            digest.wholeMatch(
+                of: /[a-z0-9]+:[a-fA-F0-9]{32,}/
+            ) != nil
+        else {
+            throw Error.invalidTarball(
+                reason: "invalid OCI content digest: \(digest)"
+            )
+        }
+        let parts = digest.split(separator: ":", maxSplits: 1)
+        return (String(parts[0]), String(parts[1]))
+    }
+
+    private static func blobURL(
+        for digest: String,
+        in ociLayoutPath: URL
+    ) throws -> URL {
+        let components = try digestComponents(digest)
+        let layoutRoot = ociLayoutPath
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let blobsRoot =
+            layoutRoot
+            .appendingPathComponent("blobs")
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard blobsRoot.path.hasPrefix(layoutRoot.path + "/") else {
+            throw Error.invalidTarball(
+                reason: "OCI blob directory escapes the image layout"
+            )
+        }
+        let url =
+            blobsRoot
+            .appendingPathComponent(components.algorithm)
+            .appendingPathComponent(components.value)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard url.path.hasPrefix(blobsRoot.path + "/") else {
+            throw Error.invalidTarball(
+                reason: "OCI content digest escapes the blob directory"
+            )
+        }
+        return url
+    }
+
+    private static func readOCIMetadata(
+        for digest: String,
+        in ociLayoutPath: URL
+    ) throws -> Data {
+        let components = try digestComponents(digest)
+        return try BoundedFileReader.readImageMetadata(
+            relativePath:
+                "blobs/\(components.algorithm)/\(components.value)",
+            under: ociLayoutPath
+        )
+    }
+
+    private static func imagePlatform(
+        fromConfigDigest digest: String,
+        in ociLayoutPath: URL
+    ) throws -> DockerArchiveImagePlatform {
+        try JSONDecoder().decode(
+            DockerArchiveImagePlatform.self,
+            from: readOCIMetadata(for: digest, in: ociLayoutPath)
+        )
     }
 }
 

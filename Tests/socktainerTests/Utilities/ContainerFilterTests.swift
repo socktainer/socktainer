@@ -88,31 +88,80 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
-    @Test("ancestor digest expands to every stored reference for that image")
-    func ancestorIdentityExpansion() async throws {
+    @Test("ancestor resolves to the immutable image root")
+    func ancestorIdentityResolution() async throws {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         let resolver = StubImageReferenceResolver(
-            referencesByIdentifier: [
-                digest: ["docker.io/library/alpine:3.22", "docker.io/library/alpine:latest"]
+            identitiesByIdentifier: [
+                digest: .init(
+                    rootDigests: [digest],
+                    references: ["docker.io/library/alpine:3.22", "docker.io/library/alpine:latest"]
+                )
             ])
-        let filters = await ClientContainerService.resolvingAncestorFilters(
-            ["ancestor": [digest]], with: resolver)
+        let resolved = await ClientContainerService.resolveAncestorFilter([digest], with: resolver)
         let containers = [
-            try makeSnapshot(id: "a", image: "docker.io/library/alpine:latest"),
-            try makeSnapshot(id: "b", image: "docker.io/library/nginx:latest"),
+            try makeSnapshot(id: "a", image: "docker.io/library/alpine:latest", imageDigest: digest),
+            try makeSnapshot(id: "b", image: "docker.io/library/nginx:latest", imageDigest: "sha256:bbbb"),
         ]
 
-        let result = ClientContainerService.applyFilters(containers, filters: filters)
+        let result = ClientContainerService.applyFilters(
+            containers,
+            filters: ["ancestor": [digest]],
+            resolvedAncestors: resolved
+        )
 
         #expect(result.map(\.id) == ["a"])
-        #expect(filters["ancestor"] == [digest, "docker.io/library/alpine:3.22", "docker.io/library/alpine:latest"])
     }
 
     @Test("unresolvable ancestor preserves the original filter value")
-    func ancestorResolutionFailurePreservesInput() async {
-        let filters = await ClientContainerService.resolvingAncestorFilters(
-            ["ancestor": ["legacy:latest"]], with: StubImageReferenceResolver(referencesByIdentifier: [:]))
-        #expect(filters["ancestor"] == ["legacy:latest"])
+    func ancestorResolutionFailureOnlyMatchesDigestlessLegacySnapshots() async throws {
+        let resolved = await ClientContainerService.resolveAncestorFilter(
+            ["legacy:latest"],
+            with: StubImageReferenceResolver(identitiesByIdentifier: [:])
+        )
+        #expect(resolved?.unresolvedReferences == ["legacy:latest"])
+        let modern = try makeSnapshot(
+            id: "modern",
+            image: "legacy:latest",
+            imageDigest: "sha256:" + String(repeating: "9", count: 64)
+        )
+        let legacy = try makeSnapshot(
+            id: "legacy",
+            image: "legacy:latest",
+            imageDigest: ""
+        )
+
+        let result = ClientContainerService.applyFilters(
+            [modern, legacy],
+            filters: ["ancestor": ["legacy:latest"]],
+            resolvedAncestors: resolved
+        )
+
+        #expect(result.map(\.id) == ["legacy"])
+    }
+
+    @Test("ancestor tag replacement matches only containers created from the new root")
+    func ancestorAfterTagReplacement() async throws {
+        let oldDigest = "sha256:" + String(repeating: "1", count: 64)
+        let newDigest = "sha256:" + String(repeating: "2", count: 64)
+        let tag = "docker.io/library/example:latest"
+        let resolver = StubImageReferenceResolver(
+            identitiesByIdentifier: [
+                tag: .init(rootDigests: [newDigest], references: [tag])
+            ])
+        let resolved = await ClientContainerService.resolveAncestorFilter([tag], with: resolver)
+        let containers = [
+            try makeSnapshot(id: "old", image: tag, imageDigest: oldDigest),
+            try makeSnapshot(id: "new", image: tag, imageDigest: newDigest),
+        ]
+
+        let result = ClientContainerService.applyFilters(
+            containers,
+            filters: ["ancestor": [tag]],
+            resolvedAncestors: resolved
+        )
+
+        #expect(result.map(\.id) == ["new"])
     }
 
     // MARK: - unknown key
@@ -192,6 +241,41 @@ struct ContainerFilterTests {
         let result = ClientContainerService.applyFilters(
             containers, filters: ["label": ["myapp=test"]])
         #expect(result.map(\.id) == ["a"])
+    }
+
+    @Test("internal image attribution labels are not visible to Docker label filters")
+    func hiddenImageIdentityLabelsDoNotMatch() throws {
+        let containers = [
+            try makeSnapshot(
+                id: "a",
+                labels: [
+                    "visible": "yes",
+                    ContainerImageIdentity.requestedReferenceLabel:
+                        "example:latest",
+                    ContainerImageIdentity.configDigestLabel:
+                        "sha256:" + String(repeating: "a", count: 64),
+                ]
+            )
+        ]
+
+        let visible = ClientContainerService.applyFilters(
+            containers,
+            filters: ["label": ["visible=yes"]]
+        )
+        let requestedIdentity = ClientContainerService.applyFilters(
+            containers,
+            filters: [
+                "label": [ContainerImageIdentity.requestedReferenceLabel]
+            ]
+        )
+        let digestIdentity = ClientContainerService.applyFilters(
+            containers,
+            filters: ["label": [ContainerImageIdentity.configDigestLabel]]
+        )
+
+        #expect(visible.map(\.id) == ["a"])
+        #expect(requestedIdentity.isEmpty)
+        #expect(digestIdentity.isEmpty)
     }
 
     // MARK: - volume stub
@@ -285,13 +369,13 @@ struct ContainerFilterTests {
 }
 
 private struct StubImageReferenceResolver: ImageReferenceResolving {
-    let referencesByIdentifier: [String: [String]]
+    let identitiesByIdentifier: [String: ResolvedImageFilterIdentity]
 
-    func references(for identifier: String) async throws -> [String] {
-        guard let references = referencesByIdentifier[identifier] else {
+    func identity(for identifier: String) async throws -> ResolvedImageFilterIdentity {
+        guard let identity = identitiesByIdentifier[identifier] else {
             throw ImageIdentityResolutionError.notFound(identifier)
         }
-        return references
+        return identity
     }
 }
 
@@ -302,6 +386,7 @@ private func makeSnapshot(
     status: RuntimeStatus = .running,
     labels: [String: String] = [:],
     image: String = "alpine:latest",
+    imageDigest: String = "sha256:abc",
     networkNames: [String] = []
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
@@ -311,7 +396,7 @@ private func makeSnapshot(
         reference: image,
         descriptor: Descriptor(
             mediaType: "application/vnd.oci.image.index.v1+json",
-            digest: "sha256:abc", size: 0))
+            digest: imageDigest, size: 0))
     var config = ContainerConfiguration(id: id, image: img, process: proc)
     config.labels = labels
     let attachments = try networkNames.map { try makeAttachment(network: $0) }

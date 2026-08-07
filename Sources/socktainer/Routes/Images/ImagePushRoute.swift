@@ -64,6 +64,8 @@ extension ImagePushRoute {
                 )
             } catch ClientImageError.notFound(let id) {
                 throw Abort(.notFound, reason: "No such image: \(id)")
+            } catch ClientImageError.conflict(let message) {
+                throw Abort(.conflict, reason: message)
             } catch let abort as Abort {
                 throw abort
             } catch {
@@ -74,18 +76,46 @@ extension ImagePushRoute {
             // moby's push event uses the familiar reference as Actor.ID and the familiar
             // name without tag as the `name` attribute (daemon/containerd/image_push.go).
             let familiarName = (try? Reference.parse(reference))?.name ?? imageName
-            response.body = .init(stream: { writer in
-                Task {
-                    await DockerProgressFrame.pipe(progressStream, to: writer) {
-                        guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
-                        await broadcaster.broadcast(
-                            DockerEvent.make(
-                                type: "image", action: "push", actorID: reference,
-                                attributes: ["name": familiarName]))
-                    }
+            let logger = req.logger
+            response.body = .init(managedAsyncStream: { writer in
+                try await producePushResponse(
+                    progressStream,
+                    writer: writer,
+                    logger: logger
+                ) {
+                    guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
+                    await broadcaster.broadcast(
+                        DockerEvent.make(
+                            type: "image", action: "push", actorID: reference,
+                            attributes: ["name": familiarName]))
                 }
             })
             return response
+        }
+    }
+
+    static func producePushResponse(
+        _ progress: AsyncThrowingStream<String, Error>,
+        writer: any AsyncBodyStreamWriter,
+        logger: Logger,
+        heartbeatInterval: Duration =
+            DisconnectCoupledResponseStream.defaultHeartbeatInterval,
+        onSuccess: (@Sendable () async -> Void)? = nil
+    ) async throws {
+        do {
+            try await DisconnectCoupledResponseStream.run(
+                writer: writer,
+                heartbeatInterval: heartbeatInterval
+            ) { writer in
+                try await DockerProgressFrame.pipe(
+                    progress,
+                    to: writer,
+                    onSuccess: onSuccess
+                )
+            }
+        } catch DisconnectCoupledResponseStream.ProducerError.clientDisconnected {
+            logger.debug("Image push client disconnected; cancelling push")
+            throw CancellationError()
         }
     }
 }

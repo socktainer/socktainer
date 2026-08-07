@@ -53,9 +53,9 @@ struct ContainerExportRoute: RouteCollection {
                                         id: DockerContainerID.hexId(for: current),
                                         type: "container",
                                         status: "export",
-                                        image: current.configuration.image.reference,
+                                        image: ContainerImageIdentity.requestedReference(for: current),
                                         name: current.id,
-                                        labels: LabelNormalization.restore(current.configuration.labels)
+                                        labels: ContainerImageIdentity.dockerLabels(for: current)
                                     ))
                             }
                         }

@@ -36,9 +36,13 @@ extension ContainerKillRoute {
                         id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? containerId,
                         type: "container",
                         status: "kill",
-                        image: snapshot?.configuration.image.reference ?? "",
+                        image: snapshot.map {
+                            ContainerImageIdentity.requestedReference(for: $0)
+                        } ?? "",
                         name: snapshot?.id ?? containerId,
-                        labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:]),
+                        labels: snapshot.map {
+                            ContainerImageIdentity.dockerLabels(for: $0)
+                        } ?? [:],
                         extraAttributes: ["signal": String(signalNumber)]
                     )
                     await broadcaster.broadcast(event)

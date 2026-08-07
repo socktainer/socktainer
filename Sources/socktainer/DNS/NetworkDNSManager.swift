@@ -34,13 +34,22 @@ actor NetworkDNSManager {
     private let appSupportURL: URL
     private let dnsPort: Int
     private let containerSystemConfig: ContainerSystemConfig
+    private let imageClient: ClientImageService
     private var pendingCreation: [String: Task<String, Error>] = [:]
     private var log = Logger(label: "socktainer.dns.manager")
 
-    init(appSupportURL: URL, dnsPort: Int = 2054, containerSystemConfig: ContainerSystemConfig) {
+    init(
+        appSupportURL: URL,
+        dnsPort: Int = 2054,
+        containerSystemConfig: ContainerSystemConfig,
+        imageClient: ClientImageService? = nil
+    ) {
         self.appSupportURL = appSupportURL
         self.dnsPort = dnsPort
         self.containerSystemConfig = containerSystemConfig
+        self.imageClient =
+            imageClient
+            ?? ClientImageService(containerSystemConfig: containerSystemConfig)
     }
 
     // MARK: - Public API
@@ -55,8 +64,15 @@ actor NetworkDNSManager {
         let appSupportURL = self.appSupportURL
         let dnsPort = self.dnsPort
         let containerSystemConfig = self.containerSystemConfig
+        let imageClient = self.imageClient
         let task = Task<String, Error> {
-            try await Self.createDNSContainerWork(networkId: networkId, appSupportURL: appSupportURL, dnsPort: dnsPort, containerSystemConfig: containerSystemConfig)
+            try await Self.createDNSContainerWork(
+                networkId: networkId,
+                appSupportURL: appSupportURL,
+                dnsPort: dnsPort,
+                containerSystemConfig: containerSystemConfig,
+                imageClient: imageClient
+            )
         }
         pendingCreation[networkId] = task
 
@@ -135,7 +151,13 @@ actor NetworkDNSManager {
     // MARK: - Private implementation
 
     /// Runs outside the actor's executor to avoid deadlock with the Task created in ensureDNSContainer.
-    private static func createDNSContainerWork(networkId: String, appSupportURL: URL, dnsPort: Int, containerSystemConfig: ContainerSystemConfig) async throws -> String {
+    private static func createDNSContainerWork(
+        networkId: String,
+        appSupportURL: URL,
+        dnsPort: Int,
+        containerSystemConfig: ContainerSystemConfig,
+        imageClient: ClientImageService
+    ) async throws -> String {
         let containerClient = ContainerClient()
         // Sanitize to respect Apple Container's 64-char container ID limit
         let containerId = ContainerNameUtility.sanitize(containerPrefix + networkId)
@@ -154,7 +176,8 @@ actor NetworkDNSManager {
 
         let image = try await EmbeddedDNSImage.ensure(
             containerSystemConfig: containerSystemConfig,
-            appSupportURL: appSupportURL
+            appSupportURL: appSupportURL,
+            imageClient: imageClient
         )
 
         let platform = Platform.current

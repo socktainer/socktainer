@@ -52,7 +52,7 @@ private struct EmptyContainerClient: ClientContainerProtocol {
 private struct StubImageClient: ClientImageProtocol {
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
     func delete(id: String) async throws -> ImageDeletionResult { ImageDeletionResult(untagged: id, digest: "sha256:abc", deletedDigest: nil) }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
@@ -61,7 +61,7 @@ private struct StubImageClient: ClientImageProtocol {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
         URL(fileURLWithPath: "/dev/null")
     }

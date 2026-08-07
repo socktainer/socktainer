@@ -11,17 +11,27 @@ struct RESTImageHistoryQuery: Vapor.Content {
 struct ImageHistoryRoute: RouteCollection {
     let systemConfig: ContainerSystemConfig
     let identityResolver: ImageIdentityResolver
+    let runnableImageSelector: RunnableImageSelector
 
-    init(systemConfig: ContainerSystemConfig, identityResolver: ImageIdentityResolver? = nil) {
+    init(
+        systemConfig: ContainerSystemConfig,
+        identityResolver: ImageIdentityResolver? = nil,
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
+    ) {
         self.systemConfig = systemConfig
         self.identityResolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
+        self.runnableImageSelector = runnableImageSelector
     }
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
             .GET,
             pattern: "/images/{name:.*}/history",
-            use: ImageHistoryRoute.handler(systemConfig: systemConfig, identityResolver: identityResolver)
+            use: ImageHistoryRoute.handler(
+                systemConfig: systemConfig,
+                identityResolver: identityResolver,
+                runnableImageSelector: runnableImageSelector
+            )
         )
     }
 }
@@ -42,111 +52,98 @@ extension ImageHistoryRoute {
         return explicit ?? implied
     }
 
-    private static func prioritizedManifests(_ manifests: [Descriptor], preferredPlatform: Platform?) -> [Descriptor] {
-        let primaryPlatform = requestedOrDefaultPlatform(preferredPlatform)
-
-        return manifests.enumerated().sorted { leftManifest, rightManifest in
-            let leftPlatform = leftManifest.element.platform
-            let rightPlatform = rightManifest.element.platform
-
-            if preferredPlatformMatches(
-                leftPlatform,
-                over: rightPlatform,
-                preferredPlatform: primaryPlatform
-            ) {
-                return true
-            }
-
-            return leftManifest.offset < rightManifest.offset
-        }.map(\.element)
-    }
-
-    private static func historyResponseItems(
+    static func historyResponseItems(
         for image: ClientImage,
         requestedName: String,
-        preferredPlatform: Platform?
+        tags: [String],
+        preferredPlatform: Platform?,
+        identityConstraint: RunnableImageIdentityConstraint = .unconstrained,
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
     ) async throws -> [RESTImageHistoryResponseItem] {
-        let imageIndex = try await image.index()
-        let manifests = prioritizedManifests(imageIndex.manifests, preferredPlatform: preferredPlatform)
-
-        for descriptor in manifests {
-            if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
-                referenceType == "attestation-manifest"
-            {
-                continue
-            }
-
-            guard let platform = descriptor.platform else {
-                continue
-            }
-
-            let config: ContainerizationOCI.Image
-            let manifest: ContainerizationOCI.Manifest
-            do {
-                config = try await image.config(for: platform)
-                manifest = try await image.manifest(for: platform)
-            } catch {
-                continue
-            }
-
-            let history = config.history ?? []
-            var layerIndex = 0
-            var items: [RESTImageHistoryResponseItem] = []
-
-            for (index, entry) in history.enumerated() {
-                let isEmptyLayer = entry.emptyLayer ?? false
-                let itemId: String
-                let itemSize: Int64
-
-                if isEmptyLayer {
-                    itemId = "<missing>"
-                    itemSize = 0
-                } else if layerIndex < manifest.layers.count {
-                    let layer = manifest.layers[layerIndex]
-                    itemId = layer.digest
-                    itemSize = layer.size
-                    layerIndex += 1
-                } else {
-                    itemId = "<missing>"
-                    itemSize = 0
-                }
-
-                let tags = index == history.index(before: history.endIndex) ? [image.reference] : []
-
-                items.append(
-                    RESTImageHistoryResponseItem(
-                        Id: itemId,
-                        Created: AppleContainerTimestampResolver.unixTimestampSeconds(entry.created ?? config.created),
-                        CreatedBy: entry.createdBy ?? "",
-                        Tags: tags,
-                        Size: itemSize,
-                        Comment: entry.comment ?? ""
-                    )
+        let resolvedDescriptors = try await runnableImageSelector.descriptors(
+            for: image
+        )
+        guard
+            let selectedVariant = runnableImageSelector.selectVariant(
+                from: resolvedDescriptors,
+                requestedPlatform: preferredPlatform,
+                identityConstraint: identityConstraint
+            )
+        else {
+            if let preferredPlatform {
+                throw Abort(
+                    .notFound,
+                    reason:
+                        "Image '\(requestedName)' does not provide platform '\(preferredPlatform.description)'"
                 )
             }
-
-            if !items.isEmpty {
-                return items.reversed()
-            }
-
-            return [
-                RESTImageHistoryResponseItem(
-                    Id: image.digest,
-                    Created: AppleContainerTimestampResolver.unixTimestampSeconds(config.created),
-                    CreatedBy: "",
-                    Tags: [image.reference],
-                    Size: manifest.layers.reduce(0) { $0 + $1.size },
-                    Comment: ""
-                )
-            ]
+            throw Abort(.notFound, reason: "Image '\(requestedName)' not found")
         }
 
-        throw Abort(.notFound, reason: "Image '\(requestedName)' not found")
+        let config = selectedVariant.config
+        let manifest = selectedVariant.manifest
+        let history = config.history ?? []
+        var layerIndex = 0
+        var items: [RESTImageHistoryResponseItem] = []
+
+        for (index, entry) in history.enumerated() {
+            let isEmptyLayer = entry.emptyLayer ?? false
+            let itemId: String
+            let itemSize: Int64
+
+            if isEmptyLayer {
+                itemId = "<missing>"
+                itemSize = 0
+            } else if layerIndex < manifest.layers.count {
+                let layer = manifest.layers[layerIndex]
+                itemId = layer.digest
+                itemSize = layer.size
+                layerIndex += 1
+            } else {
+                itemId = "<missing>"
+                itemSize = 0
+            }
+
+            let tags =
+                index == history.index(before: history.endIndex)
+                ? tags : []
+
+            items.append(
+                RESTImageHistoryResponseItem(
+                    Id: itemId,
+                    Created:
+                        AppleContainerTimestampResolver
+                        .unixTimestampSeconds(entry.created ?? config.created),
+                    CreatedBy: entry.createdBy ?? "",
+                    Tags: tags,
+                    Size: itemSize,
+                    Comment: entry.comment ?? ""
+                )
+            )
+        }
+
+        if !items.isEmpty {
+            return items.reversed()
+        }
+
+        return [
+            RESTImageHistoryResponseItem(
+                Id: manifest.config.digest,
+                Created:
+                    AppleContainerTimestampResolver
+                    .unixTimestampSeconds(config.created),
+                CreatedBy: "",
+                Tags: tags,
+                Size: manifest.layers.reduce(0) { $0 + $1.size },
+                Comment: ""
+            )
+        ]
     }
 
     static func handler(
         systemConfig: ContainerSystemConfig,
-        identityResolver: ImageIdentityResolver? = nil
+        identityResolver: ImageIdentityResolver? = nil,
+        runnableImageSelector: RunnableImageSelector = RunnableImageSelector()
     ) -> @Sendable (Request) async throws -> [RESTImageHistoryResponseItem] {
         let resolver = identityResolver ?? ImageIdentityResolver(systemConfig: systemConfig)
         return { req in
@@ -181,7 +178,10 @@ extension ImageHistoryRoute {
             return try await historyResponseItems(
                 for: resolved.image,
                 requestedName: refOrId,
-                preferredPlatform: preferredPlatform
+                tags: resolved.references.sorted(),
+                preferredPlatform: preferredPlatform,
+                identityConstraint: resolved.variantConstraint,
+                runnableImageSelector: runnableImageSelector
             )
         }
     }

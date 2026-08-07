@@ -14,12 +14,16 @@ struct ImageDeleteEventTests {
     // moby's imageDeleteHelper skips ActionUnTag when isDanglingImage(img) — dangling images
     // have no real tag to untag (Name == "<none>"). Verified against moby v28.5.2 source:
     // daemon/containerd/image_delete.go `if !isDanglingImage(img) { logImageEvent(...ActionUnTag) }`.
-    // Covers both dangling forms: the store's "untagged@<digest>" sentinel (what
-    // LocalOCILayoutClient assigns to a loaded tarball with no RepoTags) and a
-    // "<none>" ref imported verbatim from a foreign tarball annotation.
+    // Covers Socktainer's "moby-dangling@<digest>" retention key, the store's
+    // legacy "untagged@<digest>" sentinel, and a "<none>" ref imported verbatim
+    // from a foreign tarball annotation.
     @Test(
         "dangling image delete emits 'delete' only — no 'untag'",
-        arguments: ["untagged@sha256:abc123", "<none>@sha256:abc123"])
+        arguments: [
+            "moby-dangling@sha256:abc123",
+            "untagged@sha256:abc123",
+            "<none>@sha256:abc123",
+        ])
     func danglingImageDeleteEmitsDeleteOnly(untaggedRef: String) async throws {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
@@ -133,7 +137,7 @@ private struct DanglingImageDeleteMock: ClientImageProtocol {
     func delete(id: String) async throws -> ImageDeletionResult {
         ImageDeletionResult(untagged: untagged, digest: "sha256:abc123", deletedDigest: "sha256:abc123")
     }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws
         -> AsyncThrowingStream<PullProgress, Error>
     { AsyncThrowingStream { $0.finish() } }
     func push(reference: String, platform: Platform?, logger: Logger) async throws
@@ -142,7 +146,7 @@ private struct DanglingImageDeleteMock: ClientImageProtocol {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (
         results: [ImageDeletionResult], spaceReclaimed: Int64
     ) { ([], 0) }
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL { URL(fileURLWithPath: "/tmp") }
     func importImage(
         tarPath: URL, repo: String?, tag: String?, message: String?, changes: [String], platform: Platform,
@@ -158,7 +162,7 @@ private struct ImageDeleteMock: ClientImageProtocol {
         // the raw input. The route must use result.untagged, not the original id parameter.
         ImageDeletionResult(untagged: "docker.io/library/\(id)", digest: digest, deletedDigest: nil)
     }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws
         -> AsyncThrowingStream<PullProgress, Error>
     {
         AsyncThrowingStream { $0.finish() }
@@ -172,7 +176,7 @@ private struct ImageDeleteMock: ClientImageProtocol {
         results: [ImageDeletionResult], spaceReclaimed: Int64
     ) { ([], 0) }
     func load(
-        tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger
+        tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger
     ) async throws -> [String] { [] }
     func save(
         references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger

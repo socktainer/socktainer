@@ -137,10 +137,11 @@ extension ContainerAttachWSRoute {
                     wait: { try await process.wait() },
                     hexId: hexId,
                     nativeId: container.id,
-                    fallbackImage: container.configuration.image.reference,
-                    fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                    fallbackImage: ContainerImageIdentity.requestedReference(for: container),
+                    fallbackLabels: ContainerImageIdentity.dockerLabels(for: container),
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                    broadcaster: broadcaster
+                    broadcaster: broadcaster,
+                    fallbackRootDescriptor: container.configuration.image.descriptor
                 )
 
                 try? await ws.close()

@@ -86,10 +86,18 @@ enum LabelNormalization {
         return normalizedLabels
     }
 
-    /// Returns true if the labels dict contains the reserved internal mapping key.
-    /// Create routes must reject such inputs to prevent silent data loss.
+    /// Returns the first user key that collides with the global mapping label,
+    /// including collisions introduced by Apple-compatible normalization.
+    static func reservedKey(in labels: [String: String]) -> String? {
+        labels.keys.sorted().first {
+            $0 == mappingKey || sanitizeKey($0) == mappingKey
+        }
+    }
+
+    /// Create routes must reject reserved labels to prevent clients from
+    /// spoofing Docker-facing metadata or hiding their own keys.
     static func containsReservedKey(_ labels: [String: String]) -> Bool {
-        labels[mappingKey] != nil
+        reservedKey(in: labels) != nil
     }
 
     // MARK: - Mapping: build and restore

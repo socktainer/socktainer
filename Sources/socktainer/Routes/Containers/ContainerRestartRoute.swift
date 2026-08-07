@@ -49,9 +49,13 @@ extension ContainerRestartRoute {
                 id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? id,
                 type: "container",
                 status: "restart",
-                image: snapshot?.configuration.image.reference ?? "",
+                image: snapshot.map {
+                    ContainerImageIdentity.requestedReference(for: $0)
+                } ?? "",
                 name: snapshot?.id ?? id,
-                labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:])
+                labels: snapshot.map {
+                    ContainerImageIdentity.dockerLabels(for: $0)
+                } ?? [:]
             )
             await broadcaster.broadcast(event)
 
@@ -69,9 +73,12 @@ extension ContainerRestartRoute {
                 await ContainerStartRoute.armRestartObserver(
                     nativeId: snap.id,
                     eventId: eventId,
-                    image: snap.configuration.image.reference,
+                    image: ContainerImageIdentity.requestedReference(
+                        for: snap
+                    ),
                     name: snap.id,
-                    labels: LabelNormalization.restore(snap.configuration.labels),
+                    labels: ContainerImageIdentity.dockerLabels(for: snap),
+                    rootDescriptor: snap.configuration.image.descriptor,
                     ip: ContainerStartRoute.dnsAttachmentIP(in: snap),
                     refreshCache: true,
                     restartPolicy: restartPolicy,

@@ -435,7 +435,7 @@ private struct StubImageClient: ClientImageProtocol {
     func delete(id: String) async throws -> ImageDeletionResult {
         ImageDeletionResult(untagged: id, digest: "sha256:abc", deletedDigest: nil)
     }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws
         -> AsyncThrowingStream<PullProgress, Error>
     {
         AsyncThrowingStream { $0.finish() }
@@ -451,7 +451,7 @@ private struct StubImageClient: ClientImageProtocol {
             5_000_000
         )
     }
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
         URL(fileURLWithPath: "/tmp")
     }

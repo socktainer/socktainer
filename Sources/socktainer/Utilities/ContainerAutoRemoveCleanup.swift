@@ -1,3 +1,4 @@
+import ContainerizationOCI
 import Foundation
 
 /// Performs the full `--rm` cleanup once `ContainerInfoCache.consumeAutoRemove` grants it:
@@ -12,10 +13,14 @@ enum ContainerAutoRemoveCleanup {
         fallbackImage: String,
         fallbackLabels: [String: String],
         dnsServer: SocktainerDNSServer?,
-        broadcaster: EventBroadcaster?
+        broadcaster: EventBroadcaster?,
+        fallbackRootDescriptor: Descriptor? = nil,
+        leaseReconciler: any ContainerImageLeaseReconciling =
+            RegisteredContainerImageLeaseReconciler()
     ) async {
         let cached = await ContainerInfoCache.shared.get(id: hexId)
         let labels = cached?.labels ?? fallbackLabels
+        let rootDescriptor = cached?.rootDescriptor ?? fallbackRootDescriptor
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
@@ -36,5 +41,8 @@ enum ContainerAutoRemoveCleanup {
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
+        if let rootDescriptor {
+            await leaseReconciler.reconcile(rootDescriptor: rootDescriptor)
+        }
     }
 }

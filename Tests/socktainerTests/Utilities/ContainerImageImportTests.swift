@@ -21,7 +21,7 @@ struct ContainerImageImportTests {
         let tarData = try Data(contentsOf: tarPath)
         let expectedDiffID = "sha256:\(tarData.sha256Hex())"
 
-        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+        let identity = try ContainerImageUtility.buildSingleLayerOCILayout(
             tarPath: tarPath,
             ociLayoutPath: fixture.ociLayoutDir,
             platform: Platform(arch: "arm64", os: "linux"),
@@ -36,6 +36,8 @@ struct ContainerImageImportTests {
         #expect(index.manifests[0].annotations == nil)
 
         let manifest = try fixture.manifest(index.manifests[0])
+        #expect(index.manifests[0].digest == "sha256:\(identity.manifestDigest)")
+        #expect(manifest.config.digest == "sha256:\(identity.configDigest)")
         #expect(manifest.layers.count == 1)
         #expect(manifest.layers[0].mediaType == MediaTypes.imageLayerGzip)
 
@@ -225,28 +227,54 @@ struct ContainerImageImportTests {
     ///
     /// moby stores zstd input as-is (`tar+zstd`); bzip2/xz are decompressed and
     /// re-compressed to gzip (`tar+gzip`) since OCI has no bzip2/xz layer media type.
-    private static let reserializeFixtures: [(format: String, base64: String, expectedMediaType: String)] = [
-        (
-            "bzip2",
-            "QlpoOTFBWSZTWRkuyEcAAHr/sf65A4BQA//iOmb/8P7n//AAQA4IABAACDABWVCDKaaFJtR6j1PUGmm0QGhoaAYQaMmTTI9JtQ4yZNGIaaGAmhiaNMmIGRhNGmmEGTDakVG9TJplPUYRoaGQNAAGgDT1AaaG1MEdB4GT2KcdxOtDZdByTfFeb9TklZYNZq+fUekKdkOZAsVl1tkjavxvnSPocKJMkKNsDEisCToOWVlhco3c9bXcTYYYwbRYVOqfZwlAtRpjt+a1YDI6iU7wzkD7KMObOpEjnnckiU4xkd+Kh5pFQ62HjEZGbLwQxhDTVTjfBbKAQRELzXdQqAX67X6xXrjewhHuLC8uLrzVAi1IKXwasz6p2PS9gEw4rmPALnzhwianMEyYs2jK36e1sKTE5HRKbDDZqRGf9FswOI7QzT95ngc1IhGyXaPspSZv0zIWGQ3/Wsbt8LpM+jS+pKUkjOEqhaeWgqOkG7eYgZhWqmNW0SJQkIGoXpXkyk7WdLVHmRpjCXy4XYllkUxNZpLSTiknhBRFYsRlLHSmSX+LuSKcKEgMl2QjgA==",
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-        ),
-        (
-            "xz",
-            "/Td6WFoAAATm1rRGBMDOAoAgIQEWAAAAAAAAAPrQkD7gD/8BRl0AFxfJBlOXkB3hI639Z/BGKdQsiNk3G5TXgSL/9PGJePOERCMsgYG7SRkm7x/x1QlB6IymM77jwvL+3uVRKpSuVgGKzX27zZpn1ukRtdADafE3gYjzDdb3EILHfcfYnJObF/wZoI6eEcxwHyAaZtL37BFqSf3+2TcHRTRzPV38HQlp48FUM29Mo4EvotRBel/qM+pR0IszPtGiWUIkjgiUZOJE4T02wYToEVcYHi87qdxcuGtOdRjMEd9fzz7SCk5QGzBDuQ3huy4/0RsxqQK2WWigdxfN7TA3WNrdfgxNMlMI3WJAJFJDcOUtm4zZcIsi74/RbxAYsGb9W9hApQqcj3RYkkDhv5f2D8P8Pno2PbU2LiDbt/A18/vscNJpIqaKQZT54XU+4o1AqJoOTRq70Jch5aqr9WOh0GpVxWuMEj+6SLNa7QAAAAD6JSwLckZHRQAB6gKAIAAAgk9e27HEZ/sCAAAAAARZWg==",
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-        ),
-        (
-            "zstd",
-            "KLUv/WQADyULAPYQPS4wpWobgFwKQ0EBpSp+u9FNwHgoQ3QPVHpuXX5hRQAZQ3b7u0ka1MClXAsMRigFLAAwADAAHAuj3FXRUI3Q3NnSq4G8GXrP55G7fC9G7YDP3d2lnA2hdHe+23VYre9xcAHURa8PYTZzX7OMOgujCBQDzDxxyWQkAMwfZn7MzODuhsYoNEUTmBcsUBDQ9d8DoX2SqdIzNiD0Byd8SAeBxBcj+JhR5K3qWu2OrfnFKT06sN+hT9noQgAJxrDow4YXCv5ZZa9B5wJhtl+iqrSyr72d7rGxqUyUCaYhsKF9LKFq4Xg6Go00WaSIs/fSzSEwTJTJRQoqINCCESot0AP9aStwTQE7yVZtYwOo0gncTxYGEANguPxOkIEsqTv/OIidGSI7vcFQtzscQMZwC9CETE0F6ZS/wbettQ2eUSP+Tl5eC86wlUjBqPmwIUckkFRXYBzNB6BJDAltmBw4N9auySUBAxjqzA==",
-            "application/vnd.oci.image.layer.v1.tar+zstd"
-        ),
-    ]
+    private static let exactDecompressionDigest =
+        "c38f6fe55b56982c69b2188729ee597d312cd6f734db3e1d934f0979ef6681ef"
+
+    /// The normal xz fixture below with its LZMA2 dictionary property changed
+    /// to 40 (`UINT32_MAX`) and the block-header CRC repaired. Its payload is
+    /// otherwise unchanged, but accepting the header would let an unbounded
+    /// decoder reserve roughly 4 GiB for a 4 KiB tar.
+    private static let excessiveDictionaryXZBase64 =
+        "/Td6WFoAAATm1rRGBMDOAoAgIQEoAAAAAAAAALWR167gD/8BRl0AFxfJBlOXkB3hI639Z/BGKdQsiNk3G5TXgSL/9PGJePOERCMsgYG7SRkm7x/x1QlB6IymM77jwvL+3uVRKpSuVgGKzX27zZpn1ukRtdADafE3gYjzDdb3EILHfcfYnJObF/wZoI6eEcxwHyAaZtL37BFqSf3+2TcHRTRzPV38HQlp48FUM29Mo4EvotRBel/qM+pR0IszPtGiWUIkjgiUZOJE4T02wYToEVcYHi87qdxcuGtOdRjMEd9fzz7SCk5QGzBDuQ3huy4/0RsxqQK2WWagdxfN7TA3WNrdfgxNMlMI3WJAJFJDcOUtm4zZcIsi74/RbxAYsGb9W9hApQqcj3RYkkDhv5f2D8P8Pno2PbU2LiDbt/A18/vscNJpIqaKQZT54XU+4o1AqJoOTRq70Jch5aqr9WOh0GpVxWuMEj+6SLNa7QAAAAD6JSwLckZHRQAB6gKAIAAAgk9e27HEZ/sCAAAAAARZWg=="
+
+    private static let reserializeFixtures:
+        [(
+            format: String,
+            base64: String,
+            expectedMediaType: String,
+            expectedDiffID: String
+        )] = [
+            (
+                "bzip2",
+                "QlpoOTFBWSZTWRkuyEcAAHr/sf65A4BQA//iOmb/8P7n//AAQA4IABAACDABWVCDKaaFJtR6j1PUGmm0QGhoaAYQaMmTTI9JtQ4yZNGIaaGAmhiaNMmIGRhNGmmEGTDakVG9TJplPUYRoaGQNAAGgDT1AaaG1MEdB4GT2KcdxOtDZdByTfFeb9TklZYNZq+fUekKdkOZAsVl1tkjavxvnSPocKJMkKNsDEisCToOWVlhco3c9bXcTYYYwbRYVOqfZwlAtRpjt+a1YDI6iU7wzkD7KMObOpEjnnckiU4xkd+Kh5pFQ62HjEZGbLwQxhDTVTjfBbKAQRELzXdQqAX67X6xXrjewhHuLC8uLrzVAi1IKXwasz6p2PS9gEw4rmPALnzhwianMEyYs2jK36e1sKTE5HRKbDDZqRGf9FswOI7QzT95ngc1IhGyXaPspSZv0zIWGQ3/Wsbt8LpM+jS+pKUkjOEqhaeWgqOkG7eYgZhWqmNW0SJQkIGoXpXkyk7WdLVHmRpjCXy4XYllkUxNZpLSTiknhBRFYsRlLHSmSX+LuSKcKEgMl2QjgA==",
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                exactDecompressionDigest
+            ),
+            (
+                "xz",
+                "/Td6WFoAAATm1rRGBMDOAoAgIQEWAAAAAAAAAPrQkD7gD/8BRl0AFxfJBlOXkB3hI639Z/BGKdQsiNk3G5TXgSL/9PGJePOERCMsgYG7SRkm7x/x1QlB6IymM77jwvL+3uVRKpSuVgGKzX27zZpn1ukRtdADafE3gYjzDdb3EILHfcfYnJObF/wZoI6eEcxwHyAaZtL37BFqSf3+2TcHRTRzPV38HQlp48FUM29Mo4EvotRBel/qM+pR0IszPtGiWUIkjgiUZOJE4T02wYToEVcYHi87qdxcuGtOdRjMEd9fzz7SCk5QGzBDuQ3huy4/0RsxqQK2WWigdxfN7TA3WNrdfgxNMlMI3WJAJFJDcOUtm4zZcIsi74/RbxAYsGb9W9hApQqcj3RYkkDhv5f2D8P8Pno2PbU2LiDbt/A18/vscNJpIqaKQZT54XU+4o1AqJoOTRq70Jch5aqr9WOh0GpVxWuMEj+6SLNa7QAAAAD6JSwLckZHRQAB6gKAIAAAgk9e27HEZ/sCAAAAAARZWg==",
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                exactDecompressionDigest
+            ),
+            (
+                "zstd",
+                "KLUv/WQADyULAPYQPS4wpWobgFwKQ0EBpSp+u9FNwHgoQ3QPVHpuXX5hRQAZQ3b7u0ka1MClXAsMRigFLAAwADAAHAuj3FXRUI3Q3NnSq4G8GXrP55G7fC9G7YDP3d2lnA2hdHe+23VYre9xcAHURa8PYTZzX7OMOgujCBQDzDxxyWQkAMwfZn7MzODuhsYoNEUTmBcsUBDQ9d8DoX2SqdIzNiD0Byd8SAeBxBcj+JhR5K3qWu2OrfnFKT06sN+hT9noQgAJxrDow4YXCv5ZZa9B5wJhtl+iqrSyr72d7rGxqUyUCaYhsKF9LKFq4Xg6Go00WaSIs/fSzSEwTJTJRQoqINCCESot0AP9aStwTQE7yVZtYwOo0gncTxYGEANguPxOkIEsqTv/OIidGSI7vcFQtzscQMZwC9CETE0F6ZS/wbettQ2eUSP+Tl5eC86wlUjBqPmwIUckkFRXYBzNB6BJDAltmBw4N9auySUBAxjqzA==",
+                "application/vnd.oci.image.layer.v1.tar+zstd",
+                exactDecompressionDigest
+            ),
+        ]
 
     @Test(
         "a compressed body reserializes with the diff_id reflecting real content, not compressed bytes",
         arguments: reserializeFixtures)
-    func reserializedCompressionUsesRealContentForDiffID(fixtureCase: (format: String, base64: String, expectedMediaType: String)) async throws {
+    func reserializedCompressionUsesRealContentForDiffID(
+        fixtureCase: (
+            format: String,
+            base64: String,
+            expectedMediaType: String,
+            expectedDiffID: String
+        )
+    ) async throws {
         let fixture = try ImportFixture()
         defer { fixture.cleanUp() }
 
@@ -290,13 +318,21 @@ struct ContainerImageImportTests {
             decompressed = try #require(layerData.gunzip())
         }
         let expectedDiffID = "sha256:\(decompressed.sha256Hex())"
+        #expect(expectedDiffID == "sha256:\(fixtureCase.expectedDiffID)")
         #expect(try fixture.config(manifest).rootfs.diffIDs == [expectedDiffID])
     }
 
     @Test(
         "a bzip2/xz/zstd layer whose decompressed size exceeds the configured cap is rejected",
         arguments: reserializeFixtures)
-    func decompressedContentExceedingCapIsRejected(fixtureCase: (format: String, base64: String, expectedMediaType: String)) async throws {
+    func decompressedContentExceedingCapIsRejected(
+        fixtureCase: (
+            format: String,
+            base64: String,
+            expectedMediaType: String,
+            expectedDiffID: String
+        )
+    ) async throws {
         let fixture = try ImportFixture()
         defer { fixture.cleanUp() }
 
@@ -318,6 +354,63 @@ struct ContainerImageImportTests {
         } catch ContainerImageUtility.Error.invalidTarball(let reason) {
             #expect(reason.contains("exceeds"))
         }
+    }
+
+    @Test("xz dictionary memory is bounded independently of expanded bytes")
+    func xzDictionaryMemoryIsBounded() throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let compressedPath = fixture.root.appendingPathComponent(
+            "hostile-dictionary.tar.xz"
+        )
+        try #require(
+            Data(base64Encoded: Self.excessiveDictionaryXZBase64)
+        ).write(to: compressedPath)
+        let destination = fixture.root.appendingPathComponent("expanded.tar")
+
+        #expect(throws: FilteredStreamDecoder.Error.memoryLimitExceeded) {
+            try FilteredStreamDecoder.decompress(
+                source: compressedPath,
+                destination: destination,
+                compression: .xz,
+                maxBytes: 1024 * 1024,
+                maxDecoderMemoryBytes: 256 * 1024 * 1024
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @Test("xz import rejects an excessive dictionary and removes staging")
+    func xzImportRejectsExcessiveDictionaryAndCleansUp() throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let compressedPath = fixture.root.appendingPathComponent(
+            "hostile-import.tar.xz"
+        )
+        try #require(
+            Data(base64Encoded: Self.excessiveDictionaryXZBase64)
+        ).write(to: compressedPath)
+        #expect(try fixture.importStagingDirectories().isEmpty)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: compressedPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 1024 * 1024
+            )
+            Issue.record("expected excessive xz dictionary to be rejected")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("failed to decompress"))
+        }
+
+        #expect(try fixture.importStagingDirectories().isEmpty)
     }
 
     @Test("a gzip layer whose decompressed size exceeds the configured cap is rejected")
@@ -344,6 +437,98 @@ struct ContainerImageImportTests {
         } catch ContainerImageUtility.Error.invalidTarball(let reason) {
             #expect(reason.contains("exceeds"))
         }
+    }
+
+    @Test(
+        "an extreme-ratio compressed layer stops at the expanded-byte cap and removes staging",
+        arguments: ["gzip", "zstd"]
+    )
+    func compressedBombIsRejectedAndCleanedUp(codec: String) async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        let plainTar = try fixture.makeTar(
+            fileData: Data(repeating: 0, count: 8 * 1024 * 1024)
+        )
+        let compressedPath = fixture.root.appendingPathComponent(
+            "bomb.tar.\(codec)"
+        )
+        switch codec {
+        case "gzip":
+            try #require(try Data(contentsOf: plainTar).gzip()).write(
+                to: compressedPath
+            )
+        case "zstd":
+            try ZstdTestSupport.compress(
+                source: plainTar,
+                destination: compressedPath
+            )
+        default:
+            Issue.record("unexpected compression case \(codec)")
+            return
+        }
+        let compressedSize = try #require(
+            FileManager.default.attributesOfItem(
+                atPath: compressedPath.path
+            )[.size] as? Int
+        )
+        #expect(compressedSize < 64 * 1024)
+        #expect(try fixture.importStagingDirectories().isEmpty)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: compressedPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 64 * 1024
+            )
+            Issue.record("expected \(codec) bomb to exceed the cap")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("exceeds"))
+        }
+
+        #expect(try fixture.importStagingDirectories().isEmpty)
+    }
+
+    @Test("cancelling compressed import removes its private staging directory")
+    func cancelledCompressedImportCleansUp() async throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+        let compressedPath = fixture.root.appendingPathComponent(
+            "cancelled.tar.zstd"
+        )
+        try #require(
+            Data(base64Encoded: Self.reserializeFixtures[2].base64)
+        ).write(to: compressedPath)
+
+        let ociLayoutDir = fixture.ociLayoutDir
+        let task = Task.detached {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: compressedPath,
+                ociLayoutPath: ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: Logger(label: "cancelled-import-test")
+            )
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("expected cancelled import to throw CancellationError")
+        } catch is CancellationError {
+            // Expected: both the decoder's partial file and its parent staging
+            // directory are removed by their respective defers.
+        }
+        #expect(try fixture.importStagingDirectories().isEmpty)
     }
 
     @Test("many empty entries are still bounded by the cap even though their content bytes alone round to zero")
@@ -377,6 +562,37 @@ struct ContainerImageImportTests {
             Issue.record("expected many-empty-entry import exceeding the cap via header/padding accounting to be rejected")
         } catch ContainerImageUtility.Error.invalidTarball(let reason) {
             #expect(reason.contains("exceeds"))
+        }
+    }
+
+    @Test("tar entry count is capped before the next member payload is read")
+    func tarEntryCountIsBounded() throws {
+        let fixture = try ImportFixture()
+        defer { fixture.cleanUp() }
+
+        for index in 0..<4 {
+            try Data("entry-\(index)".utf8).write(
+                to: fixture.rootfsDir.appendingPathComponent("file-\(index)")
+            )
+        }
+        let tarPath = fixture.root.appendingPathComponent("too-many.tar")
+        try ArchiveUtility.create(tarPath: tarPath, from: fixture.rootfsDir)
+
+        do {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: tarPath,
+                ociLayoutPath: fixture.ociLayoutDir,
+                platform: Platform(arch: "arm64", os: "linux"),
+                config: SynthesizedImageConfig(),
+                message: nil,
+                reference: nil,
+                logger: fixture.logger,
+                maxExpandedLayerSize: 1024 * 1024,
+                maxTarEntries: 3
+            )
+            Issue.record("expected the fourth tar member to be rejected")
+        } catch ContainerImageUtility.Error.invalidTarball(let reason) {
+            #expect(reason.contains("3-entry limit"))
         }
     }
 
@@ -544,10 +760,24 @@ private struct ImportFixture {
     }
 
     func makeTar(fileContents: String) throws -> URL {
-        try Data(fileContents.utf8).write(to: rootfsDir.appendingPathComponent("hello.txt"))
+        try makeTar(fileData: Data(fileContents.utf8))
+    }
+
+    func makeTar(fileData: Data) throws -> URL {
+        try fileData.write(
+            to: rootfsDir.appendingPathComponent("hello.txt")
+        )
         let tarPath = root.appendingPathComponent("import.tar")
         try ArchiveUtility.create(tarPath: tarPath, from: rootfsDir)
         return tarPath
+    }
+
+    func importStagingDirectories() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(
+            atPath: ociLayoutDir.path
+        ).filter {
+            $0.hasPrefix("socktainer-compressed-import-")
+        }
     }
 
     func index() throws -> Index {

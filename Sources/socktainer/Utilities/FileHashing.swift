@@ -10,6 +10,7 @@ enum FileHashing {
         var hasher = SHA256()
         var size = 0
         while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            try Task.checkCancellation()
             hasher.update(data: chunk)
             size += chunk.count
         }

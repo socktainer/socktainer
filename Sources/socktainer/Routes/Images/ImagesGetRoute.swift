@@ -43,13 +43,31 @@ struct ImagesGetRoute: RouteCollection {
             throw Abort(.internalServerError, reason: "AppleContainerAppSupportUrl not configured")
         }
 
+        let savedArchive: SavedImageArchive?
         let tarballPath: URL
         do {
-            tarballPath = try await client.save(references: references, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
+            if let identitySavingClient = client as? any ImageSavingWithIdentity {
+                let saved = try await identitySavingClient.saveWithIdentities(
+                    references: references,
+                    platform: platform,
+                    appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+                    logger: req.logger
+                )
+                savedArchive = saved
+                tarballPath = saved.url
+            } else {
+                savedArchive = nil
+                tarballPath = try await client.save(
+                    references: references,
+                    platform: platform,
+                    appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+                    logger: req.logger
+                )
+            }
         } catch let error as ClientImageError {
             switch error {
             case .notFound(let id):
-                throw Abort(.notFound, reason: id)
+                throw Abort(.notFound, reason: "No such image: \(id)")
             case .digestReferenceNotAllowed(let repo):
                 throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
             case .conflict(let message):
@@ -61,24 +79,48 @@ struct ImagesGetRoute: RouteCollection {
         // moby emits one "save" event per exported image with the digest as Actor.ID
         // (daemon/containerd/image_exporter.go). A reference the store cannot resolve
         // to a digest is carried as-is.
-        let digestsByReference = await client.digestsByReference()
-        let savedActorIds = references.map { digestsByReference[$0] ?? $0 }
+        let actorIDs: [String]
+        if let savedArchive {
+            actorIDs = savedArchive.actorIDs
+        } else {
+            let identityProvider = client as? any ImageConfigIdentityProviding
+            let digestsByReference = await client.digestsByReference()
+            var fallbackActorIDs: [String] = []
+            for reference in references {
+                fallbackActorIDs.append(
+                    await identityProvider?.configDigest(for: reference)
+                        ?? digestsByReference[reference]
+                        ?? reference
+                )
+            }
+            actorIDs = fallbackActorIDs
+        }
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
 
-        let response = try await req.fileio.asyncStreamFile(at: tarballPath.path) { result in
-            guard case .success = result, let broadcaster else { return }
-            for actorId in savedActorIds {
-                await broadcaster.broadcast(
-                    DockerEvent.make(
-                        type: "image", action: "save", actorID: actorId,
-                        attributes: ["name": actorId]))
+        let response: Response
+        do {
+            response = try await req.fileio.asyncStreamFile(
+                at: tarballPath.path
+            ) { result in
+                defer { try? FileManager.default.removeItem(at: tempDir) }
+                guard case .success = result, let broadcaster else { return }
+                for actorId in actorIDs {
+                    await broadcaster.broadcast(
+                        DockerEvent.make(
+                            type: "image", action: "save", actorID: actorId,
+                            attributes: ["name": actorId]))
+                }
             }
+        } catch {
+            try? FileManager.default.removeItem(at: tempDir)
+            throw error
         }
 
         response.headers.contentType = HTTPMediaType(type: "application", subType: "x-tar")
 
-        Task {
-            try? await Task.sleep(for: .seconds(5))
+        // Vapor does not invoke `onCompleted` for a conditional 304 response.
+        // No body owns the file in that case, so cleanup is immediate.
+        if response.status == .notModified {
             try? FileManager.default.removeItem(at: tempDir)
         }
 

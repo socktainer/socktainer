@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Vapor
 
 @testable import socktainer
 
@@ -46,5 +47,52 @@ struct DockerProgressFrameTests {
         #expect(statusJson["status"] as? String == hostile)
         let errorJson = try decode(DockerProgressFrame.error(hostile))
         #expect(errorJson["error"] as? String == hostile)
+    }
+
+    @Test("a failed HTTP write cancels the progress producer")
+    func writerDisconnectCancelsProducer() async throws {
+        let app = try await Application.make(.testing)
+        let terminated = AsyncStream<Void>.makeStream()
+        let progress = AsyncThrowingStream<String, Error> { continuation in
+            continuation.onTermination = { @Sendable _ in
+                terminated.continuation.yield(())
+                terminated.continuation.finish()
+            }
+            continuation.yield("operation started")
+        }
+        let writer = FailingBodyStreamWriter(
+            eventLoop: app.eventLoopGroup.next()
+        )
+
+        let pipe = Task {
+            await DockerProgressFrame.pipe(progress, to: writer)
+        }
+        await pipe.value
+        var terminationIterator = terminated.stream.makeAsyncIterator()
+        let producerWasCancelled = await terminationIterator.next() != nil
+        try await app.asyncShutdown()
+
+        #expect(producerWasCancelled)
+    }
+}
+
+private enum BodyWriterTestError: Error {
+    case disconnected
+}
+
+private final class FailingBodyStreamWriter: BodyStreamWriter,
+    @unchecked Sendable
+{
+    let eventLoop: any EventLoop
+
+    init(eventLoop: any EventLoop) {
+        self.eventLoop = eventLoop
+    }
+
+    func write(
+        _ result: BodyStreamResult,
+        promise: EventLoopPromise<Void>?
+    ) {
+        promise?.fail(BodyWriterTestError.disconnected)
     }
 }

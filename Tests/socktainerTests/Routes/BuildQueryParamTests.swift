@@ -1,4 +1,6 @@
+import ContainerizationOCI
 import Testing
+import Vapor
 
 @testable import socktainer
 
@@ -54,5 +56,45 @@ struct BuildQueryParamTests {
     func invalidJson() {
         let result = BuildRoute.parseBuildQueryParam("not-json")
         #expect(result == [])
+    }
+
+    @Test("Malformed platform is a Docker bad request, not a process trap")
+    func malformedPlatformIsRejected() {
+        do {
+            _ = try BuildRoute.parseBuildPlatforms("linux/not-a-real-arch/extra/bits")
+            Issue.record("expected invalid platform rejection")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
+            #expect(
+                abort.reason
+                    == "invalid platform: linux/not-a-real-arch/extra/bits"
+            )
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    @Test("Empty platform selects the native Linux architecture")
+    func emptyPlatformUsesNativeLinux() throws {
+        let platforms = try BuildRoute.parseBuildPlatforms("")
+        #expect(platforms.count == 1)
+        #expect(platforms.first?.os == "linux")
+        #expect(platforms.first?.architecture == Platform.current.architecture)
+    }
+
+    @Test("classic build reports the identity captured by its load")
+    func classicBuildUsesAtomicLoadIdentity() {
+        let imported = "sha256:" + String(repeating: "a", count: 64)
+        let later = "sha256:" + String(repeating: "b", count: 64)
+        let reference = "docker.io/library/example:latest"
+
+        #expect(
+            BuildRoute.builtImageID(
+                loadedReferences: [reference],
+                capturedActorIDs: [imported],
+                identities: [reference: later],
+                fallback: reference
+            ) == imported
+        )
     }
 }

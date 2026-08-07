@@ -1,3 +1,4 @@
+import ContainerizationOCI
 import Foundation
 
 actor ContainerInfoCache {
@@ -8,6 +9,10 @@ actor ContainerInfoCache {
         let nativeId: String
         let image: String
         let labels: [String: String]
+        /// Immutable OCI root retained for the container's full lifetime. Apple
+        /// may reap `--rm` containers before cleanup runs, so this cache is the
+        /// last authoritative attribution available to release the hidden lease.
+        let rootDescriptor: Descriptor?
         /// IP on the container's primary network, stored at /start so DNS cleanup in the
         /// --rm paths can perform the same ownership check as ContainerDeleteRoute.
         let ip: String?
@@ -21,8 +26,22 @@ actor ContainerInfoCache {
     /// depend on a `store` entry existing at consume time.
     private var autoRemoveSibling: [String: String] = [:]
 
-    func set(hexId: String, nativeId: String, image: String, labels: [String: String], ip: String? = nil) {
-        let info = Info(hexId: hexId, nativeId: nativeId, image: image, labels: labels, ip: ip)
+    func set(
+        hexId: String,
+        nativeId: String,
+        image: String,
+        labels: [String: String],
+        ip: String? = nil,
+        rootDescriptor: Descriptor? = nil
+    ) {
+        let info = Info(
+            hexId: hexId,
+            nativeId: nativeId,
+            image: image,
+            labels: labels,
+            rootDescriptor: rootDescriptor,
+            ip: ip
+        )
         store[hexId] = info
         store[nativeId] = info
     }

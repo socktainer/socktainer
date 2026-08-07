@@ -33,40 +33,54 @@ extension ImageCreateRoute {
             let decodedTag = tag.removingPercentEncoding ?? tag
             let platformString = query.platform
             let platform: Platform
+            let fallbackPolicy: PlatformFallbackPolicy
             if let platformString, !platformString.isEmpty {
                 do {
                     platform = try platformOrThrow(platformString)
                 } catch {
-                    let response = Response(status: .internalServerError)
-                    response.headers.add(name: .contentType, value: "application/json")
-                    response.body = .init(string: "{\"message\": \"Failed to parse platform\"}\n")
-                    return response
+                    throw Abort(
+                        .badRequest,
+                        reason: "invalid platform: \(platformString)"
+                    )
                 }
+                fallbackPolicy = .strict
             } else {
                 platform = currentPlatform()
+                fallbackPolicy = .allowRosetta
             }
 
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
             let progressStream = try await client.pull(
-                image: image, tag: decodedTag, platform: platform, logger: req.logger)
+                image: image,
+                tag: decodedTag,
+                platform: platform,
+                fallbackPolicy: fallbackPolicy,
+                logger: req.logger
+            )
 
             let app = req.application
             // Use decodedTag (the value actually pulled) so a percent-encoded tag
             // does not produce a mismatched reference in the "pull" event.
             let pulledRef = "\(image)\(decodedTag.isEmpty ? "" : ":\(decodedTag)")"
-            response.body = .init(stream: { writer in
-                Task {
-                    let progressId = pulledRef.split(separator: "/").last.map(String.init) ?? pulledRef
-                    await DockerProgressFrame.pipe(progressStream, id: progressId, to: writer) {
-                        guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
-                        // moby's pull event uses the reference as Actor.ID and the
-                        // image name as the `name` attribute (no `image` key).
-                        await broadcaster.broadcast(
-                            DockerEvent.make(
-                                type: "image", action: "pull", actorID: pulledRef,
-                                attributes: ["name": image]))
-                    }
+            let logger = req.logger
+            response.body = .init(managedAsyncStream: { writer in
+                let progressId =
+                    pulledRef.split(separator: "/").last.map(String.init)
+                    ?? pulledRef
+                try await producePullResponse(
+                    progressStream,
+                    progressID: progressId,
+                    writer: writer,
+                    logger: logger
+                ) {
+                    guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
+                    // moby's pull event uses the reference as Actor.ID and the
+                    // image name as the `name` attribute (no `image` key).
+                    await broadcaster.broadcast(
+                        DockerEvent.make(
+                            type: "image", action: "pull", actorID: pulledRef,
+                            attributes: ["name": image]))
                 }
             })
             return response
@@ -117,47 +131,54 @@ extension ImageCreateRoute {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tarPath = tempDir.appendingPathComponent("import.tar")
         do {
-            try await writeBodyToFile(req.body, at: tarPath)
+            try await RequestBodyFileWriter.write(
+                req.body,
+                to: tarPath,
+                maxBytes: maxImportBodySize,
+                kind: "import body"
+            )
         } catch {
             try? FileManager.default.removeItem(at: tempDir)
             throw error
         }
 
         // moby defaults an empty message to "Imported from <src>".
-        let message = (query.message?.isEmpty ?? true) ? "Imported from \(fromSrc)" : query.message!
+        let message =
+            query.message.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "Imported from \(fromSrc)"
         let changes = query.changes ?? []
 
         let app = req.application
         let response = Response()
         response.headers.add(name: .contentType, value: "application/json")
-        response.body = .init(stream: { writer in
-            Task {
-                defer { try? FileManager.default.removeItem(at: tempDir) }
-                do {
-                    let (_, digest) = try await client.importImage(
-                        tarPath: tarPath,
-                        repo: repo.isEmpty ? nil : repo,
-                        tag: tag.isEmpty ? nil : tag,
-                        message: message,
-                        changes: changes,
-                        platform: platform,
-                        appleContainerAppSupportUrl: appleContainerAppSupportUrl,
-                        logger: req.logger
-                    )
-                    DockerProgressFrame.write(DockerProgressFrame.status(digest), to: writer)
-                    _ = writer.write(.end)
+        let logger = req.logger
+        response.body = .init(managedAsyncStream: { writer in
+            try await produceImportResponse(
+                temporaryDirectory: tempDir,
+                writer: writer,
+                logger: logger
+            ) { writer in
+                let (_, digest) = try await client.importImage(
+                    tarPath: tarPath,
+                    repo: repo.isEmpty ? nil : repo,
+                    tag: tag.isEmpty ? nil : tag,
+                    message: message,
+                    changes: changes,
+                    platform: platform,
+                    appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+                    logger: logger
+                )
+                try await DockerProgressFrame.write(
+                    DockerProgressFrame.status(digest),
+                    to: writer
+                )
 
-                    guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
-                    // moby's import event uses the image digest as both Actor.ID and
-                    // the `name` attribute — unlike pull/tag, the human-readable
-                    // reference never appears in this event.
-                    await broadcaster.broadcast(
-                        DockerEvent.make(type: "image", action: "import", actorID: digest, attributes: ["name": digest]))
-                } catch {
-                    req.logger.error("Failed to import image: \(error)")
-                    DockerProgressFrame.write(DockerProgressFrame.error(String(describing: error)), to: writer)
-                    _ = writer.write(.end)
-                }
+                guard let broadcaster = app.storage[EventBroadcasterKey.self] else { return }
+                // moby's import event uses the image digest as both Actor.ID and
+                // the `name` attribute — unlike pull/tag, the human-readable
+                // reference never appears in this event.
+                await broadcaster.broadcast(
+                    DockerEvent.make(type: "image", action: "import", actorID: digest, attributes: ["name": digest]))
             }
         })
         return response
@@ -168,30 +189,71 @@ extension ImageCreateRoute {
     /// runaway or malicious upload before it fills disk.
     private static let maxImportBodySize = 8 * 1024 * 1024 * 1024
 
-    /// Streams the request body to disk in chunks rather than buffering the
-    /// whole tarball in memory first, enforcing `maxImportBodySize` as it goes.
-    private static func writeBodyToFile(_ body: Request.Body, at destination: URL) async throws {
-        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
-            throw Abort(.internalServerError, reason: "failed to create temporary file for import")
-        }
-        let handle = try FileHandle(forWritingTo: destination)
-        defer { try? handle.close() }
-
-        var totalBytes = 0
-        func writeAndCheckLimit(_ buffer: ByteBuffer) throws {
-            totalBytes += buffer.readableBytes
-            guard totalBytes <= maxImportBodySize else {
-                throw Abort(.payloadTooLarge, reason: "import body exceeds the \(maxImportBodySize)-byte limit")
+    static func producePullResponse(
+        _ progress: AsyncThrowingStream<PullProgress, Error>,
+        progressID: String,
+        writer: any AsyncBodyStreamWriter,
+        logger: Logger,
+        heartbeatInterval: Duration =
+            DisconnectCoupledResponseStream.defaultHeartbeatInterval,
+        onSuccess: (@Sendable () async -> Void)? = nil
+    ) async throws {
+        do {
+            try await DisconnectCoupledResponseStream.run(
+                writer: writer,
+                heartbeatInterval: heartbeatInterval
+            ) { writer in
+                try await DockerProgressFrame.pipe(
+                    progress,
+                    id: progressID,
+                    to: writer,
+                    onSuccess: onSuccess
+                )
             }
-            try handle.write(contentsOf: Data(buffer: buffer))
-        }
-
-        if let data = body.data {
-            try writeAndCheckLimit(data)
-            return
-        }
-        for try await chunk in body {
-            try writeAndCheckLimit(chunk)
+        } catch DisconnectCoupledResponseStream.ProducerError.clientDisconnected {
+            logger.debug("Image pull client disconnected; cancelling pull")
+            throw CancellationError()
         }
     }
+
+    static func produceImportResponse(
+        temporaryDirectory: URL,
+        writer: any AsyncBodyStreamWriter,
+        logger: Logger,
+        heartbeatInterval: Duration =
+            DisconnectCoupledResponseStream.defaultHeartbeatInterval,
+        operation:
+            @Sendable @escaping (
+                any AsyncBodyStreamWriter
+            ) async throws -> Void
+    ) async throws {
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        do {
+            try await DisconnectCoupledResponseStream.run(
+                writer: writer,
+                heartbeatInterval: heartbeatInterval
+            ) { writer in
+                do {
+                    try await operation(writer)
+                } catch DisconnectCoupledResponseStream.ProducerError
+                    .clientDisconnected
+                {
+                    throw DisconnectCoupledResponseStream.ProducerError
+                        .clientDisconnected
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    logger.error("Failed to import image: \(error)")
+                    try await DockerProgressFrame.write(
+                        DockerProgressFrame.error(String(describing: error)),
+                        to: writer
+                    )
+                }
+            }
+        } catch DisconnectCoupledResponseStream.ProducerError.clientDisconnected {
+            logger.debug("Image import client disconnected; cancelling import")
+            throw CancellationError()
+        }
+    }
+
 }

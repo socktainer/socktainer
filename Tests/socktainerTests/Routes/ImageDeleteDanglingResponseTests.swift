@@ -22,6 +22,8 @@ struct ImageDeleteDanglingResponseTests {
         arguments: [
             // The sentinel LocalOCILayoutClient assigns to a loaded tarball with no RepoTags.
             "untagged@sha256:aaa111",
+            // The canonical-reference manager's hidden marker for a displaced root.
+            "moby-dangling@sha256:aaa111",
             // A ref imported verbatim from a foreign tarball's name annotation.
             "<none>:<none>",
         ])
@@ -156,7 +158,7 @@ private actor ForceRecordingImageMock: ClientImageProtocol {
         recordedForces.append(force)
         return result
     }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
@@ -165,7 +167,7 @@ private actor ForceRecordingImageMock: ClientImageProtocol {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
         URL(fileURLWithPath: "/dev/null")
     }
@@ -184,7 +186,7 @@ private struct FixedResultImageMock: ClientImageProtocol {
     let result: ImageDeletionResult
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
     func delete(id: String) async throws -> ImageDeletionResult { result }
-    func pull(image: String, tag: String?, platform: Platform, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
+    func pull(image: String, tag: String?, platform: Platform, fallbackPolicy: PlatformFallbackPolicy, logger: Logger) async throws -> AsyncThrowingStream<PullProgress, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
@@ -193,7 +195,7 @@ private struct FixedResultImageMock: ClientImageProtocol {
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }
-    func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
+    func load(tarballPath: URL, platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] { [] }
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
         URL(fileURLWithPath: "/dev/null")
     }

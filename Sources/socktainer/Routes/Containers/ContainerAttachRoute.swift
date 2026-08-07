@@ -363,10 +363,11 @@ extension ContainerAttachRoute {
                             wait: { try await process.wait() },
                             hexId: hexId,
                             nativeId: container.id,
-                            fallbackImage: container.configuration.image.reference,
-                            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            fallbackImage: ContainerImageIdentity.requestedReference(for: container),
+                            fallbackLabels: ContainerImageIdentity.dockerLabels(for: container),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            fallbackRootDescriptor: container.configuration.image.descriptor
                         )
                     }
 
@@ -524,10 +525,11 @@ extension ContainerAttachRoute {
                             wait: { try await process.wait() },
                             hexId: hexId,
                             nativeId: container.id,
-                            fallbackImage: container.configuration.image.reference,
-                            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                            fallbackImage: ContainerImageIdentity.requestedReference(for: container),
+                            fallbackLabels: ContainerImageIdentity.dockerLabels(for: container),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            fallbackRootDescriptor: container.configuration.image.descriptor
                         )
                     }
 
@@ -773,10 +775,11 @@ extension ContainerAttachRoute {
                         wait: { try await process.wait() },
                         hexId: hexId,
                         nativeId: container.id,
-                        fallbackImage: container.configuration.image.reference,
-                        fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                        fallbackImage: ContainerImageIdentity.requestedReference(for: container),
+                        fallbackLabels: ContainerImageIdentity.dockerLabels(for: container),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                        broadcaster: req.application.storage[EventBroadcasterKey.self]
+                        broadcaster: req.application.storage[EventBroadcasterKey.self],
+                        fallbackRootDescriptor: container.configuration.image.descriptor
                     )
 
                     // DockerTCPHandler owns pipes.stdin!.write after setStdinWriter(); it closes
