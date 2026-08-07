@@ -291,24 +291,6 @@ struct SocktainerDNSQueryTests {
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
     }
 
-    // Regression: NS & AR sections should be dropped when their count is set to 0.
-    @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
-    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() throws {
-        let server = SocktainerDNSServer()
-        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
-            Issue.record("Could not bind DNS server port")
-            return
-        }
-        server.register(hostname: "redis", ip: "192.168.1.10")
-
-        guard let tail = dnsResponseTail(type: 1, name: "redis", port: port) else {
-            Issue.record("No response for EDNS0 A query")
-            return
-        }
-        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
-        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
-    }
-
     @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")
     func aQueryUnknownNameReturnsNxdomain() throws {
         let server = SocktainerDNSServer()
@@ -345,6 +327,57 @@ struct SocktainerDNSQueryTests {
         server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = dnsRcode(type: 28, name: "unknown-svc", port: port)
         #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+    }
+
+    // Regression: NS & AR sections should be dropped when their count is set to 0.
+    @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
+    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "redis", ip: "192.168.1.10")
+
+        guard let tail = dnsResponseTail(type: 1, name: "redis", port: port) else {
+            Issue.record("No response for EDNS0 A query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
+    }
+
+    @Test("AAAA query with EDNS0 OPT for a single-label name returns a well-formed NODATA")
+    func aaaaQueryWithOPTForSingleLabelReturnsWellFormedNodata() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "db", ip: "192.168.67.3")
+
+        guard let tail = dnsResponseTail(type: 28, name: "db", port: port) else {
+            Issue.record("No response for EDNS0 AAAA query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
+    }
+
+    @Test("A query with EDNS0 OPT for an unknown single-label name returns a well-formed NXDOMAIN")
+    func aQueryWithOPTForUnknownSingleLabelReturnsWellFormedNxdomain() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19760, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+
+        guard let tail = dnsResponseTail(type: 1, name: "no-such-container", port: port) else {
+            Issue.record("No response for EDNS0 A query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
     }
 }
 
