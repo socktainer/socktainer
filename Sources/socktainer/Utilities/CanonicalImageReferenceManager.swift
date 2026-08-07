@@ -463,6 +463,12 @@ struct CanonicalImageReferenceManager: Sendable {
             .sorted()
     }
 
+    /// Returns only a physically stored exact key. Unlike Docker-visible image
+    /// listing, this never synthesizes a canonical handle from a familiar alias.
+    func exactImage(reference: String) async throws -> ClientImage? {
+        try await store.list().first { $0.reference == reference }
+    }
+
     /// Canonical Docker tag -> current Apple root, using the same exact-key
     /// precedence as resolver hydration. This is the commit witness for the
     /// durable exact-selector journal.

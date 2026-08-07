@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerResource
 import ContainerizationOCI
 import Darwin
@@ -302,12 +303,12 @@ struct EmbeddedDNSImageTests {
 
         // First call: fails.
         await #expect(throws: ImportError.self) {
-            try await gate.ensureOnce { throw ImportError() }
+            try await gate.ensureOnce { _ in throw ImportError() }
         }
 
         // Second call: must succeed — gate must have cleared the failed task.
         let retryCount = ActorCounter()
-        let image = try await gate.ensureOnce {
+        let image = try await gate.ensureOnce { _ in
             await retryCount.increment()
             return makeTestImage()
         }
@@ -318,8 +319,30 @@ struct EmbeddedDNSImageTests {
     @Test("ImportGate.ensureOnce returns the image produced by perform")
     func importGateReturnsPerformImage() async throws {
         let gate = EmbeddedDNSImage.ImportGate()
-        let image = try await gate.ensureOnce { makeTestImage(reference: EmbeddedDNSImage.tag) }
+        let image = try await gate.ensureOnce { _ in makeTestImage(reference: EmbeddedDNSImage.tag) }
         #expect(image.reference == EmbeddedDNSImage.tag)
+    }
+
+    @Test("ImportGate.ensureOnce revalidates after a completed success")
+    func importGateDoesNotCacheCompletedImageHandle() async throws {
+        let gate = EmbeddedDNSImage.ImportGate()
+        let callCount = ActorCounter()
+
+        _ = try await gate.ensureOnce { expected in
+            #expect(expected == nil)
+            await callCount.increment()
+            return makeTestImage()
+        }
+        _ = try await gate.ensureOnce { expected in
+            #expect(expected == makeTestImage().digest)
+            await callCount.increment()
+            return makeTestImage()
+        }
+
+        #expect(
+            await callCount.value == 2,
+            "sequential calls must re-run store validation instead of returning a stale ClientImage handle"
+        )
     }
 
     // Regression for the concurrent first-use race (Finding #1 in CodeRabbit review):
@@ -333,14 +356,14 @@ struct EmbeddedDNSImageTests {
         let callCount = ActorCounter()
 
         // Start two tasks concurrently; both will race into ensureOnce.
-        async let t1: ClientImage = gate.ensureOnce {
+        async let t1: ClientImage = gate.ensureOnce { _ in
             await callCount.increment()
             // Brief yield so the second task has a chance to arrive while the first is
             // in-flight, proving the "in-flight task" branch of ensureOnce is exercised.
             try await Task.sleep(nanoseconds: 10_000_000)
             return makeTestImage()
         }
-        async let t2: ClientImage = gate.ensureOnce {
+        async let t2: ClientImage = gate.ensureOnce { _ in
             await callCount.increment()
             try await Task.sleep(nanoseconds: 10_000_000)
             return makeTestImage()
@@ -351,6 +374,72 @@ struct EmbeddedDNSImageTests {
         let count = await callCount.value
         #expect(count == 1, "perform must execute exactly once — concurrent callers must coalesce, not each run the body")
         #expect(r1.reference == r2.reference, "coalesced callers must all receive the single leader's image")
+    }
+
+    @Test("ensure repairs familiar-only and wrong-root embedded image ownership")
+    func ensureRepairsPhysicalOwnershipAndValidatesBundledRoot() async throws {
+        let config = ContainerSystemConfig()
+        let canonical = try ClientImage.normalizeReference(
+            EmbeddedDNSImage.tag,
+            containerSystemConfig: config
+        )
+        let expectedDigest = "sha256:" + String(repeating: "a", count: 64)
+        let service = FakeEmbeddedDNSImageService(
+            canonicalReference: canonical,
+            bundledRootDigest: expectedDigest
+        )
+        let gate = EmbeddedDNSImage.ImportGate()
+
+        let first = try await EmbeddedDNSImage.ensure(
+            containerSystemConfig: config,
+            appSupportURL: FileManager.default.temporaryDirectory,
+            imageClient: service,
+            gate: gate
+        )
+        #expect(first.reference == canonical)
+        #expect(first.digest == expectedDigest)
+        #expect(await service.loadCount == 1)
+        #expect(await service.hasPhysicalReference(canonical, digest: expectedDigest))
+
+        // Apple may retain only a familiar spelling after external lifecycle work.
+        // The logical Docker inventory still exposes the canonical tag, but it is
+        // not snapshot-usable until ensure repairs exact physical ownership.
+        await service.keepOnlyFamiliarBundledReference()
+        let repaired = try await EmbeddedDNSImage.ensure(
+            containerSystemConfig: config,
+            appSupportURL: FileManager.default.temporaryDirectory,
+            imageClient: service,
+            gate: gate
+        )
+        #expect(repaired.reference == canonical)
+        #expect(await service.loadCount == 2)
+        #expect(await service.hasPhysicalReference(canonical, digest: expectedDigest))
+
+        // A replaced reserved tag must not be trusted merely because it exists.
+        await service.replaceCanonicalWithWrongRoot()
+        let restored = try await EmbeddedDNSImage.ensure(
+            containerSystemConfig: config,
+            appSupportURL: FileManager.default.temporaryDirectory,
+            imageClient: service,
+            gate: gate
+        )
+        #expect(restored.digest == expectedDigest)
+        #expect(await service.loadCount == 3)
+        #expect(await service.hasPhysicalReference(canonical, digest: expectedDigest))
+
+        // Duplicate exact owners are never resolved by picking one arbitrarily.
+        // Reimport runs the canonical replacement transaction and restores a
+        // single physical owner for the reserved tag.
+        await service.addDuplicateWrongCanonicalOwner()
+        let deduplicated = try await EmbeddedDNSImage.ensure(
+            containerSystemConfig: config,
+            appSupportURL: FileManager.default.temporaryDirectory,
+            imageClient: service,
+            gate: gate
+        )
+        #expect(deduplicated.digest == expectedDigest)
+        #expect(await service.loadCount == 4)
+        #expect(await service.canonicalOwnerRoots() == [expectedDigest])
     }
 }
 
@@ -372,6 +461,132 @@ private func makeTestImage(reference: String = EmbeddedDNSImage.tag) -> ClientIm
 private actor ActorCounter {
     private(set) var value = 0
     func increment() { value += 1 }
+}
+
+private actor FakeEmbeddedDNSImageService: EmbeddedDNSImageService {
+    private let canonicalReference: String
+    private let familiarReference = EmbeddedDNSImage.tag
+    private let bundledRootDigest: String
+    private var physicalImages: [String: ClientImage]
+    private var duplicateWrongCanonicalRoot: String?
+    private(set) var loadCount = 0
+
+    init(canonicalReference: String, bundledRootDigest: String) {
+        self.canonicalReference = canonicalReference
+        self.bundledRootDigest = bundledRootDigest
+        self.physicalImages = [:]
+        self.duplicateWrongCanonicalRoot = nil
+    }
+
+    func imageStoreInventory(includeSystemImages _: Bool) async throws -> ImageStoreInventory {
+        var physicalByDigest = Dictionary(grouping: physicalImages.values, by: \.digest)
+            .mapValues { Set($0.map(\.reference)) }
+        if let duplicateWrongCanonicalRoot {
+            physicalByDigest[duplicateWrongCanonicalRoot, default: []]
+                .insert(canonicalReference)
+        }
+        let owner = physicalImages[canonicalReference] ?? physicalImages[familiarReference]
+        let logical = owner.map {
+            ClientImage(
+                description: ImageDescription(
+                    reference: canonicalReference,
+                    descriptor: $0.descriptor
+                )
+            )
+        }
+        return ImageStoreInventory(
+            images: logical.map { [$0] } ?? [],
+            physicalReferencesByRootDigest: physicalByDigest
+        )
+    }
+
+    func load(
+        tarballPath _: URL,
+        platform _: Platform?,
+        appleContainerAppSupportUrl _: URL,
+        logger _: Logger
+    ) async throws -> [String] {
+        loadCount += 1
+        duplicateWrongCanonicalRoot = nil
+        physicalImages[familiarReference] = Self.image(
+            reference: familiarReference,
+            digest: bundledRootDigest
+        )
+        return [familiarReference]
+    }
+
+    func tag(source: String, target _: String) async throws -> ImageTaggingResult {
+        guard
+            let sourceImage = physicalImages[source]
+                ?? physicalImages[canonicalReference]
+                ?? physicalImages[familiarReference]
+        else {
+            throw ClientImageError.notFound(id: source)
+        }
+        let committed = Self.image(
+            reference: canonicalReference,
+            digest: sourceImage.digest
+        )
+        physicalImages[canonicalReference] = committed
+        physicalImages[familiarReference] = nil
+        return ImageTaggingResult(
+            image: committed,
+            dockerConfigDigest: sourceImage.digest
+        )
+    }
+
+    func keepOnlyFamiliarBundledReference() {
+        physicalImages = [
+            familiarReference: Self.image(
+                reference: familiarReference,
+                digest: bundledRootDigest
+            )
+        ]
+    }
+
+    func replaceCanonicalWithWrongRoot() {
+        duplicateWrongCanonicalRoot = nil
+        physicalImages = [
+            canonicalReference: Self.image(
+                reference: canonicalReference,
+                digest: "sha256:" + String(repeating: "b", count: 64)
+            )
+        ]
+    }
+
+    func addDuplicateWrongCanonicalOwner() {
+        duplicateWrongCanonicalRoot =
+            "sha256:" + String(repeating: "c", count: 64)
+    }
+
+    func canonicalOwnerRoots() -> Set<String> {
+        var roots = Set(
+            physicalImages.values.compactMap {
+                $0.reference == canonicalReference ? $0.digest : nil
+            }
+        )
+        if let duplicateWrongCanonicalRoot {
+            roots.insert(duplicateWrongCanonicalRoot)
+        }
+        return roots
+    }
+
+    func hasPhysicalReference(_ reference: String, digest: String) -> Bool {
+        physicalImages[reference]?.digest == digest
+    }
+
+    private static func image(reference: String, digest: String) -> ClientImage {
+        ClientImage(
+            description: ImageDescription(
+                reference: reference,
+                descriptor: Descriptor(
+                    mediaType: "application/vnd.oci.image.index.v1+json",
+                    digest: digest,
+                    size: 0
+                )
+            )
+        )
+    }
 }
 
 // MARK: - firstNamedNetwork (plain docker run --network parity)

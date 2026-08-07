@@ -4,6 +4,19 @@ import Foundation
 import Logging
 import SocktainerDNSImage
 
+protocol EmbeddedDNSImageService: ImageStoreInventoryProviding,
+    ImageTaggingProtocol
+{
+    func load(
+        tarballPath: URL,
+        platform: Platform?,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> [String]
+}
+
+extension ClientImageService: EmbeddedDNSImageService {}
+
 enum EmbeddedDNSImage {
     static let tag = SocktainerDNSImage.reference
     private static let log = Logger(label: "socktainer.dns.embedded")
@@ -11,15 +24,31 @@ enum EmbeddedDNSImage {
     actor ImportGate {
         static let shared = ImportGate()
         private var task: Task<ClientImage, Error>?
+        private var expectedRootDigest: String?
 
-        func ensureOnce(perform: @escaping @Sendable () async throws -> ClientImage) async throws -> ClientImage {
+        func ensureOnce(
+            perform: @escaping @Sendable (String?) async throws -> ClientImage
+        ) async throws -> ClientImage {
             if let existing = task {
                 return try await existing.value
             }
-            let t = Task { try await perform() }
+            let expected = expectedRootDigest
+            let t = Task { try await perform(expected) }
             task = t
             do {
-                return try await t.value
+                let image = try await t.value
+                // This is a single-flight gate, not an image cache. A ClientImage is only
+                // a handle to mutable store state and can become stale after tag replacement,
+                // removal, or an Apple Container service restart. Clearing the completed task
+                // makes every later ensure() revalidate the physical image association while
+                // still coalescing callers that overlap with this import.
+                task = nil
+                // Caching immutable content identity is safe. It lets subsequent
+                // networks validate tag ownership without re-importing the archive,
+                // while a new Socktainer process imports once to bind the tag to the
+                // image bundled in that exact binary version.
+                expectedRootDigest = image.digest
+                return image
             } catch {
                 task = nil
                 throw error
@@ -31,20 +60,20 @@ enum EmbeddedDNSImage {
     static func ensure(
         containerSystemConfig: ContainerSystemConfig,
         appSupportURL: URL,
-        imageClient: ClientImageService
+        imageClient: any EmbeddedDNSImageService,
+        gate: ImportGate = .shared
     ) async throws -> ClientImage {
         let canonicalTag = try ClientImage.normalizeReference(
             tag,
             containerSystemConfig: containerSystemConfig
         )
-        if let image = try? await imageClient.list(includeSystemImages: true)
-            .first(where: { $0.reference == canonicalTag })
-        {
-            return image
-        }
-        return try await ImportGate.shared.ensureOnce {
-            if let image = try? await imageClient.list(includeSystemImages: true)
-                .first(where: { $0.reference == canonicalTag })
+        return try await gate.ensureOnce { expectedRootDigest in
+            if let expectedRootDigest,
+                let image = await validatedExistingImage(
+                    canonicalTag: canonicalTag,
+                    expectedRootDigest: expectedRootDigest,
+                    imageClient: imageClient
+                )
             {
                 return image
             }
@@ -56,10 +85,33 @@ enum EmbeddedDNSImage {
         }
     }
 
+    private static func validatedExistingImage(
+        canonicalTag: String,
+        expectedRootDigest: String,
+        imageClient: any EmbeddedDNSImageService
+    ) async -> ClientImage? {
+        guard
+            let inventory = try? await imageClient.imageStoreInventory(
+                includeSystemImages: true
+            )
+        else { return nil }
+        let exactOwnerRoots = Set(
+            inventory.physicalReferencesByRootDigest.compactMap {
+                rootDigest, references in
+                references.contains(canonicalTag) ? rootDigest : nil
+            }
+        )
+        guard exactOwnerRoots == [expectedRootDigest] else { return nil }
+        return inventory.images.first {
+            $0.reference == canonicalTag
+                && $0.digest == expectedRootDigest
+        }
+    }
+
     private static func importAndTag(
         containerSystemConfig: ContainerSystemConfig,
         appSupportURL: URL,
-        imageClient: ClientImageService
+        imageClient: any EmbeddedDNSImageService
     ) async throws -> ClientImage {
         log.info("[dns-embedded] importing embedded DNS forwarder image")
         let loaded = try await imageClient.load(

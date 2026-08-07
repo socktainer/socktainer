@@ -1132,6 +1132,38 @@ struct CanonicalImageReferenceManagerTests {
         #expect(await pusher.references == [Self.canonical])
     }
 
+    @Test("tag normalization returns the surviving exact canonical handle")
+    func serviceTagReturnsCommittedCanonicalHandle() async throws {
+        let familiar = Self.image(
+            reference: Self.familiar,
+            digestCharacter: "a"
+        )
+        let store = FakeImageReferenceStore([familiar])
+        let coordinator = ImageMutationCoordinator()
+        let resolver = ImageIdentityResolver(
+            systemConfig: ContainerSystemConfig(),
+            catalog: store,
+            mutationCoordinator: coordinator
+        )
+        let service = ClientImageService(
+            containerSystemConfig: ContainerSystemConfig(),
+            identityResolver: resolver,
+            mutationCoordinator: coordinator,
+            referenceStore: store
+        )
+
+        let result = try await service.tag(
+            source: Self.canonical,
+            target: Self.canonical
+        )
+
+        let images = await store.imagesByReference()
+        #expect(result.image.reference == Self.canonical)
+        #expect(result.image.digest == familiar.digest)
+        #expect(images[Self.canonical]?.digest == familiar.digest)
+        #expect(images[Self.familiar] == nil)
+    }
+
     @Test("push passes no platform filter when the image graph includes an artifact")
     func servicePushPreservesArtifactGraph() async throws {
         let owner = Self.image(

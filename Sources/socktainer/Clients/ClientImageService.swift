@@ -457,9 +457,19 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                     ],
                     prepared: replacement
                 )
+                guard
+                    let committed = try await referenceManager.exactImage(
+                        reference: canonicalTarget
+                    ), committed.digest == resolved.image.digest
+                else {
+                    throw CanonicalImageReferenceError.replacementMissing(
+                        target: canonicalTarget,
+                        digest: resolved.image.digest
+                    )
+                }
                 await identityResolver.invalidate()
                 return ImageTaggingResult(
-                    image: resolved.image,
+                    image: committed,
                     dockerConfigDigest: resolved.dockerConfigDigest
                 )
             }
