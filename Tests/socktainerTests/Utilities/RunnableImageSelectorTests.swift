@@ -97,11 +97,40 @@ private actor RecordingRunnableSnapshotProvider:
     }
 }
 
-private struct StaticRunnableImageClient: ClientImageProtocol {
-    let image: ClientImage
+private struct StaticRunnableImageClient: ClientImageProtocol,
+    ImageStoreInventoryProviding
+{
+    let images: [ClientImage]
+    let selections: [DockerTagConfigSelection]
+
+    init(image: ClientImage) {
+        self.images = [image]
+        self.selections = []
+    }
+
+    init(
+        images: [ClientImage],
+        selections: [DockerTagConfigSelection] = []
+    ) {
+        self.images = images
+        self.selections = selections
+    }
 
     func list(includeSystemImages: Bool) async throws -> [ClientImage] {
-        [image]
+        images
+    }
+
+    func imageStoreInventory(
+        includeSystemImages: Bool
+    ) async throws -> ImageStoreInventory {
+        ImageStoreInventory(
+            images: images,
+            physicalReferencesByRootDigest: Dictionary(
+                grouping: images,
+                by: \.digest
+            ).mapValues { Set($0.map(\.reference)) },
+            tagConfigSelections: selections
+        )
     }
 
     func delete(id: String) async throws -> ImageDeletionResult {
@@ -575,6 +604,32 @@ struct RunnableImageSelectorTests {
 
             try await app.testing().test(
                 .GET,
+                "/v1.51/images/json?filters=%7B%22reference%22%3A%5B%22selector%3Alatest%22%5D%7D"
+            ) { response async throws in
+                #expect(response.status == .ok)
+                let summaries = try response.content.decode(
+                    [RESTImageSummary].self
+                )
+                #expect(summaries.count == 1)
+                #expect(
+                    summaries.first?.RepoTags
+                        == ["docker.io/library/selector:latest"]
+                )
+            }
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/json?filters=%7B%22reference%22%3A%7B%22unrelated%3Alatest%22%3Atrue%7D%7D"
+            ) { response async throws in
+                #expect(response.status == .ok)
+                #expect(
+                    try response.content.decode([RESTImageSummary].self)
+                        .isEmpty
+                )
+            }
+
+            try await app.testing().test(
+                .GET,
                 "/v1.51/images/docker.io/library/selector:latest/json?manifests=true"
             ) { response async throws in
                 #expect(response.status == .ok)
@@ -598,6 +653,173 @@ struct RunnableImageSelectorTests {
                 artifactConfigDigest
             )
         )
+    }
+
+    @Test("image list rejects malformed reference filters with an empty inventory")
+    func imageListRejectsMalformedFiltersBeforeEmptyInventory() async throws {
+        try await withApp { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[AppleContainerAppSupportUrlKey.self] =
+                FileManager.default.temporaryDirectory
+
+            try app.register(
+                collection: ImageListRoute(
+                    client: StaticRunnableImageClient(images: []),
+                    containerListProvider: { [] }
+                )
+            )
+
+            for path in [
+                "/v1.51/images/json?filters=%7B%22reference%22%3A%22selector%3Alatest%22%7D",
+                "/v1.51/images/json?filters=%7B%22reference%22%3A%7B%22selector%3Alatest%22%3A%22true%22%7D%7D",
+            ] {
+                try await app.testing().test(.GET, path) { response async in
+                    #expect(response.status == .badRequest)
+                }
+            }
+        }
+    }
+
+    @Test("image list keeps digest identity routing separate from digest visibility")
+    func imageListDigestIdentityHonorsVisibilityFlag() async throws {
+        let root = Self.numberedDigest(96_000)
+        let armManifest = Self.numberedDigest(96_001)
+        let armConfig = Self.numberedDigest(96_002)
+        let amdManifest = Self.numberedDigest(96_003)
+        let amdConfig = Self.numberedDigest(96_004)
+        let tag = "docker.io/library/selector:multi"
+        let repositoryDigest =
+            "docker.io/library/selector@\(amdManifest)"
+        let arm = Platform(arch: "arm64", os: "linux")
+        let amd = Platform(arch: "amd64", os: "linux")
+        let armDescriptor = Descriptor(
+            mediaType: MediaTypes.imageManifest,
+            digest: armManifest,
+            size: 50,
+            platform: arm
+        )
+        let amdDescriptor = Descriptor(
+            mediaType: MediaTypes.imageManifest,
+            digest: amdManifest,
+            size: 50,
+            platform: amd
+        )
+        let index = Index(manifests: [armDescriptor, amdDescriptor])
+        let provider = RecordingRunnableImageContentProvider(
+            indexes: [root: index],
+            manifests: [
+                armManifest: Self.manifest(configDigest: armConfig),
+                amdManifest: Self.manifest(configDigest: amdConfig),
+            ],
+            configs: [
+                armConfig: Self.config(
+                    architecture: "arm64",
+                    label: "arm64"
+                ),
+                amdConfig: Self.config(
+                    architecture: "amd64",
+                    label: "amd64"
+                ),
+            ]
+        )
+        let descriptor = Descriptor(
+            mediaType: MediaTypes.index,
+            digest: root,
+            size: 100
+        )
+        let images = [tag, repositoryDigest].map {
+            ClientImage(
+                description: ImageDescription(
+                    reference: $0,
+                    descriptor: descriptor
+                )
+            )
+        }
+        let client = StaticRunnableImageClient(
+            images: images,
+            selections: [
+                .init(
+                    reference: tag,
+                    rootDigest: root,
+                    configDigest: armConfig
+                ),
+                .init(
+                    reference: repositoryDigest,
+                    rootDigest: root,
+                    configDigest: amdConfig
+                ),
+            ]
+        )
+        let rawFilter =
+            "{\"reference\":[\"\(repositoryDigest)\"]}"
+        let encodedFilterValue = rawFilter.addingPercentEncoding(
+            withAllowedCharacters: .alphanumerics.union(
+                CharacterSet(charactersIn: "-._~")
+            )
+        )
+        let encodedFilter = try #require(encodedFilterValue)
+
+        try await withApp { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[AppleContainerAppSupportUrlKey.self] =
+                FileManager.default.temporaryDirectory
+            try app.register(
+                collection: ImageListRoute(
+                    client: client,
+                    runnableImageSelector: RunnableImageSelector(
+                        contentProvider: provider
+                    ),
+                    containerListProvider: { [] }
+                )
+            )
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/json"
+            ) { response async throws in
+                let rows = try response.content.decode(
+                    [RESTImageSummary].self
+                )
+                #expect(rows.count == 1)
+                #expect(rows.first?.Id == armConfig)
+                #expect(rows.first?.RepoTags == [tag])
+                #expect(rows.first?.RepoDigests.isEmpty == true)
+            }
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/json?digests=true"
+            ) { response async throws in
+                let rows = try response.content.decode(
+                    [RESTImageSummary].self
+                )
+                #expect(rows.count == 2)
+                let byID = Dictionary(
+                    uniqueKeysWithValues: rows.map { ($0.Id, $0) }
+                )
+                #expect(byID[armConfig]?.RepoTags == [tag])
+                #expect(
+                    byID[amdConfig]?.RepoDigests == [repositoryDigest]
+                )
+            }
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/images/json?filters=\(encodedFilter)"
+            ) { response async throws in
+                let rows = try response.content.decode(
+                    [RESTImageSummary].self
+                )
+                #expect(rows.count == 1)
+                #expect(rows.first?.Id == amdConfig)
+                #expect(rows.first?.RepoTags.isEmpty == true)
+                #expect(rows.first?.RepoDigests.isEmpty == true)
+            }
+        }
     }
 
     @Test("every OCI and BuildKit artifact marker plus unknown platforms is excluded")

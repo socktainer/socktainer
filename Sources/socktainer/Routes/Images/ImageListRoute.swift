@@ -1,11 +1,13 @@
 import ContainerAPIClient
 import ContainerResource
 import ContainerizationOCI
+import Darwin
 import Vapor
 
 struct RESTImageListQuery: Vapor.Content {
     let manifests: Bool?
     let digests: Bool?
+    let filters: String?
 }
 
 struct ImageListRoute: RouteCollection {
@@ -53,10 +55,167 @@ extension ImageListRoute {
         let manifestDigests: Set<String>
     }
 
+    struct DockerReferenceFilter: Sendable {
+        let patterns: [String]
+
+        init(patterns: [String]) throws {
+            let patterns = Array(Set(patterns)).sorted()
+            for pattern in patterns {
+                try ImageListRoute.validateGlobPattern(pattern)
+            }
+            self.patterns = patterns
+        }
+
+        func matches(_ reference: String) -> Bool {
+            let targets = ImageListRoute.referenceMatchTargets(reference)
+            return patterns.contains { pattern in
+                targets.contains { target in
+                    fnmatch(pattern, target, FNM_PATHNAME) == 0
+                }
+            }
+        }
+    }
+
+    /// Modern Docker clients encode filters as `map[string]map[string]bool`.
+    /// The bool is historical wire baggage: Moby treats every present key as a
+    /// filter value, even when it is false. Older clients used arrays. Decode
+    /// only those two complete shapes so malformed or mixed payloads fail
+    /// closed instead of accidentally returning an unfiltered inventory.
+    static func referenceFilter(_ rawFilters: String?) throws
+        -> DockerReferenceFilter?
+    {
+        guard let rawFilters, !rawFilters.isEmpty else { return nil }
+        guard let data = rawFilters.data(using: .utf8) else {
+            throw invalidFilters(rawFilters)
+        }
+
+        let decoder = JSONDecoder()
+        let patterns: [String]
+        if let filters = try? decoder.decode(
+            [String: [String: Bool]].self,
+            from: data
+        ) {
+            patterns = filters["reference"].map { Array($0.keys) } ?? []
+        } else if let filters = try? decoder.decode(
+            [String: [String]].self,
+            from: data
+        ) {
+            patterns = filters["reference"] ?? []
+        } else {
+            throw invalidFilters(rawFilters)
+        }
+
+        guard !patterns.isEmpty else { return nil }
+        return try DockerReferenceFilter(patterns: patterns)
+    }
+
+    /// Apply the filter while references are still associated with one Apple
+    /// OCI root. Waiting until rows are merged by Docker config ID can attach a
+    /// non-matching root's descriptor, manifests, or container count to the
+    /// result when distinct roots select the same config.
+    static func references(
+        _ references: [String],
+        matching filter: DockerReferenceFilter?
+    ) -> [String] {
+        guard let filter else { return references }
+
+        let matched = Set(
+            references.filter { reference in
+                !DockerImageReferenceSemantics.isInternalReference(reference)
+                    && !DockerImageReferenceSemantics
+                        .isBareSHA256Identifier(reference)
+                    && filter.matches(reference)
+            }
+        )
+        return matched.sorted()
+    }
+
+    private static func invalidFilters(_ rawFilters: String) -> Abort {
+        Abort(.badRequest, reason: "invalid filters: \(rawFilters)")
+    }
+
+    /// Match the same four spellings as current Moby: familiar and canonical,
+    /// each with and without the tag/digest. This keeps both `alpine` and
+    /// `docker.io/library/alpine:*` useful regardless of the spelling Apple
+    /// persisted for the OCI root.
+    private static func referenceMatchTargets(_ reference: String) -> Set<String> {
+        guard let parsed = try? Reference.parse(reference) else {
+            return [reference]
+        }
+
+        let suffix: String
+        if let tag = parsed.tag {
+            suffix = ":\(tag)"
+        } else if let digest = parsed.digest {
+            suffix = "@\(digest)"
+        } else {
+            suffix = ""
+        }
+
+        let canonicalName: String
+        let familiarName: String
+        switch parsed.domain {
+        case "docker.io", "registry-1.docker.io":
+            canonicalName = "docker.io/\(parsed.path)"
+            familiarName =
+                parsed.path.hasPrefix("library/")
+                ? String(parsed.path.dropFirst("library/".count))
+                : parsed.path
+        case nil:
+            familiarName = parsed.path
+            canonicalName =
+                "docker.io/"
+                + (parsed.path.contains("/")
+                    ? parsed.path : "library/\(parsed.path)")
+        default:
+            canonicalName = parsed.name
+            familiarName = parsed.name
+        }
+
+        return [
+            familiarName + suffix,
+            familiarName,
+            canonicalName + suffix,
+            canonicalName,
+        ]
+    }
+
+    private static func validateGlobPattern(_ pattern: String) throws {
+        guard !pattern.utf8.contains(0) else {
+            throw Abort(
+                .badRequest,
+                reason: "invalid reference filter pattern: contains NUL"
+            )
+        }
+        var escaped = false
+        var inClass = false
+        for character in pattern {
+            if escaped {
+                escaped = false
+                continue
+            }
+            if character == "\\" {
+                escaped = true
+            } else if character == "[" {
+                guard !inClass else { continue }
+                inClass = true
+            } else if character == "]", inClass {
+                inClass = false
+            }
+        }
+        guard !escaped, !inClass else {
+            throw Abort(
+                .badRequest,
+                reason: "invalid reference filter pattern: \(pattern)"
+            )
+        }
+    }
+
     static func splitByPersistedTagIdentity(
         _ summaries: [RESTImageSummary],
         selections: [DockerTagConfigSelection],
-        metadataByRoot: [String: [String: DockerConfigRowMetadata]] = [:]
+        metadataByRoot: [String: [String: DockerConfigRowMetadata]] = [:],
+        includeDigests: Bool = true
     ) -> [RESTImageSummary] {
         let byRoot = Dictionary(grouping: selections, by: \.rootDigest)
         return summaries.flatMap { summary -> [RESTImageSummary] in
@@ -67,7 +226,8 @@ extension ImageListRoute {
             return splitSummary(
                 summary,
                 rootSelections: rootSelections,
-                metadataByConfig: metadataByRoot[root] ?? [:]
+                metadataByConfig: metadataByRoot[root] ?? [:],
+                includeDigests: includeDigests
             )
         }
     }
@@ -75,11 +235,15 @@ extension ImageListRoute {
     static func splitSummary(
         _ summary: RESTImageSummary,
         rootSelections: [DockerTagConfigSelection],
-        metadataByConfig: [String: DockerConfigRowMetadata] = [:]
+        metadataByConfig: [String: DockerConfigRowMetadata] = [:],
+        includeDigests: Bool = true
     ) -> [RESTImageSummary] {
-        let selectedTags = Set(rootSelections.map(\.reference))
+        let selectedReferences = Set(rootSelections.map(\.reference))
         let fallbackTags = summary.RepoTags.filter {
-            !selectedTags.contains($0)
+            !selectedReferences.contains($0)
+        }
+        let fallbackDigests = summary.RepoDigests.filter {
+            !selectedReferences.contains($0)
         }
         let byConfig = Dictionary(
             grouping: rootSelections,
@@ -88,9 +252,22 @@ extension ImageListRoute {
         var rows: [RESTImageSummary] = []
         for config in byConfig.keys.sorted() {
             guard let members = byConfig[config] else { continue }
+            let memberTags = members.compactMap { selection -> String? in
+                (try? Reference.parse(selection.reference))?.digest == nil
+                    ? selection.reference : nil
+            }
+            let memberDigests = members.compactMap { selection -> String? in
+                (try? Reference.parse(selection.reference))?.digest != nil
+                    ? selection.reference : nil
+            }
             let tags =
-                members.map(\.reference)
+                memberTags
                 + (config == summary.Id ? fallbackTags : [])
+            let digests =
+                includeDigests
+                ? memberDigests
+                    + (config == summary.Id ? fallbackDigests : [])
+                : []
             let metadata = metadataByConfig[config]
             let manifests =
                 metadata.map { metadata in
@@ -106,8 +283,7 @@ extension ImageListRoute {
                     Id: config,
                     ParentId: summary.ParentId,
                     RepoTags: Array(Set(tags)).sorted(),
-                    RepoDigests: config == summary.Id
-                        ? summary.RepoDigests : [],
+                    RepoDigests: Array(Set(digests)).sorted(),
                     Created: metadata?.created ?? summary.Created,
                     Size: metadata?.size ?? summary.Size,
                     SharedSize: summary.SharedSize,
@@ -118,7 +294,8 @@ extension ImageListRoute {
                 )
             )
         }
-        if !fallbackTags.isEmpty,
+        if !fallbackTags.isEmpty
+            || (includeDigests && !fallbackDigests.isEmpty),
             byConfig[summary.Id] == nil
         {
             rows.append(
@@ -126,7 +303,7 @@ extension ImageListRoute {
                     Id: summary.Id,
                     ParentId: summary.ParentId,
                     RepoTags: fallbackTags,
-                    RepoDigests: summary.RepoDigests,
+                    RepoDigests: includeDigests ? fallbackDigests : [],
                     Created: summary.Created,
                     Size: summary.Size,
                     SharedSize: summary.SharedSize,
@@ -352,6 +529,7 @@ extension ImageListRoute {
     ) -> @Sendable (Request) async throws -> [RESTImageSummary] {
         { req in
             let query = try req.query.decode(RESTImageListQuery.self)
+            let referenceFilter = try referenceFilter(query.filters)
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
@@ -381,6 +559,13 @@ extension ImageListRoute {
             var metadataByRoot: [String: [String: DockerConfigRowMetadata]] = [:]
 
             for group in groupByIdentity(images) {
+                let filteredReferences = references(
+                    group.references,
+                    matching: referenceFilter
+                )
+                guard referenceFilter == nil || !filteredReferences.isEmpty else {
+                    continue
+                }
                 let image = group.image
                 let resolvedDescriptors =
                     try await runnableImageSelector
@@ -507,7 +692,7 @@ extension ImageListRoute {
                 }
 
                 let repositoryMetadata = repositoryMetadata(
-                    references: group.references,
+                    references: filteredReferences,
                     rootDigest: image.descriptor.digest,
                     includeDigests: includeDigests,
                     validRepositoryDigests:
@@ -539,14 +724,24 @@ extension ImageListRoute {
                 imagesSummaries.append(summary)
             }
 
-            let selections = inventory?.tagConfigSelections ?? []
-            return mergeByDockerImageID(
+            let selections = (inventory?.tagConfigSelections ?? []).filter {
+                selection in
+                let isRepositoryDigest =
+                    (try? Reference.parse(selection.reference))?.digest != nil
+                if let referenceFilter {
+                    return referenceFilter.matches(selection.reference)
+                }
+                return includeDigests || !isRepositoryDigest
+            }
+            let summaries = mergeByDockerImageID(
                 splitByPersistedTagIdentity(
                     imagesSummaries,
                     selections: selections,
-                    metadataByRoot: metadataByRoot
+                    metadataByRoot: metadataByRoot,
+                    includeDigests: includeDigests
                 )
             )
+            return summaries
         }
     }
 }

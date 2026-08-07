@@ -78,7 +78,6 @@ struct ImageIdentityRouteSemanticsTests {
                 ),
             ]
         )
-
         #expect(rows.count == 2)
         #expect(
             Dictionary(uniqueKeysWithValues: rows.map { ($0.Id, $0.RepoTags) })
@@ -96,6 +95,88 @@ struct ImageIdentityRouteSemanticsTests {
         #expect(rowsByID[amdConfig]?.Size == 40)
         #expect(rowsByID[amdConfig]?.Labels == ["arch": "amd64"])
         #expect(rowsByID[amdConfig]?.Containers == 0)
+    }
+
+    @Test("non-host repository digest is listed under its exact platform config")
+    func repositoryDigestSelectsNonHostConfig() {
+        let root = Self.digest("6")
+        let hostConfig = Self.digest("7")
+        let nonHostConfig = Self.digest("8")
+        let nonHostManifest = Self.digest("9")
+        let repositoryDigest =
+            "docker.io/library/example@\(nonHostManifest)"
+        let summary = RESTImageSummary(
+            Id: hostConfig,
+            ParentId: "",
+            RepoTags: [],
+            RepoDigests: [repositoryDigest],
+            Created: 1,
+            Size: 2,
+            SharedSize: -1,
+            Labels: ["arch": "arm64"],
+            Containers: 0,
+            Manifests: nil,
+            Descriptor: OCIDescriptor(
+                mediaType: MediaTypes.index,
+                digest: root,
+                size: 100,
+                urls: nil,
+                annotations: nil,
+                data: nil,
+                platform: nil,
+                artifactType: nil
+            )
+        )
+
+        let rows = ImageListRoute.splitSummary(
+            summary,
+            rootSelections: [
+                .init(
+                    reference: repositoryDigest,
+                    rootDigest: root,
+                    configDigest: nonHostConfig
+                )
+            ],
+            metadataByConfig: [
+                nonHostConfig: .init(
+                    created: 3,
+                    size: 4,
+                    labels: ["arch": "amd64"],
+                    containers: 1,
+                    manifestDigests: [nonHostManifest]
+                )
+            ]
+        )
+        let hiddenRows = ImageListRoute.splitSummary(
+            summary,
+            rootSelections: [
+                .init(
+                    reference: repositoryDigest,
+                    rootDigest: root,
+                    configDigest: nonHostConfig
+                )
+            ],
+            metadataByConfig: [
+                nonHostConfig: .init(
+                    created: 3,
+                    size: 4,
+                    labels: ["arch": "amd64"],
+                    containers: 1,
+                    manifestDigests: [nonHostManifest]
+                )
+            ],
+            includeDigests: false
+        )
+
+        #expect(rows.count == 1)
+        #expect(rows.first?.Id == nonHostConfig)
+        #expect(rows.first?.RepoTags.isEmpty == true)
+        #expect(rows.first?.RepoDigests == [repositoryDigest])
+        #expect(rows.first?.Labels == ["arch": "amd64"])
+        #expect(rows.first?.Containers == 1)
+        #expect(hiddenRows.count == 1)
+        #expect(hiddenRows.first?.Id == nonHostConfig)
+        #expect(hiddenRows.first?.RepoDigests.isEmpty == true)
     }
 
     @Test("history uses the platform implied by a manifest or config identity")
@@ -166,6 +247,193 @@ struct ImageIdentityRouteSemanticsTests {
         )
         #expect(groups[0].image.reference == "docker.io/library/example:first")
         #expect(groups[1].references == ["docker.io/library/other:latest"])
+    }
+
+    @Test("image list parses Docker CLI reference filter encoding")
+    func listParsesReferenceFilters() throws {
+        let currentValue = try ImageListRoute.referenceFilter(
+            #"{"reference":{"other:*":false,"easylink-postgis:17-3.5":true}}"#
+        )
+        let legacyValue = try ImageListRoute.referenceFilter(
+            #"{"reference":["easylink-postgis:17-3.5"]}"#
+        )
+        let current = try #require(currentValue)
+        let legacy = try #require(legacyValue)
+
+        #expect(
+            current.patterns
+                == ["easylink-postgis:17-3.5", "other:*"]
+        )
+        #expect(legacy.patterns == ["easylink-postgis:17-3.5"])
+    }
+
+    @Test("malformed reference filter shapes and NUL patterns fail closed")
+    func listRejectsMalformedReferenceFilters() {
+        for raw in [
+            #"{"reference":"example:latest"}"#,
+            #"{"reference":{"example:latest":"true"}}"#,
+            #"{"reference":[true]}"#,
+            #"{"reference":["example:latest"],"dangling":{"true":true}}"#,
+            #"{"reference":["example\u0000:latest"]}"#,
+            "not-json",
+        ] {
+            #expect(throws: Abort.self) {
+                _ = try ImageListRoute.referenceFilter(raw)
+            }
+        }
+    }
+
+    @Test("exact reference filter returns only the matching root association")
+    func listFiltersExactReference() throws {
+        let filter = try ImageListRoute.DockerReferenceFilter(
+            patterns: ["easylink-postgis:17-3.5"]
+        )
+        let filtered = ImageListRoute.references(
+            [
+                "docker.io/library/easylink-postgis:17-3.5",
+                "docker.io/library/easylink-postgis:old",
+                "docker.io/library/unrelated:latest",
+            ],
+            matching: filter
+        )
+
+        #expect(
+            filtered
+                == ["docker.io/library/easylink-postgis:17-3.5"]
+        )
+    }
+
+    @Test("reference filters match familiar, canonical, and glob forms")
+    func listFiltersDockerReferenceForms() throws {
+        for pattern in [
+            "example",
+            "example:lat*",
+            "docker.io/library/example",
+            "docker.io/library/example:latest",
+        ] {
+            let filter = try ImageListRoute.DockerReferenceFilter(
+                patterns: [pattern]
+            )
+            let filtered = ImageListRoute.references(
+                ["docker.io/library/example:latest"],
+                matching: filter
+            )
+            #expect(filtered.count == 1, "pattern \(pattern)")
+        }
+    }
+
+    @Test("an exact tag filter does not infer ownership of repository digests")
+    func listExactTagDoesNotJoinRepositoryDigests() throws {
+        let digest = "docker.io/library/example@\(Self.digest("c"))"
+        let unrelatedDigest = "ghcr.io/acme/example@\(Self.digest("d"))"
+        let filter = try ImageListRoute.DockerReferenceFilter(
+            patterns: ["example:latest"]
+        )
+
+        let filtered = ImageListRoute.references(
+            [
+                "docker.io/library/example:latest",
+                "docker.io/library/example:old",
+                digest,
+                unrelatedDigest,
+            ],
+            matching: filter
+        )
+
+        #expect(filtered == ["docker.io/library/example:latest"])
+    }
+
+    @Test("reference glob does not cross repository path separators")
+    func listReferenceGlobUsesPathSemantics() throws {
+        let shallow = try ImageListRoute.DockerReferenceFilter(
+            patterns: ["ghcr.io/*"]
+        )
+        let nested = try ImageListRoute.DockerReferenceFilter(
+            patterns: ["ghcr.io/*/*"]
+        )
+
+        #expect(
+            ImageListRoute.references(
+                ["ghcr.io/acme/example:latest"],
+                matching: shallow
+            ).isEmpty
+        )
+        #expect(
+            ImageListRoute.references(
+                ["ghcr.io/acme/example:latest"],
+                matching: nested
+            ).count == 1
+        )
+    }
+
+    @Test("same-config roots are filtered before metadata rows merge")
+    func listFiltersRootsBeforeConfigMerge() throws {
+        let config = Self.digest("e")
+        let matchingRoot = Self.digest("f")
+        let nonmatchingRoot = Self.digest("0")
+        let filter = try ImageListRoute.DockerReferenceFilter(
+            patterns: ["wanted:latest"]
+        )
+        let roots = [
+            (
+                digest: matchingRoot,
+                references: ["docker.io/library/wanted:latest"],
+                containers: 1
+            ),
+            (
+                digest: nonmatchingRoot,
+                references: ["docker.io/library/other:latest"],
+                containers: 9
+            ),
+        ]
+
+        let rootRows = roots.compactMap { root -> RESTImageSummary? in
+            let references = ImageListRoute.references(
+                root.references,
+                matching: filter
+            )
+            guard !references.isEmpty else { return nil }
+            return RESTImageSummary(
+                Id: config,
+                ParentId: "",
+                RepoTags: references,
+                RepoDigests: [],
+                Created: 1,
+                Size: 2,
+                SharedSize: -1,
+                Labels: ["root": root.digest],
+                Containers: root.containers,
+                Manifests: [
+                    ImageManifestSummary(
+                        ID: root.digest,
+                        Descriptor: nil,
+                        Available: true,
+                        Kind: "image",
+                        Size: nil,
+                        ImageData: nil,
+                        AttestationData: nil
+                    )
+                ],
+                Descriptor: OCIDescriptor(
+                    mediaType: MediaTypes.index,
+                    digest: root.digest,
+                    size: 100,
+                    urls: nil,
+                    annotations: nil,
+                    data: nil,
+                    platform: nil,
+                    artifactType: nil
+                )
+            )
+        }
+        let merged = ImageListRoute.mergeByDockerImageID(rootRows)
+
+        #expect(merged.count == 1)
+        #expect(merged.first?.Descriptor?.digest == matchingRoot)
+        #expect(merged.first?.Labels["root"] == matchingRoot)
+        #expect(merged.first?.Containers == 1)
+        #expect(merged.first?.Manifests?.compactMap(\.ID) == [matchingRoot])
+        #expect(merged.first?.RepoTags == ["docker.io/library/wanted:latest"])
     }
 
     @Test("an anonymous lease-only row attributes its stopped container without exposing a tag")

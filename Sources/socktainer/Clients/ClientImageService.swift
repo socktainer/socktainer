@@ -540,19 +540,39 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
         var result: [DockerTagConfigSelection] = []
         for image in images {
             guard
-                let canonical = referenceManager.canonicalTag(
-                    image.reference
-                ), let resolved = try? await identityResolver.resolve(canonical)
+                let selectionReference = Self.dockerSelectionReference(
+                    image.reference,
+                    referenceManager: referenceManager
+                ),
+                let resolved = try? await identityResolver.resolve(
+                    selectionReference
+                )
             else { continue }
             result.append(
                 .init(
-                    reference: canonical,
+                    reference: selectionReference,
                     rootDigest: resolved.image.digest,
                     configDigest: resolved.dockerConfigDigest
                 )
             )
         }
         return result
+    }
+
+    private static func dockerSelectionReference(
+        _ reference: String,
+        referenceManager: CanonicalImageReferenceManager
+    ) -> String? {
+        if let canonical = referenceManager.canonicalTag(reference) {
+            return canonical
+        }
+        guard
+            !DockerImageReferenceSemantics.isInternalReference(reference),
+            !DockerImageReferenceSemantics.isBareSHA256Identifier(reference),
+            let parsed = try? Reference.parse(reference),
+            parsed.digest != nil
+        else { return nil }
+        return reference
     }
 
     func imageStoreInventory(
@@ -614,16 +634,17 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
         var tagSelections: [DockerTagConfigSelection] = []
         for image in visibleImages {
             guard
-                let canonical = referenceManager.canonicalTag(
-                    image.reference
+                let selectionReference = Self.dockerSelectionReference(
+                    image.reference,
+                    referenceManager: referenceManager
                 ),
                 let resolved =
                     try? await identityResolver
-                    .resolveDuringMutation(canonical)
+                    .resolveDuringMutation(selectionReference)
             else { continue }
             tagSelections.append(
                 .init(
-                    reference: canonical,
+                    reference: selectionReference,
                     rootDigest: resolved.image.digest,
                     configDigest: resolved.dockerConfigDigest
                 )
