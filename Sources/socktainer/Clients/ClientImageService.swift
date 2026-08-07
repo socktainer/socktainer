@@ -147,10 +147,21 @@ extension ClientImageProtocol {
     }
 }
 
-enum ClientImageError: Error {
+enum ClientImageError: Error, CustomStringConvertible {
     case notFound(id: String)
     case digestReferenceNotAllowed(repo: String)
     case conflict(String)
+
+    var description: String {
+        switch self {
+        case .notFound(let id):
+            return "No such image: \(id)"
+        case .digestReferenceNotAllowed(let repo):
+            return "cannot reference \(repo) by digest"
+        case .conflict(let message):
+            return message
+        }
+    }
 }
 
 enum PullProgress: Sendable {
@@ -318,7 +329,7 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                     currentRootByReference:
                         try await referenceManager.currentOwnerDigests()
                 )
-                let replacement = try await referenceManager.prepareToReplace(
+                var replacement = try await referenceManager.prepareToReplace(
                     references
                 )
                 prepared = replacement
@@ -332,6 +343,13 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                 // canonical-key commit as an operation failure so rollback
                 // restores the previous owner.
                 try Task.checkCancellation()
+                replacement =
+                    try await referenceManager
+                    .prepareRepositoryDigestAssignments(
+                        outcome.assignments,
+                        prepared: replacement
+                    )
+                prepared = replacement
                 let transaction = try await referenceConstraintStore.prepare(
                     outcome.assignments.compactMap { assignment in
                         guard
@@ -376,6 +394,13 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                     )
                 }
                 await identityResolver.invalidate()
+                if case CanonicalImageReferenceError.conflictingAssignments(
+                    let target
+                ) = error {
+                    throw ClientImageError.conflict(
+                        "conflict: \(target) has conflicting image assignments"
+                    )
+                }
                 throw error
             }
         }
@@ -1183,11 +1208,11 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                     let pulled = try await replacingImages(
                         targeting: [reference],
                         operation: {
-                            var pulled: ClientImage
+                            var pullResult: PulledImageResult
                             do {
                                 let byteCounter = PullByteCounter()
                                 let unpackCounter = PullByteCounter()
-                                pulled = try await imagePuller.pullAndUnpack(
+                                pullResult = try await imagePuller.pullAndUnpack(
                                     reference: reference,
                                     platform: platform,
                                     containerSystemConfig: containerSystemConfig,
@@ -1228,7 +1253,7 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                                 let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
                                 logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
                                 continuation.yield(.message("linux/arm64 not available — retrying with linux/amd64 (Rosetta)"))
-                                pulled = try await imagePuller.pullAndUnpack(
+                                pullResult = try await imagePuller.pullAndUnpack(
                                     reference: reference,
                                     platform: amd64,
                                     containerSystemConfig: containerSystemConfig,
@@ -1237,17 +1262,18 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                                 )
                                 logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
                             }
+                            let pulled = pullResult.image
                             return ImageReplacementOutcome(
                                 value: PulledImageIdentity(
                                     image: pulled,
                                     dockerConfigDigest: pulled.digest
                                 ),
-                                assignments: [
-                                    CanonicalImageAssignment(
-                                        targetReference: reference,
-                                        image: pulled
-                                    )
-                                ]
+                                assignments: Self.pullAssignments(
+                                    reference: reference,
+                                    image: pulled,
+                                    distributionDigest:
+                                        pullResult.distributionDigest
+                                )
                             )
                         },
                         afterCommit: { [identityResolver] pulled in
@@ -1272,6 +1298,34 @@ struct ClientImageService: ClientImageProtocol, ImageTaggingProtocol,
                 task.cancel()
             }
         }
+    }
+
+    private static func pullAssignments(
+        reference: String,
+        image: ClientImage,
+        distributionDigest: String
+    ) -> [CanonicalImageAssignment] {
+        var assignments = [
+            CanonicalImageAssignment(
+                targetReference: reference,
+                image: image
+            )
+        ]
+        guard
+            let parsed = try? Reference.parse(reference),
+            parsed.digest == nil,
+            let digestReference = try? parsed.withDigest(
+                distributionDigest.hasPrefix("sha256:")
+                    ? distributionDigest : "sha256:\(distributionDigest)"
+            ).description
+        else { return assignments }
+        assignments.append(
+            CanonicalImageAssignment(
+                targetReference: digestReference,
+                image: image
+            )
+        )
+        return assignments
     }
 
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<

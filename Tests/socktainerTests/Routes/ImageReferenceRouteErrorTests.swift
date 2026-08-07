@@ -11,6 +11,30 @@ import VaporTesting
 
 @Suite("Image reference routes — Docker identity errors")
 struct ImageReferenceRouteErrorTests {
+    @Test("pull streams immutable-association conflicts in Docker error framing")
+    func pullImmutableAssociationConflictIsDockerFramed() async throws {
+        let client = ThrowingImageClient(failure: .streamConflict)
+        try await withReferenceErrorApp(client: client) { app in
+            try app.register(collection: ImageCreateRoute(client: client))
+
+            try await app.testing().test(
+                .POST,
+                "/v1.51/images/create?fromImage=registry.example.test%2Fteam%2Fexample&tag=latest"
+            ) { response async throws in
+                #expect(response.status == .ok)
+                let frame = try JSONDecoder().decode(
+                    PullErrorFrame.self,
+                    from: Data(response.body.readableBytesView)
+                )
+                #expect(
+                    frame.error
+                        == "conflict: registry.example.test/team/example has conflicting image assignments"
+                )
+                #expect(!response.body.string.contains("conflictingAssignments("))
+            }
+        }
+    }
+
     @Test("push preserves an ambiguous image ID as a 409 conflict")
     func pushAmbiguousImageIsConflict() async throws {
         try await withReferenceErrorApp(client: ThrowingImageClient(failure: .ambiguous)) {
@@ -68,6 +92,7 @@ struct ImageReferenceRouteErrorTests {
 private enum ReferenceRouteFailure: Sendable {
     case notFound
     case ambiguous
+    case streamConflict
 }
 
 private struct ThrowingImageClient: ClientImageProtocol {
@@ -86,6 +111,15 @@ private struct ThrowingImageClient: ClientImageProtocol {
         fallbackPolicy: PlatformFallbackPolicy,
         logger: Logger
     ) async throws -> AsyncThrowingStream<PullProgress, Error> {
+        if case .streamConflict = failure {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(
+                    throwing: ClientImageError.conflict(
+                        "conflict: \(image) has conflicting image assignments"
+                    )
+                )
+            }
+        }
         throw imageError(image)
     }
 
@@ -141,12 +175,20 @@ private struct ThrowingImageClient: ClientImageProtocol {
             return .notFound(id: id)
         case .ambiguous:
             return .conflict("conflict: \(id) is an ambiguous image ID")
+        case .streamConflict:
+            return .conflict(
+                "conflict: \(id) has conflicting image assignments"
+            )
         }
     }
 }
 
 private struct ReferenceRouteErrorBody: Vapor.Content {
     let message: String
+}
+
+private struct PullErrorFrame: Decodable {
+    let error: String
 }
 
 private func withReferenceErrorApp(

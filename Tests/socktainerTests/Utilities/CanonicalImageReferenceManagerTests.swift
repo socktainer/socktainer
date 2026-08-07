@@ -642,6 +642,334 @@ struct CanonicalImageReferenceManagerTests {
         #expect(!messages.contains("Image digest: \(replacement.digest)"))
     }
 
+    @Test("a single-manifest pull persists the distribution manifest digest")
+    func singleManifestPullPersistsDistributionDigest() async throws {
+        let reference = "registry.example.test/team/example:qa"
+        let replacement = Self.image(
+            reference: reference,
+            digestCharacter: "c"
+        )
+        let distributionDigest = RunnableCatalogFixture.manifestDigest(
+            for: replacement.digest
+        )
+        let repositoryDigest =
+            "registry.example.test/team/example@\(distributionDigest)"
+        let store = FakeImageReferenceStore([])
+        let coordinator = ImageMutationCoordinator()
+        let resolver = ImageIdentityResolver(
+            systemConfig: ContainerSystemConfig(),
+            catalog: store,
+            mutationCoordinator: coordinator
+        )
+        let service = ClientImageService(
+            containerSystemConfig: ContainerSystemConfig(),
+            identityResolver: resolver,
+            mutationCoordinator: coordinator,
+            referenceStore: store,
+            imagePuller: FakeImagePuller(
+                image: replacement,
+                store: store,
+                distributionDigest: distributionDigest
+            )
+        )
+
+        let progress = try await service.pull(
+            image: "registry.example.test/team/example",
+            tag: "qa",
+            platform: Platform(arch: "arm64", os: "linux"),
+            fallbackPolicy: .strict,
+            logger: Logger(label: "registry-pull-identity-test")
+        )
+        for try await _ in progress {}
+
+        let images = await store.imagesByReference()
+        #expect(images[reference]?.digest == replacement.digest)
+        #expect(images[repositoryDigest]?.digest == replacement.digest)
+
+        let byTag = try await resolver.resolve(reference)
+        #expect(byTag.repositoryDigests == [repositoryDigest])
+        #expect(byTag.image.digest == replacement.digest)
+
+        let byDigest = try await resolver.resolve(repositoryDigest)
+        #expect(byDigest.repositoryDigests == [repositoryDigest])
+        #expect(byDigest.image.digest == replacement.digest)
+        #expect(
+            byDigest.kind
+                == .manifest(Platform(arch: "arm64", os: "linux"))
+        )
+    }
+
+    @Test("a multi-platform pull persists the distribution index digest")
+    func indexPullPersistsDistributionDigest() async throws {
+        let reference = "registry.example.test/team/indexed:qa"
+        let replacement = Self.image(
+            reference: reference,
+            digestCharacter: "d"
+        )
+        let repositoryDigest =
+            "registry.example.test/team/indexed@\(replacement.digest)"
+        let store = FakeImageReferenceStore([])
+        let coordinator = ImageMutationCoordinator()
+        let resolver = ImageIdentityResolver(
+            systemConfig: ContainerSystemConfig(),
+            catalog: store,
+            mutationCoordinator: coordinator
+        )
+        let service = ClientImageService(
+            containerSystemConfig: ContainerSystemConfig(),
+            identityResolver: resolver,
+            mutationCoordinator: coordinator,
+            referenceStore: store,
+            imagePuller: FakeImagePuller(image: replacement, store: store)
+        )
+
+        let progress = try await service.pull(
+            image: "registry.example.test/team/indexed",
+            tag: "qa",
+            platform: Platform(arch: "arm64", os: "linux"),
+            fallbackPolicy: .strict,
+            logger: Logger(label: "registry-index-pull-identity-test")
+        )
+        for try await _ in progress {}
+
+        let byTag = try await resolver.resolve(reference)
+        #expect(byTag.repositoryDigests == [repositoryDigest])
+        let byDigest = try await resolver.resolve(repositoryDigest)
+        #expect(byDigest.image.digest == replacement.digest)
+        #expect(byDigest.kind == .root)
+    }
+
+    @Test("Apple indirect indexes retain the registry manifest identity")
+    func indirectIndexDistributionIdentity() throws {
+        let storedDigest = "sha256:" + String(repeating: "a", count: 64)
+        let manifestDigest = "sha256:" + String(repeating: "b", count: 64)
+        let indirect = Index(
+            manifests: [
+                Descriptor(
+                    mediaType: MediaTypes.imageManifest,
+                    digest: manifestDigest,
+                    size: 100,
+                    platform: Platform(arch: "arm64", os: "linux")
+                )
+            ],
+            annotations: [AnnotationKeys.containerizationIndexIndirect: "true"]
+        )
+        #expect(
+            try LiveImagePuller.distributionDigest(
+                storedDigest: storedDigest,
+                index: indirect
+            ) == manifestDigest
+        )
+
+        let direct = Index(manifests: indirect.manifests)
+        #expect(
+            try LiveImagePuller.distributionDigest(
+                storedDigest: storedDigest,
+                index: direct
+            ) == storedDigest
+        )
+    }
+
+    @Test("repository digest installation participates in replacement rollback")
+    func repositoryDigestInstallationRollsBack() async throws {
+        let old = Self.image(reference: Self.canonical, digestCharacter: "a")
+        let replacement = Self.image(
+            reference: Self.canonical,
+            digestCharacter: "b"
+        )
+        let repositoryDigest =
+            "docker.io/library/example@\(replacement.digest)"
+        let store = FakeImageReferenceStore([old])
+        let manager = Self.manager(store: store)
+        var prepared = try await manager.prepareToReplace([Self.canonical])
+        await store.put(replacement)
+        let assignments = [
+            CanonicalImageAssignment(
+                targetReference: Self.canonical,
+                image: replacement
+            ),
+            CanonicalImageAssignment(
+                targetReference: repositoryDigest,
+                image: replacement
+            ),
+        ]
+        prepared = try await manager.prepareRepositoryDigestAssignments(
+            assignments,
+            prepared: prepared
+        )
+
+        try await manager.commit(assignments, prepared: prepared)
+        #expect(
+            await store.image(reference: repositoryDigest)?.digest
+                == replacement.digest
+        )
+
+        await manager.rollback(prepared)
+        let images = await store.imagesByReference()
+        #expect(images[Self.canonical]?.digest == old.digest)
+        #expect(images[repositoryDigest] == nil)
+        #expect(images[Self.dangling(old.digest)] == nil)
+    }
+
+    @Test("duplicate physical references never trap replacement preparation")
+    func duplicatePhysicalReferencesDoNotTrap() async throws {
+        let first = Self.image(reference: Self.canonical, digestCharacter: "a")
+        let second = Self.image(reference: Self.canonical, digestCharacter: "b")
+        let firstAlias = Self.image(reference: "first:latest", digestCharacter: "a")
+        let secondAlias = Self.image(reference: "second:latest", digestCharacter: "b")
+        let store = DuplicateImageReferenceStore([
+            first, second, firstAlias, secondAlias,
+        ])
+        let manager = CanonicalImageReferenceManager(
+            systemConfig: ContainerSystemConfig(),
+            store: store
+        )
+
+        _ = try await manager.prepareToReplace([Self.canonical])
+    }
+
+    @Test("an immutable repository digest never overwrites conflicting ownership")
+    func repositoryDigestConflictIsRejected() async throws {
+        let existing = Self.image(
+            reference:
+                "registry.example.test/team/example@sha256:\(String(repeating: "9", count: 64))",
+            digestCharacter: "a"
+        )
+        let replacement = Self.image(
+            reference: "replacement:latest",
+            digestCharacter: "b"
+        )
+        let store = DuplicateImageReferenceStore([existing, replacement])
+        let manager = CanonicalImageReferenceManager(
+            systemConfig: ContainerSystemConfig(),
+            store: store
+        )
+        var prepared = try await manager.prepareToReplace([])
+        let assignments = [
+            CanonicalImageAssignment(
+                targetReference: existing.reference,
+                image: replacement
+            )
+        ]
+        prepared = try await manager.prepareRepositoryDigestAssignments(
+            assignments,
+            prepared: prepared
+        )
+
+        do {
+            try await manager.commit(assignments, prepared: prepared)
+            Issue.record("expected immutable repository digest conflict")
+        } catch CanonicalImageReferenceError.conflictingAssignments(let target) {
+            #expect(target == existing.reference)
+        }
+        let owners = try await store.list().filter {
+            $0.reference == existing.reference
+        }
+        #expect(owners.count == 1)
+        #expect(owners.first?.digest == existing.digest)
+    }
+
+    @Test("a digest pull failure restores an exact key overwritten by Apple")
+    func failedDigestPullRestoresPreexistingAssociation() async throws {
+        let repositoryDigest =
+            "registry.example.test/team/example@sha256:\(String(repeating: "9", count: 64))"
+        let existing = Self.image(
+            reference: repositoryDigest,
+            digestCharacter: "a"
+        )
+        let replacement = Self.image(
+            reference: repositoryDigest,
+            digestCharacter: "b"
+        )
+        let store = FakeImageReferenceStore([existing])
+        let coordinator = ImageMutationCoordinator()
+        let resolver = ImageIdentityResolver(
+            systemConfig: ContainerSystemConfig(),
+            catalog: store,
+            mutationCoordinator: coordinator
+        )
+        let service = ClientImageService(
+            containerSystemConfig: ContainerSystemConfig(),
+            identityResolver: resolver,
+            mutationCoordinator: coordinator,
+            referenceStore: store,
+            imagePuller: OverwriteThenFailImagePuller(
+                image: replacement,
+                store: store
+            )
+        )
+
+        let progress = try await service.pull(
+            image: repositoryDigest,
+            tag: nil,
+            platform: Platform(arch: "arm64", os: "linux"),
+            fallbackPolicy: .strict,
+            logger: Logger(label: "failed-digest-pull-rollback-test")
+        )
+        await #expect(throws: FakeStoreError.self) {
+            for try await _ in progress {}
+        }
+
+        let images = await store.imagesByReference()
+        #expect(images[repositoryDigest]?.digest == existing.digest)
+        #expect(images[Self.dangling(existing.digest)] == nil)
+    }
+
+    @Test("a digest pull cannot replace an existing immutable association")
+    func digestPullCannotReplacePreexistingAssociation() async throws {
+        let distributionDigest =
+            "sha256:" + String(repeating: "9", count: 64)
+        let repositoryDigest =
+            "registry.example.test/team/example@\(distributionDigest)"
+        let existing = Self.image(
+            reference: repositoryDigest,
+            digestCharacter: "a"
+        )
+        let replacement = Self.image(
+            reference: repositoryDigest,
+            digestCharacter: "b"
+        )
+        let store = FakeImageReferenceStore([existing])
+        let coordinator = ImageMutationCoordinator()
+        let resolver = ImageIdentityResolver(
+            systemConfig: ContainerSystemConfig(),
+            catalog: store,
+            mutationCoordinator: coordinator
+        )
+        let service = ClientImageService(
+            containerSystemConfig: ContainerSystemConfig(),
+            identityResolver: resolver,
+            mutationCoordinator: coordinator,
+            referenceStore: store,
+            imagePuller: FakeImagePuller(
+                image: replacement,
+                store: store,
+                distributionDigest: distributionDigest
+            )
+        )
+
+        let progress = try await service.pull(
+            image: repositoryDigest,
+            tag: nil,
+            platform: Platform(arch: "arm64", os: "linux"),
+            fallbackPolicy: .strict,
+            logger: Logger(label: "digest-pull-conflict-test")
+        )
+        do {
+            for try await _ in progress {}
+            Issue.record("expected immutable repository digest conflict")
+        } catch let error as ClientImageError {
+            #expect(
+                error.description
+                    == "conflict: \(repositoryDigest) has conflicting image assignments"
+            )
+        }
+
+        let images = await store.imagesByReference()
+        #expect(images[repositoryDigest]?.digest == existing.digest)
+        #expect(images[Self.dangling(existing.digest)] == nil)
+    }
+
     @Test("a strict arm64 pull never retries amd64")
     func strictPullDoesNotRetryAMD64() async throws {
         let store = FakeImageReferenceStore([])
@@ -1546,6 +1874,7 @@ private actor StaticImageIdentityCatalog: ImageIdentityCatalog {
 private struct FakeImagePuller: ImagePulling {
     let image: ClientImage
     let store: FakeImageReferenceStore
+    var distributionDigest: String? = nil
 
     func pullAndUnpack(
         reference: String,
@@ -1553,7 +1882,7 @@ private struct FakeImagePuller: ImagePulling {
         containerSystemConfig: ContainerSystemConfig,
         downloadProgress: ProgressUpdateHandler?,
         unpackProgress: ProgressUpdateHandler?
-    ) async throws -> ClientImage {
+    ) async throws -> PulledImageResult {
         let pulled = ClientImage(
             description: ImageDescription(
                 reference: reference,
@@ -1561,7 +1890,32 @@ private struct FakeImagePuller: ImagePulling {
             )
         )
         await store.put(pulled)
-        return pulled
+        return PulledImageResult(
+            image: pulled,
+            distributionDigest: distributionDigest ?? pulled.digest
+        )
+    }
+}
+
+private struct OverwriteThenFailImagePuller: ImagePulling {
+    let image: ClientImage
+    let store: FakeImageReferenceStore
+
+    func pullAndUnpack(
+        reference: String,
+        platform: Platform,
+        containerSystemConfig: ContainerSystemConfig,
+        downloadProgress: ProgressUpdateHandler?,
+        unpackProgress: ProgressUpdateHandler?
+    ) async throws -> PulledImageResult {
+        let pulled = ClientImage(
+            description: ImageDescription(
+                reference: reference,
+                descriptor: image.descriptor
+            )
+        )
+        await store.put(pulled)
+        throw FakeStoreError.injected
     }
 }
 
@@ -1581,7 +1935,7 @@ private actor PlatformFallbackImagePuller: ImagePulling {
         containerSystemConfig: ContainerSystemConfig,
         downloadProgress: ProgressUpdateHandler?,
         unpackProgress: ProgressUpdateHandler?
-    ) async throws -> ClientImage {
+    ) async throws -> PulledImageResult {
         requestedArchitectures.append(platform.architecture)
         guard platform.architecture == "amd64" else {
             throw ContainerizationError(
@@ -1596,7 +1950,10 @@ private actor PlatformFallbackImagePuller: ImagePulling {
             )
         )
         await store.put(pulled)
-        return pulled
+        return PulledImageResult(
+            image: pulled,
+            distributionDigest: pulled.digest
+        )
     }
 }
 
@@ -1612,7 +1969,7 @@ private struct CancellationIgnoringImagePuller: ImagePulling {
         containerSystemConfig: ContainerSystemConfig,
         downloadProgress: ProgressUpdateHandler?,
         unpackProgress: ProgressUpdateHandler?
-    ) async throws -> ClientImage {
+    ) async throws -> PulledImageResult {
         let pulled = ClientImage(
             description: ImageDescription(
                 reference: reference,
@@ -1625,7 +1982,44 @@ private struct CancellationIgnoringImagePuller: ImagePulling {
             await Task.yield()
         }
         cancellationObserved.yield(())
-        return pulled
+        return PulledImageResult(
+            image: pulled,
+            distributionDigest: pulled.digest
+        )
+    }
+}
+
+private actor DuplicateImageReferenceStore: ImageReferenceStore {
+    private var images: [ClientImage]
+
+    init(_ images: [ClientImage]) {
+        self.images = images
+    }
+
+    func list() async throws -> [ClientImage] {
+        images
+    }
+
+    func tag(existing: String, new: String) async throws -> ClientImage {
+        guard let source = images.first(where: { $0.reference == existing }) else {
+            throw ContainerizationError(.notFound, message: "image \(existing) not found")
+        }
+        let tagged = ClientImage(
+            description: ImageDescription(
+                reference: new,
+                descriptor: source.descriptor
+            )
+        )
+        images.append(tagged)
+        return tagged
+    }
+
+    func delete(reference: String) async throws {
+        images.removeAll { $0.reference == reference }
+    }
+
+    func cleanUpOrphanedBlobs() async throws -> UInt64 {
+        0
     }
 }
 

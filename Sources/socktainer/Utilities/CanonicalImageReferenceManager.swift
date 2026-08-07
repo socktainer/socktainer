@@ -58,6 +58,8 @@ struct PreparedImageReplacement: Sendable {
     }
 
     fileprivate var targets: Set<String> = []
+    fileprivate var exactRepositoryDigestTargets: Set<String> = []
+    fileprivate var initialRootsByReference: [String: Set<String>] = [:]
     fileprivate var originalReferences: [OriginalReference] = []
     fileprivate var preservedReferencesByDigest: [String: String] = [:]
 }
@@ -93,6 +95,43 @@ struct CanonicalImageReferenceManager: Sendable {
         try await prepare(references, excludingPreservationForDigest: nil)
     }
 
+    /// Adds immutable distribution associations discovered by an operation
+    /// after its OCI root has been resolved (notably a tag pull). Recording the
+    /// pre-existing exact keys makes their installation part of the same
+    /// rollback boundary as mutable tag ownership.
+    func prepareRepositoryDigestAssignments(
+        _ assignments: [CanonicalImageAssignment],
+        prepared: PreparedImageReplacement
+    ) async throws -> PreparedImageReplacement {
+        let targets = Set(
+            assignments.compactMap { assignment in
+                repositoryDigest(assignment.targetReference)
+            }
+        )
+        guard !targets.isEmpty else { return prepared }
+
+        var updated = prepared
+        updated.exactRepositoryDigestTargets.formUnion(targets)
+        let recorded = Set(updated.originalReferences.map(\.reference))
+        updated.originalReferences.append(
+            contentsOf: try targets.sorted().compactMap { target in
+                guard !recorded.contains(target),
+                    let roots = prepared.initialRootsByReference[target]
+                else { return nil }
+                guard roots.count == 1, let digest = roots.first else {
+                    throw CanonicalImageReferenceError.conflictingAssignments(
+                        target: target
+                    )
+                }
+                return PreparedImageReplacement.OriginalReference(
+                    reference: target,
+                    digest: digest
+                )
+            }
+        )
+        return updated
+    }
+
     /// Retires one logical tag while retaining only roots that had already been
     /// displaced by another authoritative owner. The selected owner is being
     /// explicitly deleted and must not be converted into a dangling image.
@@ -111,15 +150,27 @@ struct CanonicalImageReferenceManager: Sendable {
         excludingPreservationForDigest excludedDigest: String?
     ) async throws -> PreparedImageReplacement {
         let targets = Set(references.compactMap(canonicalTag))
-        guard !targets.isEmpty else { return PreparedImageReplacement() }
-
+        let exactRepositoryDigestTargets = Set(
+            references.compactMap(repositoryDigest)
+        )
         let images = try await store.list()
+        let initialRootsByReference = Self.rootsByReference(images)
+        for target in exactRepositoryDigestTargets {
+            if let roots = initialRootsByReference[target], roots.count != 1 {
+                throw CanonicalImageReferenceError.conflictingAssignments(
+                    target: target
+                )
+            }
+        }
         let owners = images.filter { image in
             !claimedTags(for: image).isDisjoint(with: targets)
+                || exactRepositoryDigestTargets.contains(image.reference)
         }
         let byDigest = Dictionary(grouping: owners, by: \.digest)
         var prepared = PreparedImageReplacement(
             targets: targets,
+            exactRepositoryDigestTargets: exactRepositoryDigestTargets,
+            initialRootsByReference: initialRootsByReference,
             originalReferences: owners.map {
                 PreparedImageReplacement.OriginalReference(
                     reference: $0.reference,
@@ -147,7 +198,11 @@ struct CanonicalImageReferenceManager: Sendable {
                 let otherRealReferences = images.contains { image in
                     image.digest == digest
                         && !Self.isDanglingReference(image.reference)
-                        && !(canonicalTag(image.reference).map(targets.contains) ?? false)
+                        && !(canonicalTag(image.reference).map(targets.contains)
+                            ?? false)
+                        && !exactRepositoryDigestTargets.contains(
+                            image.reference
+                        )
                 }
                 guard !otherRealReferences else { continue }
 
@@ -197,6 +252,24 @@ struct CanonicalImageReferenceManager: Sendable {
             throw CanonicalImageReferenceError.assignmentMissing(target: target)
         }
 
+        var digestAssignments: [String: CanonicalImageAssignment] = [:]
+        for assignment in assignments {
+            guard let target = repositoryDigest(assignment.targetReference)
+            else { continue }
+            if let existing = digestAssignments[target],
+                existing.image.digest != assignment.image.digest
+            {
+                throw CanonicalImageReferenceError.conflictingAssignments(
+                    target: target
+                )
+            }
+            digestAssignments[target] = assignment
+        }
+        for target in prepared.exactRepositoryDigestTargets
+        where digestAssignments[target] == nil {
+            throw CanonicalImageReferenceError.assignmentMissing(target: target)
+        }
+
         for target in assignmentsByTarget.keys.sorted() {
             guard let assignment = assignmentsByTarget[target] else { continue }
             if assignment.image.reference != target {
@@ -214,6 +287,51 @@ struct CanonicalImageReferenceManager: Sendable {
 
             let finalOwner = try await store.list().first(where: { $0.reference == target })
             guard finalOwner?.digest == assignment.image.digest else {
+                throw CanonicalImageReferenceError.replacementMissing(
+                    target: target,
+                    digest: assignment.image.digest
+                )
+            }
+        }
+
+        for target in digestAssignments.keys.sorted() {
+            guard let assignment = digestAssignments[target] else { continue }
+            if let initialRoots = prepared.initialRootsByReference[target],
+                !initialRoots.allSatisfy({
+                    $0 == assignment.image.digest
+                })
+            {
+                throw CanonicalImageReferenceError.conflictingAssignments(
+                    target: target
+                )
+            }
+            let existing = try await store.list().filter {
+                $0.reference == target
+            }
+            if !existing.isEmpty {
+                guard
+                    existing.allSatisfy({
+                        $0.digest == assignment.image.digest
+                    })
+                else {
+                    throw CanonicalImageReferenceError.conflictingAssignments(
+                        target: target
+                    )
+                }
+            } else {
+                _ = try await store.tag(
+                    existing: assignment.image.reference,
+                    new: target
+                )
+            }
+            let finalAssociations = try await store.list().filter {
+                $0.reference == target
+            }
+            guard !finalAssociations.isEmpty,
+                finalAssociations.allSatisfy({
+                    $0.digest == assignment.image.digest
+                })
+            else {
                 throw CanonicalImageReferenceError.replacementMissing(
                     target: target,
                     digest: assignment.image.digest
@@ -247,10 +365,16 @@ struct CanonicalImageReferenceManager: Sendable {
 
             let originalExactTargets = Set(
                 prepared.originalReferences.compactMap { original in
-                    prepared.targets.contains(original.reference) ? original.reference : nil
+                    prepared.targets.union(
+                        prepared.exactRepositoryDigestTargets
+                    ).contains(original.reference)
+                        ? original.reference : nil
                 }
             )
-            for target in prepared.targets.subtracting(originalExactTargets).sorted() {
+            let createdTargets = prepared.targets.union(
+                prepared.exactRepositoryDigestTargets
+            ).subtracting(originalExactTargets)
+            for target in createdTargets.sorted() {
                 if images.contains(where: { $0.reference == target }) {
                     try await store.delete(reference: target)
                     images = try await store.list()
@@ -294,6 +418,24 @@ struct CanonicalImageReferenceManager: Sendable {
             return nil
         }
         return normalized
+    }
+
+    private func repositoryDigest(_ reference: String) -> String? {
+        guard
+            !DockerImageReferenceSemantics.isInternalReference(reference),
+            !DockerImageReferenceSemantics.isBareSHA256Identifier(reference),
+            let parsed = try? Reference.parse(reference),
+            parsed.digest != nil
+        else { return nil }
+        return reference
+    }
+
+    private static func rootsByReference(
+        _ images: [ClientImage]
+    ) -> [String: Set<String>] {
+        images.reduce(into: [:]) { result, image in
+            result[image.reference, default: []].insert(image.digest)
+        }
     }
 
     func physicalReferences(claiming reference: String) async throws -> [String] {
