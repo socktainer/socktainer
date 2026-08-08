@@ -21,10 +21,12 @@ enum ContainerAutoRemoveCleanup {
         let cached = await ContainerInfoCache.shared.get(id: hexId)
         let labels = cached?.labels ?? fallbackLabels
         let rootDescriptor = cached?.rootDescriptor ?? fallbackRootDescriptor
+        let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: nativeId)
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
                 nativeId: nativeId,
+                logicalName: dockerName,
                 labels: labels,
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer
@@ -35,12 +37,14 @@ enum ContainerAutoRemoveCleanup {
                 ContainerAttachRoute.makeAutoRemoveEvent(
                     id: hexId,
                     image: cached?.image ?? fallbackImage,
-                    name: cached?.nativeId ?? nativeId,
+                    name: dockerName,
                     labels: labels
                 ))
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
+        await PublishedPortManagerRegistry.shared.close(nativeID: nativeId)
+        try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeId)
         if let rootDescriptor {
             await leaseReconciler.reconcile(rootDescriptor: rootDescriptor)
         }

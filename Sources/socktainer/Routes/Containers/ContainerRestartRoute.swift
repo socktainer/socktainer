@@ -27,10 +27,29 @@ extension ContainerRestartRoute {
 
             if let nativeId = snapshot?.id {
                 await ContainerRestartState.shared.reset(id: nativeId)
+                await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeId)
             }
 
             do {
-                try await client.restart(id: id, signal: signal, timeout: timeout)
+                if let snapshot, !snapshot.configuration.publishedPorts.isEmpty,
+                    let appSupportURL = req.application.storage[AppleContainerAppSupportUrlKey.self]
+                {
+                    try await DockerContainerMetadataStore.shared.adopt(
+                        nativeID: snapshot.id,
+                        name: snapshot.id,
+                        publishedPorts: snapshot.configuration.publishedPorts
+                    )
+                    try await client.stop(id: id, signal: signal, timeout: timeout)
+                    var stopped = snapshot
+                    if let refreshed = try await client.getContainer(nativeID: snapshot.id) { stopped = refreshed }
+                    try ApplePublishedPortCompatibility.suppressNativeForwarder(
+                        container: stopped,
+                        appSupportURL: appSupportURL
+                    )
+                    try await client.start(id: id, detachKeys: nil)
+                } else {
+                    try await client.restart(id: id, signal: signal, timeout: timeout)
+                }
             } catch ClientContainerError.notFound {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
@@ -42,6 +61,12 @@ extension ContainerRestartRoute {
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            let dockerName: String
+            if let snapshot {
+                dockerName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+            } else {
+                dockerName = id
+            }
             // Carry the canonical 64-char Docker id, not the raw request
             // reference (name or short id), so clients can correlate this
             // event with start/kill/die (same pattern as those routes).
@@ -52,7 +77,7 @@ extension ContainerRestartRoute {
                 image: snapshot.map {
                     ContainerImageIdentity.requestedReference(for: $0)
                 } ?? "",
-                name: snapshot?.id ?? id,
+                name: dockerName,
                 labels: snapshot.map {
                     ContainerImageIdentity.dockerLabels(for: $0)
                 } ?? [:]
@@ -67,6 +92,8 @@ extension ContainerRestartRoute {
                 id: id, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: req.logger
             )
             if let snap = restartedSnapshot {
+                try await req.application.storage[PublishedPortManagerKey.self]?.reconcile(container: snap)
+                let restartedName = await DockerContainerMetadataStore.shared.name(nativeID: snap.id)
                 let eventId = DockerContainerID.hexId(for: snap)
                 let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
                 let generation = await ContainerRestartState.shared.currentGeneration(id: snap.id)
@@ -76,7 +103,7 @@ extension ContainerRestartRoute {
                     image: ContainerImageIdentity.requestedReference(
                         for: snap
                     ),
-                    name: snap.id,
+                    name: restartedName,
                     labels: ContainerImageIdentity.dockerLabels(for: snap),
                     rootDescriptor: snap.configuration.image.descriptor,
                     ip: ContainerStartRoute.dnsAttachmentIP(in: snap),

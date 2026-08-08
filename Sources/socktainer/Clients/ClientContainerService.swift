@@ -78,15 +78,29 @@ actor ContainerExitCodeStore {
 protocol ClientContainerProtocol: Sendable {
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot]
     func getContainer(id: String) async throws -> ContainerSnapshot?
+    func getContainer(nativeID: String) async throws -> ContainerSnapshot?
     func enforceContainerRunning(container: ContainerSnapshot) throws
 
     func start(id: String, detachKeys: String?) async throws
+    func start(nativeID: String, detachKeys: String?) async throws
     func stop(id: String, signal: String?, timeout: Int?) async throws
     func restart(id: String, signal: String?, timeout: Int?) async throws
     func kill(id: String, signal: String?) async throws
     func delete(id: String) async throws
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
+}
+
+extension ClientContainerProtocol {
+    /// Private runtime lookup seam. Test clients whose Docker and native names are
+    /// identical can use this default; the live client bypasses public alias rules.
+    func getContainer(nativeID: String) async throws -> ContainerSnapshot? {
+        try await getContainer(id: nativeID)
+    }
+
+    func start(nativeID: String, detachKeys: String?) async throws {
+        try await start(id: nativeID, detachKeys: detachKeys)
+    }
 }
 
 enum ClientContainerError: Error {
@@ -112,17 +126,90 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-        let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
+        var candidates = showAll ? allContainers : allContainers.filter { $0.status == .running }
+        var effectiveFilters = filters
+        if let names = filters["name"] {
+            var allowed = Set<String>()
+            for container in candidates {
+                let name = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
+                if names.contains(where: { name.contains(DockerContainerMetadataStore.normalized($0)) }) {
+                    allowed.insert(container.id)
+                }
+            }
+            candidates = candidates.filter { allowed.contains($0.id) }
+            effectiveFilters.removeValue(forKey: "name")
+        }
+        if let exposed = filters["expose"] {
+            var allowed = Set<String>()
+            for container in candidates {
+                let ports = await DockerContainerMetadataStore.shared.ports(
+                    nativeID: container.id,
+                    fallback: container.configuration.publishedPorts
+                )
+                let values = ports.map { "\($0.containerPort)/\($0.proto.rawValue)" }
+                if exposed.allSatisfy({ value in values.contains { $0.contains(value) } }) {
+                    allowed.insert(container.id)
+                }
+            }
+            candidates = candidates.filter { allowed.contains($0.id) }
+            effectiveFilters.removeValue(forKey: "expose")
+        }
+        if let published = filters["publish"] {
+            var allowed = Set<String>()
+            for container in candidates {
+                let ports = await DockerContainerMetadataStore.shared.ports(
+                    nativeID: container.id,
+                    fallback: container.configuration.publishedPorts
+                )
+                let values = ports.map { "\($0.hostPort):\($0.containerPort)" }
+                if published.allSatisfy({ value in values.contains { $0.contains(value) } }) {
+                    allowed.insert(container.id)
+                }
+            }
+            candidates = candidates.filter { allowed.contains($0.id) }
+            effectiveFilters.removeValue(forKey: "publish")
+        }
         let resolvedAncestors = await Self.resolveAncestorFilter(
-            filters["ancestor"],
+            effectiveFilters["ancestor"],
             with: imageReferenceResolver
         )
+        let identityFilterKeys: Set<String> = ["id", "before", "since"]
+        let resolvedContainerIdentities: [String: ResolvedContainerFilterIdentity]
+        if identityFilterKeys.isDisjoint(with: effectiveFilters.keys) {
+            resolvedContainerIdentities = [:]
+        } else {
+            resolvedContainerIdentities = await Self.resolveContainerFilterIdentities(
+                allContainers
+            )
+        }
         return Self.applyFilters(
-            running,
-            filters: filters,
+            candidates,
+            filters: effectiveFilters,
             allContainers: allContainers,
-            resolvedAncestors: resolvedAncestors
+            resolvedAncestors: resolvedAncestors,
+            resolvedContainerIdentities: resolvedContainerIdentities
         )
+    }
+
+    struct ResolvedContainerFilterIdentity: Sendable {
+        let logicalName: String
+        let dockerID: String
+    }
+
+    static func resolveContainerFilterIdentities(
+        _ containers: [ContainerSnapshot]
+    ) async -> [String: ResolvedContainerFilterIdentity] {
+        var identities: [String: ResolvedContainerFilterIdentity] = [:]
+        identities.reserveCapacity(containers.count)
+        for container in containers {
+            identities[container.id] = ResolvedContainerFilterIdentity(
+                logicalName: await DockerContainerMetadataStore.shared.name(
+                    nativeID: container.id
+                ),
+                dockerID: DockerContainerID.hexId(for: container)
+            )
+        }
+        return identities
     }
 
     struct ResolvedAncestorFilter: Sendable {
@@ -228,9 +315,32 @@ struct ClientContainerService: ClientContainerProtocol {
         _ containers: [ContainerSnapshot],
         filters: [String: [String]],
         allContainers: [ContainerSnapshot] = [],
-        resolvedAncestors: ResolvedAncestorFilter? = nil
+        resolvedAncestors: ResolvedAncestorFilter? = nil,
+        resolvedContainerIdentities: [String: ResolvedContainerFilterIdentity] = [:]
     ) -> [ContainerSnapshot] {
         let referencePool = allContainers.isEmpty ? containers : allContainers
+        func identity(for container: ContainerSnapshot) -> ResolvedContainerFilterIdentity {
+            resolvedContainerIdentities[container.id]
+                ?? ResolvedContainerFilterIdentity(
+                    logicalName: container.id,
+                    dockerID: DockerContainerID.hexId(for: container)
+                )
+        }
+        func resolveReference(_ reference: String) -> ContainerSnapshot? {
+            let normalized = DockerContainerMetadataStore.normalized(reference)
+            let nameMatches = referencePool.filter {
+                identity(for: $0).logicalName == normalized
+            }
+            if nameMatches.count == 1 { return nameMatches[0] }
+            guard nameMatches.isEmpty else { return nil }
+
+            let idMatches = referencePool.filter {
+                identity(for: $0).dockerID.hasPrefix(reference)
+            }
+            return idMatches.count == 1 ? idMatches[0] : nil
+        }
+        let beforeReferences = filters["before"]?.compactMap(resolveReference) ?? []
+        let sinceReferences = filters["since"]?.compactMap(resolveReference) ?? []
         var result = containers
         for (key, values) in filters {
             switch key {
@@ -265,8 +375,9 @@ struct ClientContainerService: ClientContainerProtocol {
                 result = result.filter { values.contains($0.id) }
             case "id":
                 result = result.filter { container in
-                    values.contains { value in
-                        container.id == value || DockerContainerID.hexId(for: container).hasPrefix(value)
+                    let dockerID = identity(for: container).dockerID
+                    return values.contains { value in
+                        dockerID.hasPrefix(value)
                     }
                 }
             case "ancestor":
@@ -281,37 +392,27 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             case "before":
                 result = result.filter { container in
-                    for beforeId in values {
-                        if let beforeContainer = referencePool.first(where: {
-                            $0.id == beforeId || $0.id.hasPrefix(beforeId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(beforeId)
-                        }) {
-                            if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
-                                let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
-                            {
-                                return containerTimestamp < beforeTimestamp
-                            }
-                            return container.id < beforeContainer.id
+                    beforeReferences.contains { beforeContainer in
+                        if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
+                            let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
+                        {
+                            return containerTimestamp < beforeTimestamp
                         }
+                        return identity(for: container).dockerID
+                            < identity(for: beforeContainer).dockerID
                     }
-                    return false
                 }
             case "since":
                 result = result.filter { container in
-                    for sinceId in values {
-                        if let sinceContainer = referencePool.first(where: {
-                            $0.id == sinceId || $0.id.hasPrefix(sinceId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(sinceId)
-                        }) {
-                            if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
-                                let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
-                            {
-                                return containerTimestamp > sinceTimestamp
-                            }
-                            return container.id > sinceContainer.id
+                    sinceReferences.contains { sinceContainer in
+                        if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
+                            let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
+                        {
+                            return containerTimestamp > sinceTimestamp
                         }
+                        return identity(for: container).dockerID
+                            > identity(for: sinceContainer).dockerID
                     }
-                    return false
                 }
             case "health":
                 // Health filtering requires the HealthCheckManager (available in
@@ -353,9 +454,18 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
+        if let nativeID = try await DockerContainerMetadataStore.shared.nativeID(
+            named: id,
+            existingNativeIDs: Set(allContainers.map(\.id))
+        ) {
+            return allContainers.first { $0.id == nativeID }
+        }
         let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
             let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
+            let effectiveName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+            guard effectiveName == DockerContainerMetadataStore.normalized(id) else { return nil }
             return Self.isDNSSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
@@ -363,7 +473,6 @@ struct ClientContainerService: ClientContainerProtocol {
             // against the derived IDs of all containers. Use the original
             // unsanitized reference: sanitize() mangles 64-char hex IDs into
             // non-hex strings (containing "-"), which breaks hex prefix matching.
-            let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
             switch DockerContainerID.resolve(reference: id, entries: entries) {
             case .match(let nativeId):
@@ -373,6 +482,17 @@ struct ClientContainerService: ClientContainerProtocol {
             case .none:
                 return nil
             }
+        }
+    }
+
+    func getContainer(nativeID: String) async throws -> ContainerSnapshot? {
+        do {
+            let snapshot = try await containerClient.withClient {
+                try await $0.get(id: nativeID)
+            }
+            return Self.isDNSSidecar(snapshot) ? nil : snapshot
+        } catch let error as ContainerizationError where error.code == .notFound {
+            return nil
         }
     }
 
@@ -394,12 +514,24 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
 
+        try await startResolved(container: container)
+    }
+
+    func start(nativeID: String, detachKeys: String?) async throws {
+        guard let container = try await getContainer(nativeID: nativeID) else {
+            throw ClientContainerError.notFound(id: nativeID)
+        }
+
+        try await startResolved(container: container)
+    }
+
+    private func startResolved(container: ContainerSnapshot) async throws {
         if container.status == .running {
             return
         }
 
         try await ContainerFilesystemOperationLock.shared.withLock(containerID: container.id) {
-            guard let current = try await self.getContainer(id: container.id), current.status != .running else {
+            guard let current = try await self.getContainer(nativeID: container.id), current.status != .running else {
                 return
             }
             try await VMLifecycleAdmission.shared.withSlot {
@@ -599,7 +731,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             case "label":
                 containersToDelete = containersToDelete.filter { container in
-                    let labels = container.configuration.labels
+                    let labels = ContainerImageIdentity.dockerLabels(for: container)
                     return values.allSatisfy { labelFilter in
                         if labelFilter.contains("!=") {
                             if let eqIdx = labelFilter.range(of: "!=") {

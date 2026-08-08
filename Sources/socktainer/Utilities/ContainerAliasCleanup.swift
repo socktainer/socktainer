@@ -9,14 +9,16 @@ import Foundation
 enum ContainerAliasCleanup {
     static func unregisterAllAliases(
         nativeId: String,
+        logicalName: String? = nil,
         labels: [String: String],
         cachedIP: String?,
         dnsServer: SocktainerDNSServer
     ) {
         guard let cachedIP else { return }
 
-        if !nativeId.isEmpty {
-            dnsServer.unregisterIfOwned(hostname: nativeId, expectedIP: cachedIP)
+        let primaryName = logicalName ?? nativeId
+        if !primaryName.isEmpty {
+            dnsServer.unregisterIfOwned(hostname: primaryName, expectedIP: cachedIP)
         }
         if let namesLabel = labels["socktainer.dns.names"] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {

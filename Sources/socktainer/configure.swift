@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerPersistence
+import ContainerResource
 import ContainerizationError
 import Vapor
 
@@ -22,6 +23,15 @@ func configure(_ app: Application) async throws {
     // Define app support path early since it's needed by multiple services
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
+    let metadataStorageURL =
+        ProcessInfo.processInfo.environment[
+            "SOCKTAINER_METADATA_DIRECTORY"
+        ].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? appleContainerAppSupportUrl
+    try await DockerContainerMetadataStore.shared.configure(
+        storageDirectory: metadataStorageURL,
+        enforceExclusiveAccess: true
+    )
 
     let systemConfig: ContainerSystemConfig
     do {
@@ -51,6 +61,13 @@ func configure(_ app: Application) async throws {
         imageReferenceResolver: imageIdentityResolver,
         imageLeaseReconciler: imageLeaseReconciler
     )
+    let publishedPortManager = PublishedPortManager(
+        eventLoopGroup: app.eventLoopGroup,
+        logger: Logger(label: "socktainer.ports")
+    )
+    app.storage[PublishedPortManagerKey.self] = publishedPortManager
+    await PublishedPortManagerRegistry.shared.configure(publishedPortManager)
+    app.lifecycle.use(PublishedPortManagerLifecycle(manager: publishedPortManager))
     let containerImageMetadataProvider = CanonicalContainerImageMetadataProvider(
         resolver: imageIdentityResolver
     )
@@ -124,7 +141,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerPauseRoute())
     try app.register(collection: ContainerPruneRoute(client: containerClient))
-    try app.register(collection: ContainerRenameRoute())
+    try app.register(collection: ContainerRenameRoute(client: containerClient))
     try app.register(collection: ContainerResizeRoute(client: containerClient))
     try app.register(collection: ContainerRestartRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
@@ -282,29 +299,31 @@ func configure(_ app: Application) async throws {
     // tracks status so `/containers/{id}/json` can return `.State.Health`.
     let healthCheckManager = HealthCheckManager(broadcaster: broadcaster)
     app.storage[HealthCheckManagerKey.self] = healthCheckManager
+    let recoveredLifecycleMonitor = RecoveredContainerLifecycleMonitor(
+        client: containerClient,
+        portManager: publishedPortManager,
+        dnsServer: dnsServer,
+        healthManager: healthCheckManager,
+        logger: app.logger
+    )
+    app.lifecycle.use(
+        RecoveredContainerLifecycleHandler(monitor: recoveredLifecycleMonitor)
+    )
 
-    // Resume healthcheck loops and DNS registrations for any containers that were
-    // running when Socktainer last stopped. SocktainerDNSServer is in-memory so
-    // entries are lost on restart; without re-registration containers that are
-    // restarted (not re-created) via docker start cannot be resolved by peers.
+    // Seed recovery when Apple is available immediately. The monitor is started
+    // unconditionally and owns the same idempotent recovery path for containers
+    // first discovered after a transient Apple service outage.
     let resumeClient = ContainerClient()
+    var recoveredContainers: [ContainerSnapshot] = []
     if let runningContainers = try? await resumeClient.list() {
-        for container in runningContainers where container.status == .running {
-            // Skip DNS-sidecar containers — they are internal infrastructure.
-            guard !ClientContainerService.isDNSSidecar(container)
-            else { continue }
-
-            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
-
-            // Resume healthcheck loop if the container has one.
-            guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
-                let config = try? JSONDecoder().decode(HealthcheckConfig.self, from: Data(json.utf8)),
-                HealthCheckManager.parseTest(config.Test) != nil  // skip NONE / disabled checks
-            else { continue }
-            await healthCheckManager.start(containerId: container.id, config: config)
-            app.logger.info("Resumed healthcheck for \(container.id)")
+        recoveredContainers = runningContainers.filter {
+            !ClientContainerService.isDNSSidecar($0)
         }
+        try? await DockerContainerMetadataStore.shared.reconcile(
+            existingNativeIDs: Set(runningContainers.map(\.id))
+        )
     }
+    await recoveredLifecycleMonitor.start(containers: recoveredContainers)
 
     // Sidecar adoption and network reaping (in that order — a network whose only
     // member was its sidecar must appear empty to the reaper) are best-effort
@@ -314,15 +333,19 @@ func configure(_ app: Application) async throws {
     // nothing. Network reaping context: Apple Container's vmnet state degrades
     // as orphaned networks accumulate and eventually breaks container-to-container
     // routing (EHOSTUNREACH).
-    let housekeepingLogger = app.logger
-    let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
-        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
-        await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
-    }
-    if !housekeepingFinished {
-        app.logger.warning(
-            "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."
-        )
+    if ProcessInfo.processInfo.environment["SOCKTAINER_SKIP_STARTUP_HOUSEKEEPING"] == "1" {
+        app.logger.warning("[startup] housekeeping explicitly disabled for an isolated acceptance daemon")
+    } else {
+        let housekeepingLogger = app.logger
+        let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+            await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+            await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
+        }
+        if !housekeepingFinished {
+            app.logger.warning(
+                "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."
+            )
+        }
     }
 
 }

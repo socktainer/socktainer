@@ -51,6 +51,17 @@ extension ContainerStartRoute {
                 if container.status == .running {
                     req.logger.debug("Container \(id) is already running")
                 } else {
+                    try await DockerContainerMetadataStore.shared.adopt(
+                        nativeID: container.id,
+                        name: container.id,
+                        publishedPorts: container.configuration.publishedPorts
+                    )
+                    if let appSupportURL = req.application.storage[AppleContainerAppSupportUrlKey.self] {
+                        try ApplePublishedPortCompatibility.suppressNativeForwarder(
+                            container: container,
+                            appSupportURL: appSupportURL
+                        )
+                    }
                     // Try to start the container
                     try await client.start(id: id, detachKeys: detachKeys)
                     req.logger.debug("Started container \(id)")
@@ -79,6 +90,16 @@ extension ContainerStartRoute {
             )
 
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
+            if let startedSnapshot,
+                let portManager = req.application.storage[PublishedPortManagerKey.self]
+            {
+                do {
+                    try await portManager.reconcile(container: startedSnapshot)
+                } catch {
+                    req.logger.error("Failed to publish ports for \(startedSnapshot.id): \(error)")
+                    throw Abort(.internalServerError, reason: "Failed to publish container ports: \(error)")
+                }
+            }
             // Derive the canonical 64-char Docker ID once here so the cache and all
             // lifecycle events use the same stable id the create event returned.
             let eventId = metadataSnapshot.map { DockerContainerID.hexId(for: $0) } ?? id
@@ -113,6 +134,12 @@ extension ContainerStartRoute {
             // /start sees it already running — indistinguishable from a redundant `docker start`.
             // Gating dropped the start (and die) events for the common `docker run` case, so we
             // accept a possible extra event on the rare redundant `docker start` instead.
+            let eventName: String
+            if let metadataSnapshot {
+                eventName = await DockerContainerMetadataStore.shared.name(nativeID: metadataSnapshot.id)
+            } else {
+                eventName = id
+            }
             let event = DockerEvent.simpleEvent(
                 id: eventId,
                 type: "container",
@@ -120,7 +147,7 @@ extension ContainerStartRoute {
                 image: metadataSnapshot.map {
                     ContainerImageIdentity.requestedReference(for: $0)
                 } ?? "",
-                name: metadataSnapshot?.id ?? id,
+                name: eventName,
                 labels: metadataSnapshot.map {
                     ContainerImageIdentity.dockerLabels(for: $0)
                 } ?? [:]
@@ -130,13 +157,14 @@ extension ContainerStartRoute {
             // Observe the container process exit to fire the "die" event.
             // Runs as a detached background task — the start route returns immediately.
             if let snap = metadataSnapshot {
+                let observerName = await DockerContainerMetadataStore.shared.name(nativeID: snap.id)
                 let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
                 let generation = await ContainerRestartState.shared.currentGeneration(id: snap.id)
                 await ContainerStartRoute.armRestartObserver(
                     nativeId: snap.id,
                     eventId: eventId,
                     image: ContainerImageIdentity.requestedReference(for: snap),
-                    name: snap.id,
+                    name: observerName,
                     labels: ContainerImageIdentity.dockerLabels(for: snap),
                     rootDescriptor: snap.configuration.image.descriptor,
                     ip: ContainerStartRoute.dnsAttachmentIP(in: startedSnapshot),
@@ -186,13 +214,17 @@ extension ContainerStartRoute {
             // stale one broadcasts its own "die" for an exit the current observer already owns.
             guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
 
+            // The forwarder must not outlive the running process. This also frees
+            // the host port before restart-policy recovery or --rm cleanup.
+            await PublishedPortManagerRegistry.shared.close(nativeID: nativeId)
+
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            let exitSnapshot = try? await client.getContainer(id: nativeId)
+            let exitSnapshot = try? await client.getContainer(nativeID: nativeId)
             if let exitSnapshot {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
@@ -201,9 +233,10 @@ extension ContainerStartRoute {
             attrs["exitCode"] = String(code)
             // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
             attrs["execDuration"] = String(Int(executionDuration))
+            let currentName = await DockerContainerMetadataStore.shared.name(nativeID: nativeId)
             let dieEvent = DockerEvent.simpleEvent(
                 id: eventId, type: "container", status: "die",
-                image: image, name: name, labels: attrs
+                image: image, name: currentName, labels: attrs
             )
             await broadcaster.broadcast(dieEvent)
 
@@ -245,6 +278,7 @@ extension ContainerStartRoute {
                     let cached = await ContainerInfoCache.shared.get(id: nativeId)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: nativeId,
+                        logicalName: currentName,
                         labels: cached?.labels ?? labels,
                         cachedIP: cached?.ip,
                         dnsServer: dnsServer
@@ -283,7 +317,7 @@ extension ContainerStartRoute {
             // RestartCount for a restart that the generation check just aborted.
             let attempt = await ContainerRestartState.shared.nextAttempt(id: nativeId)
             do {
-                try await client.start(id: nativeId, detachKeys: nil)
+                try await client.start(nativeID: nativeId, detachKeys: nil)
             } catch {
                 await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
                 logger.warning("restart-policy: failed to restart \(nativeId) (attempt \(attempt)): \(error)")
@@ -294,6 +328,13 @@ extension ContainerStartRoute {
             let restartedSnapshot = await ContainerStartRoute.performPostStartSetup(
                 id: nativeId, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: logger
             )
+            if let restartedSnapshot {
+                do {
+                    try await PublishedPortManagerRegistry.shared.reconcile(container: restartedSnapshot)
+                } catch {
+                    logger.error("restart-policy: failed to restore published ports for \(nativeId): \(error)")
+                }
+            }
 
             // Refresh the cache before broadcasting "start" so a listener that reacts to the
             // event by reading ContainerInfoCache always sees the restarted container's new IP.
@@ -317,8 +358,16 @@ extension ContainerStartRoute {
             if let snap = restartedSnapshot ?? exitSnapshot {
                 await VolumeMountEvents.broadcastMounts(for: snap, containerId: eventId, broadcaster: broadcaster)
             }
+            let restartedName = await DockerContainerMetadataStore.shared.name(nativeID: nativeId)
             await broadcaster.broadcast(
-                DockerEvent.simpleEvent(id: eventId, type: "container", status: "start", image: image, name: name, labels: labels)
+                DockerEvent.simpleEvent(
+                    id: eventId,
+                    type: "container",
+                    status: "start",
+                    image: image,
+                    name: restartedName,
+                    labels: labels
+                )
             )
         }
     }
@@ -381,12 +430,19 @@ extension ContainerStartRoute {
         // returned from create, which the native lookup rejects. Retry up to 5 times
         // (500 ms total): Apple Container may return the container before the vmnet IP
         // is assigned, leaving networks[] empty on the first fetch.
-        var startedSnapshot = (try? await client.getContainer(id: id)) ?? nil
-        if startedSnapshot?.networks.isEmpty == true {
-            for _ in 0..<5 {
+        var startedSnapshot = try? await client.getContainer(id: id)
+        if startedSnapshot == nil {
+            startedSnapshot = try? await client.getContainer(nativeID: id)
+        }
+        if startedSnapshot.flatMap({ PublishedPortManager.publicationAddress(in: $0) }) == nil {
+            for _ in 0..<20 {
                 try? await Task.sleep(nanoseconds: 100_000_000)
-                if let refreshed = try? await client.getContainer(id: id),
-                    !refreshed.networks.isEmpty
+                var refreshed = try? await client.getContainer(id: id)
+                if refreshed == nil {
+                    refreshed = try? await client.getContainer(nativeID: id)
+                }
+                if let refreshed,
+                    PublishedPortManager.publicationAddress(in: refreshed) != nil
                 {
                     startedSnapshot = refreshed
                     break
@@ -403,9 +459,20 @@ extension ContainerStartRoute {
             // forwarder so any registration would be unreachable; skip entirely if none of the
             // container's attachments qualify, rather than falling back to the first attachment.
             if let ip = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
-                if !snapshot.id.isEmpty {
-                    dnsServer.register(hostname: snapshot.id, ip: ip)
-                    logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+                if !dockerName.isEmpty {
+                    dnsServer.register(hostname: dockerName, ip: ip)
+                    logger.info("[dns] registered container name '\(dockerName)' → \(ip)")
+                    let latestName = await DockerContainerMetadataStore.shared.name(
+                        nativeID: snapshot.id
+                    )
+                    if latestName != dockerName {
+                        dnsServer.unregisterIfOwned(
+                            hostname: dockerName,
+                            expectedIP: ip
+                        )
+                        dnsServer.register(hostname: latestName, ip: ip)
+                    }
                 }
 
                 // Names stored at create time (Compose service aliases via socktainer.dns.names)
@@ -483,8 +550,12 @@ extension ContainerStartRoute {
     /// fails to match on multi-network containers.
     static func dnsAttachmentIP(in snapshot: ContainerSnapshot?) -> String? {
         let reservedNetworks: Set<String> = ["default", "bridge", "host", "none"]
-        return snapshot?.networks.first { !$0.network.isEmpty && !reservedNetworks.contains($0.network) }?
-            .ipv4Address.address.description
+        return snapshot?.networks.first {
+            let address = $0.ipv4Address.address.description
+            return !$0.network.isEmpty && !reservedNetworks.contains($0.network)
+                && !address.isEmpty && address != "0.0.0.0"
+        }?
+        .ipv4Address.address.description
     }
 
     /// Re-registers a resumed container's DNS aliases (name, `socktainer.dns.names`,
@@ -493,10 +564,18 @@ extension ContainerStartRoute {
     /// across daemon restarts. Uses dnsAttachmentIP so a container whose first network
     /// attachment happens to be reserved (e.g. bridge) still gets re-registered on its
     /// named network, instead of being skipped entirely.
-    static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) {
+    static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) async {
         guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
 
-        dnsServer.register(hostname: container.id, ip: ip)
+        let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
+        dnsServer.register(hostname: dockerName, ip: ip)
+        let latestName = await DockerContainerMetadataStore.shared.name(
+            nativeID: container.id
+        )
+        if latestName != dockerName {
+            dnsServer.unregisterIfOwned(hostname: dockerName, expectedIP: ip)
+            dnsServer.register(hostname: latestName, ip: ip)
+        }
         if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
                 dnsServer.register(hostname: name, ip: ip)
@@ -508,6 +587,6 @@ extension ContainerStartRoute {
                 dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
             }
         }
-        logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
+        logger.info("[dns] re-registered '\(dockerName)' → \(ip) on resume")
     }
 }

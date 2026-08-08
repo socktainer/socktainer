@@ -29,6 +29,12 @@ extension ContainerKillRoute {
             do {
                 try await client.kill(id: containerId, signal: signal)
                 if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                    let dockerName: String
+                    if let snapshot {
+                        dockerName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+                    } else {
+                        dockerName = containerId
+                    }
                     // moby's kill event carries the numeric signal in {"signal": <int>}.
                     // Docker defaults to SIGKILL when no signal is given.
                     let signalNumber = (try? parseSignal(signal ?? "SIGKILL")) ?? SIGKILL
@@ -39,7 +45,7 @@ extension ContainerKillRoute {
                         image: snapshot.map {
                             ContainerImageIdentity.requestedReference(for: $0)
                         } ?? "",
-                        name: snapshot?.id ?? containerId,
+                        name: dockerName,
                         labels: snapshot.map {
                             ContainerImageIdentity.dockerLabels(for: $0)
                         } ?? [:],

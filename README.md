@@ -241,6 +241,27 @@ available on `PATH`. A stale `credsStore` entry causes BuildKit registry request
 fail before Socktainer is involved; fix the helper or use a dedicated Docker config
 that contains only the settings needed for this runtime.
 
+### Container rename and published-port recovery
+
+Apple Container IDs are immutable, while Docker Compose uses container rename to
+complete `up --force-recreate`. Socktainer therefore keeps the Docker-visible name
+in an atomically persisted registry keyed by the immutable Apple ID. Rename keeps
+the Docker object ID, image, mounts, and volume data unchanged; name conflicts are
+serialized and survive a Socktainer restart.
+
+Socktainer also owns Docker host-port listeners. This avoids an Apple Container
+1.2.1 failure mode where its runtime helper keeps a listening socket after a full
+system restart but can no longer reach a container on a custom network. Desired
+port mappings are persisted with the Docker name and reconciled after container,
+Socktainer, and Apple Container restarts.
+
+Containers created by an older Socktainer release migrate on their first ordinary
+stop/start after this version is installed. The stopped container's native
+forwarding field is cleared before bootstrap and Socktainer takes ownership of the
+same mapping. The Apple container ID, root filesystem, image descriptor, mounts,
+and named volumes are not recreated. No `down -v` or manual image/volume deletion
+is required.
+
 ### Volume sync mode
 
 Named volumes default to `fsync`, so guest `fsync()` calls are flushed to the host

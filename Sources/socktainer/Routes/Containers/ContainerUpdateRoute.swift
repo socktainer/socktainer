@@ -60,6 +60,7 @@ struct ContainerUpdateRoute: RouteCollection {
             await RestartPolicyOverrideStore.shared.set(id: DockerContainerID.hexId(for: container), policy: policy)
 
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
                         id: DockerContainerID.hexId(for: container),
@@ -68,7 +69,7 @@ struct ContainerUpdateRoute: RouteCollection {
                         image: ContainerImageIdentity.requestedReference(
                             for: container
                         ),
-                        name: container.id,
+                        name: dockerName,
                         labels: ContainerImageIdentity.dockerLabels(for: container)
                     ))
             }

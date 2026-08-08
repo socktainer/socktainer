@@ -33,17 +33,21 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 guard !ClientContainerService.isDNSSidecar(container) else {
                     continue
                 }
+                let dockerName = await DockerContainerMetadataStore.shared.name(
+                    nativeID: container.id
+                )
+                let dockerID = DockerContainerID.hexId(for: container)
                 for attachment in container.networks {
                     if attachment.network == network.Id || attachment.network == network.Name {
                         let nc = NetworkContainer(
-                            Name: container.id,
+                            Name: dockerName,
                             EndpointID: nil,  // Apple container doesn't have a matching field
                             MacAddress: nil,  // Apple container doesn't have a matching field
                             IPv4Address: String(describing: attachment.ipv4Address),
                             IPv6Address: nil
                         )
-                        containersForNetwork[container.id] = nc
-                        logger.debug("Container \(container.id) attached to network \(network.Name) (ID: \(network.Id))")
+                        containersForNetwork[dockerID] = nc
+                        logger.debug("Container \(dockerName) attached to network \(network.Name) (ID: \(network.Id))")
                     }
                 }
             }

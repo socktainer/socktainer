@@ -30,7 +30,12 @@ extension ContainerDeleteRoute {
                 snapshot.map {
                     ContainerImageIdentity.requestedReference(for: $0)
                 } ?? cached?.image ?? ""
-            let eventName = snapshot?.id ?? cached?.nativeId ?? id
+            let eventName: String
+            if let snapshot {
+                eventName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+            } else {
+                eventName = cached?.nativeId ?? id
+            }
             let eventLabels =
                 snapshot.map {
                     ContainerImageIdentity.dockerLabels(for: $0)
@@ -41,10 +46,13 @@ extension ContainerDeleteRoute {
             let eventId = snapshot.map { DockerContainerID.hexId(for: $0) } ?? cached?.hexId ?? id
 
             func broadcastRemove() async {
-                await ContainerInfoCache.shared.remove(id: id)
-                // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
-                await ContainerRestartState.shared.reset(id: eventName)
+                await ContainerInfoCache.shared.remove(id: eventId)
                 await RestartPolicyOverrideStore.shared.remove(id: eventId)
+                if let nativeID = snapshot?.id ?? cached?.nativeId {
+                    await ContainerRestartState.shared.reset(id: nativeID)
+                    await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeID)
+                    try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+                }
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
@@ -82,6 +90,7 @@ extension ContainerDeleteRoute {
                     let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
+                        logicalName: eventName,
                         labels: cached?.labels
                             ?? ContainerImageIdentity.dockerLabels(for: container),
                         cachedIP: cached?.ip ?? containerIP,

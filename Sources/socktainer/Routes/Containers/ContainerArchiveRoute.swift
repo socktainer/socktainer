@@ -32,7 +32,7 @@ struct ContainerArchiveRoute: RouteCollection {
             throw Abort(.notFound, reason: "No such container: \(reference)")
         }
         return try await ContainerFilesystemOperationLock.shared.withLock(containerID: resolved.id) {
-            guard let current = try await containerClient.getContainer(id: resolved.id) else {
+            guard let current = try await containerClient.getContainer(nativeID: resolved.id) else {
                 throw Abort(.notFound, reason: "No such container: \(reference)")
             }
             return try await operation(current)
@@ -84,7 +84,7 @@ struct ContainerArchiveRoute: RouteCollection {
                     // moby emits "archive-path" on a successful GET (daemon/archive_unix.go);
                     // HEAD emits nothing.
                     if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                        await broadcaster.broadcast(DockerEvent.containerEvent("archive-path", container: container))
+                        await broadcaster.broadcast(await DockerEvent.containerEvent("archive-path", container: container))
                     }
 
                     return Response(
@@ -171,7 +171,7 @@ struct ContainerArchiveRoute: RouteCollection {
                     // moby emits "extract-to-dir" after a successful extraction
                     // (daemon/archive_unix.go).
                     if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
-                        await broadcaster.broadcast(DockerEvent.containerEvent("extract-to-dir", container: container))
+                        await broadcaster.broadcast(await DockerEvent.containerEvent("extract-to-dir", container: container))
                     }
 
                     return Response(status: .ok)

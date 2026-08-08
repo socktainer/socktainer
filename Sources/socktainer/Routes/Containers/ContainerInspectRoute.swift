@@ -75,10 +75,15 @@ extension ContainerInspectRoute {
                 throw Abort(.notFound, reason: "Container not found")
             }
             let imageMetadata = await imageMetadataProvider.metadata(for: container)
+            let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
+            let dockerPorts = await DockerContainerMetadataStore.shared.ports(
+                nativeID: container.id,
+                fallback: container.configuration.publishedPorts
+            )
 
             let exposedPorts = Dictionary(
                 uniqueKeysWithValues:
-                    container.configuration.publishedPorts.map {
+                    dockerPorts.map {
                         ("\($0.containerPort)/\($0.proto.rawValue)", EmptyObject())
                     }
             )
@@ -98,7 +103,7 @@ extension ContainerInspectRoute {
                 ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
 
             let containerConfig: ContainerConfig = ContainerConfig(
-                Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
+                Hostname: container.configuration.networks.first?.options.hostname ?? dockerName,
                 Domainname: container.configuration.dns?.domain,
                 User: getUserString(from: container.configuration.initProcess.user),
                 AttachStdin: false,  // no mechanism to derive this value
@@ -173,7 +178,7 @@ extension ContainerInspectRoute {
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
-                Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
+                Ports: Dictionary(grouping: dockerPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
                     .mapValues { bindings in
                         bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
                     },
@@ -220,7 +225,7 @@ extension ContainerInspectRoute {
                 HostnamePath: "/etc/hostname",
                 HostsPath: "/etc/hosts",
                 LogPath: nil,  // Apple containers don't have a log path
-                Name: "/" + container.id,
+                Name: "/" + dockerName,
                 RestartCount: await ContainerRestartState.shared.count(id: container.id),
                 Driver: "",
                 Platform: "linux",

@@ -121,9 +121,17 @@ actor HealthCheckManager {
         // Emit Docker health_status event on every transition (including starting → healthy).
         if previous != health.Status, let broadcaster {
             Task {
+                let cached = await ContainerInfoCache.shared.get(id: id)
+                let dockerName = await DockerContainerMetadataStore.shared.name(
+                    nativeID: id
+                )
                 let event = DockerEvent.simpleEvent(
-                    id: id, type: "container",
-                    status: "health_status: \(health.Status)"
+                    id: cached?.hexId ?? id,
+                    type: "container",
+                    status: "health_status: \(health.Status)",
+                    image: cached?.image ?? "",
+                    name: dockerName,
+                    labels: cached?.labels ?? [:]
                 )
                 await broadcaster.broadcast(event)
             }

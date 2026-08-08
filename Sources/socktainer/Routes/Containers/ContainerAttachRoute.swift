@@ -39,7 +39,7 @@ extension ContainerAttachRoute {
     /// Shared by the HTTP and WS attach routes.
     static func broadcastAttach(container: ContainerSnapshot?, stream: Bool, logs: Bool, broadcaster: EventBroadcaster?) async {
         guard let container, stream || logs, let broadcaster else { return }
-        await broadcaster.broadcast(DockerEvent.containerEvent("attach", container: container))
+        await broadcaster.broadcast(await DockerEvent.containerEvent("attach", container: container))
     }
 
     /// moby logs "detach" only when a streaming attach ends while the container still
@@ -47,7 +47,7 @@ extension ContainerAttachRoute {
     /// container's own exit closed the stream. Shared by the HTTP and WS attach routes.
     static func broadcastLogDetach(container: ContainerSnapshot, stream: Bool, currentStatus: RuntimeStatus?, broadcaster: EventBroadcaster?) async {
         guard stream, currentStatus == .running, let broadcaster else { return }
-        await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
+        await broadcaster.broadcast(await DockerEvent.containerEvent("detach", container: container))
     }
 
     /// Interactive (bootstrap) attach detach: the connection died while no exit code is
@@ -57,7 +57,7 @@ extension ContainerAttachRoute {
     /// Shared by the HTTP TCP-upgrade and WS attach routes.
     static func broadcastInteractiveDetach(container: ContainerSnapshot, channelActive: Bool, recordedExitCode: Int32?, broadcaster: EventBroadcaster?) async {
         guard !channelActive, recordedExitCode == nil, let broadcaster else { return }
-        await broadcaster.broadcast(DockerEvent.containerEvent("detach", container: container))
+        await broadcaster.broadcast(await DockerEvent.containerEvent("detach", container: container))
     }
 
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
@@ -419,7 +419,7 @@ extension ContainerAttachRoute {
         let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
         let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
-        guard let currentContainer = try await client.getContainer(id: container.id) else {
+        guard let currentContainer = try await client.getContainer(nativeID: container.id) else {
             throw Abort(.notFound, reason: "Container not found")
         }
 

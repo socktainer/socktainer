@@ -73,19 +73,20 @@ extension DockerEvent {
     }
 
     /// Container-shaped event derived from a snapshot: canonical 64-char Docker id,
-    /// image reference, native name, and restored labels — the fields every
+    /// image reference, Docker-visible name, and restored labels — the fields every
     /// container lifecycle event site otherwise re-derives by hand.
     static func containerEvent(
         _ action: String,
         container: ContainerSnapshot,
         extraAttributes: [String: String] = [:]
-    ) -> DockerEvent {
-        simpleEvent(
+    ) async -> DockerEvent {
+        let name = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
+        return simpleEvent(
             id: DockerContainerID.hexId(for: container),
             type: "container",
             status: action,
             image: ContainerImageIdentity.requestedReference(for: container),
-            name: container.id,
+            name: name,
             labels: ContainerImageIdentity.dockerLabels(for: container),
             extraAttributes: extraAttributes
         )
@@ -93,9 +94,15 @@ extension DockerEvent {
 }
 
 actor EventBroadcaster {
+    /// Docker's `since` query replays daemon events emitted before the request.
+    /// Keep a bounded in-memory journal: it has daemon-lifetime semantics (like
+    /// the broadcaster itself) without allowing event traffic to grow memory
+    /// without limit.
+    private static let historyLimit = 4_096
     private var continuations: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
+    private var history: [DockerEvent] = []
 
-    func stream() -> AsyncStream<DockerEvent> {
+    func stream(since: UInt64? = nil, until: UInt64? = nil) -> AsyncStream<DockerEvent> {
         let id = UUID()
 
         // Register the continuation synchronously, before returning the stream. The
@@ -105,17 +112,54 @@ actor EventBroadcaster {
         // (e.g. a container's start event firing right after `docker events` connects).
         // `makeStream` lets us register inside the actor-isolated method with no race.
         let (stream, continuation) = AsyncStream.makeStream(of: DockerEvent.self)
+        if let since {
+            for event in history
+            where event.timeNano >= since && until.map({ event.timeNano <= $0 }) != false {
+                continuation.yield(event)
+            }
+        }
+        if let until, until <= Self.nowNanoseconds() {
+            continuation.finish()
+            return stream
+        }
         continuations[id] = continuation
+        let deadlineTask: Task<Void, Never>?
+        if let until {
+            let remaining = max(
+                0,
+                Double(until) / 1_000_000_000 - Date().timeIntervalSince1970
+            )
+            deadlineTask = Task {
+                if remaining > 0 {
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(remaining * 1_000_000_000)
+                    )
+                }
+                guard !Task.isCancelled else { return }
+                continuation.finish()
+            }
+        } else {
+            deadlineTask = nil
+        }
         continuation.onTermination = { @Sendable _ in
+            deadlineTask?.cancel()
             Task { await self.removeContinuation(id: id) }
         }
         return stream
     }
 
     func broadcast(_ event: DockerEvent) {
+        history.append(event)
+        if history.count > Self.historyLimit {
+            history.removeFirst(history.count - Self.historyLimit)
+        }
         for continuation in continuations.values {
             continuation.yield(event)
         }
+    }
+
+    private static func nowNanoseconds() -> UInt64 {
+        UInt64(max(0, Date().timeIntervalSince1970) * 1_000_000_000)
     }
 
     private func removeContinuation(id: UUID) {

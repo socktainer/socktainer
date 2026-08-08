@@ -45,6 +45,7 @@ let package = Package(
                 .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerResource", package: "container"),
                 .product(name: "ContainerRuntimeClient", package: "container"),
+                .product(name: "SocketForwarder", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationArchive", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),

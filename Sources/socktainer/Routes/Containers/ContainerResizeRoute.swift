@@ -35,7 +35,7 @@ struct ContainerResizeRoute: RouteCollection {
                     let broadcaster = req.application.storage[EventBroadcasterKey.self]
                 {
                     await broadcaster.broadcast(
-                        DockerEvent.containerEvent(
+                        await DockerEvent.containerEvent(
                             "resize", container: container,
                             extraAttributes: ["height": String(h), "width": String(w)]
                         ))

@@ -36,10 +36,13 @@ struct ContainerExportRoute: RouteCollection {
 
             do {
                 return try await ContainerFilesystemOperationLock.shared.withLock(containerID: container.id) {
-                    guard let current = try await containerClient.getContainer(id: container.id) else {
+                    guard let current = try await containerClient.getContainer(nativeID: container.id) else {
                         throw Abort(.notFound, reason: "No such container: \(reference)")
                     }
                     let tarPath = try await archiveClient.exportRootfs(containerId: current.id)
+                    let dockerName = await DockerContainerMetadataStore.shared.name(
+                        nativeID: current.id
+                    )
 
                     let broadcaster = req.application.storage[EventBroadcasterKey.self]
                     let response: Response
@@ -54,7 +57,7 @@ struct ContainerExportRoute: RouteCollection {
                                         type: "container",
                                         status: "export",
                                         image: ContainerImageIdentity.requestedReference(for: current),
-                                        name: current.id,
+                                        name: dockerName,
                                         labels: ContainerImageIdentity.dockerLabels(for: current)
                                     ))
                             }

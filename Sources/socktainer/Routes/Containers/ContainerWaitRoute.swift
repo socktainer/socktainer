@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Vapor
 
@@ -36,14 +37,18 @@ struct ContainerWaitRoute: RouteCollection {
             // Preflight before flushing headers so a missing container returns a
             // real 404 instead of a streamed `200 {"StatusCode":0}` — the latter
             // would make "no such container" indistinguishable from a clean exit.
+            let resolvedContainer: ContainerSnapshot
             do {
-                guard try await client.getContainer(id: containerId) != nil else {
+                guard let container = try await client.getContainer(id: containerId) else {
                     throw Abort(.notFound, reason: "No such container: \(containerId)")
                 }
+                resolvedContainer = container
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
+            let nativeID = resolvedContainer.id
+            let stableReference = DockerContainerID.hexId(for: resolvedContainer)
 
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: "application/json")
@@ -59,16 +64,16 @@ struct ContainerWaitRoute: RouteCollection {
                         var statusCode: Int64 = 0
                         if let manager = req.application.storage[HealthCheckManagerKey.self] {
                             while true {
-                                let health = await manager.currentHealth(for: containerId)
+                                let health = await manager.currentHealth(for: nativeID)
                                 if health?.Status == "healthy" { break }
                                 if health == nil {
                                     statusCode = 1
                                     break
                                 }
-                                guard let container = try? await client.getContainer(id: containerId),
+                                guard let container = try? await client.getContainer(nativeID: nativeID),
                                     container.status == .running
                                 else {
-                                    let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                                    let code = await ContainerExitCodeStore.shared.get(id: nativeID) ?? 1
                                     statusCode = Int64(code)
                                     break
                                 }
@@ -79,7 +84,7 @@ struct ContainerWaitRoute: RouteCollection {
                         }
                         result = RESTContainerWait(statusCode: statusCode)
                     } else if condition == .removed {
-                        result = try await client.wait(id: containerId, condition: condition)
+                        result = try await client.wait(id: stableReference, condition: condition)
                     } else {
                         // Race native wait against ContainerExitCodeStore polling.
                         // Pipe-bootstrapped containers (docker run) may not surface
@@ -87,13 +92,17 @@ struct ContainerWaitRoute: RouteCollection {
                         // parallel and take whichever resolves first.
                         result = await withTaskGroup(of: RESTContainerWait?.self) { group in
                             group.addTask {
-                                try? await client.wait(id: containerId, condition: condition)
+                                try? await client.wait(id: stableReference, condition: condition)
                             }
                             group.addTask {
                                 let pollIntervalNs: UInt64 = 100_000_000
                                 let maxPolls = Int(30_000_000_000 / pollIntervalNs)
                                 for _ in 0..<maxPolls {
-                                    if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
+                                    var code = await ContainerExitCodeStore.shared.get(id: nativeID)
+                                    if code == nil {
+                                        code = await ContainerExitCodeStore.shared.get(id: stableReference)
+                                    }
+                                    if let code {
                                         return RESTContainerWait(statusCode: Int64(code))
                                     }
                                     try? await Task.sleep(nanoseconds: pollIntervalNs)

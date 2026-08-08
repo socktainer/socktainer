@@ -44,10 +44,20 @@ extension ContainerStopRoute {
                 throw Abort(.internalServerError, reason: "Failed to stop container: \(error)")
             }
 
+            if let nativeID = snapshot?.id {
+                await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeID)
+            }
+
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
             // Carry the canonical 64-char Docker id, not the raw request
             // reference (name or short id), so clients can correlate this
             // event with start/kill/die (same pattern as those routes).
+            let eventName: String
+            if let snapshot {
+                eventName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
+            } else {
+                eventName = id
+            }
             let event = DockerEvent.simpleEvent(
                 id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? id,
                 type: "container",
@@ -55,7 +65,7 @@ extension ContainerStopRoute {
                 image: snapshot.map {
                     ContainerImageIdentity.requestedReference(for: $0)
                 } ?? "",
-                name: snapshot?.id ?? id,
+                name: eventName,
                 labels: snapshot.map {
                     ContainerImageIdentity.dockerLabels(for: $0)
                 } ?? [:]

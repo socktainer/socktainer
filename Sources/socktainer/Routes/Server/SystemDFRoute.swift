@@ -391,7 +391,7 @@ extension SystemDFRoute {
                     let imageMetadata = await imageMetadataProvider.metadata(
                         for: container
                     )
-                    return containerSummary(
+                    return await containerSummary(
                         from: container,
                         size: Int64(clamping: size),
                         imageMetadata: imageMetadata
@@ -455,8 +455,13 @@ extension SystemDFRoute {
         from container: ContainerSnapshot,
         size: Int64,
         imageMetadata: DockerContainerImageMetadata
-    ) -> RESTContainerSummary {
-        let ports = container.configuration.publishedPorts.map { port in
+    ) async -> RESTContainerSummary {
+        let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
+        let dockerPorts = await DockerContainerMetadataStore.shared.ports(
+            nativeID: container.id,
+            fallback: container.configuration.publishedPorts
+        )
+        let ports = dockerPorts.map { port in
             ContainerPort(
                 IP: port.hostAddress.description,
                 PrivatePort: Int(port.containerPort),
@@ -516,7 +521,7 @@ extension SystemDFRoute {
 
         return RESTContainerSummary(
             Id: DockerContainerID.hexId(for: container),
-            Names: ["/" + container.id],
+            Names: ["/" + dockerName],
             Image: imageMetadata.displayReference,
             ImageID: imageMetadata.configDigest,
             ImageManifestDescriptor: nil,

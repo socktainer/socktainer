@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationExtras
 import ContainerizationOCI
+import Foundation
 import Testing
 
 @testable import socktainer
@@ -68,11 +69,41 @@ struct ContainerFilterTests {
 
     // MARK: - id
 
-    @Test("id filter matches exact container id")
+    @Test("id filter matches exact stable Docker id")
     func idExact() throws {
-        let containers = [try makeSnapshot(id: "abc"), try makeSnapshot(id: "def")]
-        let result = ClientContainerService.applyFilters(containers, filters: ["id": ["abc"]])
+        let target = try makeSnapshot(id: "abc")
+        let containers = [target, try makeSnapshot(id: "def")]
+        let result = ClientContainerService.applyFilters(
+            containers,
+            filters: ["id": [DockerContainerID.hexId(for: target)]]
+        )
         #expect(result.map(\.id) == ["abc"])
+    }
+
+    @Test("id filter never exposes an opaque native id")
+    func idFilterHidesOpaqueNativeID() throws {
+        let target = try makeSnapshot(id: "compose-db-random-native")
+        let dockerID = DockerContainerID.hexId(for: target)
+        let identities = [
+            target.id: ClientContainerService.ResolvedContainerFilterIdentity(
+                logicalName: "db",
+                dockerID: dockerID
+            )
+        ]
+
+        let nativeResult = ClientContainerService.applyFilters(
+            [target],
+            filters: ["id": [target.id]],
+            resolvedContainerIdentities: identities
+        )
+        let dockerResult = ClientContainerService.applyFilters(
+            [target],
+            filters: ["id": [String(dockerID.prefix(12))]],
+            resolvedContainerIdentities: identities
+        )
+
+        #expect(nativeResult.isEmpty)
+        #expect(dockerResult.map(\.id) == [target.id])
     }
 
     // MARK: - ancestor
@@ -288,16 +319,15 @@ struct ContainerFilterTests {
         #expect(result.isEmpty)
     }
 
-    // MARK: - before / since (fallback: lexicographic id ordering when no timestamp)
+    // MARK: - before / since
 
-    @Test("before=c keeps containers whose id comes before 'c' lexicographically")
+    @Test("before resolves a visible name and uses creation time")
     func beforeFilter() throws {
-        // Without timestamps, before/since fall back to lexicographic id comparison.
         let containers = [
-            try makeSnapshot(id: "aaa"),
-            try makeSnapshot(id: "bbb"),
-            try makeSnapshot(id: "ccc"),
-            try makeSnapshot(id: "ddd"),
+            try makeSnapshot(id: "aaa", creationTimestamp: 100),
+            try makeSnapshot(id: "bbb", creationTimestamp: 200),
+            try makeSnapshot(id: "ccc", creationTimestamp: 300),
+            try makeSnapshot(id: "ddd", creationTimestamp: 400),
         ]
         let result = ClientContainerService.applyFilters(
             containers, filters: ["before": ["ccc"]], allContainers: containers)
@@ -306,24 +336,74 @@ struct ContainerFilterTests {
 
     @Test("before= with hex ID prefix resolves correctly")
     func beforeFilterHexPrefix() throws {
-        let ref = try makeSnapshot(id: "ccc")
+        let ref = try makeSnapshot(id: "ccc", creationTimestamp: 200)
         let hexPrefix = String(DockerContainerID.hexId(for: ref).prefix(12))
-        let containers = [try makeSnapshot(id: "aaa"), ref, try makeSnapshot(id: "ddd")]
+        let containers = [
+            try makeSnapshot(id: "aaa", creationTimestamp: 100),
+            ref,
+            try makeSnapshot(id: "ddd", creationTimestamp: 300),
+        ]
         let result = ClientContainerService.applyFilters(
             containers, filters: ["before": [hexPrefix]], allContainers: containers)
         #expect(result.map(\.id) == ["aaa"])
     }
 
-    @Test("since=a keeps containers whose id comes after 'a' lexicographically")
+    @Test("since resolves a visible name and uses creation time")
     func sinceFilter() throws {
         let containers = [
-            try makeSnapshot(id: "aaa"),
-            try makeSnapshot(id: "bbb"),
-            try makeSnapshot(id: "ccc"),
+            try makeSnapshot(id: "aaa", creationTimestamp: 100),
+            try makeSnapshot(id: "bbb", creationTimestamp: 200),
+            try makeSnapshot(id: "ccc", creationTimestamp: 300),
         ]
         let result = ClientContainerService.applyFilters(
             containers, filters: ["since": ["aaa"]], allContainers: containers)
         #expect(result.map(\.id) == ["bbb", "ccc"])
+    }
+
+    @Test("before and since round-trip logical names without accepting native ids")
+    func relativeFiltersUseLogicalIdentity() throws {
+        let older = try makeSnapshot(id: "opaque-old", creationTimestamp: 100)
+        let reference = try makeSnapshot(id: "opaque-reference", creationTimestamp: 200)
+        let newer = try makeSnapshot(id: "opaque-new", creationTimestamp: 300)
+        let containers = [older, reference, newer]
+        let identities = Dictionary(
+            uniqueKeysWithValues: [
+                (older, "old"),
+                (reference, "reference"),
+                (newer, "new"),
+            ].map { container, name in
+                (
+                    container.id,
+                    ClientContainerService.ResolvedContainerFilterIdentity(
+                        logicalName: name,
+                        dockerID: DockerContainerID.hexId(for: container)
+                    )
+                )
+            }
+        )
+
+        let before = ClientContainerService.applyFilters(
+            containers,
+            filters: ["before": ["/reference"]],
+            allContainers: containers,
+            resolvedContainerIdentities: identities
+        )
+        let since = ClientContainerService.applyFilters(
+            containers,
+            filters: ["since": [String(DockerContainerID.hexId(for: reference).prefix(12))]],
+            allContainers: containers,
+            resolvedContainerIdentities: identities
+        )
+        let leakedNative = ClientContainerService.applyFilters(
+            containers,
+            filters: ["before": [reference.id]],
+            allContainers: containers,
+            resolvedContainerIdentities: identities
+        )
+
+        #expect(before.map(\.id) == [older.id])
+        #expect(since.map(\.id) == [newer.id])
+        #expect(leakedNative.isEmpty)
     }
 
     // MARK: - remaining filter keys (behavioural smoke tests)
@@ -387,7 +467,8 @@ private func makeSnapshot(
     labels: [String: String] = [:],
     image: String = "alpine:latest",
     imageDigest: String = "sha256:abc",
-    networkNames: [String] = []
+    networkNames: [String] = [],
+    creationTimestamp: TimeInterval? = nil
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
@@ -399,6 +480,10 @@ private func makeSnapshot(
             digest: imageDigest, size: 0))
     var config = ContainerConfiguration(id: id, image: img, process: proc)
     config.labels = labels
+    if let creationTimestamp {
+        config.labels[AppleContainerTimestampResolver.legacyCreationTimestampLabel] =
+            String(creationTimestamp)
+    }
     let attachments = try networkNames.map { try makeAttachment(network: $0) }
     return ContainerSnapshot(configuration: config, status: status, networks: attachments)
 }

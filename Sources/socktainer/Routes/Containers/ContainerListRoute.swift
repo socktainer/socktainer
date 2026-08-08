@@ -77,7 +77,11 @@ extension ContainerListRoute {
 
             var summaries: [RESTContainerSummary] = []
             for (container, createdDate) in decorated {
-                let ports = container.configuration.publishedPorts.map { port in
+                let dockerPorts = await DockerContainerMetadataStore.shared.ports(
+                    nativeID: container.id,
+                    fallback: container.configuration.publishedPorts
+                )
+                let ports = dockerPorts.map { port in
                     ContainerPort(
                         IP: port.hostAddress.description,
                         PrivatePort: Int(port.containerPort),
@@ -138,6 +142,7 @@ extension ContainerListRoute {
                 let imageMetadata = await imageMetadataProvider.metadata(
                     for: container
                 )
+                let dockerName = await DockerContainerMetadataStore.shared.name(nativeID: container.id)
 
                 let mobyState = container.status.mobyState
                 // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
@@ -166,7 +171,7 @@ extension ContainerListRoute {
 
                 let summary = RESTContainerSummary(
                     Id: DockerContainerID.hexId(for: container),
-                    Names: ["/" + container.id],
+                    Names: ["/" + dockerName],
                     Image: imageMetadata.displayReference,
                     ImageID: imageMetadata.configDigest,
                     ImageManifestDescriptor: nil,
