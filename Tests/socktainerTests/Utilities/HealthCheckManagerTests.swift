@@ -154,20 +154,20 @@ struct HealthCheckManagerTests {
 
     @Test("health_status events are emitted on status transition to healthy")
     func healthStatusEventsEmitted() async throws {
-        actor Collector {
-            var statuses: [String] = []
-            func append(_ s: String) { statuses.append(s) }
-        }
-        let collector = Collector()
         let broadcaster = EventBroadcaster()
+        // Register with the actor before the probe can transition. Creating the
+        // stream inside the unstructured collector task leaves scheduling free
+        // to run the healthcheck first, which correctly broadcasts to zero
+        // subscribers and makes this test nondeterministic under load.
+        let eventStream = await broadcaster.stream()
 
-        let collectTask = Task { @Sendable in
-            for await event in await broadcaster.stream() {
+        let collectTask = Task { @Sendable () -> String? in
+            for await event in eventStream {
                 if event.status.hasPrefix("health_status:") {
-                    await collector.append(event.status)
+                    return event.status
                 }
-                if await collector.statuses.count >= 1 { break }
             }
+            return nil
         }
 
         let mgr = HealthCheckManager(
@@ -178,12 +178,10 @@ struct HealthCheckManagerTests {
         let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
         await mgr.start(containerId: "c1", config: cfg)
         try await Self.waitForStatus("healthy", on: mgr, id: "c1")
-        try await Task.sleep(nanoseconds: 20_000_000)
-        collectTask.cancel()
+        let received = await Self.waitForCollectedEvent(collectTask)
         await mgr.stop(containerId: "c1")
 
-        let received = await collector.statuses
-        #expect(received.contains("health_status: healthy"))
+        #expect(received == "health_status: healthy")
     }
 
     // MARK: - Log entry detail for failing probe
@@ -245,5 +243,19 @@ struct HealthCheckManagerTests {
         Issue.record("waitForStatus timed out: expected '\(expected)' but got '\(actual ?? "nil")' for container '\(id)'")
         struct TimeoutError: Error {}
         throw TimeoutError()
+    }
+
+    private static func waitForCollectedEvent(_ task: Task<String?, Never>) async -> String? {
+        await withTaskGroup(of: String?.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(3))
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            task.cancel()
+            return result
+        }
     }
 }
