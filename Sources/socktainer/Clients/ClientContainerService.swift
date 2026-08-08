@@ -609,6 +609,24 @@ struct ClientContainerService: ClientContainerProtocol {
 
         await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
         try await containerClient.withClient { try await $0.kill(id: container.id, signal: signal) }
+        // `docker kill` is also the Engine API for non-terminating signals
+        // (HUP, USR1, CONT, ...). Do not poison restart-policy state when the
+        // target handled the signal and remains alive.
+        let postSignalStatus = try? await getContainer(id: container.id)?.status
+        if Self.shouldClearExplicitStop(signal: signal, postSignalStatus: postSignalStatus) {
+            await ContainerRestartState.shared.clearExplicitlyStopped(id: container.id)
+        }
+    }
+
+    static func shouldClearExplicitStop(
+        signal: String,
+        postSignalStatus: RuntimeStatus?
+    ) -> Bool {
+        guard postSignalStatus == .running else { return false }
+        // SIGKILL cannot be caught. Apple's signal RPC may return just before
+        // the snapshot changes to stopped, so never clear this intent from a
+        // transient running observation.
+        return (try? parseSignal(signal)) != SIGKILL
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {

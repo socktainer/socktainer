@@ -16,6 +16,10 @@ actor ContainerRestartState {
         explicitlyStopped.insert(id)
     }
 
+    func clearExplicitlyStopped(id: String) {
+        explicitlyStopped.remove(id)
+    }
+
     func consumeExplicitlyStopped(id: String) -> Bool {
         explicitlyStopped.remove(id) != nil
     }

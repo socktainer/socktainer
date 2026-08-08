@@ -28,6 +28,24 @@ extension ContainerKillRoute {
 
             do {
                 try await client.kill(id: containerId, signal: signal)
+                if let nativeID = snapshot?.id {
+                    // Docker's kill endpoint also sends non-terminating signals
+                    // such as SIGHUP and SIGCONT. Retire listeners only when the
+                    // signal actually stopped (or removed) the native object.
+                    let stopped: Bool
+                    do {
+                        stopped = try await client.getContainer(id: nativeID)?.status != .running
+                    } catch ClientContainerError.notFound {
+                        stopped = true
+                    } catch {
+                        stopped = false
+                    }
+                    if stopped {
+                        await req.application.storage[PublishedPortManagerKey.self]?.close(
+                            nativeID: nativeID
+                        )
+                    }
+                }
                 if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                     let dockerName: String
                     if let snapshot {

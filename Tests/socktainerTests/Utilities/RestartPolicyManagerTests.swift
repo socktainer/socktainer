@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Testing
 
@@ -180,6 +181,42 @@ struct ContainerRestartStateTests {
         await state.markExplicitlyStopped(id: "c1")
         #expect(await state.consumeExplicitlyStopped(id: "c1"))
         #expect(!(await state.consumeExplicitlyStopped(id: "c1")))
+    }
+
+    @Test("a handled kill signal can clear explicit-stop state")
+    func clearExplicitStopAfterHandledSignal() async {
+        let state = ContainerRestartState()
+        await state.markExplicitlyStopped(id: "signal-handler")
+        await state.clearExplicitlyStopped(id: "signal-handler")
+        #expect(!(await state.consumeExplicitlyStopped(id: "signal-handler")))
+    }
+
+    @Test("only a handled non-KILL signal clears explicit-stop intent")
+    func signalPostcheckDecision() {
+        #expect(
+            ClientContainerService.shouldClearExplicitStop(
+                signal: "SIGHUP",
+                postSignalStatus: .running
+            )
+        )
+        #expect(
+            !ClientContainerService.shouldClearExplicitStop(
+                signal: "SIGKILL",
+                postSignalStatus: .running
+            )
+        )
+        #expect(
+            !ClientContainerService.shouldClearExplicitStop(
+                signal: "9",
+                postSignalStatus: .running
+            )
+        )
+        #expect(
+            !ClientContainerService.shouldClearExplicitStop(
+                signal: "SIGTERM",
+                postSignalStatus: .stopped
+            )
+        )
     }
 
     @Test("nextAttempt increments per container independently")

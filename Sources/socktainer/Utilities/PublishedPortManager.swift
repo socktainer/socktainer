@@ -1,4 +1,5 @@
 import ContainerResource
+import ContainerizationExtras
 import Darwin
 import Foundation
 import Logging
@@ -20,6 +21,7 @@ actor PublishedPortManager {
     private let eventLoopGroup: any EventLoopGroup
     private let logger: Logger
     private var active: [String: ActivePublication] = [:]
+    private var operationLocks: [String: OperationLockEntry] = [:]
     private var pendingReservations: [UUID: [Int32]] = [:]
     private var heldReservations: [String: [Int32]] = [:]
     private var handoffReservations: [PortKey: Int] = [:]
@@ -38,6 +40,11 @@ actor PublishedPortManager {
     private struct ActivePublication {
         let specifications: [ForwarderSpecification]
         let forwarders: [SocketForwarderResult]
+    }
+
+    private struct OperationLockEntry {
+        let lock: AsyncLock
+        var users: Int
     }
 
     struct ForwarderSpecification: Equatable, Sendable {
@@ -118,12 +125,30 @@ actor PublishedPortManager {
     }
 
     func reconcile(container: ContainerSnapshot) async throws {
+        let lock = retainOperationLock(for: container.id)
+        do {
+            try await lock.withLock { _ in
+                try await self.reconcileLocked(container: container)
+            }
+            releaseOperationLock(for: container.id, lock: lock)
+        } catch {
+            releaseOperationLock(for: container.id, lock: lock)
+            throw error
+        }
+    }
+
+    /// The actor alone is not a sufficient critical section: starting and
+    /// stopping a SocketForwarder suspends, which permits another actor call to
+    /// enter. Keep the complete per-container transaction under an async lock so
+    /// recovery polling and lifecycle routes cannot both bind (or close past) the
+    /// same publication.
+    private func reconcileLocked(container: ContainerSnapshot) async throws {
         let ports = await DockerContainerMetadataStore.shared.ports(
             nativeID: container.id,
             fallback: container.configuration.publishedPorts
         )
         guard !ports.isEmpty else {
-            await close(nativeID: container.id)
+            await closeLocked(nativeID: container.id)
             return
         }
         guard let address = Self.publicationAddress(in: container) else {
@@ -219,6 +244,14 @@ actor PublishedPortManager {
     }
 
     func close(nativeID: String) async {
+        let lock = retainOperationLock(for: nativeID)
+        await lock.withLock { _ in
+            await self.closeLocked(nativeID: nativeID)
+        }
+        releaseOperationLock(for: nativeID, lock: lock)
+    }
+
+    private func closeLocked(nativeID: String) async {
         if let descriptors = heldReservations.removeValue(forKey: nativeID) {
             for descriptor in descriptors { _ = Darwin.close(descriptor) }
         }
@@ -237,6 +270,30 @@ actor PublishedPortManager {
         pendingReservations.removeAll()
         heldReservations.removeAll()
     }
+
+    private func retainOperationLock(for nativeID: String) -> AsyncLock {
+        if var entry = operationLocks[nativeID] {
+            entry.users += 1
+            operationLocks[nativeID] = entry
+            return entry.lock
+        }
+        let lock = AsyncLock(log: logger)
+        operationLocks[nativeID] = OperationLockEntry(lock: lock, users: 1)
+        return lock
+    }
+
+    private func releaseOperationLock(for nativeID: String, lock: AsyncLock) {
+        guard var entry = operationLocks[nativeID], entry.lock === lock else { return }
+        precondition(entry.users > 0, "published-port operation lock released without a user")
+        entry.users -= 1
+        if entry.users == 0 {
+            operationLocks.removeValue(forKey: nativeID)
+        } else {
+            operationLocks[nativeID] = entry
+        }
+    }
+
+    func cachedOperationLockCount() -> Int { operationLocks.count }
 
     static func publicationAddress(in container: ContainerSnapshot) -> String? {
         if let namedNetworkAddress = ContainerStartRoute.dnsAttachmentIP(in: container) {

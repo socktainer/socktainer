@@ -129,6 +129,59 @@ struct PublishedPortManagerTests {
         }
     }
 
+    @Test("concurrent reconciliation publishes one listener and close releases it")
+    func concurrentReconciliationIsSerialized() async throws {
+        try await withApp { app in
+            let nativeID = "published-port-concurrent-reconcile"
+            let manager = PublishedPortManager(
+                eventLoopGroup: app.eventLoopGroup,
+                logger: Logger(label: "socktainer.tests.concurrent-reconcile")
+            )
+            let requested = try PublishPort(
+                hostAddress: IPAddress("127.0.0.1"),
+                hostPort: 0,
+                containerPort: 54_321,
+                proto: .tcp,
+                count: 1
+            )
+            let reservation = try await manager.reserveDynamicPorts([requested])
+            let hostPort = try #require(reservation.ports.first?.hostPort)
+            await manager.commit(reservation, nativeID: nativeID)
+            try await DockerContainerMetadataStore.shared.set(
+                nativeID: nativeID,
+                name: nativeID,
+                publishedPorts: reservation.ports
+            )
+            let snapshot = try makeContainerSnapshot(
+                nativeId: nativeID,
+                ip: "127.0.0.1",
+                network: "compose_default",
+                labels: [:],
+                status: .running
+            )
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<32 {
+                        group.addTask { try await manager.reconcile(container: snapshot) }
+                    }
+                    try await group.waitForAll()
+                }
+            } catch {
+                await manager.shutdown()
+                try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+                throw error
+            }
+
+            #expect(await manager.cachedOperationLockCount() == 0)
+            #expect(!Self.canBindTCP(port: hostPort))
+            await manager.close(nativeID: nativeID)
+            #expect(await manager.cachedOperationLockCount() == 0)
+            #expect(Self.canBindTCP(port: hostPort))
+            try await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+            await manager.shutdown()
+        }
+    }
+
     private static func canBindTCP(port: UInt16) -> Bool {
         let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard descriptor >= 0 else { return false }
