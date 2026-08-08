@@ -120,6 +120,7 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
                 continue
             }
             if container.status == .running,
+                Self.securePublishedSocket(at: Self.socketPath(for: networkID, under: runtimeRoot)),
                 Self.isUsable(
                     container,
                     hostSocket: Self.socketPath(for: networkID, under: runtimeRoot),
@@ -159,6 +160,7 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
         let client = ContainerClient()
         if let existing = try? await client.get(id: containerID),
             existing.status == .running,
+            securePublishedSocket(at: hostSocket),
             isUsable(existing, hostSocket: hostSocket, ownerID: ownerID),
             await relayAcceptsConnections(at: hostSocket, eventLoopGroup: eventLoopGroup)
         {
@@ -228,7 +230,7 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
             try await process.start()
             try io.closeAfterStart()
             for _ in 0..<100 {
-                if privateSocketExists(at: hostSocket),
+                if securePublishedSocket(at: hostSocket),
                     await relayAcceptsConnections(
                         at: hostSocket,
                         eventLoopGroup: eventLoopGroup
@@ -281,6 +283,20 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
             && (status.st_mode & S_IFMT) == S_IFSOCK
             && status.st_uid == getuid()
             && (status.st_mode & 0o777) == 0o600
+    }
+
+    /// Apple Container 1.2.1 records the requested `0600` permission in the
+    /// container configuration but can initially publish the host UDS using
+    /// the runtime's broader umask. The parent directory is already private;
+    /// normalize the owned socket before exposing it to a frontend listener.
+    static func securePublishedSocket(at path: String) -> Bool {
+        var status = stat()
+        guard lstat(path, &status) == 0,
+            (status.st_mode & S_IFMT) == S_IFSOCK,
+            status.st_uid == getuid(),
+            chmod(path, 0o600) == 0
+        else { return false }
+        return privateSocketExists(at: path)
     }
 
     private static func relayAcceptsConnections(

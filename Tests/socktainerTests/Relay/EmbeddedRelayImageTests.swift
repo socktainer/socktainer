@@ -2,6 +2,7 @@ import ContainerResource
 import ContainerizationOCI
 import CryptoKit
 import Foundation
+import NIOPosix
 import Testing
 
 @testable import socktainer
@@ -61,6 +62,23 @@ struct EmbeddedRelayImageTests {
         #expect(throws: POSIXError(.EACCES)) {
             try NetworkRelayManager.ensurePrivateDirectory(link)
         }
+    }
+
+    @Test("published relay sockets are narrowed to owner-only access")
+    func socketPermissionNormalization() async throws {
+        let root = try RequestBodyFileWriter.createSecureTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = root.appendingPathComponent("relay.sock").path
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = try await ServerBootstrap(group: group)
+            .bind(unixDomainSocketPath: socketPath)
+            .get()
+        #expect(chmod(socketPath, 0o755) == 0)
+        #expect(NetworkRelayManager.securePublishedSocket(at: socketPath))
+        let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        try await channel.close()
+        try await group.shutdownGracefully()
     }
 
     @Test("relay sidecars are hidden as Socktainer infrastructure")
