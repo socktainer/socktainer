@@ -27,9 +27,20 @@ struct NetworkPruneRoute: RouteCollection {
                     continue
                 }
                 do {
+                    // Recheck after listing so a container attached during the
+                    // prune race cannot cause infrastructure to be torn down.
+                    if let current = try await networkClient.getNetwork(
+                        id: network.Id,
+                        logger: req.logger
+                    ), let containers = current.Containers, !containers.isEmpty {
+                        continue
+                    }
                     // Clean up DNS forwarder sidecar before deleting the network
                     if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                         await dnsManager.cleanupDNSContainer(networkId: network.Id)
+                    }
+                    if let relayManager = req.application.storage[NetworkRelayManagerKey.self] {
+                        await relayManager.cleanupRelay(networkID: network.Id)
                     }
                     try await networkClient.delete(id: network.Id, logger: req.logger)
                     deletedNetworks.append(network.Id)

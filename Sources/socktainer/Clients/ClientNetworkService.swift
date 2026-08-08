@@ -30,7 +30,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 // If CoreDNS shows up as an attached container, docker compose down
                 // reports "Resource is still in use" and skips the DELETE /networks/{id}
                 // call — preventing our cleanup hook from firing.
-                guard !ClientContainerService.isDNSSidecar(container) else {
+                guard !ClientContainerService.isInfrastructureSidecar(container) else {
                     continue
                 }
                 let dockerName = await DockerContainerMetadataStore.shared.name(

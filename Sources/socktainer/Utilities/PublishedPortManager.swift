@@ -7,12 +7,16 @@ import NIO
 import SocketForwarder
 import Vapor
 
-/// Owns Docker host-port publication independently of Apple's runtime helper.
-///
-/// Apple Container 1.2.1 starts its forwarder inside `container-runtime-linux`.
-/// On macOS 27 an ad-hoc Homebrew runtime can retain the listener while losing
-/// permission to connect to a custom-network guest after a system restart. A
-/// Socktainer-owned listener is restartable and is reconciled from durable metadata.
+protocol NetworkPortRelayProviding: Sendable {
+    /// Ensures the network-scoped guest relay is running and returns the local
+    /// Unix socket transported by Apple Container over vsock.
+    func ensureRelay(networkID: String) async throws -> String
+}
+
+/// Owns Docker's localhost listeners while delegating the guest-network hop to a
+/// network-scoped relay reached through Apple Container's published Unix socket.
+/// This avoids a direct LaunchAgent-to-guest IP connection, which macOS Local
+/// Network Privacy can deny even when the same binary works from Terminal.
 actor PublishedPortManager {
     enum PortError: Error {
         case missingContainerAddress(String)
@@ -20,6 +24,7 @@ actor PublishedPortManager {
 
     private let eventLoopGroup: any EventLoopGroup
     private let logger: Logger
+    private let relayProvider: (any NetworkPortRelayProviding)?
     private var active: [String: ActivePublication] = [:]
     private var operationLocks: [String: OperationLockEntry] = [:]
     private var pendingReservations: [UUID: [Int32]] = [:]
@@ -68,9 +73,14 @@ actor PublishedPortManager {
         }
     }
 
-    init(eventLoopGroup: any EventLoopGroup, logger: Logger) {
+    init(
+        eventLoopGroup: any EventLoopGroup,
+        logger: Logger,
+        relayProvider: (any NetworkPortRelayProviding)? = nil
+    ) {
         self.eventLoopGroup = eventLoopGroup
         self.logger = logger
+        self.relayProvider = relayProvider
     }
 
     func reserveDynamicPorts(_ ports: [PublishPort]) throws -> DynamicPortReservation {
@@ -151,10 +161,15 @@ actor PublishedPortManager {
             await closeLocked(nativeID: container.id)
             return
         }
-        guard let address = Self.publicationAddress(in: container) else {
+        guard let endpoint = Self.publicationEndpoint(in: container) else {
             throw PortError.missingContainerAddress(container.id)
         }
+        let address = endpoint.address
         let specifications = Self.specifications(for: ports, containerAddress: address)
+        // Always revalidate the relay, even when the frontend specification did
+        // not change. The sidecar/runtime can disappear independently during an
+        // Apple system restart while this in-memory listener remains active.
+        let relaySocketPath = try await relayProvider?.ensureRelay(networkID: endpoint.network)
         if active[container.id]?.specifications == specifications {
             logger.debug("Published ports for \(container.id) are already reconciled")
             return
@@ -205,15 +220,39 @@ actor PublishedPortManager {
                 var lastError: Error?
                 for attempt in 0..<3 {
                     do {
-                        switch specification.transport {
-                        case .tcp:
+                        switch (specification.transport, relaySocketPath) {
+                        case (.tcp, .some(let socketPath)):
+                            result = try await RelayTCPForwarder(
+                                proxyAddress: host,
+                                relaySocketPath: socketPath,
+                                destination: try PortRelayProtocol.Destination(
+                                    address: specification.containerAddress,
+                                    port: specification.containerPort,
+                                    transport: .tcp
+                                ),
+                                eventLoopGroup: eventLoopGroup,
+                                log: logger
+                            ).run().get()
+                        case (.udp, .some(let socketPath)):
+                            result = try await RelayUDPForwarder(
+                                proxyAddress: host,
+                                relaySocketPath: socketPath,
+                                destination: try PortRelayProtocol.Destination(
+                                    address: specification.containerAddress,
+                                    port: specification.containerPort,
+                                    transport: .udp
+                                ),
+                                eventLoopGroup: eventLoopGroup,
+                                log: logger
+                            ).run().get()
+                        case (.tcp, .none):
                             result = try await TCPForwarder(
                                 proxyAddress: host,
                                 serverAddress: backend,
                                 eventLoopGroup: eventLoopGroup,
                                 log: logger
                             ).run().get()
-                        case .udp:
+                        case (.udp, .none):
                             result = try await UDPForwarder(
                                 proxyAddress: host,
                                 serverAddress: backend,
@@ -296,8 +335,19 @@ actor PublishedPortManager {
     func cachedOperationLockCount() -> Int { operationLocks.count }
 
     static func publicationAddress(in container: ContainerSnapshot) -> String? {
-        if let namedNetworkAddress = ContainerStartRoute.dnsAttachmentIP(in: container) {
-            return namedNetworkAddress
+        publicationEndpoint(in: container)?.address
+    }
+
+    static func publicationEndpoint(
+        in container: ContainerSnapshot
+    ) -> (network: String, address: String)? {
+        let reserved: Set<String> = ["default", "bridge", "host", "none"]
+        if let named = container.networks.first(where: {
+            let address = $0.ipv4Address.address.description
+            return !$0.network.isEmpty && !reserved.contains($0.network)
+                && !address.isEmpty && address != "0.0.0.0"
+        }) {
+            return (named.network, named.ipv4Address.address.description)
         }
         // Unlike embedded DNS, host publication is valid on Docker's reserved
         // default/bridge networks. Only host/none lack a guest endpoint.
@@ -306,7 +356,7 @@ actor PublishedPortManager {
             let address = $0.ipv4Address.address.description
             return !unusable.contains($0.network)
                 && !address.isEmpty && address != "0.0.0.0"
-        }?.ipv4Address.address.description
+        }.map { ($0.network, $0.ipv4Address.address.description) }
     }
 
     static func specifications(

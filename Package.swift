@@ -59,6 +59,7 @@ let package = Package(
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 "CFilteredStream",
                 "BuildInfo",
+                "CRelayImage",
             ]
         ),
         .testTarget(
@@ -91,6 +92,11 @@ let package = Package(
                 .define("DOCKER_ENGINE_API_MAX_VERSION", to: "\"\(dockerEngineApiMaxVersion)\""),
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(resolvedVersion(for: "container"))\""),
             ]
+        ),
+        .target(
+            name: "CRelayImage",
+            dependencies: [],
+            publicHeadersPath: "include"
         ),
     ]
 

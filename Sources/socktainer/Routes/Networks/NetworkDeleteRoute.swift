@@ -21,10 +21,23 @@ struct NetworkDeleteRoute: RouteCollection {
             let summary = try? await client.getNetwork(id: id, logger: logger)
             let resolvedId = summary?.Id ?? id
 
+            // Validate Docker-visible attachments before removing internal
+            // sidecars. Otherwise a correctly rejected network deletion would
+            // leave a live network without DNS or port relay service.
+            if let containers = summary?.Containers, !containers.isEmpty {
+                throw Abort(
+                    .forbidden,
+                    reason: "error while removing network: network \(resolvedId) has active endpoints"
+                )
+            }
+
             // Remove the DNS forwarder sidecar BEFORE deleting the network —
             // the network can't be deleted while the DNS container is still attached.
             if let dnsManager = req.application.storage[NetworkDNSManagerKey.self] {
                 await dnsManager.cleanupDNSContainer(networkId: resolvedId)
+            }
+            if let relayManager = req.application.storage[NetworkRelayManagerKey.self] {
+                await relayManager.cleanupRelay(networkID: resolvedId)
             }
             try await client.delete(id: resolvedId, logger: logger)
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -34,6 +47,8 @@ struct NetworkDeleteRoute: RouteCollection {
                         attributes: ["name": summary?.Name ?? id, "type": summary?.Driver ?? "nat"]))
             }
             return Response(status: .noContent)
+        } catch let abort as AbortError {
+            throw abort
         } catch {
             if error.localizedDescription.contains("not found") {
                 throw Abort(.notFound, reason: "Network not found")

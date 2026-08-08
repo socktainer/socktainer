@@ -249,11 +249,32 @@ in an atomically persisted registry keyed by the immutable Apple ID. Rename keep
 the Docker object ID, image, mounts, and volume data unchanged; name conflicts are
 serialized and survive a Socktainer restart.
 
-Socktainer also owns Docker host-port listeners. This avoids an Apple Container
-1.2.1 failure mode where its runtime helper keeps a listening socket after a full
-system restart but can no longer reach a container on a custom network. Desired
-port mappings are persisted with the Docker name and reconciled after container,
-Socktainer, and Apple Container restarts.
+Socktainer owns the Docker-visible host-port listeners, but its Homebrew
+LaunchAgent never connects directly to an Apple guest IP. macOS Local Network
+Privacy allows Terminal children to make that connection but does not
+automatically allow LaunchAgents, which would make a shell-launched test pass and
+the installed service fail with `EHOSTUNREACH`.
+
+For each network that publishes a port, Socktainer starts a small embedded relay
+sidecar. Apple Container publishes the sidecar's Unix socket to the host over
+vsock. The data path is:
+
+```text
+localhost -> Socktainer -> private Unix socket -> Apple vsock -> network relay -> container
+```
+
+The relay accepts only destinations inside its assigned network CIDRs. Its host
+directory is mode `0700`, each socket is `0600`, and relay image identity is
+versioned so upgrades replace stale sidecars. TCP half-close and UDP datagram
+boundaries are preserved. No Local Network privacy grant, root daemon, network
+extension, or terminal-launched service is required.
+
+Desired port mappings are persisted with the Docker name and reconciled after
+container, Socktainer, and Apple Container restarts. Relay sidecars have no user
+volumes and are hidden from Docker container listing and prune semantics. A
+stable instance-owner label and namespaced sidecar ID prevent separately
+configured Socktainer LaunchAgents from adopting or deleting each other's
+relays.
 
 Containers created by an older Socktainer release migrate on their first ordinary
 stop/start after this version is installed. The stopped container's native
@@ -372,6 +393,17 @@ sudo xcode-select -s /Applications/Xcode-26.app/Contents/Developer
 
 ```bash
 make
+```
+
+The reviewed Linux/arm64 relay OCI image is compiled into the executable. To
+change its Rust source, regenerate the embedded C payload explicitly on an Apple
+Container host and commit the source and generated payload together:
+
+```bash
+cd RelaySidecar
+./build-embedded.sh
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
 2. (Optional) Format the code:

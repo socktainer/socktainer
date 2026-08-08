@@ -182,6 +182,63 @@ struct PublishedPortManagerTests {
         }
     }
 
+    @Test("relay reconciliation selects the container network and remains single-owner")
+    func relayReconciliationUsesNetworkProvider() async throws {
+        try await withApp { app in
+            let nativeID = "published-port-relay-provider"
+            let provider = RecordingRelayProvider(socketPath: "/tmp/socktainer-relay-test-missing.sock")
+            let manager = PublishedPortManager(
+                eventLoopGroup: app.eventLoopGroup,
+                logger: Logger(label: "socktainer.tests.relay-provider"),
+                relayProvider: provider
+            )
+            let requested = try PublishPort(
+                hostAddress: IPAddress("127.0.0.1"),
+                hostPort: 0,
+                containerPort: 5432,
+                proto: .tcp,
+                count: 1
+            )
+            let reservation = try await manager.reserveDynamicPorts([requested])
+            let hostPort = try #require(reservation.ports.first?.hostPort)
+            await manager.commit(reservation, nativeID: nativeID)
+            try await DockerContainerMetadataStore.shared.set(
+                nativeID: nativeID,
+                name: nativeID,
+                publishedPorts: reservation.ports
+            )
+            let snapshot = try makeContainerSnapshot(
+                nativeId: nativeID,
+                networks: [
+                    (network: "bridge", ip: "192.168.64.8"),
+                    (network: "project_default", ip: "192.168.99.4"),
+                ],
+                labels: [:],
+                status: .running
+            )
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<16 {
+                        group.addTask { try await manager.reconcile(container: snapshot) }
+                    }
+                    try await group.waitForAll()
+                }
+            } catch {
+                await manager.shutdown()
+                try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+                throw error
+            }
+            let requestedNetworks = await provider.requestedNetworks()
+            #expect(requestedNetworks.count == 16)
+            #expect(requestedNetworks.allSatisfy { $0 == "project_default" })
+            #expect(!Self.canBindTCP(port: hostPort))
+            await manager.close(nativeID: nativeID)
+            #expect(Self.canBindTCP(port: hostPort))
+            try await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+            await manager.shutdown()
+        }
+    }
+
     private static func canBindTCP(port: UInt16) -> Bool {
         let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard descriptor >= 0 else { return false }
@@ -203,4 +260,18 @@ struct PublishedPortManagerTests {
             }
         }
     }
+}
+
+private actor RecordingRelayProvider: NetworkPortRelayProviding {
+    private let socketPath: String
+    private var networks: [String] = []
+
+    init(socketPath: String) { self.socketPath = socketPath }
+
+    func ensureRelay(networkID: String) async throws -> String {
+        networks.append(networkID)
+        return socketPath
+    }
+
+    func requestedNetworks() -> [String] { networks }
 }

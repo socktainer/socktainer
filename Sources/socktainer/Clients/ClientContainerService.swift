@@ -301,11 +301,18 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
-        snapshots.filter { !isDNSSidecar($0) }
+        snapshots.filter { !isInfrastructureSidecar($0) }
     }
 
     static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
         snapshot.configuration.labels[NetworkDNSManager.roleLabel] == NetworkDNSManager.dnsRole
+    }
+
+    static func isInfrastructureSidecar(_ snapshot: ContainerSnapshot) -> Bool {
+        guard let role = snapshot.configuration.labels[NetworkDNSManager.roleLabel] else {
+            return false
+        }
+        return role == NetworkDNSManager.dnsRole || role == NetworkRelayManager.relayRole
     }
 
     /// Applies parsed Docker container filters to a snapshot list.
@@ -466,7 +473,7 @@ struct ClientContainerService: ClientContainerProtocol {
             let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
             let effectiveName = await DockerContainerMetadataStore.shared.name(nativeID: snapshot.id)
             guard effectiveName == DockerContainerMetadataStore.normalized(id) else { return nil }
-            return Self.isDNSSidecar(snapshot) ? nil : snapshot
+            return Self.isInfrastructureSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
             // prefix of one fed back from `docker ps` output; resolve it
@@ -490,7 +497,7 @@ struct ClientContainerService: ClientContainerProtocol {
             let snapshot = try await containerClient.withClient {
                 try await $0.get(id: nativeID)
             }
-            return Self.isDNSSidecar(snapshot) ? nil : snapshot
+            return Self.isInfrastructureSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             return nil
         }

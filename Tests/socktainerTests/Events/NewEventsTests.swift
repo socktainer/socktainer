@@ -89,6 +89,23 @@ struct NewEventsTests {
         #expect(event?.Actor.Attributes["image"] == nil)
     }
 
+    @Test("network delete preserves infrastructure when user endpoints remain")
+    func networkDeleteRejectsAttachedEndpointBeforeCleanup() async throws {
+        let probe = NetworkDeleteProbe()
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: NetworkDeleteRoute(client: AttachedNetworkClient(probe: probe)))
+
+            try await app.testing().test(.DELETE, "/v1.51/networks/net-attached") { res async in
+                #expect(res.status == .forbidden)
+                #expect(res.body.string.contains("active endpoints"))
+            }
+        }
+        #expect(!(await probe.wasDeleted()))
+    }
+
     // MARK: - container.prune
 
     @Test("container prune route broadcasts Type=container Action=prune event")
@@ -476,4 +493,39 @@ private struct StubNetworkClient: ClientNetworkProtocol {
         RESTNetworkCreate(Id: "net-abc123", Warning: "")
     }
     func delete(id: String, logger: Logger) async throws {}
+}
+
+private actor NetworkDeleteProbe {
+    private var deleted = false
+    func recordDelete() { deleted = true }
+    func wasDeleted() -> Bool { deleted }
+}
+
+private struct AttachedNetworkClient: ClientNetworkProtocol {
+    let probe: NetworkDeleteProbe
+
+    func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] { [] }
+    func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
+        RESTNetworkSummary(
+            Name: "attached-network", Id: id, Created: "", Scope: "local", Driver: "nat",
+            EnableIPv4: true, EnableIPv6: false, Internal: false, Attachable: false, Ingress: false,
+            IPAM: NetworkIPAM(Driver: "", Config: []), Options: [:],
+            Containers: [
+                "docker-id": NetworkContainer(
+                    Name: "user-container", EndpointID: nil, MacAddress: nil,
+                    IPv4Address: "192.168.65.3/24", IPv6Address: nil
+                )
+            ],
+            ConfigFrom: nil, Labels: [:], Subnet: nil, Gateway: nil
+        )
+    }
+    func create(
+        name: String,
+        labels: [String: String],
+        ipv4Subnet: String?,
+        logger: Logger
+    ) async throws -> RESTNetworkCreate {
+        RESTNetworkCreate(Id: "unused", Warning: "")
+    }
+    func delete(id: String, logger: Logger) async throws { await probe.recordDelete() }
 }

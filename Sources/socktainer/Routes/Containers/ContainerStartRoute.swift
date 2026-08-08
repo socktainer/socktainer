@@ -452,7 +452,7 @@ extension ContainerStartRoute {
 
         if let dnsServer,
             let snapshot = startedSnapshot,
-            !ClientContainerService.isDNSSidecar(snapshot)
+            !ClientContainerService.isInfrastructureSidecar(snapshot)
         {
             // Register only on a network that has a DNS forwarder sidecar — same reserved set
             // as sidecarNetwork. On reserved networks (default/bridge/host/none) there is no
@@ -539,7 +539,7 @@ extension ContainerStartRoute {
     }
 
     static func sidecarNetwork(configuredNetworks: [String], roleLabel: String?) -> String? {
-        if roleLabel == NetworkDNSManager.dnsRole { return nil }
+        if roleLabel != nil { return nil }
         let reserved: Set<String> = ["default", "bridge", "host", "none"]
         return configuredNetworks.first { !$0.isEmpty && !reserved.contains($0) }
     }

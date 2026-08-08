@@ -172,7 +172,7 @@ actor RecoveredContainerLifecycleMonitor {
     /// deliberately idempotent so startup seeds and containers first discovered
     /// after a transient Apple service outage use the same recovery transaction.
     private func recoverRunningContainer(_ container: ContainerSnapshot) async {
-        guard !ClientContainerService.isDNSSidecar(container) else { return }
+        guard !ClientContainerService.isInfrastructureSidecar(container) else { return }
 
         do {
             try await DockerContainerMetadataStore.shared.adopt(

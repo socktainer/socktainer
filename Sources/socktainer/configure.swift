@@ -61,13 +61,6 @@ func configure(_ app: Application) async throws {
         imageReferenceResolver: imageIdentityResolver,
         imageLeaseReconciler: imageLeaseReconciler
     )
-    let publishedPortManager = PublishedPortManager(
-        eventLoopGroup: app.eventLoopGroup,
-        logger: Logger(label: "socktainer.ports")
-    )
-    app.storage[PublishedPortManagerKey.self] = publishedPortManager
-    await PublishedPortManagerRegistry.shared.configure(publishedPortManager)
-    app.lifecycle.use(PublishedPortManagerLifecycle(manager: publishedPortManager))
     let containerImageMetadataProvider = CanonicalContainerImageMetadataProvider(
         resolver: imageIdentityResolver
     )
@@ -77,6 +70,22 @@ func configure(_ app: Application) async throws {
         identityResolver: imageIdentityResolver,
         mutationCoordinator: imageMutationCoordinator
     )
+    let relayManager = try NetworkRelayManager(
+        appSupportURL: appleContainerAppSupportUrl,
+        runtimeRoot: metadataStorageURL,
+        containerSystemConfig: systemConfig,
+        imageClient: imageClient,
+        eventLoopGroup: app.eventLoopGroup
+    )
+    app.storage[NetworkRelayManagerKey.self] = relayManager
+    let publishedPortManager = PublishedPortManager(
+        eventLoopGroup: app.eventLoopGroup,
+        logger: Logger(label: "socktainer.ports"),
+        relayProvider: relayManager
+    )
+    app.storage[PublishedPortManagerKey.self] = publishedPortManager
+    await PublishedPortManagerRegistry.shared.configure(publishedPortManager)
+    app.lifecycle.use(PublishedPortManagerLifecycle(manager: publishedPortManager))
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClient = ClientVolumeService()
@@ -317,7 +326,7 @@ func configure(_ app: Application) async throws {
     var recoveredContainers: [ContainerSnapshot] = []
     if let runningContainers = try? await resumeClient.list() {
         recoveredContainers = runningContainers.filter {
-            !ClientContainerService.isDNSSidecar($0)
+            !ClientContainerService.isInfrastructureSidecar($0)
         }
         try? await DockerContainerMetadataStore.shared.reconcile(
             existingNativeIDs: Set(runningContainers.map(\.id))
@@ -339,11 +348,12 @@ func configure(_ app: Application) async throws {
         let housekeepingLogger = app.logger
         let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
             await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+            await relayManager.adoptOrRemoveSidecarsFromPreviousRun()
             await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
         }
         if !housekeepingFinished {
             app.logger.warning(
-                "[startup] DNS-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."
+                "[startup] infrastructure-sidecar adoption / orphaned-network reaping did not finish within 30s — continuing startup without it. The container runtime may be unhealthy (see apple/container#1884)."
             )
         }
     }

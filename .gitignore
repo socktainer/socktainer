@@ -1,4 +1,5 @@
 .build
 .vscode
 .swiftpm
-
+RelaySidecar/target/
+RelaySidecar/artifacts/
