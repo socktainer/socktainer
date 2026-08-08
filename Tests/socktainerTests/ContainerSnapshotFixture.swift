@@ -10,6 +10,8 @@ func makeContainerSnapshot(
     nativeId: String,
     networks: [(network: String, ip: String)],
     labels: [String: String],
+    imageDigest: String = "sha256:abc",
+    publishedSockets: [PublishSocket] = [],
     status: RuntimeStatus = .stopped
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
@@ -20,11 +22,12 @@ func makeContainerSnapshot(
         reference: "alpine:latest",
         descriptor: Descriptor(
             mediaType: "application/vnd.oci.image.index.v1+json",
-            digest: "sha256:abc", size: 0
+            digest: imageDigest, size: 0
         )
     )
     var config = ContainerConfiguration(id: nativeId, image: img, process: proc)
     config.labels = labels
+    config.publishedSockets = publishedSockets
 
     // Attachment is Codable — use JSON to avoid depending on internal CIDRv4/IPv4Address inits.
     let attachments = try networks.map { entry -> Attachment in
@@ -50,7 +53,16 @@ func makeContainerSnapshot(
     ip: String,
     network: String,
     labels: [String: String],
+    imageDigest: String = "sha256:abc",
+    publishedSockets: [PublishSocket] = [],
     status: RuntimeStatus = .stopped
 ) throws -> ContainerSnapshot {
-    try makeContainerSnapshot(nativeId: nativeId, networks: [(network: network, ip: ip)], labels: labels, status: status)
+    try makeContainerSnapshot(
+        nativeId: nativeId,
+        networks: [(network: network, ip: ip)],
+        labels: labels,
+        imageDigest: imageDigest,
+        publishedSockets: publishedSockets,
+        status: status
+    )
 }

@@ -154,6 +154,11 @@ struct ContainerImageIdentityTests {
                 "SOCKTAINER.IMAGE.CONFIG-DIGEST": "spoof"
             ]) == "SOCKTAINER.IMAGE.CONFIG-DIGEST"
         )
+        #expect(
+            ContainerImageIdentity.reservedUserLabel(in: [
+                ContainerImageIdentity.instanceOwnerLabel: "spoof"
+            ]) == ContainerImageIdentity.instanceOwnerLabel
+        )
     }
 
     @Test("container-specific label names remain valid on non-container resources")

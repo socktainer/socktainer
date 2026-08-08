@@ -636,6 +636,14 @@ extension ContainerCreateRoute {
                 body.Image
             containerLabels[ContainerImageIdentity.configDigestLabel] =
                 preparedImage.variant.manifest.config.digest
+            guard let instanceOwnerID = req.application.storage[ContainerInstanceOwnerKey.self]
+            else {
+                throw Abort(
+                    .internalServerError,
+                    reason: "Socktainer container instance identity is unavailable"
+                )
+            }
+            containerLabels[ContainerImageIdentity.instanceOwnerLabel] = instanceOwnerID
 
             // Persist the requested healthcheck across create → start so the
             // start route can launch the probe loop and inspect can return it

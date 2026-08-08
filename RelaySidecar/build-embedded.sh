@@ -10,6 +10,10 @@ mkdir -p "$relay_root/artifacts"
 
 container build --platform linux/arm64 -t "$image_ref" "$relay_root"
 container image save --platform linux/arm64 --output "$archive" "$image_ref"
+root_digest=$(tar -xOf "$archive" index.json | jq -er '
+  if (.manifests | length) == 1 then .manifests[0].digest else error("unexpected manifest count") end
+')
+printf 'embedded relay root digest: %s\n' "$root_digest"
 gzip -n -9 -f "$archive"
 xxd -i -n socktainer_relay_image_archive "$archive.gz" > "$c_source"
 perl -pi -e 's/^unsigned char socktainer_relay_image_archive\[\]/static const unsigned char socktainer_relay_image_archive[]/; s/^unsigned int socktainer_relay_image_archive_len/static const unsigned int socktainer_relay_image_archive_len/' "$c_source"

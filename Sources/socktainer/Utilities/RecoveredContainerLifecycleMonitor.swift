@@ -3,6 +3,10 @@ import Foundation
 import Logging
 import Vapor
 
+struct ContainerInstanceOwnerKey: StorageKey {
+    typealias Value = String
+}
+
 /// Reconciles containers that were already running when Socktainer booted.
 ///
 /// Their original process wait handles belonged to the previous daemon, so the
@@ -26,6 +30,7 @@ actor RecoveredContainerLifecycleMonitor {
     private let healthManager: HealthCheckManager
     private let logger: Logger
     private let interval: Duration
+    private let requiredOwnerID: String?
     private var tracked: [String: Tracked] = [:]
     private var task: Task<Void, Never>?
 
@@ -35,7 +40,8 @@ actor RecoveredContainerLifecycleMonitor {
         dnsServer: SocktainerDNSServer,
         healthManager: HealthCheckManager,
         logger: Logger,
-        interval: Duration = .seconds(1)
+        interval: Duration = .seconds(1),
+        requiredOwnerID: String? = nil
     ) {
         self.client = client
         self.portManager = portManager
@@ -43,6 +49,7 @@ actor RecoveredContainerLifecycleMonitor {
         self.healthManager = healthManager
         self.logger = logger
         self.interval = interval
+        self.requiredOwnerID = requiredOwnerID
     }
 
     func start(containers: [ContainerSnapshot]) async {
@@ -91,6 +98,16 @@ actor RecoveredContainerLifecycleMonitor {
         }
         for (nativeID, item) in tracked {
             if let current = byID[nativeID], current.status == .running {
+                if let requiredOwnerID,
+                    current.configuration.labels[ContainerImageIdentity.instanceOwnerLabel]
+                        != requiredOwnerID
+                {
+                    await retireTrackedRuntimeState(item)
+                    logger.warning(
+                        "Stopped reconciling \(item.logicalName) because its native ID now belongs to another Socktainer instance"
+                    )
+                    continue
+                }
                 var refreshed = item
                 refreshed.logicalName = await DockerContainerMetadataStore.shared.name(
                     nativeID: nativeID
@@ -173,6 +190,13 @@ actor RecoveredContainerLifecycleMonitor {
     /// after a transient Apple service outage use the same recovery transaction.
     private func recoverRunningContainer(_ container: ContainerSnapshot) async {
         guard !ClientContainerService.isInfrastructureSidecar(container) else { return }
+        if let requiredOwnerID {
+            guard
+                container.configuration.labels[ContainerImageIdentity.instanceOwnerLabel]
+                    == requiredOwnerID,
+                await DockerContainerMetadataStore.shared.entry(nativeID: container.id) != nil
+            else { return }
+        }
 
         do {
             try await DockerContainerMetadataStore.shared.adopt(
@@ -244,6 +268,25 @@ actor RecoveredContainerLifecycleMonitor {
             ip: ip,
             absentSince: nil
         )
+    }
+
+    /// Drops only this daemon's ephemeral state when a native ID is reused by a
+    /// foreign generation. The foreign Apple object and the durable metadata
+    /// record are intentionally left untouched.
+    private func retireTrackedRuntimeState(_ item: Tracked) async {
+        await portManager.close(nativeID: item.nativeID)
+        await healthManager.stop(containerId: item.nativeID)
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: item.nativeID,
+            logicalName: item.logicalName,
+            labels: item.labels,
+            cachedIP: item.ip,
+            dnsServer: dnsServer
+        )
+        await ContainerRestartState.shared.reset(id: item.nativeID)
+        await ContainerInfoCache.shared.remove(id: item.hexID)
+        await RestartPolicyOverrideStore.shared.remove(id: item.hexID)
+        tracked.removeValue(forKey: item.nativeID)
     }
 }
 

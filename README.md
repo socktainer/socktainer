@@ -276,6 +276,15 @@ stable instance-owner label and namespaced sidecar ID prevent separately
 configured Socktainer LaunchAgents from adopting or deleting each other's
 relays.
 
+An isolated secondary daemon can additionally set
+`SOCKTAINER_CONTAINER_RECOVERY_SCOPE=metadata`. In that mode it reconciles only
+native containers that are both present in its configured metadata registry and
+carry that registry's instance-owner label, including containers it creates
+later; it neither adopts nor publishes ports for foreign containers visible in
+Apple's shared store. The production default is `all` so
+first-time migration can still adopt containers created by older Socktainer
+versions.
+
 Containers created by an older Socktainer release migrate on their first ordinary
 stop/start after this version is installed. The stopped container's native
 forwarding field is cleared before bootstrap and Socktainer takes ownership of the

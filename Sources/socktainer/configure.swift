@@ -32,6 +32,8 @@ func configure(_ app: Application) async throws {
         storageDirectory: metadataStorageURL,
         enforceExclusiveAccess: true
     )
+    let containerInstanceOwnerID = NetworkRelayManager.ownerID(seed: metadataStorageURL)
+    app.storage[ContainerInstanceOwnerKey.self] = containerInstanceOwnerID
 
     let systemConfig: ContainerSystemConfig
     do {
@@ -308,13 +310,28 @@ func configure(_ app: Application) async throws {
     // tracks status so `/containers/{id}/json` can return `.State.Health`.
     let healthCheckManager = HealthCheckManager(broadcaster: broadcaster)
     app.storage[HealthCheckManagerKey.self] = healthCheckManager
+    let recoveryScope =
+        ProcessInfo.processInfo.environment["SOCKTAINER_CONTAINER_RECOVERY_SCOPE"]
+        ?? "all"
+    guard recoveryScope == "all" || recoveryScope == "metadata" else {
+        throw Abort(
+            .internalServerError,
+            reason: "SOCKTAINER_CONTAINER_RECOVERY_SCOPE must be 'all' or 'metadata'"
+        )
+    }
     let recoveredLifecycleMonitor = RecoveredContainerLifecycleMonitor(
         client: containerClient,
         portManager: publishedPortManager,
         dnsServer: dnsServer,
         healthManager: healthCheckManager,
-        logger: app.logger
+        logger: app.logger,
+        requiredOwnerID: recoveryScope == "metadata" ? containerInstanceOwnerID : nil
     )
+    if recoveryScope == "metadata" {
+        app.logger.notice(
+            "[startup] container recovery is scoped to this metadata registry"
+        )
+    }
     app.lifecycle.use(
         RecoveredContainerLifecycleHandler(monitor: recoveredLifecycleMonitor)
     )

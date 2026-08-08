@@ -1,5 +1,6 @@
 use socktainer_port_relay::{parse_cidrs, serve_connection};
 use std::fs;
+use std::io;
 use std::os::unix::net::UnixListener;
 use std::sync::{
     Arc,
@@ -9,6 +10,13 @@ use std::thread;
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+}
+
+fn should_log_connection_error(error: &io::Error) -> bool {
+    // The host checks that Apple's published Unix socket is accepting before
+    // reusing a relay. That probe deliberately opens and closes without a
+    // tunnel preface, which is a clean liveness signal rather than a fault.
+    error.kind() != io::ErrorKind::UnexpectedEof
 }
 
 fn main() {
@@ -36,7 +44,9 @@ fn main() {
                 let active = active.clone();
                 let allowed = allowed.clone();
                 thread::spawn(move || {
-                    if let Err(error) = serve_connection(stream, &allowed) {
+                    if let Err(error) = serve_connection(stream, &allowed)
+                        && should_log_connection_error(&error)
+                    {
                         eprintln!("socktainer-port-relay: tunnel ended: {error}");
                     }
                     active.fetch_sub(1, Ordering::AcqRel);
@@ -44,5 +54,23 @@ fn main() {
             }
             Err(error) => eprintln!("socktainer-port-relay: accept failed: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_log_connection_error;
+    use std::io;
+
+    #[test]
+    fn clean_liveness_disconnect_is_silent_but_protocol_errors_are_logged() {
+        assert!(!should_log_connection_error(&io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "probe closed"
+        )));
+        assert!(should_log_connection_error(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad preface"
+        )));
     }
 }

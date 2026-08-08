@@ -82,9 +82,10 @@ enum ContainerImageIdentity {
     static let requestedReferenceLabel =
         "socktainer.image.requested-reference"
     static let configDigestLabel = "socktainer.image.config-digest"
+    static let instanceOwnerLabel = "socktainer.instance.owner"
 
     static var reservedLabels: Set<String> {
-        [requestedReferenceLabel, configDigestLabel]
+        [requestedReferenceLabel, configDigestLabel, instanceOwnerLabel]
     }
 
     static func reservedUserLabel(

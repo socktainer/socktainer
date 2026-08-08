@@ -21,6 +21,12 @@ struct NetworkRelayManagerKey: StorageKey {
 /// connections to guest-network IPs, keeping the Homebrew LaunchAgent outside
 /// macOS Local Network Privacy entirely.
 actor NetworkRelayManager: NetworkPortRelayProviding {
+    private struct PendingRelayOperation {
+        let id: UInt64
+        let cleanupEpoch: UInt64
+        let task: Task<String, Error>
+    }
+
     static let relayRole = "relay"
     static let artifactLabel = "socktainer.relay.artifact-sha256"
     static let ownerLabel = "socktainer.relay.owner"
@@ -35,8 +41,10 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
     private let containerSystemConfig: ContainerSystemConfig
     private let imageClient: ClientImageService
     private let eventLoopGroup: any EventLoopGroup
-    private var pending: [String: Task<String, Error>] = [:]
-    private var cleaning: Set<String> = []
+    private var pending: [String: PendingRelayOperation] = [:]
+    private var cleanupEpoch: [String: UInt64] = [:]
+    private var cleaning: [String: Int] = [:]
+    private var nextPendingID: UInt64 = 0
     private let log = Logger(label: "socktainer.relay.manager")
 
     init(
@@ -56,20 +64,13 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
     }
 
     func ensureRelay(networkID: String) async throws -> String {
-        guard !cleaning.contains(networkID) else {
-            throw ContainerizationError(
-                .invalidState,
-                message: "relay cleanup is in progress for network \(networkID)"
-            )
-        }
-        if let pending = pending[networkID] { return try await pending.value }
         let appSupportURL = appSupportURL
         let runtimeRoot = runtimeRoot
         let ownerID = ownerID
         let systemConfig = containerSystemConfig
         let imageClient = imageClient
         let eventLoopGroup = eventLoopGroup
-        let task = Task {
+        return try await ensureRelayCoordinated(networkID: networkID) {
             try await Self.ensureRelayWork(
                 networkID: networkID,
                 appSupportURL: appSupportURL,
@@ -80,36 +81,122 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
                 eventLoopGroup: eventLoopGroup
             )
         }
-        pending[networkID] = task
+    }
+
+    private func ensureRelayCoordinated(
+        networkID: String,
+        work: @escaping @Sendable () async throws -> String,
+        onJoined: (@Sendable () async -> Void)? = nil,
+        afterWork: (@Sendable () async -> Void)? = nil
+    ) async throws -> String {
+        guard cleaning[networkID, default: 0] == 0 else {
+            throw ContainerizationError(
+                .invalidState,
+                message: "relay cleanup is in progress for network \(networkID)"
+            )
+        }
+        let operation: PendingRelayOperation
+        if let existing = pending[networkID] {
+            operation = existing
+        } else {
+            nextPendingID &+= 1
+            operation = PendingRelayOperation(
+                id: nextPendingID,
+                cleanupEpoch: cleanupEpoch[networkID, default: 0],
+                task: Task { try await work() }
+            )
+            pending[networkID] = operation
+        }
+        await onJoined?()
         do {
-            let socket = try await task.value
-            pending.removeValue(forKey: networkID)
+            let socket = try await operation.task.value
+            await afterWork?()
+            guard cleanupEpoch[networkID, default: 0] == operation.cleanupEpoch,
+                cleaning[networkID, default: 0] == 0
+            else {
+                throw CancellationError()
+            }
+            removePending(networkID: networkID, operationID: operation.id)
             return socket
         } catch {
-            pending.removeValue(forKey: networkID)
+            removePending(networkID: networkID, operationID: operation.id)
             throw error
         }
     }
 
     func cleanupRelay(networkID: String) async {
-        cleaning.insert(networkID)
-        defer { cleaning.remove(networkID) }
-        if let task = pending.removeValue(forKey: networkID) {
-            task.cancel()
-            _ = try? await task.value
+        let ownerID = ownerID
+        let runtimeRoot = runtimeRoot
+        await cleanupRelayCoordinated(networkID: networkID) {
+            let id = Self.containerID(for: networkID, ownerID: ownerID)
+            let client = ContainerClient()
+            if let snapshot = try? await client.get(id: id) {
+                if snapshot.status == .running { try? await client.stop(id: id) }
+                try? await client.delete(id: id)
+            }
+            try? FileManager.default.removeItem(
+                at: Self.socketDirectory(for: networkID, under: runtimeRoot)
+            )
         }
-        let id = Self.containerID(for: networkID, ownerID: ownerID)
-        let client = ContainerClient()
-        if let snapshot = try? await client.get(id: id) {
-            if snapshot.status == .running { try? await client.stop(id: id) }
-            try? await client.delete(id: id)
+    }
+
+    private func cleanupRelayCoordinated(
+        networkID: String,
+        perform: @escaping @Sendable () async -> Void
+    ) async {
+        cleaning[networkID, default: 0] += 1
+        cleanupEpoch[networkID, default: 0] &+= 1
+        defer {
+            let remaining = cleaning[networkID, default: 1] - 1
+            if remaining == 0 {
+                cleaning.removeValue(forKey: networkID)
+            } else {
+                cleaning[networkID] = remaining
+            }
         }
-        try? FileManager.default.removeItem(at: Self.socketDirectory(for: networkID, under: runtimeRoot))
+        if let operation = pending.removeValue(forKey: networkID) {
+            operation.task.cancel()
+            _ = try? await operation.task.value
+        }
+        await perform()
+    }
+
+    private func removePending(networkID: String, operationID: UInt64) {
+        guard pending[networkID]?.id == operationID else { return }
+        pending.removeValue(forKey: networkID)
+    }
+
+    // Deterministic coordination hooks for race regression tests. Production
+    // callers use the protocol methods above and cannot supply alternate work.
+    func ensureRelayForTesting(
+        networkID: String,
+        work: @escaping @Sendable () async throws -> String,
+        onJoined: (@Sendable () async -> Void)? = nil,
+        afterWork: (@Sendable () async -> Void)? = nil
+    ) async throws -> String {
+        try await ensureRelayCoordinated(
+            networkID: networkID,
+            work: work,
+            onJoined: onJoined,
+            afterWork: afterWork
+        )
+    }
+
+    func cleanupRelayForTesting(
+        networkID: String,
+        perform: @escaping @Sendable () async -> Void = {}
+    ) async {
+        await cleanupRelayCoordinated(networkID: networkID, perform: perform)
+    }
+
+    func cleanupInProgressForTesting(networkID: String) -> Bool {
+        cleaning[networkID, default: 0] > 0
     }
 
     func adoptOrRemoveSidecarsFromPreviousRun() async {
         let client = ContainerClient()
         guard let containers = try? await client.list() else { return }
+        let expectedImageDigest = SocktainerRelayImage.rootDigest
         for container in containers where Self.isRelay(container) {
             guard Self.isOwnedRelay(container, ownerID: ownerID) else { continue }
             guard let networkID = container.configuration.labels[NetworkDNSManager.networkLabel],
@@ -124,7 +211,8 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
                 Self.isUsable(
                     container,
                     hostSocket: Self.socketPath(for: networkID, under: runtimeRoot),
-                    ownerID: ownerID
+                    ownerID: ownerID,
+                    expectedImageDigest: expectedImageDigest
                 ),
                 await Self.relayAcceptsConnections(
                     at: Self.socketPath(for: networkID, under: runtimeRoot),
@@ -158,13 +246,31 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
         }
         let containerID = containerID(for: networkID, ownerID: ownerID)
         let client = ContainerClient()
+        let expectedImageDigest = SocktainerRelayImage.rootDigest
         if let existing = try? await client.get(id: containerID),
             existing.status == .running,
             securePublishedSocket(at: hostSocket),
-            isUsable(existing, hostSocket: hostSocket, ownerID: ownerID),
+            isUsable(
+                existing,
+                hostSocket: hostSocket,
+                ownerID: ownerID,
+                expectedImageDigest: expectedImageDigest
+            ),
             await relayAcceptsConnections(at: hostSocket, eventLoopGroup: eventLoopGroup)
         {
             return hostSocket
+        }
+
+        let image = try await EmbeddedRelayImage.ensure(
+            containerSystemConfig: containerSystemConfig,
+            appSupportURL: appSupportURL,
+            imageClient: imageClient
+        )
+        guard image.digest == expectedImageDigest else {
+            throw ContainerizationError(
+                .invalidState,
+                message: "embedded relay image root does not match the reviewed artifact"
+            )
         }
 
         if let existing = try? await client.get(id: containerID) {
@@ -176,11 +282,6 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
         let network = try await NetworkClient().get(id: networkID)
         var allowedCIDRs = [network.status.ipv4Subnet.description]
         if let ipv6 = network.status.ipv6Subnet { allowedCIDRs.append(ipv6.description) }
-        let image = try await EmbeddedRelayImage.ensure(
-            containerSystemConfig: containerSystemConfig,
-            appSupportURL: appSupportURL,
-            imageClient: imageClient
-        )
         _ = try await image.getCreateSnapshot(platform: .current)
 
         let process = ProcessConfiguration(
@@ -263,10 +364,12 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
     static func isUsable(
         _ snapshot: ContainerSnapshot,
         hostSocket: String,
-        ownerID: String
+        ownerID: String,
+        expectedImageDigest: String
     ) -> Bool {
         guard snapshot.configuration.labels[artifactLabel] == SocktainerRelayImage.artifactSHA256,
             snapshot.configuration.labels[ownerLabel] == ownerID,
+            snapshot.configuration.image.descriptor.digest == expectedImageDigest,
             snapshot.configuration.publishedSockets.count == 1
         else { return false }
         let published = snapshot.configuration.publishedSockets[0]
