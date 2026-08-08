@@ -97,7 +97,11 @@ struct ContainerRestartPolicyPostStartTests {
 
             // Crash: the observer decides to restart and enters its backoff sleep.
             await ContainerExitCodeStore.shared.set(id: nativeId, code: 1)
-            let enteredBackoff = try await pollUntil(timeoutSeconds: 2) {
+            // The complete suite runs more than a thousand tests concurrently;
+            // allow scheduler saturation without converting that load into a
+            // false lifecycle-race failure. The state transition itself remains
+            // the synchronization point (there is no fixed pre-race sleep).
+            let enteredBackoff = try await pollUntil(timeoutSeconds: 10) {
                 await ContainerRestartState.shared.isPendingRestart(id: nativeId)
             }
             #expect(enteredBackoff, "observer must enter its backoff window before the race can be exercised")
