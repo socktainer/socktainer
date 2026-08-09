@@ -63,8 +63,14 @@ extension ImageListRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageSummary] {
         { req in
             let query = try req.query.decode(RESTImageListQuery.self)
-            // moby validates the filters before doing any listing work.
+            // moby validates the filters before doing any listing work. Key/shape
+            // validation already happens inside the parser; running applyFilters
+            // against an empty list here additionally fail-fasts on an invalid
+            // `dangling` value (e.g. `dangling=bogus`) before the real listing
+            // and image-summary work below, at the cost of a second (cheap,
+            // no-op-on-empty-input) filter pass once the real summaries exist.
             let filters = try DockerImageFilterUtility.parseImageListFilters(filterParam: query.filters, logger: req.logger)
+            _ = try ImageListRoute.applyFilters([], filters: filters)
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
@@ -187,10 +193,18 @@ extension ImageListRoute {
     /// AND together, matching moby.
     static func applyFilters(_ summaries: [RESTImageSummary], filters: [String: [String]]) throws -> [RESTImageSummary] {
         var result = summaries
-        if let dangling = filters["dangling"], !dangling.isEmpty {
+        // A present (even empty) `dangling` key is validated, unlike `reference`
+        // (where a present-but-empty filter matches nothing): real Docker 400s
+        // `{"dangling":[]}` outright rather than treating it as "no filter" —
+        // verified live. `!dangling.isEmpty` would treat it as absent instead.
+        if let dangling = filters["dangling"] {
             // moby's filters.GetBoolOrDefault recognizes only 0/1/true/false
             // here (stricter than the MobyBool query-parameter semantics) and
-            // rejects an unrecognized or conflicting value with a 400.
+            // rejects the value set if it has no recognized true/false token,
+            // or has both — but does NOT reject an extra unrecognized token
+            // once a real one is present: `dangling=[true,maybe]` behaves as
+            // `dangling=true` on real Docker (verified live), so `maybe` here
+            // is silently irrelevant, not itself invalid.
             let isTrue = dangling.contains("1") || dangling.contains("true")
             let isFalse = dangling.contains("0") || dangling.contains("false")
             guard isTrue != isFalse else {

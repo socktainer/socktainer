@@ -93,14 +93,26 @@ struct ImageListFilterTests {
         #expect(kept.map(\.RepoTags) == [["docker.io/library/alpine:latest"]])
     }
 
-    @Test("An unrecognized or conflicting dangling value is a 400, like moby's GetBoolOrDefault")
-    func applyDanglingInvalid() {
+    @Test(
+        "An unrecognized-only or conflicting dangling value is a 400, like moby's GetBoolOrDefault",
+        arguments: [["maybe"], ["true", "false"], []])
+    func applyDanglingInvalid(values: [String]) {
         let images = [Self.summary(repoTags: [])]
-        for values in [["maybe"], ["true", "false"]] {
-            #expect(throws: Abort.self) {
-                try ImageListRoute.applyFilters(images, filters: ["dangling": values])
-            }
+        let error = #expect(throws: Abort.self) {
+            try ImageListRoute.applyFilters(images, filters: ["dangling": values])
         }
+        #expect(error?.status == .badRequest, "values: \(values)")
+    }
+
+    @Test("An unrecognized value alongside a recognized one does not invalidate the filter, like real Docker")
+    func applyDanglingIgnoresExtraUnrecognizedValue() throws {
+        // Verified live against real Docker: dangling=[true,maybe] behaves as
+        // dangling=true — the unrecognized "maybe" is simply irrelevant once a
+        // real true/false token is present, it does not 400 the request.
+        let tagged = Self.summary(repoTags: ["docker.io/library/alpine:latest"])
+        let untagged = Self.summary(repoTags: [])
+        let kept = try ImageListRoute.applyFilters([tagged, untagged], filters: ["dangling": ["true", "maybe"]])
+        #expect(kept.map(\.RepoTags) == [[]])
     }
 
     @Test("reference filters to matching images")
