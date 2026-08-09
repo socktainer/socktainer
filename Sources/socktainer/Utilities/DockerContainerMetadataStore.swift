@@ -5,10 +5,9 @@ import Foundation
 /// Durable Docker-facing metadata that Apple Container cannot represent natively.
 ///
 /// Apple container identifiers are immutable and its 1.2.1 API has no rename operation.
-/// Published ports also have to be owned by Socktainer on macOS versions where the
-/// Apple runtime helper loses local-network authorization. Keeping both properties in
-/// one atomically-written registry makes name/port mutations linearizable and allows
-/// daemon restart reconciliation without changing the underlying container or volumes.
+/// Keeping the Docker-visible name and native published-port mapping in one
+/// atomically-written registry makes name/port mutations linearizable and allows
+/// daemon restart recovery without changing the underlying container or volumes.
 actor DockerContainerMetadataStore {
     static let shared = DockerContainerMetadataStore()
 

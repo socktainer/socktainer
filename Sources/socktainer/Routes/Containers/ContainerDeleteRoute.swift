@@ -50,7 +50,7 @@ extension ContainerDeleteRoute {
                 await RestartPolicyOverrideStore.shared.remove(id: eventId)
                 if let nativeID = snapshot?.id ?? cached?.nativeId {
                     await ContainerRestartState.shared.reset(id: nativeID)
-                    await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeID)
+                    await req.application.storage[DynamicPortAllocatorKey.self]?.release(nativeID: nativeID)
                     try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
                 }
                 guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else { return }

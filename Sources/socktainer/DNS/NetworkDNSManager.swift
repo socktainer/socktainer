@@ -19,8 +19,12 @@ struct NetworkDNSManagerKey: StorageKey {
 /// to SocktainerDNSServer on the macOS host via the network gateway, without
 /// pulling anything from the internet at runtime.
 ///
-/// DNS containers are identified by the label `socktainer.role=dns` and
-/// named `socktainer-dns-{networkId}`.
+/// Apple Container's built-in hostname resolver only exposes one attachment
+/// hostname. Docker and Compose need additional aliases, so this is the one
+/// infrastructure VM Socktainer keeps for each named network. Published ports
+/// deliberately do not use a sidecar; Apple owns those forwarders natively.
+/// DNS containers are identified by the label `socktainer.role=dns` and named
+/// `socktainer-dns-{networkId}`.
 actor NetworkDNSManager {
     static let dnsRole = "dns"
     static let roleLabel = "socktainer.role"
@@ -28,8 +32,10 @@ actor NetworkDNSManager {
     static let containerPrefix = "socktainer-dns-"
     static let dnsPort = 2054
     static let sidecarCPUs = 1
-    // Virtualization.framework rejects anything below 200 MiB.
-    static let sidecarMemoryInBytes: UInt64 = 256.mib()
+    // Apple Container rejects configurations below 200 MiB. This is a hard
+    // platform floor, not a sizing preference; the forwarder itself uses only
+    // a few MiB of guest memory.
+    static let sidecarMemoryInBytes: UInt64 = 200.mib()
 
     private let appSupportURL: URL
     private let dnsPort: Int
