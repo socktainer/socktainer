@@ -13,6 +13,8 @@
 # limitations under the License.
 
 BUILD_CONFIGURATION ?= debug
+TEST_PARALLELISM ?= $(shell sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.ncpu)
+TEST_SWIFT_FLAGS ?= --disable-index-store
 
 SWIFT := "swift"
 DESTDIR ?= /usr/local/
@@ -72,7 +74,8 @@ help:
 
 .PHONY: test
 test: lint-pipes
-	@$(SWIFT) test -c $(BUILD_CONFIGURATION)
+	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
+		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
 
 # Prevent Foundation's Pipe() from being used when passing fds to Apple Container
 # APIs (createProcess/bootstrap). Apple closes those fds immediately after duping
