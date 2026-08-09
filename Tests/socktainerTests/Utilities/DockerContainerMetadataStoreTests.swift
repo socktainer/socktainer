@@ -243,3 +243,42 @@ struct DockerContainerMetadataStoreTests {
         #expect(await store.name(nativeID: "live") == "db")
     }
 }
+
+@Suite("Apple published-port compatibility")
+struct ApplePublishedPortCompatibilityTests {
+    @Test("migration clears only native forwarding and preserves container configuration")
+    func suppressesNativeForwarder() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("socktainer-port-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundle = root.appendingPathComponent("containers/db", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+
+        let process = ProcessConfiguration(
+            executable: "/bin/postgres", arguments: [], environment: ["PGDATA=/data"],
+            workingDirectory: "/", terminal: false, user: .id(uid: 999, gid: 999)
+        )
+        let image = ImageDescription(
+            reference: "postgres:17",
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.manifest.v1+json", digest: "sha256:abc", size: 1)
+        )
+        var configuration = ContainerConfiguration(id: "db", image: image, process: process)
+        configuration.labels = ["durability": "fsync"]
+        configuration.publishedPorts = [
+            try PublishPort(hostAddress: IPAddress("127.0.0.1"), hostPort: 55434, containerPort: 5432, proto: .tcp, count: 1)
+        ]
+        try JSONEncoder().encode(configuration).write(to: bundle.appendingPathComponent("config.json"))
+        let snapshot = ContainerSnapshot(configuration: configuration, status: .stopped, networks: [])
+
+        try ApplePublishedPortCompatibility.suppressNativeForwarder(container: snapshot, appSupportURL: root)
+        let migrated = try JSONDecoder().decode(
+            ContainerConfiguration.self,
+            from: Data(contentsOf: bundle.appendingPathComponent("config.json"))
+        )
+        #expect(migrated.id == configuration.id)
+        #expect(migrated.image.descriptor == configuration.image.descriptor)
+        #expect(migrated.initProcess.environment == configuration.initProcess.environment)
+        #expect(migrated.labels == configuration.labels)
+        #expect(migrated.publishedPorts.isEmpty)
+    }
+}

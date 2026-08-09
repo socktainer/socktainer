@@ -55,7 +55,7 @@ extension ContainerPruneRoute {
                 let hexID = DockerContainerID.hexId(for: snapshot)
                 let logicalName = logicalNameByNativeID[nativeID] ?? nativeID
                 dockerDeletedIDs.append(hexID)
-                await req.application.storage[DynamicPortAllocatorKey.self]?.release(
+                await req.application.storage[PublishedPortManagerKey.self]?.close(
                     nativeID: nativeID
                 )
                 await req.application.storage[HealthCheckManagerKey.self]?.stop(containerId: nativeID)
