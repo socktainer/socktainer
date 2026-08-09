@@ -287,8 +287,11 @@ struct DockerImageFilterUtility {
                 guard dict.values.allSatisfy({ DockerImageFilterUtility.isJSONBool($0) }) else {
                     throw Abort(.badRequest, reason: "invalid filter")
                 }
-                let keys = dict.compactMap { (k, v) in (v as? Bool == true) ? k : nil }
-                if !keys.isEmpty { parsedFilters[key] = keys }
+                // Always register the key, even with zero true entries: real
+                // Docker treats a present-but-empty filter as "match nothing"
+                // (verified live: `{"reference":{}}` and an all-false map both
+                // return no images), not "no filter" the way an absent key does.
+                parsedFilters[key] = dict.compactMap { (k, v) in (v as? Bool == true) ? k : nil }
             } else if let arr = value as? [Any] {
                 guard let strings = arr as? [String] else {
                     throw Abort(.badRequest, reason: "invalid filter")

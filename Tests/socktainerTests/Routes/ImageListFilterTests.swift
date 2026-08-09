@@ -111,6 +111,28 @@ struct ImageListFilterTests {
         #expect(kept.map(\.RepoTags) == [["docker.io/library/alpine:latest"]])
     }
 
+    @Test("A present reference key with no values matches nothing, unlike an absent key")
+    func applyReferenceEmptyMatchesNothing() throws {
+        // {"reference":{}} and an all-false map both parse to an empty patterns
+        // array, which must still be a real (if impossible-to-satisfy) filter —
+        // verified live: real Docker returns no images for both.
+        let alpine = Self.summary(repoTags: ["docker.io/library/alpine:latest"])
+        let kept = try ImageListRoute.applyFilters([alpine], filters: ["reference": []])
+        #expect(kept.isEmpty)
+    }
+
+    @Test("A boolean-map reference filter with false-only or mixed entries keeps only the true ones")
+    func parseBooleanMapFalseAndMixedEntries() throws {
+        let logger = Logger(label: "test")
+        let falseOnly = try DockerImageFilterUtility.parseImageListFilters(
+            filterParam: #"{"reference": {"alpine": false}}"#, logger: logger)
+        #expect(falseOnly == ["reference": []], "an all-false map registers the key with zero values, not no filter")
+
+        let mixed = try DockerImageFilterUtility.parseImageListFilters(
+            filterParam: #"{"reference": {"alpine": true, "old": false}}"#, logger: logger)
+        #expect(mixed == ["reference": ["alpine"]], "only the true-valued key survives")
+    }
+
     @Test("reference and dangling AND together")
     func referenceAndDanglingAnd() throws {
         let alpine = Self.summary(repoTags: ["docker.io/library/alpine:latest"])
@@ -174,7 +196,10 @@ struct ImageListFilterTests {
     @Test("isJSONBool tells a real JSON boolean apart from a bridged NSNumber")
     func isJSONBoolDistinguishesFromNumber() throws {
         let data = #"{"a": true, "b": false, "c": 1, "d": 0, "e": "x"}"#.data(using: .utf8)!
-        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            Issue.record("Expected a JSON object")
+            return
+        }
         #expect(DockerImageFilterUtility.isJSONBool(json["a"]!))
         #expect(DockerImageFilterUtility.isJSONBool(json["b"]!))
         #expect(!DockerImageFilterUtility.isJSONBool(json["c"]!), "a JSON 1 must not bridge to true")

@@ -198,7 +198,12 @@ extension ImageListRoute {
             }
             result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags) == isTrue }
         }
-        if let patterns = filters["reference"], !patterns.isEmpty {
+        // A present `reference` key with zero values (an empty array, or a
+        // boolean map with no true entries) is a real Docker filter that
+        // matches nothing — not the same as the key being absent. `contains`
+        // over an empty `patterns` array already returns false for every
+        // image, which is exactly that "matches nothing" behavior.
+        if let patterns = filters["reference"] {
             result = result.filter { ImageListFilter.referenceMatches(patterns: patterns, repoTags: $0.RepoTags) }
         }
         return result
