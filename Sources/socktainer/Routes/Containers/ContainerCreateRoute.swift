@@ -600,11 +600,12 @@ extension ContainerCreateRoute {
                 containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
             }
 
-            // Socktainer owns forwarding. Apple's runtime helper can retain a
-            // listening socket while macOS denies its backend custom-network
-            // connection after a system restart. Desired mappings are persisted
-            // atomically below and reconciled after every start/daemon restart.
-            containerConfiguration.publishedPorts = []
+            // Apple Container owns published TCP/UDP forwarding. Its runtime
+            // uses the same bounded NIO forwarders as the `container` CLI and
+            // keeps the listener lifecycle coupled to the container VM.
+            // Dynamic host ports are replaced with their durable reservation
+            // below before this configuration is committed.
+            containerConfiguration.publishedPorts = publishedPorts
 
             // Handle DNS configuration from request
             let nameservers = body.HostConfig?.Dns ?? []
@@ -891,6 +892,34 @@ extension ContainerCreateRoute {
                 )
             }
 
+            // Resolve dynamic host ports before materializing the pre-create bundle so
+            // the bundle marker, native configuration, and durable Docker metadata all
+            // carry the same immutable published-port mapping.
+            let portManager = req.application.storage[DynamicPortAllocatorKey.self]
+            var durablePublishedPorts = publishedPorts
+            var dynamicPortReservation: DynamicPortAllocator.DynamicPortReservation?
+            if publishedPorts.contains(where: { $0.hostPort == 0 }) {
+                guard let portManager else {
+                    throw Abort(
+                        .internalServerError,
+                        reason: "Dynamic host-port allocator is not configured"
+                    )
+                }
+                do {
+                    let reservation = try await portManager.reserveDynamicPorts(
+                        publishedPorts
+                    )
+                    dynamicPortReservation = reservation
+                    durablePublishedPorts = reservation.ports
+                } catch {
+                    throw Abort(
+                        .internalServerError,
+                        reason: "Failed to reserve dynamic host ports: \(error)"
+                    )
+                }
+            }
+            containerConfiguration.publishedPorts = durablePublishedPorts
+
             let preparedRootFS: PreparedContainerRootFS
             do {
                 preparedRootFS = try rootFSMaterializer.materialize(
@@ -911,49 +940,38 @@ extension ContainerCreateRoute {
                     logger: req.logger
                 )
                 guard recovered else {
+                    if let dynamicPortReservation {
+                        await portManager?.cancel(dynamicPortReservation)
+                    }
                     throw Abort(
                         .conflict,
                         reason: "Conflict. The container name \"/\(id)\" is already in use."
                     )
                 }
-                preparedRootFS = try rootFSMaterializer.materialize(
-                    snapshot: preparedImage.snapshot.filesystem,
-                    containerID: nativeID,
-                    readOnly: containerConfiguration.readOnly,
-                    reservation: imageLeaseReservation
-                )
+                do {
+                    preparedRootFS = try rootFSMaterializer.materialize(
+                        snapshot: preparedImage.snapshot.filesystem,
+                        containerID: nativeID,
+                        readOnly: containerConfiguration.readOnly,
+                        reservation: imageLeaseReservation
+                    )
+                } catch {
+                    if let dynamicPortReservation {
+                        await portManager?.cancel(dynamicPortReservation)
+                    }
+                    throw error
+                }
+            } catch {
+                if let dynamicPortReservation {
+                    await portManager?.cancel(dynamicPortReservation)
+                }
+                throw error
             }
 
             let options = ContainerCreateOptions(
                 autoRemove: body.HostConfig?.AutoRemove ?? false,
                 rootFsOverride: preparedRootFS.filesystem
             )
-            let finalContainerConfiguration = containerConfiguration
-            let portManager = req.application.storage[PublishedPortManagerKey.self]
-            var durablePublishedPorts = publishedPorts
-            var dynamicPortReservation: PublishedPortManager.DynamicPortReservation?
-            if publishedPorts.contains(where: { $0.hostPort == 0 }) {
-                guard let portManager else {
-                    preparedRootFS.rollback()
-                    throw Abort(
-                        .internalServerError,
-                        reason: "Dynamic host-port allocator is not configured"
-                    )
-                }
-                do {
-                    let reservation = try await portManager.reserveDynamicPorts(
-                        publishedPorts
-                    )
-                    dynamicPortReservation = reservation
-                    durablePublishedPorts = reservation.ports
-                } catch {
-                    preparedRootFS.rollback()
-                    throw Abort(
-                        .internalServerError,
-                        reason: "Failed to reserve dynamic host ports: \(error)"
-                    )
-                }
-            }
             do {
                 let existingNativeIDs = Set(
                     (try await client.list(showAll: true, filters: [:])).map(\.id)
@@ -1002,7 +1020,7 @@ extension ContainerCreateRoute {
                 leaseManager: imageLeaseManager
             )
             switch await committer.commit(
-                configuration: finalContainerConfiguration,
+                configuration: containerConfiguration,
                 options: options,
                 kernel: kernel,
                 lease: imageLease
@@ -1019,7 +1037,7 @@ extension ContainerCreateRoute {
                 req.logger.debug("Container created successfully with ID: \(container.id)")
             case .definitivelyFailed(let error):
                 preparedRootFS.rollback()
-                await portManager?.close(nativeID: nativeID)
+                await portManager?.release(nativeID: nativeID)
                 try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
                 req.logger.error("Failed to create container: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
@@ -1028,7 +1046,7 @@ extension ContainerCreateRoute {
                 // configuration differs. Never remove it; only clear our marker
                 // and let the combined lease reconciler retire our unused root.
                 preparedRootFS.markCommitted()
-                await portManager?.close(nativeID: nativeID)
+                await portManager?.release(nativeID: nativeID)
                 try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
                 req.logger.error(
                     "Container create returned \(error), and ID \(existing.id) now belongs to a different native configuration"
@@ -1046,7 +1064,7 @@ extension ContainerCreateRoute {
                 let logger = req.logger
                 Task.detached(priority: .utility) {
                     await Self.settleIndeterminateCreate(
-                        expected: finalContainerConfiguration,
+                        expected: containerConfiguration,
                         options: options,
                         kernel: kernel,
                         lease: imageLease,
@@ -1210,7 +1228,7 @@ extension ContainerCreateRoute {
                 return
             case .conflicting(let existing, let error):
                 preparedRootFS.markCommitted()
-                await PublishedPortManagerRegistry.shared.close(nativeID: expected.id)
+                await DynamicPortAllocatorRegistry.shared.release(nativeID: expected.id)
                 try? await metadataStore.remove(nativeID: expected.id)
                 await leaseReconciler.reconcile(
                     rootDescriptor: rootDescriptor,
@@ -1222,7 +1240,7 @@ extension ContainerCreateRoute {
                 return
             case .definitivelyFailed(let error):
                 preparedRootFS.rollback()
-                await PublishedPortManagerRegistry.shared.close(nativeID: expected.id)
+                await DynamicPortAllocatorRegistry.shared.release(nativeID: expected.id)
                 try? await metadataStore.remove(nativeID: expected.id)
                 await leaseReconciler.reconcile(
                     rootDescriptor: rootDescriptor,

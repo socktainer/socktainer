@@ -45,7 +45,6 @@ let package = Package(
                 .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerResource", package: "container"),
                 .product(name: "ContainerRuntimeClient", package: "container"),
-                .product(name: "SocketForwarder", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationArchive", package: "containerization"),
                 .product(name: "ContainerizationEXT4", package: "containerization"),
@@ -59,7 +58,6 @@ let package = Package(
                 .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 "CFilteredStream",
                 "BuildInfo",
-                "CRelayImage",
             ]
         ),
         .testTarget(
@@ -92,11 +90,6 @@ let package = Package(
                 .define("DOCKER_ENGINE_API_MAX_VERSION", to: "\"\(dockerEngineApiMaxVersion)\""),
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(resolvedVersion(for: "container"))\""),
             ]
-        ),
-        .target(
-            name: "CRelayImage",
-            dependencies: [],
-            publicHeadersPath: "include"
         ),
     ]
 

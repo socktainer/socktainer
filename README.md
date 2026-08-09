@@ -249,32 +249,33 @@ in an atomically persisted registry keyed by the immutable Apple ID. Rename keep
 the Docker object ID, image, mounts, and volume data unchanged; name conflicts are
 serialized and survive a Socktainer restart.
 
-Socktainer owns the Docker-visible host-port listeners, but its Homebrew
-LaunchAgent never connects directly to an Apple guest IP. macOS Local Network
-Privacy allows Terminal children to make that connection but does not
-automatically allow LaunchAgents, which would make a shell-launched test pass and
-the installed service fail with `EHOSTUNREACH`.
-
-For each network that publishes a port, Socktainer starts a small embedded relay
-sidecar. Apple Container publishes the sidecar's Unix socket to the host over
-vsock. The data path is:
+Socktainer passes published TCP/UDP mappings directly to Apple Container's
+native `publishedPorts` configuration. Apple owns the host listener, guest
+forwarder, IPv4/IPv6 binding, and teardown, so the data path is:
 
 ```text
-localhost -> Socktainer -> private Unix socket -> Apple vsock -> network relay -> container
+localhost -> Apple native forwarder -> container network attachment -> container
 ```
 
-The relay accepts only destinations inside its assigned network CIDRs. Its host
-directory is mode `0700`, each socket is `0600`, and relay image identity is
-versioned so upgrades replace stale sidecars. TCP half-close and UDP datagram
-boundaries are preserved. No Local Network privacy grant, root daemon, network
-extension, or terminal-launched service is required.
+Dynamic Docker ports use bounded reservation sockets only between create and
+start. The reservation is persisted with the resolved mapping, then released
+immediately before Apple starts its native forwarder; a bind conflict is
+reported by Apple rather than hidden behind a competing listener. This removes
+the old per-network relay VM, Unix-socket protocol, host relay listener, and
+published-port reconciliation manager while preserving TCP/UDP and IPv4/IPv6
+semantics.
 
-Desired port mappings are persisted with the Docker name and reconciled after
-container, Socktainer, and Apple Container restarts. Relay sidecars have no user
-volumes and are hidden from Docker container listing and prune semantics. A
-stable instance-owner label and namespaced sidecar ID prevent separately
-configured Socktainer LaunchAgents from adopting or deleting each other's
-relays.
+For DNS, Socktainer keeps one small embedded forwarder sidecar per user-defined
+network because Docker/Compose aliases are broader than Apple's built-in
+single-attachment hostname lookup. The DNS helper is right-sized to Apple's
+200 MiB minimum and is the only remaining network helper VM. Published ports do
+not create a helper.
+
+Desired mappings and the native container configuration are persisted together.
+On restart, Socktainer re-adopts running native containers and rebuilds DNS
+aliases; it does not recreate port listeners. Stopping or deleting a container
+lets Apple tear down its native forwarders, while network deletion removes its
+DNS helper before deleting the network.
 
 An isolated secondary daemon can additionally set
 `SOCKTAINER_CONTAINER_RECOVERY_SCOPE=metadata`. In that mode it reconciles only
@@ -285,12 +286,10 @@ Apple's shared store. The production default is `all` so
 first-time migration can still adopt containers created by older Socktainer
 versions.
 
-Containers created by an older Socktainer release migrate on their first ordinary
-stop/start after this version is installed. The stopped container's native
-forwarding field is cleared before bootstrap and Socktainer takes ownership of the
-same mapping. The Apple container ID, root filesystem, image descriptor, mounts,
-and named volumes are not recreated. No `down -v` or manual image/volume deletion
-is required.
+This architecture intentionally drops the obsolete internal relay metadata and
+resource layout. Existing native containers retain their Apple configuration;
+Socktainer recovery adopts only the current metadata format and rebuilds DNS
+aliases from live snapshots. No relay migration or compatibility path remains.
 
 ### Volume sync mode
 
@@ -404,16 +403,9 @@ sudo xcode-select -s /Applications/Xcode-26.app/Contents/Developer
 make
 ```
 
-The reviewed Linux/arm64 relay OCI image is compiled into the executable. To
-change its Rust source, regenerate the embedded C payload explicitly on an Apple
-Container host and commit the source and generated payload together:
-
-```bash
-cd RelaySidecar
-./build-embedded.sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
+The embedded Linux/arm64 DNS forwarder image is compiled into the executable.
+Published ports use Apple Container's native runtime forwarders; Socktainer no
+longer builds or ships a relay OCI image.
 
 2. (Optional) Format the code:
 
@@ -428,6 +420,9 @@ make fmt
 ```
 
 > The server will create the socket at `$HOME/.socktainer/container.sock`.
+
+For the networking footprint experiment and exact `/usr/bin/footprint`
+measurement procedure, see [docs/networking-memory-benchmark.md](docs/networking-memory-benchmark.md).
 
 ### Testing ✅
 

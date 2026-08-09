@@ -318,10 +318,7 @@ struct ClientContainerService: ClientContainerProtocol, ContainerStatsClientProt
     }
 
     static func isInfrastructureSidecar(_ snapshot: ContainerSnapshot) -> Bool {
-        guard let role = snapshot.configuration.labels[NetworkDNSManager.roleLabel] else {
-            return false
-        }
-        return role == NetworkDNSManager.dnsRole || role == NetworkRelayManager.relayRole
+        isDNSSidecar(snapshot)
     }
 
     /// Applies parsed Docker container filters to a snapshot list.

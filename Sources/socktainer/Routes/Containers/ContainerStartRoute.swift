@@ -56,12 +56,9 @@ extension ContainerStartRoute {
                         name: container.id,
                         publishedPorts: container.configuration.publishedPorts
                     )
-                    if let appSupportURL = req.application.storage[AppleContainerAppSupportUrlKey.self] {
-                        try ApplePublishedPortCompatibility.suppressNativeForwarder(
-                            container: container,
-                            appSupportURL: appSupportURL
-                        )
-                    }
+                    await req.application.storage[DynamicPortAllocatorKey.self]?.release(
+                        nativeID: container.id
+                    )
                     // Try to start the container
                     try await client.start(id: id, detachKeys: detachKeys)
                     req.logger.debug("Started container \(id)")
@@ -90,16 +87,6 @@ extension ContainerStartRoute {
             )
 
             let metadataSnapshot = startedSnapshot ?? preStartSnapshot
-            if let startedSnapshot,
-                let portManager = req.application.storage[PublishedPortManagerKey.self]
-            {
-                do {
-                    try await portManager.reconcile(container: startedSnapshot)
-                } catch {
-                    req.logger.error("Failed to publish ports for \(startedSnapshot.id): \(error)")
-                    throw Abort(.internalServerError, reason: "Failed to publish container ports: \(error)")
-                }
-            }
             // Derive the canonical 64-char Docker ID once here so the cache and all
             // lifecycle events use the same stable id the create event returned.
             let eventId = metadataSnapshot.map { DockerContainerID.hexId(for: $0) } ?? id
@@ -214,10 +201,6 @@ extension ContainerStartRoute {
             // stale one broadcasts its own "die" for an exit the current observer already owns.
             guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
 
-            // The forwarder must not outlive the running process. This also frees
-            // the host port before restart-policy recovery or --rm cleanup.
-            await PublishedPortManagerRegistry.shared.close(nativeID: nativeId)
-
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
@@ -328,14 +311,6 @@ extension ContainerStartRoute {
             let restartedSnapshot = await ContainerStartRoute.performPostStartSetup(
                 id: nativeId, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: logger
             )
-            if let restartedSnapshot {
-                do {
-                    try await PublishedPortManagerRegistry.shared.reconcile(container: restartedSnapshot)
-                } catch {
-                    logger.error("restart-policy: failed to restore published ports for \(nativeId): \(error)")
-                }
-            }
-
             // Refresh the cache before broadcasting "start" so a listener that reacts to the
             // event by reading ContainerInfoCache always sees the restarted container's new IP.
             await ContainerStartRoute.armRestartObserver(
@@ -434,22 +409,6 @@ extension ContainerStartRoute {
         if startedSnapshot == nil {
             startedSnapshot = try? await client.getContainer(nativeID: id)
         }
-        if startedSnapshot.flatMap({ PublishedPortManager.publicationAddress(in: $0) }) == nil {
-            for _ in 0..<20 {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                var refreshed = try? await client.getContainer(id: id)
-                if refreshed == nil {
-                    refreshed = try? await client.getContainer(nativeID: id)
-                }
-                if let refreshed,
-                    PublishedPortManager.publicationAddress(in: refreshed) != nil
-                {
-                    startedSnapshot = refreshed
-                    break
-                }
-            }
-        }
-
         if let dnsServer,
             let snapshot = startedSnapshot,
             !ClientContainerService.isInfrastructureSidecar(snapshot)

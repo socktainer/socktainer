@@ -41,7 +41,7 @@ extension ContainerKillRoute {
                         stopped = false
                     }
                     if stopped {
-                        await req.application.storage[PublishedPortManagerKey.self]?.close(
+                        await req.application.storage[DynamicPortAllocatorKey.self]?.release(
                             nativeID: nativeID
                         )
                     }

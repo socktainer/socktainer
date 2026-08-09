@@ -25,7 +25,6 @@ actor RecoveredContainerLifecycleMonitor {
     }
 
     private let client: ClientContainerProtocol
-    private let portManager: PublishedPortManager
     private let dnsServer: SocktainerDNSServer
     private let healthManager: HealthCheckManager
     private let logger: Logger
@@ -36,7 +35,6 @@ actor RecoveredContainerLifecycleMonitor {
 
     init(
         client: ClientContainerProtocol,
-        portManager: PublishedPortManager,
         dnsServer: SocktainerDNSServer,
         healthManager: HealthCheckManager,
         logger: Logger,
@@ -44,7 +42,6 @@ actor RecoveredContainerLifecycleMonitor {
         requiredOwnerID: String? = nil
     ) {
         self.client = client
-        self.portManager = portManager
         self.dnsServer = dnsServer
         self.healthManager = healthManager
         self.logger = logger
@@ -130,18 +127,6 @@ actor RecoveredContainerLifecycleMonitor {
                         logger: logger
                     )
                 }
-                // A non-empty native field means Apple's legacy forwarder still
-                // owns these host listeners. Do not create a competing listener;
-                // stop/start performs the persisted migration first.
-                if current.configuration.publishedPorts.isEmpty {
-                    do {
-                        try await portManager.reconcile(container: current)
-                    } catch {
-                        logger.warning(
-                            "Recovered-container port reconciliation for \(item.logicalName) will retry: \(error)"
-                        )
-                    }
-                }
                 continue
             }
 
@@ -157,7 +142,6 @@ actor RecoveredContainerLifecycleMonitor {
                 }
             }
 
-            await portManager.close(nativeID: nativeID)
             await healthManager.stop(containerId: nativeID)
             let currentName =
                 await DockerContainerMetadataStore.shared.entry(nativeID: nativeID)?.name
@@ -246,20 +230,6 @@ actor RecoveredContainerLifecycleMonitor {
             await healthManager.start(containerId: container.id, config: config)
         }
 
-        if container.configuration.publishedPorts.isEmpty {
-            do {
-                try await portManager.reconcile(container: container)
-            } catch {
-                logger.warning(
-                    "Recovered-container port reconciliation for \(logicalName) will retry: \(error)"
-                )
-            }
-        } else {
-            logger.warning(
-                "Container \(logicalName) still uses Apple's legacy port forwarder; stop/start it once to migrate publication without recreating the container"
-            )
-        }
-
         tracked[container.id] = Tracked(
             nativeID: container.id,
             hexID: DockerContainerID.hexId(for: container),
@@ -274,7 +244,6 @@ actor RecoveredContainerLifecycleMonitor {
     /// foreign generation. The foreign Apple object and the durable metadata
     /// record are intentionally left untouched.
     private func retireTrackedRuntimeState(_ item: Tracked) async {
-        await portManager.close(nativeID: item.nativeID)
         await healthManager.stop(containerId: item.nativeID)
         ContainerAliasCleanup.unregisterAllAliases(
             nativeId: item.nativeID,

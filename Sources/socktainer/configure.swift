@@ -32,7 +32,7 @@ func configure(_ app: Application) async throws {
         storageDirectory: metadataStorageURL,
         enforceExclusiveAccess: true
     )
-    let containerInstanceOwnerID = NetworkRelayManager.ownerID(seed: metadataStorageURL)
+    let containerInstanceOwnerID = ContainerInstanceOwnerID.forMetadataDirectory(metadataStorageURL)
     app.storage[ContainerInstanceOwnerKey.self] = containerInstanceOwnerID
 
     let systemConfig: ContainerSystemConfig
@@ -72,22 +72,10 @@ func configure(_ app: Application) async throws {
         identityResolver: imageIdentityResolver,
         mutationCoordinator: imageMutationCoordinator
     )
-    let relayManager = try NetworkRelayManager(
-        appSupportURL: appleContainerAppSupportUrl,
-        runtimeRoot: metadataStorageURL,
-        containerSystemConfig: systemConfig,
-        imageClient: imageClient,
-        eventLoopGroup: app.eventLoopGroup
-    )
-    app.storage[NetworkRelayManagerKey.self] = relayManager
-    let publishedPortManager = PublishedPortManager(
-        eventLoopGroup: app.eventLoopGroup,
-        logger: Logger(label: "socktainer.ports"),
-        relayProvider: relayManager
-    )
-    app.storage[PublishedPortManagerKey.self] = publishedPortManager
-    await PublishedPortManagerRegistry.shared.configure(publishedPortManager)
-    app.lifecycle.use(PublishedPortManagerLifecycle(manager: publishedPortManager))
+    let dynamicPortAllocator = DynamicPortAllocator(logger: Logger(label: "socktainer.ports"))
+    app.storage[DynamicPortAllocatorKey.self] = dynamicPortAllocator
+    await DynamicPortAllocatorRegistry.shared.configure(dynamicPortAllocator)
+    app.lifecycle.use(DynamicPortAllocatorLifecycle(allocator: dynamicPortAllocator))
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
     let volumeClient = ClientVolumeService()
@@ -321,7 +309,6 @@ func configure(_ app: Application) async throws {
     }
     let recoveredLifecycleMonitor = RecoveredContainerLifecycleMonitor(
         client: containerClient,
-        portManager: publishedPortManager,
         dnsServer: dnsServer,
         healthManager: healthCheckManager,
         logger: app.logger,
@@ -351,8 +338,9 @@ func configure(_ app: Application) async throws {
     }
     await recoveredLifecycleMonitor.start(containers: recoveredContainers)
 
-    // Sidecar adoption and network reaping (in that order — a network whose only
-    // member was its sidecar must appear empty to the reaper) are best-effort
+    // Obsolete relay migration, DNS-sidecar adoption, and network reaping (in
+    // that order — a network whose only member was infrastructure must appear
+    // empty to the reaper) are best-effort
     // housekeeping over XPC calls that hang indefinitely when the runtime is
     // wedged (apple/container#1884). Time-box them: a daemon that skips
     // housekeeping still serves clients, one that never binds its socket serves
@@ -364,8 +352,11 @@ func configure(_ app: Application) async throws {
     } else {
         let housekeepingLogger = app.logger
         let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+            await ObsoleteRelayResourceMigration.removeOwnedResources(
+                ownerID: containerInstanceOwnerID,
+                logger: housekeepingLogger
+            )
             await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
-            await relayManager.adoptOrRemoveSidecarsFromPreviousRun()
             await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
         }
         if !housekeepingFinished {

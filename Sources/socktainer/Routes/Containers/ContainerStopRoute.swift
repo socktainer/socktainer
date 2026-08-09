@@ -45,7 +45,7 @@ extension ContainerStopRoute {
             }
 
             if let nativeID = snapshot?.id {
-                await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeID)
+                await req.application.storage[DynamicPortAllocatorKey.self]?.release(nativeID: nativeID)
             }
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
