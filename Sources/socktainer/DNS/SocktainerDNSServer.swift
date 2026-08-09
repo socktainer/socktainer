@@ -218,11 +218,11 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
         // QDCOUNT > 1 → FORMERR is answered in handleLocalQuery (fast path).
         guard let (qname, qtype, questionEnd) = parseQuestion(packet, offset: 12) else {
+            // Malformed question — no end to strip; forward as-is.
             return forwardToUpstream(packet)
         }
 
         // Response skeleton: header + question, any additional sections dropped.
-        // Upstream forwarding below still uses the original packet.
         let responsePacket = makeResponsePacket(packet, questionEnd: questionEnd)
 
         let normalized = Self.normalize(qname)
@@ -253,7 +253,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
             if known { return buildNodataResponse(packet: responsePacket) }
         }
 
-        return forwardToUpstream(packet)
+        // Forward without EDNS0: our 512-byte recv buffer can't hold a large response.
+        return forwardToUpstream(makeQueryPacket(packet, questionEnd: questionEnd))
     }
 
     private func parseQuestion(_ packet: [UInt8], offset: Int) -> (String, UInt16, Int)? {
@@ -294,6 +295,16 @@ final class SocktainerDNSServer: @unchecked Sendable {
     /// dropped), so the answer lands directly after the question, where clients parse it.
     private func makeResponsePacket(_ packet: [UInt8], questionEnd: Int) -> [UInt8] {
         makeResponseHeader(packet) + Array(packet[12..<questionEnd])
+    }
+
+    /// Query skeleton forwarded upstream: header + question with any additional records
+    /// (e.g. an EDNS0 OPT) dropped and ARCOUNT zeroed, so the packet stays well-formed.
+    private func makeQueryPacket(_ packet: [UInt8], questionEnd: Int) -> [UInt8] {
+        var query = Array(packet.prefix(12))
+        query[10] = 0  // ARCOUNT=0
+        query[11] = 0
+        query += Array(packet[12..<questionEnd])
+        return query
     }
 
     private func buildAResponse(packet: [UInt8], ip: [UInt8]) -> [UInt8] {
