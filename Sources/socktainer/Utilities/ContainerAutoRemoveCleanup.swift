@@ -43,7 +43,7 @@ enum ContainerAutoRemoveCleanup {
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
-        await DynamicPortAllocatorRegistry.shared.release(nativeID: nativeId)
+        await PublishedPortManagerRegistry.shared.close(nativeID: nativeId)
         try? await DockerContainerMetadataStore.shared.remove(nativeID: nativeId)
         if let rootDescriptor {
             await leaseReconciler.reconcile(rootDescriptor: rootDescriptor)

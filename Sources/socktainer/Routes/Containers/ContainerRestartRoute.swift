@@ -27,11 +27,29 @@ extension ContainerRestartRoute {
 
             if let nativeId = snapshot?.id {
                 await ContainerRestartState.shared.reset(id: nativeId)
-                await req.application.storage[DynamicPortAllocatorKey.self]?.release(nativeID: nativeId)
+                await req.application.storage[PublishedPortManagerKey.self]?.close(nativeID: nativeId)
             }
 
             do {
-                try await client.restart(id: id, signal: signal, timeout: timeout)
+                if let snapshot, !snapshot.configuration.publishedPorts.isEmpty,
+                    let appSupportURL = req.application.storage[AppleContainerAppSupportUrlKey.self]
+                {
+                    try await DockerContainerMetadataStore.shared.adopt(
+                        nativeID: snapshot.id,
+                        name: snapshot.id,
+                        publishedPorts: snapshot.configuration.publishedPorts
+                    )
+                    try await client.stop(id: id, signal: signal, timeout: timeout)
+                    var stopped = snapshot
+                    if let refreshed = try await client.getContainer(nativeID: snapshot.id) { stopped = refreshed }
+                    try ApplePublishedPortCompatibility.suppressNativeForwarder(
+                        container: stopped,
+                        appSupportURL: appSupportURL
+                    )
+                    try await client.start(id: id, detachKeys: nil)
+                } else {
+                    try await client.restart(id: id, signal: signal, timeout: timeout)
+                }
             } catch ClientContainerError.notFound {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
@@ -74,6 +92,7 @@ extension ContainerRestartRoute {
                 id: id, client: client, dnsServer: dnsServer, healthManager: healthManager, logger: req.logger
             )
             if let snap = restartedSnapshot {
+                try await req.application.storage[PublishedPortManagerKey.self]?.reconcile(container: snap)
                 let restartedName = await DockerContainerMetadataStore.shared.name(nativeID: snap.id)
                 let eventId = DockerContainerID.hexId(for: snap)
                 let restartPolicy = RestartPolicyManager.decode(from: snap.configuration.labels)
