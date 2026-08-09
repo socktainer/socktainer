@@ -149,6 +149,7 @@ struct ContainerStatsTests {
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
         let stats = RESTContainerStats.build(
             id: "c1",
+            name: "web",
             prev: makeSample(cpuUsec: 1_000_000, memUsage: 64_000_000, memLimit: 2_000_000_000),
             curr: makeSample(
                 cpuUsec: 2_000_000, memUsage: 128_000_000, memLimit: 2_000_000_000,
@@ -158,6 +159,7 @@ struct ContainerStatsTests {
         let data = try JSONEncoder().encode(stats)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         #expect(json?["id"] as? String == "c1")
+        #expect(json?["name"] as? String == "web")
         #expect(json?["cpu_stats"] != nil)
         #expect(json?["memory_stats"] != nil)
         #expect(json?["networks"] != nil)

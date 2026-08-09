@@ -43,6 +43,7 @@ struct ContainerStatsRoute: RouteCollection {
                 throw Abort(.notFound, reason: "No such container: \(id)")
             }
             let nativeID = container.id
+            let name = await DockerContainerMetadataStore.shared.name(nativeID: nativeID)
 
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: "application/json")
@@ -63,7 +64,7 @@ struct ContainerStatsRoute: RouteCollection {
                                 guard let currSample = try? await client.stats(nativeID: nativeID) else { break }
                                 let currRead = Date()
                                 let stats = RESTContainerStats.build(
-                                    id: id, prev: prevSample, curr: currSample,
+                                    id: id, name: name, prev: prevSample, curr: currSample,
                                     prevRead: prevRead, currRead: currRead)
                                 if let data = try? JSONEncoder().encode(stats) {
                                     var buf = sharedAllocator.buffer(capacity: data.count + 1)
@@ -81,7 +82,7 @@ struct ContainerStatsRoute: RouteCollection {
                             guard let currSample = try? await client.stats(nativeID: nativeID) else { return }
                             let currRead = Date()
                             let stats = RESTContainerStats.build(
-                                id: id, prev: prevSample, curr: currSample,
+                                id: id, name: name, prev: prevSample, curr: currSample,
                                 prevRead: prevRead, currRead: currRead)
                             if let data = try? JSONEncoder().encode(stats) {
                                 var buf = sharedAllocator.buffer(capacity: data.count)
