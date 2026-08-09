@@ -1,11 +1,28 @@
 import Foundation
 import Testing
 import Vapor
+import VaporTesting
 
 @testable import socktainer
 
 @Suite("Docker events query semantics")
 struct EventsRouteFilterTests {
+    @Test("event stream flushes immediately before the first event")
+    func streamFlushesImmediately() async throws {
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: EventsRoute(client: EventsHealthCheckClient()))
+
+            try await app.testing().test(.GET, "/v1.51/events?until=0") { response async in
+                #expect(response.status == .ok)
+                #expect(response.body.getString(at: 0, length: response.body.readableBytes) == "\n")
+            }
+        }
+    }
+
     @Test("container names and Docker ID prefixes round-trip through event filters")
     func containerIdentityFilter() throws {
         let id = String(repeating: "a", count: 64)
@@ -94,4 +111,8 @@ struct EventsRouteFilterTests {
         #expect(await iterator.next()?.id == "two")
         #expect(await iterator.next() == nil)
     }
+}
+
+private struct EventsHealthCheckClient: ClientHealthCheckProtocol {
+    func ping() async throws {}
 }

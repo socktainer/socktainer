@@ -1,6 +1,8 @@
 import ContainerResource
 import Foundation
 import Testing
+import Vapor
+import VaporTesting
 
 @testable import socktainer
 
@@ -160,5 +162,122 @@ struct ContainerStatsTests {
         #expect(json?["memory_stats"] != nil)
         #expect(json?["networks"] != nil)
         #expect(json?["pids_stats"] != nil)
+    }
+
+    @Test("Stats resolves Docker IDs before sampling the Apple container")
+    func resolvesDockerIDToNativeID() async throws {
+        let dockerID = String(repeating: "a", count: 64)
+        let nativeID = "compose-project-service-1"
+        let snapshot = try makeContainerSnapshot(
+            nativeId: nativeID,
+            networks: [],
+            labels: [:],
+            status: .running
+        )
+        let client = ContainerStatsClientMock(
+            requestReference: dockerID,
+            snapshot: snapshot,
+            samples: [makeSample(cpuUsec: 1), makeSample(cpuUsec: 2)]
+        )
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(
+                collection: ContainerStatsRoute(
+                    client: client,
+                    sampleIntervalNanoseconds: 0
+                )
+            )
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/containers/\(dockerID)/stats?stream=false"
+            ) { response async throws in
+                #expect(response.status == .ok)
+                let stats = try response.content.decode(RESTContainerStats.self)
+                #expect(stats.id == dockerID)
+            }
+        }
+
+        #expect(await client.resolvedReferences() == [dockerID])
+        #expect(await client.sampledNativeIDs() == [nativeID, nativeID])
+    }
+
+    @Test("Streaming one-shot emits one sample and closes")
+    func streamingOneShotCloses() async throws {
+        let dockerID = String(repeating: "b", count: 64)
+        let nativeID = "native-one-shot"
+        let snapshot = try makeContainerSnapshot(
+            nativeId: nativeID,
+            networks: [],
+            labels: [:],
+            status: .running
+        )
+        let client = ContainerStatsClientMock(
+            requestReference: dockerID,
+            snapshot: snapshot,
+            samples: [makeSample(cpuUsec: 1), makeSample(cpuUsec: 2)]
+        )
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(
+                collection: ContainerStatsRoute(
+                    client: client,
+                    sampleIntervalNanoseconds: 0
+                )
+            )
+
+            try await app.testing().test(
+                .GET,
+                "/v1.51/containers/\(dockerID)/stats?stream=true&one-shot=true"
+            ) { response async throws in
+                #expect(response.status == .ok)
+                let stats = try response.content.decode(RESTContainerStats.self)
+                #expect(stats.id == dockerID)
+            }
+        }
+
+        #expect(await client.sampledNativeIDs() == [nativeID, nativeID])
+    }
+}
+
+private actor ContainerStatsClientMock: ContainerStatsClientProtocol {
+    let requestReference: String
+    let snapshot: ContainerSnapshot
+    var samples: [ContainerStats]
+    var references: [String] = []
+    var nativeIDs: [String] = []
+
+    init(
+        requestReference: String,
+        snapshot: ContainerSnapshot,
+        samples: [ContainerStats]
+    ) {
+        self.requestReference = requestReference
+        self.snapshot = snapshot
+        self.samples = samples
+    }
+
+    func getContainer(id: String) -> ContainerSnapshot? {
+        references.append(id)
+        return id == requestReference ? snapshot : nil
+    }
+
+    func stats(nativeID: String) throws -> ContainerStats {
+        nativeIDs.append(nativeID)
+        return samples.removeFirst()
+    }
+
+    func resolvedReferences() -> [String] {
+        references
+    }
+
+    func sampledNativeIDs() -> [String] {
+        nativeIDs
     }
 }

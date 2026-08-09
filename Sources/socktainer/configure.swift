@@ -156,7 +156,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerResizeRoute(client: containerClient))
     try app.register(collection: ContainerRestartRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
-    try app.register(collection: ContainerStatsRoute())
+    try app.register(collection: ContainerStatsRoute(client: containerClient))
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerTopRoute())
     try app.register(collection: ContainerUnpauseRoute())

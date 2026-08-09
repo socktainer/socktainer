@@ -120,6 +120,19 @@ extension EventsRoute {
             response.headers.add(name: .contentType, value: "application/json")
 
             response.body = .init(asyncStream: { writer in
+                // Flush the response head immediately. Docker CLI opens /events
+                // before starting no-argument commands such as `docker stats`;
+                // without an initial body write, Vapor waits for the first real
+                // event and the CLI never proceeds to the command's API calls.
+                // JSON decoders accept this newline as leading whitespace.
+                var preamble = req.application.allocator.buffer(capacity: 1)
+                preamble.writeString("\n")
+                do {
+                    try await writer.write(.buffer(preamble))
+                } catch {
+                    return
+                }
+
                 for await event in stream {
                     if let until, event.timeNano > until { break }
                     guard filter.matches(event) else { continue }

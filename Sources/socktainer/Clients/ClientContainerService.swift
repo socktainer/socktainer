@@ -91,6 +91,15 @@ protocol ClientContainerProtocol: Sendable {
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
 
+/// The narrow container-service surface needed by the Docker stats route.
+///
+/// Docker-facing references (names and Docker-style IDs) must first be resolved
+/// to the native Apple container ID before requesting runtime statistics.
+protocol ContainerStatsClientProtocol: Sendable {
+    func getContainer(id: String) async throws -> ContainerSnapshot?
+    func stats(nativeID: String) async throws -> ContainerStats
+}
+
 extension ClientContainerProtocol {
     /// Private runtime lookup seam. Test clients whose Docker and native names are
     /// identical can use this default; the live client bypasses public alias rules.
@@ -110,7 +119,7 @@ enum ClientContainerError: Error {
     case unsupportedCondition(ContainerWaitCondition)
 }
 
-struct ClientContainerService: ClientContainerProtocol {
+struct ClientContainerService: ClientContainerProtocol, ContainerStatsClientProtocol {
     private let containerClient = ReconnectingContainerClient(makeClient: { ContainerClient() })
     private let imageReferenceResolver: (any ImageReferenceResolving)?
     private let imageLeaseReconciler: any ContainerImageLeaseReconciling
@@ -501,6 +510,10 @@ struct ClientContainerService: ClientContainerProtocol {
         } catch let error as ContainerizationError where error.code == .notFound {
             return nil
         }
+    }
+
+    func stats(nativeID: String) async throws -> ContainerStats {
+        try await containerClient.withClient { try await $0.stats(id: nativeID) }
     }
 
     func enforceContainerRunning(container: ContainerSnapshot) throws {
