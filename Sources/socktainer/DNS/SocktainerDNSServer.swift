@@ -174,7 +174,10 @@ final class SocktainerDNSServer: @unchecked Sendable {
         guard packet.count >= 12 else { return nil }
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
-        guard let (qname, qtype, questionEnd) = parseQuestionSection(packet) else { return nil }
+        // RFC 9619: QDCOUNT > 1 is FORMERR.
+        let qd = (UInt16(packet[4]) << 8) | UInt16(packet[5])
+        guard qd <= 1 else { return buildFormerrResponse(packet: packet) }
+        guard let (qname, qtype, questionEnd) = parseQuestion(packet, offset: 12) else { return nil }
         // Response skeleton: header + question, any additional sections dropped.
         let responsePacket = makeResponsePacket(packet, questionEnd: questionEnd)
         let normalized = Self.normalize(qname)
@@ -213,7 +216,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
 
-        guard let (qname, qtype, questionEnd) = parseQuestionSection(packet) else {
+        // QDCOUNT > 1 → FORMERR is answered in handleLocalQuery (fast path).
+        guard let (qname, qtype, questionEnd) = parseQuestion(packet, offset: 12) else {
             return forwardToUpstream(packet)
         }
 
@@ -252,7 +256,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return forwardToUpstream(packet)
     }
 
-    private func parseOneQuestion(_ packet: [UInt8], offset: Int) -> (String, UInt16, Int)? {
+    private func parseQuestion(_ packet: [UInt8], offset: Int) -> (String, UInt16, Int)? {
         var pos = offset
         var labels: [String] = []
         while pos < packet.count {
@@ -270,26 +274,9 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return (labels.joined(separator: "."), qtype, pos)
     }
 
-    /// Parses all QDCOUNT questions; returns the first question's name/type and the
-    /// offset past the last, or nil if malformed.
-    private func parseQuestionSection(_ packet: [UInt8]) -> (String, UInt16, Int)? {
-        let qd = Int((UInt16(packet[4]) << 8) | UInt16(packet[5]))
-        guard qd >= 1 else { return nil }
-        var pos = 12
-        guard let (qname, qtype, firstEnd) = parseOneQuestion(packet, offset: pos) else { return nil }
-        pos = firstEnd
-        for _ in 1..<qd {
-            guard let (_, _, next) = parseOneQuestion(packet, offset: pos) else { return nil }
-            pos = next
-        }
-        return (qname, qtype, pos)
-    }
-
-    /// Response skeleton shared by the builders: header + question with any additional
-    /// records (e.g. an EDNS0 OPT) dropped, so the answer lands directly after the
-    /// question, where clients parse it.
-    private func makeResponsePacket(_ packet: [UInt8], questionEnd: Int) -> [UInt8] {
-        var response = Array(packet[0..<questionEnd])
+    /// DNS response header: QR=1, the query's RD echoed, AN/NS/AR counts zeroed.
+    private func makeResponseHeader(_ packet: [UInt8]) -> [UInt8] {
+        var response = Array(packet.prefix(12))
         let rd = (UInt16(packet[2]) << 8 | UInt16(packet[3])) & 0x0100
         let rflags: UInt16 = 0x8000 | rd  // QR=1
         response[2] = UInt8(rflags >> 8)
@@ -301,6 +288,12 @@ final class SocktainerDNSServer: @unchecked Sendable {
         response[10] = 0  // ARCOUNT=0
         response[11] = 0
         return response
+    }
+
+    /// Header + question skeleton shared by the answer builders (additional records
+    /// dropped), so the answer lands directly after the question, where clients parse it.
+    private func makeResponsePacket(_ packet: [UInt8], questionEnd: Int) -> [UInt8] {
+        makeResponseHeader(packet) + Array(packet[12..<questionEnd])
     }
 
     private func buildAResponse(packet: [UInt8], ip: [UInt8]) -> [UInt8] {
@@ -328,6 +321,15 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private func buildNxdomainResponse(packet: [UInt8]) -> [UInt8] {
         var response = packet
         response[3] |= 0x03  // RCODE=3 (NXDOMAIN)
+        return response
+    }
+
+    // FORMERR (RCODE=1): header only, question dropped, so counts stay consistent.
+    private func buildFormerrResponse(packet: [UInt8]) -> [UInt8] {
+        var response = makeResponseHeader(packet)
+        response[3] |= 0x01  // RCODE=1 (FORMERR)
+        response[4] = 0  // QDCOUNT=0
+        response[5] = 0
         return response
     }
 

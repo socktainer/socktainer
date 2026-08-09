@@ -170,36 +170,44 @@ struct SocktainerDNSServerTests {
 
 // MARK: - DNS query behaviour
 
-/// Sends a minimal DNS A or AAAA query via UDP and returns the RCODE from the response.
-private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
+/// Sends a minimal DNS query (one question per `names` entry) via UDP and returns the RCODE.
+private func dnsRcode(type: UInt16, names: [String], port: Int) -> UInt8? {
     guard
-        let response = sendDnsQuery(makeDnsQuery(name: name, type: type, edns0: false), port: port),
+        let response = sendDnsQuery(makeDnsQuery(names: names, type: type, edns0: false), port: port),
         response.count >= 4
     else { return nil }
     return response[3] & 0x0F
 }
 
-/// Builds a DNS query packet (ID 0x1234, RD=1), optionally with an EDNS0 OPT
-/// additional record (ARCOUNT=1, UDP payload 4096) like real resolvers send.
-private func makeDnsQuery(name: String, type: UInt16, edns0: Bool) -> [UInt8] {
-    var qname = [UInt8]()
-    for label in name.split(separator: ".") {
-        let bytes = Array(label.utf8)
-        qname.append(UInt8(bytes.count))
-        qname.append(contentsOf: bytes)
+/// Builds a DNS query packet (ID 0x1234, RD=1): one question per `names` entry
+/// (QDCOUNT = names.count), optionally with an EDNS0 OPT additional record
+/// (ARCOUNT=1, UDP payload 4096) like real resolvers send.
+private func makeDnsQuery(names: [String], type: UInt16, edns0: Bool) -> [UInt8] {
+    func qnameBytes(_ name: String) -> [UInt8] {
+        var qname = [UInt8]()
+        for label in name.split(separator: ".") {
+            let bytes = Array(label.utf8)
+            qname.append(UInt8(bytes.count))
+            qname.append(contentsOf: bytes)
+        }
+        qname.append(0)
+        return qname
     }
-    qname.append(0)
 
     var packet = [UInt8]()
     packet += [0x12, 0x34, 0x01, 0x00]  // ID + RD=1 query
-    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00]  // QDCOUNT=1
+    packet += [UInt8(names.count >> 8), UInt8(names.count & 0xFF)]  // QDCOUNT
+    packet += [0x00, 0x00]  // ANCOUNT=0
+    packet += [0x00, 0x00]  // NSCOUNT=0
     if edns0 {
         packet += [0x00, 0x01]  // ARCOUNT=1
     } else {
-        packet += [0x00, 0x00]
+        packet += [0x00, 0x00]  // ARCOUNT=0
     }
-    packet += qname
-    packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+    for name in names {
+        packet += qnameBytes(name)
+        packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+    }
     if edns0 {
         // EDNS0 OPT record: root name, TYPE=41, CLASS=4096 (UDP payload), TTL=0, RDLEN=0
         packet += [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
@@ -242,9 +250,9 @@ private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
 /// Sends an EDNS0-OPT query and returns the response's ARCOUNT and the bytes remaining
 /// after the question and answer sections. Both are 0 for a well-formed response — an
 /// echoed OPT record or trailing bytes would make them nonzero.
-private func dnsResponseTail(type: UInt16, name: String, port: Int) -> (arcount: Int, remaining: Int)? {
+private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcount: Int, remaining: Int)? {
     guard
-        let response = sendDnsQuery(makeDnsQuery(name: name, type: type, edns0: true), port: port),
+        let response = sendDnsQuery(makeDnsQuery(names: names, type: type, edns0: true), port: port),
         response.count >= 12
     else { return nil }
     let qd = Int((UInt16(response[4]) << 8) | UInt16(response[5]))
@@ -287,7 +295,7 @@ struct SocktainerDNSQueryTests {
             return
         }
         server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
-        let rcode = dnsRcode(type: 1, name: "supabase_db_supabase", port: port)
+        let rcode = dnsRcode(type: 1, names: ["supabase_db_supabase"], port: port)
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
     }
 
@@ -300,7 +308,7 @@ struct SocktainerDNSQueryTests {
         }
         // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 1, name: "no-such-container", port: port)
+        let rcode = dnsRcode(type: 1, names: ["no-such-container"], port: port)
         #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding to 1.1.1.1")
     }
 
@@ -313,7 +321,7 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "db", ip: "192.168.67.3")
         // NODATA is RCODE=0 with zero answer records; the test checks RCODE only.
-        let rcode = dnsRcode(type: 28, name: "db", port: port)
+        let rcode = dnsRcode(type: 28, names: ["db"], port: port)
         #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not NXDOMAIN from 1.1.1.1")
     }
 
@@ -325,8 +333,21 @@ struct SocktainerDNSQueryTests {
             return
         }
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 28, name: "unknown-svc", port: port)
+        let rcode = dnsRcode(type: 28, names: ["unknown-svc"], port: port)
         #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+    }
+
+    @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
+    func qdcountGreaterThanOneReturnsFormerr() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19770, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+
+        // Two questions in one query — RFC 9619: must be refused with FORMERR.
+        let rcode = dnsRcode(type: 1, names: ["redis", "db"], port: port)
+        #expect(rcode == 1, "QDCOUNT > 1 must be answered with FORMERR (RCODE=1)")
     }
 
     // Regression: NS & AR sections should be dropped when their count is set to 0.
@@ -339,7 +360,7 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "redis", ip: "192.168.1.10")
 
-        guard let tail = dnsResponseTail(type: 1, name: "redis", port: port) else {
+        guard let tail = dnsResponseTail(type: 1, names: ["redis"], port: port) else {
             Issue.record("No response for EDNS0 A query")
             return
         }
@@ -356,7 +377,7 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "db", ip: "192.168.67.3")
 
-        guard let tail = dnsResponseTail(type: 28, name: "db", port: port) else {
+        guard let tail = dnsResponseTail(type: 28, names: ["db"], port: port) else {
             Issue.record("No response for EDNS0 AAAA query")
             return
         }
@@ -372,7 +393,7 @@ struct SocktainerDNSQueryTests {
             return
         }
 
-        guard let tail = dnsResponseTail(type: 1, name: "no-such-container", port: port) else {
+        guard let tail = dnsResponseTail(type: 1, names: ["no-such-container"], port: port) else {
             Issue.record("No response for EDNS0 A query")
             return
         }
