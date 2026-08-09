@@ -25,7 +25,9 @@ MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
 # Build information - only shows real version if exactly on a tagged commit
 export BUILD_VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null || echo "0.0.0-dev")
 export BUILD_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-export BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Keep debug and test manifests stable so local rebuilds can reuse BuildInfo.
+# Release builds override this with the actual build timestamp below.
+export BUILD_TIME ?= development
 # Build information - docker engine API versions
 export DOCKER_ENGINE_API_MIN_VERSION := v1.32
 export DOCKER_ENGINE_API_MAX_VERSION := v1.51
@@ -46,6 +48,7 @@ socktainer: build
 
 .PHONY: release
 release: BUILD_CONFIGURATION = release
+release: BUILD_TIME = $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 release: all
 
 .PHONY: version
