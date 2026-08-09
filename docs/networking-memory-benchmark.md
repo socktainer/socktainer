@@ -78,7 +78,8 @@ swap samples are intentionally disabled by default. Set
 system pressure cannot be attributed safely while unrelated containers exist.
 
 The script records three stable samples for idle, DNS activity, and published
-port traffic, then records three create/restart/delete lifecycle cycles. It
+port traffic, restarts the Socktainer daemon while the disposable resources
+remain alive, then records three create/restart/delete lifecycle cycles. It
 writes:
 
 - `/usr/bin/footprint -f bytes --noCategories` per Socktainer, API-server,
@@ -100,23 +101,25 @@ host physical footprint.
 
 | Component | Before: host physical footprint | After architecture | Notes |
 | --- | ---: | ---: | --- |
-| Socktainer daemon | 16.3 MB | 23,637,371 B / 22.54 MiB idle mean | Debug binary; remained bounded across the short scenarios. |
-| container-apiserver | 8.5 MB | 10,983,317 B / 10.47 MiB idle mean | Shared Apple runtime process. |
-| 2 workload VMs | 905.6 MiB | 490,467,451 B / 467.75 MiB idle mean for 4 disposable PostgreSQL VMs | Workload count differs; not used for the helper comparison. |
-| 2 DNS helper VMs | 449.3 MiB | 495,284,850 B / 472.34 MiB idle mean | 200 MiB configured per helper; actual host footprint is measured. |
+| Socktainer daemon | 16.3 MB | 24,052,456 B / 22.94 MiB idle mean | Debug binary; remained bounded across the short scenarios and daemon restart. |
+| container-apiserver | 8.5 MB | 10,431,723 B / 9.95 MiB idle mean | Shared Apple runtime process. |
+| 2 workload VMs | 905.6 MiB | 2,012,889,643 B / 1,919.64 MiB idle mean for 4 disposable PostgreSQL VMs | Workload count differs; not used for the helper comparison. |
+| 2 DNS helper VMs | 449.3 MiB | 494,842,507 B / 471.92 MiB idle mean | 200 MiB configured per helper; actual host footprint is measured. |
 | 2 relay helper VMs | 475.8 MiB | 0 | Native Apple published ports replace them. |
-| All four helpers | 925.1 MiB | 472.34 MiB idle mean for 2 DNS helpers | 452.76 MiB / 48.94% measured reduction. The configured 200 MiB floor alone permits at most 56.8%; the 70% goal is not reachable with one alias-capable helper per network under this platform floor. |
+| All four helpers | 925.1 MiB | 471.92 MiB idle mean for 2 DNS helpers | 453.18 MiB / 48.99% measured reduction. The configured 200 MiB floor alone permits at most 56.8%; the 70% goal is not reachable with one alias-capable helper per network under this platform floor. |
 | Complete attributable host footprint | 1,972,300,288 B / 1.84 GiB | not sampled in this run | Whole-system sampling was skipped to avoid benchmarking the live EasyLink/Glass workloads. |
 
 The disposable run used two isolated networks, four PostgreSQL containers, four
-uniquely named volumes, three samples per short scenario, and three lifecycle
-cycles. DNS succeeded on both networks (`192.168.248.4` and `192.168.247.4`).
-Apple’s native published TCP ports accepted IPv4 traffic on `127.0.0.1:51880`
-and IPv6 traffic on `[::1]:51883`. Helper totals were 472.34 MiB idle, 472.85
-MiB during DNS activity, 472.95 MiB during port traffic, and 473.24 MiB across
-lifecycle samples; this is bounded short-scenario variation, not a monotonic
-helper leak. System pressure and swap must be recorded separately on a
-disposable-only host with the opt-in flag.
+uniquely named volumes, three samples per short scenario, one daemon restart,
+and three lifecycle cycles. DNS succeeded on both networks (`192.168.248.4` and
+`192.168.247.4`).
+Apple’s native published TCP ports accepted IPv4 traffic on `127.0.0.1:52402`
+and IPv6 traffic on `[::1]:52407`. Helper totals were 471.92 MiB idle, 472.42
+MiB during DNS activity, 472.88 MiB during port traffic, and 473.05 MiB after
+daemon restart; the lifecycle samples remained bounded, with one final sample
+coinciding with helper teardown. This is bounded short-scenario variation, not
+a monotonic helper leak. System pressure and swap must be recorded separately
+on a disposable-only host with the opt-in flag.
 
 The hard floor is why the result is reported honestly rather than by lowering a
 configuration below what Apple accepts or excluding the remaining DNS VMs from
