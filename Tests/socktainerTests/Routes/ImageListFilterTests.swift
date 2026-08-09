@@ -49,6 +49,14 @@ struct ImageListFilterTests {
         #expect(!ImageListFilter.referenceMatches(patterns: ["alpine:3.*"], repoTags: ["docker.io/library/alpine:latest"]))
     }
 
+    @Test("A ? glob matches exactly one character, like path.Match")
+    func questionMarkGlob() {
+        #expect(ImageListFilter.referenceMatches(patterns: ["alp?ne"], repoTags: ["docker.io/library/alpine:latest"]))
+        #expect(!ImageListFilter.referenceMatches(patterns: ["alp?ne"], repoTags: ["docker.io/library/alpne:latest"]), "? must match exactly one character, not zero")
+        #expect(!ImageListFilter.referenceMatches(patterns: ["alp?ne"], repoTags: ["docker.io/library/alppine:latest"]), "? must match exactly one character, not two")
+        #expect(ImageListFilter.referenceMatches(patterns: ["alpine:3.1?"], repoTags: ["docker.io/library/alpine:3.18"]))
+    }
+
     @Test("A star does not cross the path separator, like path.Match")
     func starDoesNotCrossSlash() {
         // `*` matches a single-segment familiar name but not `user/app`.
