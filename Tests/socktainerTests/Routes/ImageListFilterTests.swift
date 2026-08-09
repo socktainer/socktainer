@@ -147,6 +147,41 @@ struct ImageListFilterTests {
         #expect(error?.reason == "invalid filter 'bogus'")
     }
 
+    @Test(
+        "Malformed JSON, a non-object top level, and an unsupported value shape are all a 400, like real Docker",
+        arguments: [
+            "not-json",
+            "[]",
+            #"{"reference": 1}"#,
+            #"{"reference": {"alpine": "yes"}}"#,
+            #"{"reference": {"alpine": 1}}"#,
+            #"{"reference": [1, 2]}"#,
+        ])
+    func parseInvalidShapeIs400(filterParam: String) {
+        let error = #expect(throws: Abort.self) {
+            try DockerImageFilterUtility.parseImageListFilters(filterParam: filterParam, logger: Logger(label: "test"))
+        }
+        #expect(error?.status == .badRequest, "filterParam: \(filterParam)")
+    }
+
+    @Test("An absent or empty filters param means no filter, not an error")
+    func parseAbsentOrEmptyIsNoFilter() throws {
+        let logger = Logger(label: "test")
+        #expect(try DockerImageFilterUtility.parseImageListFilters(filterParam: nil, logger: logger).isEmpty)
+        #expect(try DockerImageFilterUtility.parseImageListFilters(filterParam: "", logger: logger).isEmpty)
+    }
+
+    @Test("isJSONBool tells a real JSON boolean apart from a bridged NSNumber")
+    func isJSONBoolDistinguishesFromNumber() throws {
+        let data = #"{"a": true, "b": false, "c": 1, "d": 0, "e": "x"}"#.data(using: .utf8)!
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        #expect(DockerImageFilterUtility.isJSONBool(json["a"]!))
+        #expect(DockerImageFilterUtility.isJSONBool(json["b"]!))
+        #expect(!DockerImageFilterUtility.isJSONBool(json["c"]!), "a JSON 1 must not bridge to true")
+        #expect(!DockerImageFilterUtility.isJSONBool(json["d"]!), "a JSON 0 must not bridge to false")
+        #expect(!DockerImageFilterUtility.isJSONBool(json["e"]!))
+    }
+
     // MARK: - Helpers
 
     private static func summary(repoTags: [String]) -> RESTImageSummary {

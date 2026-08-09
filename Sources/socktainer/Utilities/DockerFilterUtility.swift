@@ -257,14 +257,23 @@ struct DockerImageFilterUtility {
     /// before, dangling, label, reference, since, and until, and rejects any
     /// other key with a 400 (filters.Validate); this normalizes the three JSON
     /// shapes docker clients send into `[key: [value]]`.
+    ///
+    /// An absent or empty `filters` param means "no filter" (200, unfiltered).
+    /// A non-empty param that fails to decode — malformed JSON, a non-object
+    /// top level, or a value that is not one of the three accepted shapes
+    /// (map of string->bool, array of strings, or a single string) — is a 400
+    /// `invalid filter`, matching real Docker's `filters.FromJSON`. Verified
+    /// against a live daemon: malformed JSON, `[]`, `{"reference": 1}`,
+    /// `{"reference": {"alpine": "yes"}}`, and `{"reference": [1, 2]}` all 400.
     static func parseImageListFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
         var parsedFilters: [String: [String]] = [:]
         let allowedKeys: Set<String> = ["before", "dangling", "label", "reference", "since", "until"]
 
-        guard let filterParam, let data = filterParam.data(using: .utf8) else { return parsedFilters }
-        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            logger.warning("Failed to decode image list filters")
+        guard let filterParam, !filterParam.isEmpty, let data = filterParam.data(using: .utf8) else {
             return parsedFilters
+        }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw Abort(.badRequest, reason: "invalid filter")
         }
         for (key, value) in json {
             guard allowedKeys.contains(key) else {
@@ -272,15 +281,35 @@ struct DockerImageFilterUtility {
             }
             // {"reference": {"alpine:*": true}} / {"reference": ["alpine:*"]} / {"reference": "alpine:*"}
             if let dict = value as? [String: Any] {
+                // `as? Bool` bridges any NSNumber (so a JSON `1` would pass as
+                // `true`); check the JSON node's real CF type instead so a
+                // numeric value here is rejected, matching real Docker.
+                guard dict.values.allSatisfy({ DockerImageFilterUtility.isJSONBool($0) }) else {
+                    throw Abort(.badRequest, reason: "invalid filter")
+                }
                 let keys = dict.compactMap { (k, v) in (v as? Bool == true) ? k : nil }
                 if !keys.isEmpty { parsedFilters[key] = keys }
-            } else if let arr = value as? [String] {
-                parsedFilters[key] = arr
+            } else if let arr = value as? [Any] {
+                guard let strings = arr as? [String] else {
+                    throw Abort(.badRequest, reason: "invalid filter")
+                }
+                parsedFilters[key] = strings
             } else if let str = value as? String {
                 parsedFilters[key] = [str]
+            } else {
+                throw Abort(.badRequest, reason: "invalid filter")
             }
         }
         return parsedFilters
+    }
+
+    /// True only for an actual JSON boolean node. `JSONSerialization` bridges
+    /// both JSON booleans and numbers to `NSNumber`, so plain `is Bool`/`as?
+    /// Bool` casts also accept a JSON `1`/`0` as `true`/`false` — checking the
+    /// underlying CoreFoundation type tells them apart.
+    static func isJSONBool(_ value: Any) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }
 
