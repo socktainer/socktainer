@@ -93,15 +93,41 @@ public struct AppleContainerVersionCheck {
         return error.isCode(.internalError) && error.message.hasPrefix("XPC timeout for request")
     }
 
+    /// What to do once a `VersionCheckError` has been classified.
+    enum CompatibilityAction: Equatable {
+        case proceedWithWarning(String)
+        case abort(String)
+    }
+
+    static func compatibilityAction(for error: VersionCheckError) -> CompatibilityAction {
+        switch error {
+        case .incompatibleVersion:
+            return .proceedWithWarning(
+                "⚠️  Apple Container compatibility warning:\n"
+                    + "   \(error.localizedDescription)\n"
+                    + "   Continuing anyway — most functionality works across nearby versions, but you may hit issues."
+            )
+        case .versionDetectionFailed, .appleContainerUnavailable:
+            return .abort(
+                "❌ Apple Container compatibility check failed:\n"
+                    + "   Error: \(error.localizedDescription)"
+            )
+        }
+    }
+
     /// Performs compatibility check with user-friendly output and exit if it fails
     public static func performCompatibilityCheck() async {
         do {
             try await checkCompatibility()
             print("✅ Apple Container compatibility check passed")
         } catch let error as VersionCheckError {
-            print("❌ Apple Container compatibility check failed:")
-            print("   Error: \(error.localizedDescription)")
-            exit(1)
+            switch compatibilityAction(for: error) {
+            case .proceedWithWarning(let message):
+                print(message)
+            case .abort(let message):
+                print(message)
+                exit(1)
+            }
         } catch {
             print("⚠️  Warning: Could not verify Apple Container compatibility: \(error)")
         }
