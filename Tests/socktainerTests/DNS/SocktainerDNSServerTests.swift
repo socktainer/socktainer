@@ -216,8 +216,94 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
     return nil
 }
 
+/// Sends a DNS A query with an EDNS0 OPT record appended to the ADDITIONAL section —
+/// matching what Go's resolver and `dig` send by default — and returns the raw response.
+private func dnsQueryWithEDNS0(name: String, port: Int) -> [UInt8]? {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x56, 0x78, 0x01, 0x00]  // ID + RD=1 query
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]  // QDCOUNT=1, ARCOUNT=1
+    packet += qname
+    packet += [0x00, 0x01, 0x00, 0x01]  // QTYPE=A, QCLASS=IN
+    // EDNS0 OPT pseudo-record: root name, TYPE=41, CLASS=4096 (UDP payload size), TTL=0, RDLENGTH=0
+    packet += [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+    var dst = sockaddr_in()
+    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst.sin_family = sa_family_t(AF_INET)
+    dst.sin_port = in_port_t(port).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
+
+    for attempt in 0..<5 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { continue }
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let sent = packet.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &dst) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, ptr.baseAddress!, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent > 0 else { continue }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = recv(fd, &buf, buf.count, 0)
+        if n > 0 { return Array(buf[0..<n]) }
+    }
+    return nil
+}
+
 @Suite("SocktainerDNSServer — query behaviour")
 struct SocktainerDNSQueryTests {
+
+    // Regression test for #329: the response used to reuse the entire raw query packet
+    // (including the client's trailing EDNS0 OPT record) as its base, so the OPT record
+    // ended up masquerading as the answer while the real A record became unaccounted
+    // trailing bytes. Go's resolver and `dig` both send EDNS0 by default.
+    @Test("A query with an EDNS0 OPT record still returns the real A record as the answer")
+    func aQueryWithEDNS0ReturnsCorrectAnswer() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "redis", ip: "192.168.67.5")
+        guard let response = dnsQueryWithEDNS0(name: "redis", port: port) else {
+            Issue.record("No response received")
+            return
+        }
+
+        let ancount = (UInt16(response[6]) << 8) | UInt16(response[7])
+        let arcount = (UInt16(response[10]) << 8) | UInt16(response[11])
+        #expect(ancount == 1, "must claim exactly one answer")
+        #expect(arcount == 0, "must not carry the client's EDNS0 OPT through as an additional record")
+
+        // Walk the question the same way the server does: QNAME labels, then QTYPE(2) + QCLASS(2).
+        var pos = 12
+        while pos < response.count, response[pos] != 0 {
+            pos += Int(response[pos]) + 1
+        }
+        pos += 1 + 4
+
+        let answerType = (UInt16(response[pos + 2]) << 8) | UInt16(response[pos + 3])
+        #expect(answerType == 1, "the record right after the question must be the A record, not the client's leftover OPT (type 41)")
+
+        let rdlength = (Int(response[pos + 10]) << 8) | Int(response[pos + 11])
+        let rdataStart = pos + 12
+        #expect(rdlength == 4)
+        #expect(Array(response[rdataStart..<(rdataStart + 4)]) == [192, 168, 67, 5])
+        #expect(response.count == rdataStart + 4, "response must not carry any leftover bytes from the client's OPT record")
+    }
 
     @Test("A query for registered single-label name returns RCODE 0 (NOERROR)")
     func aQueryKnownNameReturnsNoerror() throws {
