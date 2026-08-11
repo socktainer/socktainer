@@ -9,6 +9,7 @@ private actor RelayRecoveryFixture {
     private var statuses: [PortRelayProtocol.ConnectStatus]
     private(set) var creations = 0
     private(set) var replacements = 0
+    private(set) var probes = 0
 
     init(statuses: [PortRelayProtocol.ConnectStatus]) {
         self.statuses = statuses
@@ -22,12 +23,13 @@ private actor RelayRecoveryFixture {
     func replace() { replacements += 1 }
 
     func probe(_ socket: String) throws -> PortRelayProtocol.ConnectStatus {
+        probes += 1
         guard !statuses.isEmpty else { throw ExpectedFailure.exhausted }
         return statuses.removeFirst()
     }
 
-    func counts() -> (creations: Int, replacements: Int) {
-        (creations, replacements)
+    func counts() -> (creations: Int, replacements: Int, probes: Int) {
+        (creations, replacements, probes)
     }
 }
 
@@ -35,7 +37,9 @@ private actor RelayRecoveryFixture {
 struct NetworkRelayRecoveryTests {
     @Test("route failure replaces the relay once and accepts the recovered route")
     func replacesBrokenRoute() async throws {
-        let fixture = RelayRecoveryFixture(statuses: [.routeUnavailable, .ready])
+        let fixture = RelayRecoveryFixture(
+            statuses: Array(repeating: .routeUnavailable, count: 5) + [.ready]
+        )
 
         let socket = try await NetworkRelayManager.checkedRelayForTesting(
             createOrAdopt: { await fixture.createOrAdopt() },
@@ -47,12 +51,32 @@ struct NetworkRelayRecoveryTests {
         let counts = await fixture.counts()
         #expect(counts.creations == 2)
         #expect(counts.replacements == 1)
+        #expect(counts.probes == 6)
+    }
+
+    @Test("transient route failure recovers without replacing the relay")
+    func transientFailureIsRetried() async throws {
+        let fixture = RelayRecoveryFixture(
+            statuses: [.routeUnavailable, .routeUnavailable, .ready]
+        )
+
+        let socket = try await NetworkRelayManager.checkedRelayForTesting(
+            createOrAdopt: { await fixture.createOrAdopt() },
+            replace: { await fixture.replace() },
+            probe: { try await fixture.probe($0) }
+        )
+
+        #expect(socket == "/tmp/relay-1.sock")
+        let counts = await fixture.counts()
+        #expect(counts.creations == 1)
+        #expect(counts.replacements == 0)
+        #expect(counts.probes == 3)
     }
 
     @Test("persistent route failure is bounded to one replacement")
     func persistentFailureIsBounded() async {
         let fixture = RelayRecoveryFixture(
-            statuses: [.routeUnavailable, .routeUnavailable]
+            statuses: Array(repeating: .routeUnavailable, count: 10)
         )
 
         await #expect(throws: (any Error).self) {
@@ -65,6 +89,7 @@ struct NetworkRelayRecoveryTests {
         let counts = await fixture.counts()
         #expect(counts.creations == 2)
         #expect(counts.replacements == 1)
+        #expect(counts.probes == 10)
     }
 
     @Test(

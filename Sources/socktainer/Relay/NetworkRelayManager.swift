@@ -103,6 +103,9 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
                         destination: destination,
                         eventLoopGroup: eventLoopGroup
                     )
+                },
+                pause: {
+                    try await Task.sleep(for: .milliseconds(500))
                 }
             )
         }
@@ -217,12 +220,14 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
     static func checkedRelayForTesting(
         createOrAdopt: @escaping @Sendable () async throws -> String,
         replace: @escaping @Sendable () async -> Void,
-        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus
+        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus,
+        pause: @escaping @Sendable () async throws -> Void = {}
     ) async throws -> String {
         try await checkedRelay(
             createOrAdopt: createOrAdopt,
             replace: replace,
-            probe: probe
+            probe: probe,
+            pause: pause
         )
     }
 
@@ -393,14 +398,15 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
     private static func checkedRelay(
         createOrAdopt: @escaping @Sendable () async throws -> String,
         replace: @escaping @Sendable () async -> Void,
-        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus
+        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus,
+        pause: @escaping @Sendable () async throws -> Void
     ) async throws -> String {
         var socket = try await createOrAdopt()
-        var status = try await probe(socket)
+        var status = try await probeRoute(socket, probe: probe, pause: pause)
         if status == .routeUnavailable {
             await replace()
             socket = try await createOrAdopt()
-            status = try await probe(socket)
+            status = try await probeRoute(socket, probe: probe, pause: pause)
         }
         switch status {
         case .ready, .connectionRefused, .timedOut:
@@ -411,6 +417,20 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
                 message: "relay target probe failed with status \(status)"
             )
         }
+    }
+
+    private static func probeRoute(
+        _ socket: String,
+        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus,
+        pause: @escaping @Sendable () async throws -> Void
+    ) async throws -> PortRelayProtocol.ConnectStatus {
+        let maximumAttempts = 5
+        for attempt in 1...maximumAttempts {
+            let status = try await probe(socket)
+            if status != .routeUnavailable || attempt == maximumAttempts { return status }
+            try await pause()
+        }
+        return .failed
     }
 
     private static func removeRelayWork(
