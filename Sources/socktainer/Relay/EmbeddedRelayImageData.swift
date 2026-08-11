@@ -3,8 +3,8 @@ import Foundation
 
 enum SocktainerRelayImage {
     static let reference = "socktainer-port-relay:embedded"
-    static let artifactSHA256 = "706ea8e3b48885c643d359080f97df33b4f399b43bc68b4981c424fc481a7958"
-    static let rootDigest = "sha256:883341a21539574c78c16fcfbcda14b1d7e25640be9ea2aa55ef841c51e147dc"
+    static let artifactSHA256 = "d0be9d3c58c182e2b6a2dea62f29fb693bb5eed868834b1b775038b83c0e29a2"
+    static let rootDigest = "sha256:a1363bcc0d70bdd857bd26e88857c91d1fd89ded35ed18eab6c2123cacb78160"
 
     static var archiveData: Data {
         Data(

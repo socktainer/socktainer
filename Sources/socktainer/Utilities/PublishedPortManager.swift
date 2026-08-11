@@ -10,7 +10,10 @@ import Vapor
 protocol NetworkPortRelayProviding: Sendable {
     /// Ensures the network-scoped guest relay is running and returns the local
     /// Unix socket transported by Apple Container over vsock.
-    func ensureRelay(networkID: String) async throws -> String
+    func ensureRelay(
+        networkID: String,
+        checking destination: PortRelayProtocol.Destination
+    ) async throws -> String
 }
 
 /// Owns Docker's localhost listeners while delegating the guest-network hop to a
@@ -169,7 +172,15 @@ actor PublishedPortManager {
         // Always revalidate the relay, even when the frontend specification did
         // not change. The sidecar/runtime can disappear independently during an
         // Apple system restart while this in-memory listener remains active.
-        let relaySocketPath = try await relayProvider?.ensureRelay(networkID: endpoint.network)
+        let relayDestination = try PortRelayProtocol.Destination(
+            address: specifications[0].containerAddress,
+            port: specifications[0].containerPort,
+            transport: specifications[0].transport == .tcp ? .tcp : .udp
+        )
+        let relaySocketPath = try await relayProvider?.ensureRelay(
+            networkID: endpoint.network,
+            checking: relayDestination
+        )
         if active[container.id]?.specifications == specifications {
             logger.debug("Published ports for \(container.id) are already reconciled")
             return

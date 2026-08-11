@@ -7,8 +7,10 @@ use std::thread;
 use std::time::Duration;
 
 pub const MAGIC: [u8; 4] = *b"SKTR";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const PREFACE_SIZE: usize = 26;
+pub const ACK_MAGIC: [u8; 4] = *b"SKTA";
+pub const ACK_SIZE: usize = 8;
 pub const MAX_UDP_DATAGRAM: usize = 65_507;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -17,6 +19,32 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Transport {
     Tcp = 1,
     Udp = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ConnectStatus {
+    Ready = 0,
+    ConnectionRefused = 1,
+    RouteUnavailable = 2,
+    TimedOut = 3,
+    Denied = 4,
+    Failed = 255,
+}
+
+impl ConnectStatus {
+    pub fn encode(self) -> [u8; ACK_SIZE] {
+        [
+            ACK_MAGIC[0],
+            ACK_MAGIC[1],
+            ACK_MAGIC[2],
+            ACK_MAGIC[3],
+            VERSION,
+            self as u8,
+            0,
+            0,
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +187,7 @@ pub fn serve_connection(mut host: UnixStream, allowed: &[Cidr]) -> io::Result<()
         .iter()
         .any(|cidr| cidr.contains(preface.target.ip()))
     {
+        host.write_all(&ConnectStatus::Denied.encode())?;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "relay target is outside the configured network",
@@ -171,8 +200,18 @@ pub fn serve_connection(mut host: UnixStream, allowed: &[Cidr]) -> io::Result<()
 }
 
 fn relay_tcp(mut host: UnixStream, target: SocketAddr) -> io::Result<()> {
-    let mut guest = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT)?;
-    guest.set_nodelay(true)?;
+    let mut guest = match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+        Ok(guest) => guest,
+        Err(error) => {
+            host.write_all(&connect_status(&error).encode())?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = guest.set_nodelay(true) {
+        host.write_all(&ConnectStatus::Failed.encode())?;
+        return Err(error);
+    }
+    host.write_all(&ConnectStatus::Ready.encode())?;
     let mut host_reader = host.try_clone()?;
     let mut guest_reader = guest.try_clone()?;
 
@@ -217,12 +256,22 @@ fn write_datagram(mut output: impl Write, datagram: &[u8]) -> io::Result<()> {
 }
 
 fn relay_udp(mut host: UnixStream, target: SocketAddr) -> io::Result<()> {
-    let guest = UdpSocket::bind(if target.is_ipv4() {
+    let guest = match UdpSocket::bind(if target.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
-    })?;
-    guest.connect(target)?;
+    }) {
+        Ok(guest) => guest,
+        Err(error) => {
+            host.write_all(&ConnectStatus::Failed.encode())?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = guest.connect(target) {
+        host.write_all(&connect_status(&error).encode())?;
+        return Err(error);
+    }
+    host.write_all(&ConnectStatus::Ready.encode())?;
     guest.set_read_timeout(Some(Duration::from_secs(1)))?;
     let guest_reader = guest.try_clone()?;
     let mut host_reader = host.try_clone()?;
@@ -261,6 +310,15 @@ fn relay_udp(mut host: UnixStream, target: SocketAddr) -> io::Result<()> {
     Ok(())
 }
 
+fn connect_status(error: &io::Error) -> ConnectStatus {
+    match error.raw_os_error() {
+        Some(61 | 111) => ConnectStatus::ConnectionRefused,
+        Some(51 | 65 | 101 | 113) => ConnectStatus::RouteUnavailable,
+        Some(60 | 110) => ConnectStatus::TimedOut,
+        _ => ConnectStatus::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +350,7 @@ mod tests {
             target: "127.0.0.1:80".parse().unwrap(),
         }
         .encode();
-        bytes[4] = 2;
+        bytes[4] = VERSION.wrapping_add(1);
         assert_eq!(
             Preface::read_from(&bytes[..]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -338,11 +396,36 @@ mod tests {
             .encode(),
         )
         .unwrap();
+        let mut acknowledgement = [0u8; ACK_SIZE];
+        host.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, ConnectStatus::Ready.encode());
         host.write_all(b"select 1").unwrap();
         host.shutdown(Shutdown::Write).unwrap();
         let mut response = Vec::new();
         host.read_to_end(&mut response).unwrap();
         assert_eq!(response, b"row:1");
+    }
+
+    #[test]
+    fn tcp_refusal_is_reported_before_the_stream_closes() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = target.local_addr().unwrap();
+        drop(target);
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        thread::spawn(move || {
+            let _ = serve_connection(guest, &[Cidr::parse("127.0.0.0/8").unwrap()]);
+        });
+        host.write_all(
+            &Preface {
+                transport: Transport::Tcp,
+                target: address,
+            }
+            .encode(),
+        )
+        .unwrap();
+        let mut acknowledgement = [0u8; ACK_SIZE];
+        host.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, ConnectStatus::ConnectionRefused.encode());
     }
 
     #[test]
@@ -370,6 +453,9 @@ mod tests {
             .encode(),
         )
         .unwrap();
+        let mut acknowledgement = [0u8; ACK_SIZE];
+        host.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, ConnectStatus::Ready.encode());
         write_datagram(&mut host, b"first").unwrap();
         write_datagram(&mut host, b"second-packet").unwrap();
         assert_eq!(read_datagram(&mut host).unwrap().unwrap(), b"reply:first");
@@ -409,6 +495,9 @@ mod tests {
             .encode(),
         )
         .unwrap();
+        let mut acknowledgement = [0u8; ACK_SIZE];
+        host.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, ConnectStatus::Denied.encode());
         assert_eq!(
             worker.join().unwrap().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied

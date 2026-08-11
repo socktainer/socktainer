@@ -231,6 +231,67 @@ struct PublishedPortManagerTests {
             let requestedNetworks = await provider.requestedNetworks()
             #expect(requestedNetworks.count == 16)
             #expect(requestedNetworks.allSatisfy { $0 == "project_default" })
+            let destinations = await provider.requestedDestinations()
+            #expect(destinations.count == 16)
+            #expect(destinations.allSatisfy { $0.address == "192.168.99.4" })
+            #expect(!Self.canBindTCP(port: hostPort))
+            await manager.close(nativeID: nativeID)
+            #expect(Self.canBindTCP(port: hostPort))
+            try await DockerContainerMetadataStore.shared.remove(nativeID: nativeID)
+            await manager.shutdown()
+        }
+    }
+
+    @Test("same IP is re-probed and changed IP replaces the listener without leaking it")
+    func relayReconciliationRevalidatesAndReplaces() async throws {
+        try await withApp { app in
+            let nativeID = "published-port-relay-address-change"
+            let provider = RecordingRelayProvider(
+                socketPath: "/tmp/socktainer-relay-test-missing.sock"
+            )
+            let manager = PublishedPortManager(
+                eventLoopGroup: app.eventLoopGroup,
+                logger: Logger(label: "socktainer.tests.relay-address-change"),
+                relayProvider: provider
+            )
+            let requested = try PublishPort(
+                hostAddress: IPAddress("127.0.0.1"),
+                hostPort: 0,
+                containerPort: 5432,
+                proto: .tcp,
+                count: 1
+            )
+            let reservation = try await manager.reserveDynamicPorts([requested])
+            let hostPort = try #require(reservation.ports.first?.hostPort)
+            await manager.commit(reservation, nativeID: nativeID)
+            try await DockerContainerMetadataStore.shared.set(
+                nativeID: nativeID,
+                name: nativeID,
+                publishedPorts: reservation.ports
+            )
+            let original = try makeContainerSnapshot(
+                nativeId: nativeID,
+                ip: "192.168.99.4",
+                network: "project_default",
+                labels: [:],
+                status: .running
+            )
+            let changed = try makeContainerSnapshot(
+                nativeId: nativeID,
+                ip: "192.168.99.9",
+                network: "project_default",
+                labels: [:],
+                status: .running
+            )
+
+            try await manager.reconcile(container: original)
+            try await manager.reconcile(container: original)
+            try await manager.reconcile(container: changed)
+
+            #expect(
+                await provider.requestedDestinations().map(\.address) == [
+                    "192.168.99.4", "192.168.99.4", "192.168.99.9",
+                ])
             #expect(!Self.canBindTCP(port: hostPort))
             await manager.close(nativeID: nativeID)
             #expect(Self.canBindTCP(port: hostPort))
@@ -265,13 +326,19 @@ struct PublishedPortManagerTests {
 private actor RecordingRelayProvider: NetworkPortRelayProviding {
     private let socketPath: String
     private var networks: [String] = []
+    private var destinations: [PortRelayProtocol.Destination] = []
 
     init(socketPath: String) { self.socketPath = socketPath }
 
-    func ensureRelay(networkID: String) async throws -> String {
+    func ensureRelay(
+        networkID: String,
+        checking destination: PortRelayProtocol.Destination
+    ) async throws -> String {
         networks.append(networkID)
+        destinations.append(destination)
         return socketPath
     }
 
     func requestedNetworks() -> [String] { networks }
+    func requestedDestinations() -> [PortRelayProtocol.Destination] { destinations }
 }

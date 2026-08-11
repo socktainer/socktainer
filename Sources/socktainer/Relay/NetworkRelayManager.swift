@@ -63,22 +63,47 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
         try Self.ensurePrivateDirectory(self.runtimeRoot)
     }
 
-    func ensureRelay(networkID: String) async throws -> String {
+    func ensureRelay(
+        networkID: String,
+        checking destination: PortRelayProtocol.Destination
+    ) async throws -> String {
         let appSupportURL = appSupportURL
         let runtimeRoot = runtimeRoot
         let ownerID = ownerID
         let systemConfig = containerSystemConfig
         let imageClient = imageClient
         let eventLoopGroup = eventLoopGroup
+        let log = log
         return try await ensureRelayCoordinated(networkID: networkID) {
-            try await Self.ensureRelayWork(
-                networkID: networkID,
-                appSupportURL: appSupportURL,
-                runtimeRoot: runtimeRoot,
-                containerSystemConfig: systemConfig,
-                imageClient: imageClient,
-                ownerID: ownerID,
-                eventLoopGroup: eventLoopGroup
+            try await Self.checkedRelay(
+                createOrAdopt: {
+                    try await Self.ensureRelayWork(
+                        networkID: networkID,
+                        appSupportURL: appSupportURL,
+                        runtimeRoot: runtimeRoot,
+                        containerSystemConfig: systemConfig,
+                        imageClient: imageClient,
+                        ownerID: ownerID,
+                        eventLoopGroup: eventLoopGroup
+                    )
+                },
+                replace: {
+                    log.warning(
+                        "relay route to \(destination.address):\(destination.port) is unavailable on network \(networkID); replacing the network relay"
+                    )
+                    await Self.removeRelayWork(
+                        networkID: networkID,
+                        runtimeRoot: runtimeRoot,
+                        ownerID: ownerID
+                    )
+                },
+                probe: { socket in
+                    try await RelayRouteProbe.status(
+                        socketPath: socket,
+                        destination: destination,
+                        eventLoopGroup: eventLoopGroup
+                    )
+                }
             )
         }
     }
@@ -187,6 +212,18 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
         perform: @escaping @Sendable () async -> Void = {}
     ) async {
         await cleanupRelayCoordinated(networkID: networkID, perform: perform)
+    }
+
+    static func checkedRelayForTesting(
+        createOrAdopt: @escaping @Sendable () async throws -> String,
+        replace: @escaping @Sendable () async -> Void,
+        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus
+    ) async throws -> String {
+        try await checkedRelay(
+            createOrAdopt: createOrAdopt,
+            replace: replace,
+            probe: probe
+        )
     }
 
     func cleanupInProgressForTesting(networkID: String) -> Bool {
@@ -351,6 +388,45 @@ actor NetworkRelayManager: NetworkPortRelayProviding {
             try? FileManager.default.removeItem(atPath: hostSocket)
             throw error
         }
+    }
+
+    private static func checkedRelay(
+        createOrAdopt: @escaping @Sendable () async throws -> String,
+        replace: @escaping @Sendable () async -> Void,
+        probe: @escaping @Sendable (String) async throws -> PortRelayProtocol.ConnectStatus
+    ) async throws -> String {
+        var socket = try await createOrAdopt()
+        var status = try await probe(socket)
+        if status == .routeUnavailable {
+            await replace()
+            socket = try await createOrAdopt()
+            status = try await probe(socket)
+        }
+        switch status {
+        case .ready, .connectionRefused, .timedOut:
+            return socket
+        case .routeUnavailable, .denied, .failed:
+            throw ContainerizationError(
+                .invalidState,
+                message: "relay target probe failed with status \(status)"
+            )
+        }
+    }
+
+    private static func removeRelayWork(
+        networkID: String,
+        runtimeRoot: URL,
+        ownerID: String
+    ) async {
+        let id = containerID(for: networkID, ownerID: ownerID)
+        let client = ContainerClient()
+        if let snapshot = try? await client.get(id: id) {
+            if snapshot.status == .running { try? await client.stop(id: id) }
+            try? await client.delete(id: id)
+        }
+        try? FileManager.default.removeItem(
+            at: socketDirectory(for: networkID, under: runtimeRoot)
+        )
     }
 
     static func isRelay(_ snapshot: ContainerSnapshot) -> Bool {

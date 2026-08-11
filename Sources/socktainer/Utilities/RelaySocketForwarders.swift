@@ -79,17 +79,22 @@ private final class RelayTCPConnectHandler: ChannelInboundHandler, RemovableChan
             backend.close(promise: nil)
             return
         }
-        let (frontendGlue, backendGlue) = RelayGlueHandler.matchedPair()
         do {
             var preface = backend.allocator.buffer(capacity: PortRelayProtocol.prefaceLength)
             try destination.writePreface(into: &preface)
-            try frontendChannel.pipeline.syncOperations.addHandler(frontendGlue)
-            try backend.pipeline.syncOperations.addHandler(backendGlue)
+            try backend.pipeline.syncOperations.addHandler(
+                RelayAcknowledgementHandler { [weak self] status in
+                    guard let self else { return }
+                    self.finishActivation(
+                        status: status,
+                        backend: backend,
+                        frontend: frontend
+                    )
+                }
+            )
             backend.writeAndFlush(preface).whenComplete { result in
                 switch result {
                 case .success:
-                    frontendChannel.pipeline.syncOperations.removeHandler(self, promise: nil)
-                    try? frontendChannel.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
                     try? backend.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
                 case .failure(let error):
                     self.log?.error("relay preface write failed: \(error)")
@@ -101,6 +106,87 @@ private final class RelayTCPConnectHandler: ChannelInboundHandler, RemovableChan
             backend.close(promise: nil)
             frontend.close(promise: nil)
         }
+    }
+
+    private func finishActivation(
+        status: Result<PortRelayProtocol.ConnectStatus, Error>,
+        backend: any Channel,
+        frontend: ChannelHandlerContext
+    ) {
+        let frontendChannel = frontend.channel
+        guard frontendChannel.isActive, backend.isActive else {
+            backend.close(promise: nil)
+            frontend.close(promise: nil)
+            return
+        }
+        do {
+            let connectStatus = try status.get()
+            guard connectStatus == .ready else {
+                log?.warning("relay target connect failed with status \(connectStatus)")
+                backend.close(promise: nil)
+                frontend.close(promise: nil)
+                return
+            }
+            let (frontendGlue, backendGlue) = RelayGlueHandler.matchedPair()
+            try frontendChannel.pipeline.syncOperations.addHandler(frontendGlue)
+            try backend.pipeline.syncOperations.addHandler(backendGlue)
+            frontendChannel.pipeline.syncOperations.removeHandler(self, promise: nil)
+            try? frontendChannel.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
+            try? backend.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
+        } catch {
+            log?.error("invalid relay acknowledgement: \(error)")
+            backend.close(promise: nil)
+            frontend.close(promise: nil)
+        }
+    }
+}
+
+private final class RelayAcknowledgementHandler: ChannelInboundHandler, RemovableChannelHandler,
+    @unchecked Sendable
+{
+    typealias InboundIn = ByteBuffer
+    typealias InboundOut = ByteBuffer
+
+    private let completion: (Result<PortRelayProtocol.ConnectStatus, Error>) -> Void
+    private var buffered = ByteBuffer()
+    private var completed = false
+
+    init(completion: @escaping (Result<PortRelayProtocol.ConnectStatus, Error>) -> Void) {
+        self.completion = completion
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !completed else { return }
+        var incoming = unwrapInboundIn(data)
+        buffered.writeBuffer(&incoming)
+        do {
+            guard let status = try PortRelayProtocol.readAcknowledgement(from: &buffered) else {
+                return
+            }
+            completed = true
+            context.pipeline.syncOperations.removeHandler(self, promise: nil)
+            completion(.success(status))
+            if buffered.readableBytes > 0 {
+                context.fireChannelRead(wrapInboundOut(buffered))
+            }
+        } catch {
+            completed = true
+            completion(.failure(error))
+            context.close(promise: nil)
+        }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        guard !completed else { return }
+        completed = true
+        completion(.failure(ChannelError.eof))
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        guard !completed else { return }
+        completed = true
+        completion(.failure(error))
+        context.close(promise: nil)
     }
 }
 
@@ -352,6 +438,7 @@ private final class RelayUDPResponseDecoder: ChannelInboundHandler, @unchecked S
     private let onActivity: () -> Void
     private let onClose: () -> Void
     private var buffered = ByteBuffer()
+    private var acknowledged = false
 
     init(
         clientAddress: SocketAddress,
@@ -368,6 +455,21 @@ private final class RelayUDPResponseDecoder: ChannelInboundHandler, @unchecked S
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var incoming = unwrapInboundIn(data)
         buffered.writeBuffer(&incoming)
+        if !acknowledged {
+            do {
+                guard let status = try PortRelayProtocol.readAcknowledgement(from: &buffered) else {
+                    return
+                }
+                guard status == .ready else {
+                    context.close(promise: nil)
+                    return
+                }
+                acknowledged = true
+            } catch {
+                context.close(promise: nil)
+                return
+            }
+        }
         while let length: UInt16 = buffered.getInteger(at: buffered.readerIndex, endianness: .big) {
             let count = Int(length)
             guard count <= PortRelayProtocol.maximumDatagramLength else {
@@ -390,6 +492,108 @@ private final class RelayUDPResponseDecoder: ChannelInboundHandler, @unchecked S
 
     func channelInactive(context: ChannelHandlerContext) { onClose() }
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
+    }
+}
+
+enum RelayRouteProbe {
+    static func status(
+        socketPath: String,
+        destination: PortRelayProtocol.Destination,
+        eventLoopGroup: any EventLoopGroup
+    ) async throws -> PortRelayProtocol.ConnectStatus {
+        let eventLoop = eventLoopGroup.next()
+        let promise = eventLoop.makePromise(of: PortRelayProtocol.ConnectStatus.self)
+        let channel = try await ClientBootstrap(group: eventLoop)
+            .connectTimeout(.seconds(1))
+            .channelInitializer { channel in
+                channel.setOption(ChannelOptions.autoRead, value: false).flatMap {
+                    channel.pipeline.addHandler(
+                        RelayProbeHandler(destination: destination, promise: promise)
+                    )
+                }
+            }
+            .connect(unixDomainSocketPath: socketPath)
+            .get()
+        defer { channel.close(promise: nil) }
+        return try await promise.futureResult.get()
+    }
+}
+
+private final class RelayProbeHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+
+    private let destination: PortRelayProtocol.Destination
+    private let promise: EventLoopPromise<PortRelayProtocol.ConnectStatus>
+    private var buffered = ByteBuffer()
+    private var completed = false
+    private var timeout: Scheduled<Void>?
+    private weak var handlerContext: ChannelHandlerContext?
+
+    init(
+        destination: PortRelayProtocol.Destination,
+        promise: EventLoopPromise<PortRelayProtocol.ConnectStatus>
+    ) {
+        self.destination = destination
+        self.promise = promise
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        handlerContext = context
+        do {
+            var preface = context.channel.allocator.buffer(
+                capacity: PortRelayProtocol.prefaceLength
+            )
+            try destination.writePreface(into: &preface)
+            context.writeAndFlush(NIOAny(preface), promise: nil)
+            try? context.channel.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
+            timeout = context.eventLoop.scheduleTask(in: .seconds(6)) { [weak self] in
+                self?.probeTimedOut()
+            }
+        } catch {
+            finish(.failure(error), context: context)
+        }
+        context.fireChannelActive()
+    }
+
+    private func probeTimedOut() {
+        guard let handlerContext else { return }
+        finish(
+            .failure(ChannelError.connectTimeout(.seconds(6))),
+            context: handlerContext
+        )
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
+        buffered.writeBuffer(&incoming)
+        do {
+            guard let status = try PortRelayProtocol.readAcknowledgement(from: &buffered) else {
+                return
+            }
+            finish(.success(status), context: context)
+        } catch {
+            finish(.failure(error), context: context)
+        }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        finish(.failure(ChannelError.eof), context: context)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        finish(.failure(error), context: context)
+    }
+
+    private func finish(
+        _ value: Result<PortRelayProtocol.ConnectStatus, Error>,
+        context: ChannelHandlerContext
+    ) {
+        guard !completed else { return }
+        completed = true
+        timeout?.cancel()
+        timeout = nil
+        promise.completeWith(value)
         context.close(promise: nil)
     }
 }
