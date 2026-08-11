@@ -60,10 +60,7 @@ private struct DelayedRecoveryClient: ClientContainerProtocol {
 private actor ScopedRecoveryRelayProvider: NetworkPortRelayProviding {
     private var networks: [String] = []
 
-    func ensureRelay(
-        networkID: String,
-        checking destination: PortRelayProtocol.Destination
-    ) async throws -> String {
+    func ensureRelay(networkID: String) async throws -> String {
         networks.append(networkID)
         return "/tmp/socktainer-scoped-recovery-relay-missing.sock"
     }

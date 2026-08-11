@@ -142,7 +142,7 @@ struct EmbeddedRelayImageTests {
     @Test("embedded OCI bytes match the reviewed arm64 artifact")
     func artifactDigest() {
         let digest = SHA256.hash(data: SocktainerRelayImage.archiveData).hexString
-        #expect(digest == "d0be9d3c58c182e2b6a2dea62f29fb693bb5eed868834b1b775038b83c0e29a2")
+        #expect(digest == "706ea8e3b48885c643d359080f97df33b4f399b43bc68b4981c424fc481a7958")
     }
 
     @Test("loadable archive owns the canonical tag and advertises arm64")

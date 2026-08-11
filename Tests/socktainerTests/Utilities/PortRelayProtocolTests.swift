@@ -19,7 +19,7 @@ struct PortRelayProtocolTests {
         #expect(
             buffer.readBytes(length: buffer.readableBytes) == [
                 0x53, 0x4b, 0x54, 0x52,
-                2, 1, 4, 0,
+                1, 1, 4, 0,
                 0x15, 0x38,
                 192, 168, 254, 4,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -39,34 +39,8 @@ struct PortRelayProtocolTests {
         let bytes = buffer.readBytes(length: buffer.readableBytes)!
 
         #expect(bytes.count == 26)
-        #expect(Array(bytes[0..<10]) == [0x53, 0x4b, 0x54, 0x52, 2, 2, 6, 0, 0, 53])
+        #expect(Array(bytes[0..<10]) == [0x53, 0x4b, 0x54, 0x52, 1, 2, 6, 0, 0, 53])
         #expect(Array(bytes[10..<26]) == [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34])
-    }
-
-    @Test("connect acknowledgement is buffered, validated, and consumed")
-    func connectAcknowledgement() throws {
-        for status in [
-            PortRelayProtocol.ConnectStatus.ready,
-            .connectionRefused,
-            .routeUnavailable,
-            .timedOut,
-            .denied,
-            .failed,
-        ] {
-            var partial = ByteBuffer(bytes: [0x53, 0x4b, 0x54, 0x41])
-            #expect(try PortRelayProtocol.readAcknowledgement(from: &partial) == nil)
-            partial.writeBytes([2, status.rawValue, 0, 0, 0xaa])
-            #expect(try PortRelayProtocol.readAcknowledgement(from: &partial) == status)
-            #expect(partial.readBytes(length: 1) == [0xaa])
-        }
-    }
-
-    @Test("invalid connect acknowledgement fails closed")
-    func invalidConnectAcknowledgement() {
-        var buffer = ByteBuffer(bytes: [0x42, 0x41, 0x44, 0x21, 2, 0, 0, 0])
-        #expect(throws: PortRelayProtocol.ProtocolError.invalidAcknowledgement) {
-            _ = try PortRelayProtocol.readAcknowledgement(from: &buffer)
-        }
     }
 
     @Test("invalid addresses and ports fail before listener publication")

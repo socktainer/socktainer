@@ -265,13 +265,9 @@ localhost -> Socktainer -> private Unix socket -> Apple vsock -> network relay -
 
 The relay accepts only destinations inside its assigned network CIDRs. Its host
 directory is mode `0700`, each socket is `0600`, and relay image identity is
-versioned so upgrades replace stale sidecars. A versioned connect acknowledgement
-reports backend success, refusal, timeout, and routing failure to the host before
-application bytes flow. Running-container reconciliation probes that path even
-when the desired port and target IP are unchanged; a routing failure replaces the
-volume-free network relay once and verifies the replacement. TCP half-close and
-UDP datagram boundaries are preserved. No Local Network privacy grant, root
-daemon, network extension, or terminal-launched service is required.
+versioned so upgrades replace stale sidecars. TCP half-close and UDP datagram
+boundaries are preserved. No Local Network privacy grant, root daemon, network
+extension, or terminal-launched service is required.
 
 Desired port mappings are persisted with the Docker name and reconciled after
 container, Socktainer, and Apple Container restarts. Relay sidecars have no user
@@ -558,12 +554,7 @@ services:
 
 ### Container-to-container connections fail with `EHOSTUNREACH`
 
-Socktainer automatically replaces a published-port network relay when its target
-probe reports `no route to host` / `EHOSTUNREACH`. If unrelated
-container-to-container connections also fail, or the replacement relay reports
-the same error, Apple Container's global `vmnet` state has degraded. Gracefully
-stop database and BuildKit containers, run `container system stop && container
-system start`, then restart Socktainer.
+If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
 
 ### Network subnets (IPAM)
 

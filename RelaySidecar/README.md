@@ -9,11 +9,10 @@ it never opens a connection to a guest IP. Accepted localhost TCP connections an
 datagrams are multiplexed over this stream. The sidecar opens the final connection to
 the target container from inside the custom network.
 
-Each accepted host connection starts with a fixed 26-byte `SKTR` v2 preface: transport,
+Each accepted host connection starts with a fixed 26-byte `SKTR` v1 preface: transport,
 address family, reserved zero byte, network-order target port, and a 16-byte address.
-The relay answers with an 8-byte `SKTA` result before any payload. TCP becomes a raw
-full-duplex byte stream after a successful result and preserves half-close. UDP carries
-each datagram as a network-order `u16` length followed by its bytes. The
+TCP becomes a raw full-duplex byte stream after the preface and preserves half-close.
+UDP carries each datagram as a network-order `u16` length followed by its bytes. The
 published host socket must live in Socktainer's `0700` runtime directory and its
 `PublishSocket.permissions` must be explicitly set to `0600` (the Apple CLI default
 observed in testing was broader and must not be relied on).

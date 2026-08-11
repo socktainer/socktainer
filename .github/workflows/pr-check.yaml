@@ -292,9 +292,6 @@ jobs:
           [[ $(sudo docker network inspect bar | jq -r ".[0].Labels.test // empty") == "true" ]] || { echo "Error: Label 'test=true' not found"; exit 1;}
 
       # NOTE: Inspecting a volume is not possible in CI
-      - name: check published-port relay lifecycle with socktainer
-        run: sudo env "PATH=$PATH" ./scripts/test-published-port-relay.sh
-
       - name: check volume with socktainer
         run: |
           # create volume with randomly generated name
