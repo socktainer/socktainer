@@ -246,7 +246,14 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return forwardToUpstream(packet)
     }
 
-    private func parseQuestion(_ packet: [UInt8], offset: Int) -> (String, UInt16, Int)? {
+    /// Parses the single question at `offset`. Returns nil if QDCOUNT isn't exactly 1 —
+    /// a query claiming zero or multiple questions must not be answered as if the bytes
+    /// after the header were a single trusted question.
+    func parseQuestion(_ packet: [UInt8], offset: Int) -> (String, UInt16, Int)? {
+        guard packet.count >= 6 else { return nil }
+        let qdcount = (UInt16(packet[4]) << 8) | UInt16(packet[5])
+        guard qdcount == 1 else { return nil }
+
         var pos = offset
         var labels: [String] = []
         while pos < packet.count {

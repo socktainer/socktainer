@@ -356,6 +356,55 @@ struct SocktainerDNSQueryTests {
     }
 }
 
+/// Builds a minimal DNS query packet for `name`/`type` with a caller-specified QDCOUNT,
+/// so tests can construct headers that lie about how many questions actually follow.
+private func makeQueryPacket(name: String, type: UInt16, qdcount: UInt16) -> [UInt8] {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x00, 0x01, 0x01, 0x00]  // ID + RD=1 query
+    packet += [UInt8(qdcount >> 8), UInt8(qdcount & 0xFF), 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    packet += qname
+    packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]
+    return packet
+}
+
+@Suite("SocktainerDNSServer.parseQuestion — QDCOUNT validation")
+struct ParseQuestionQDCountTests {
+
+    @Test("QDCOUNT=1 parses the question normally")
+    func qdcountOneParses() {
+        let server = SocktainerDNSServer()
+        let packet = makeQueryPacket(name: "redis", type: 1, qdcount: 1)
+        let result = server.parseQuestion(packet, offset: 12)
+        #expect(result?.0 == "redis")
+        #expect(result?.1 == 1)
+    }
+
+    // Regression test: QDCOUNT was never checked, so a query claiming zero questions
+    // was still answered as if the well-formed bytes after the header were a trusted
+    // question — this packet would previously have been answered as a valid "redis" query.
+    @Test("QDCOUNT=0 is rejected even though a well-formed question follows")
+    func qdcountZeroRejected() {
+        let server = SocktainerDNSServer()
+        let packet = makeQueryPacket(name: "redis", type: 1, qdcount: 0)
+        #expect(server.parseQuestion(packet, offset: 12) == nil)
+    }
+
+    @Test("QDCOUNT=2 is rejected")
+    func qdcountTwoRejected() {
+        let server = SocktainerDNSServer()
+        let packet = makeQueryPacket(name: "redis", type: 1, qdcount: 2)
+        #expect(server.parseQuestion(packet, offset: 12) == nil)
+    }
+}
+
 // MARK: - EmbeddedDNSImage / SocktainerDNSImage
 
 @Suite("EmbeddedDNSImage")
