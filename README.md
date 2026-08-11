@@ -269,8 +269,7 @@ versioned so upgrades replace stale sidecars. A versioned connect acknowledgemen
 reports backend success, refusal, timeout, and routing failure to the host before
 application bytes flow. Running-container reconciliation probes that path even
 when the desired port and target IP are unchanged; a routing failure replaces the
-volume-free network relay once after bounded retries and verifies the replacement.
-TCP half-close and
+volume-free network relay once and verifies the replacement. TCP half-close and
 UDP datagram boundaries are preserved. No Local Network privacy grant, root
 daemon, network extension, or terminal-launched service is required.
 

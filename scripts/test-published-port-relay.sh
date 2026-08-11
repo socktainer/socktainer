@@ -39,7 +39,7 @@ start_target() {
         --network "$network" \
         --publish "127.0.0.1:$published_port:8080" \
         alpine:3.22 \
-        busybox httpd -f -p 8080 \
+        nc -lk -p 8080 \
         >/dev/null
 }
 
