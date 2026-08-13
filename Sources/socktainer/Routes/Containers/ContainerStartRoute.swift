@@ -176,7 +176,12 @@ extension ContainerStartRoute {
 
             // A redundant /start also arms a second observer on this nativeId; bail before a
             // stale one broadcasts its own "die" for an exit the current observer already owns.
-            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
+            // Ownership must be released on every exit path, otherwise a later attach-bootstrap
+            // run of the same container would find the claim still held and emit nothing.
+            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                await DieEventOwnership.shared.release(id: nativeId)
+                return
+            }
 
             let executionDuration = Date().timeIntervalSince(startedAt)
 
@@ -198,6 +203,7 @@ extension ContainerStartRoute {
                 image: image, name: name, labels: attrs
             )
             await broadcaster.broadcast(dieEvent)
+            await DieEventOwnership.shared.release(id: nativeId)
 
             // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
             // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
@@ -340,6 +346,10 @@ extension ContainerStartRoute {
         // explicitly-stopped; clear it here so the new observer doesn't mistake a manual
         // restart for a stop that should suppress restart-policy enforcement on the next exit.
         _ = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
+
+        // Claim the `die` event before the process can exit: the attach route's exit monitor
+        // emits it for containers nothing else observes, and exactly one of them must.
+        _ = await DieEventOwnership.shared.claim(id: nativeId)
 
         ContainerStartRoute.observeExit(
             nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,

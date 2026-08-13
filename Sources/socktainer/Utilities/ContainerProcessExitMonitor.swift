@@ -27,11 +27,41 @@ enum ContainerProcessExitMonitor {
         let code = await ContainerExitCodeStore.resolveExitCode(retryDelayNs: exitCodeRetryDelayNs, wait: wait)
         await ProcessRegistry.shared.remove(id: nativeId)
 
+        // Claim before the flush grace: the start-route observer claims when `POST /start`
+        // returns, so claiming after a 200ms sleep would hand it the event by timing rather
+        // than by ownership.
+        let ownsDieEvent: Bool
+        if broadcaster != nil {
+            ownsDieEvent = await DieEventOwnership.shared.claim(id: nativeId)
+        } else {
+            ownsDieEvent = false
+        }
+
         // Sleep before recording the code: lets this attachment's own output flush before
         // any die observer wakes and races ahead.
         try? await Task.sleep(nanoseconds: outputFlushGraceNs)
         await ContainerExitCodeStore.shared.set(id: nativeId, code: code)
         await ContainerExitCodeStore.shared.set(id: hexId, code: code)
+
+        // Emit `die` when no start-route observer owns this exit. The attach route bootstraps
+        // stopped containers, which is how `docker compose up` starts a service: it never calls
+        // `POST /start`, so nothing else would ever report the exit and Compose's
+        // --abort-on-container-exit would wait forever.
+        if let broadcaster, ownsDieEvent {
+            var attributes = fallbackLabels
+            attributes["exitCode"] = String(code)
+            await broadcaster.broadcast(
+                DockerEvent.simpleEvent(
+                    id: hexId,
+                    type: "container",
+                    status: "die",
+                    image: fallbackImage,
+                    name: nativeId,
+                    labels: attributes
+                )
+            )
+            await DieEventOwnership.shared.release(id: nativeId)
+        }
 
         // --rm: Apple Container reaps the container itself, so DELETE never arrives to
         // fire ContainerDeleteRoute's cleanup. consumeAutoRemove both gates on --rm and

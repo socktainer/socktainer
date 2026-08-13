@@ -81,33 +81,15 @@ struct ContainerWaitRoute: RouteCollection {
                     } else if condition == .removed {
                         result = try await client.wait(id: containerId, condition: condition)
                     } else {
-                        // Race native wait against ContainerExitCodeStore polling.
-                        // Pipe-bootstrapped containers (docker run) may not surface
-                        // their exit through client.wait(), so we poll the store in
-                        // parallel and take whichever resolves first.
-                        result = await withTaskGroup(of: RESTContainerWait?.self) { group in
-                            group.addTask {
-                                try? await client.wait(id: containerId, condition: condition)
-                            }
-                            group.addTask {
-                                let pollIntervalNs: UInt64 = 100_000_000
-                                let maxPolls = Int(30_000_000_000 / pollIntervalNs)
-                                for _ in 0..<maxPolls {
-                                    if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
-                                        return RESTContainerWait(statusCode: Int64(code))
-                                    }
-                                    try? await Task.sleep(nanoseconds: pollIntervalNs)
-                                }
-                                return nil
-                            }
-                            for await waitResult in group {
-                                if let waitResult {
-                                    group.cancelAll()
-                                    return waitResult
-                                }
-                            }
-                            return RESTContainerWait(statusCode: 0)
-                        }
+                        // Subscribe before returning so a die event fired during the wait is
+                        // never missed by this listener.
+                        let events = await req.application.storage[EventBroadcasterKey.self]?.stream()
+                        result = await resolveNotRunning(
+                            containerId: containerId,
+                            client: client,
+                            condition: condition,
+                            events: events
+                        )
                     }
                 } catch {
                     result = RESTContainerWait(statusCode: 0)
@@ -123,5 +105,117 @@ struct ContainerWaitRoute: RouteCollection {
 
             return Response(status: .ok, headers: headers, body: body)
         }
+    }
+}
+
+extension ContainerWaitRoute {
+    /// Poll interval shared by the exit-code and stopped-state watchers.
+    static let waitPollIntervalNs: UInt64 = 100_000_000
+    /// How long the stopped-state watcher gives the recorder to publish an exit code.
+    static let stoppedGraceNs: UInt64 = 750_000_000
+
+    /// Resolves `condition=not-running` from whichever source answers first.
+    ///
+    /// No single source is reliable:
+    /// - the native wait is authoritative while the runtime client is attached;
+    /// - `ContainerExitCodeStore` is populated by the attach paths' exit monitor;
+    /// - the `die` event fires for every container, including ones that exit before the
+    ///   wait was issued;
+    /// - the container's own state is the last resort.
+    ///
+    /// The state watcher only reports a result after it has seen the container `running`.
+    /// `docker compose up` issues `POST /wait` before `POST /start`, so a created container
+    /// is *not* running yet — reporting that as a clean exit would tell Compose the service
+    /// finished successfully before it ever started.
+    static func resolveNotRunning(
+        containerId: String,
+        client: ClientContainerProtocol,
+        condition: ContainerWaitCondition = .notRunning,
+        events: AsyncStream<DockerEvent>? = nil,
+        storeTimeoutNs: UInt64 = 30_000_000_000
+    ) async -> RESTContainerWait {
+        await withTaskGroup(of: RESTContainerWait?.self) { group in
+            group.addTask {
+                try? await client.wait(id: containerId, condition: condition)
+            }
+            group.addTask {
+                let maxPolls = Int(storeTimeoutNs / waitPollIntervalNs)
+                for _ in 0..<maxPolls {
+                    if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
+                        return RESTContainerWait(statusCode: Int64(code))
+                    }
+                    try? await Task.sleep(nanoseconds: waitPollIntervalNs)
+                }
+                return nil
+            }
+            group.addTask {
+                await dieEventResult(containerId: containerId, events: events)
+            }
+            group.addTask {
+                await stoppedStateResult(
+                    containerId: containerId,
+                    client: client,
+                    storeTimeoutNs: storeTimeoutNs
+                )
+            }
+
+            for await waitResult in group {
+                if let waitResult {
+                    group.cancelAll()
+                    return waitResult
+                }
+            }
+            return RESTContainerWait(statusCode: 0)
+        }
+    }
+
+    /// The `die` event carries the authoritative exit code and fires even when the container
+    /// exits before this wait was issued.
+    private static func dieEventResult(
+        containerId: String,
+        events: AsyncStream<DockerEvent>?
+    ) async -> RESTContainerWait? {
+        guard let events else { return nil }
+
+        for await event in events {
+            guard event.Type == "container", event.Action == "die" else { continue }
+            guard event.Actor.ID == containerId
+                || event.Actor.ID.hasPrefix(containerId)
+                || event.Actor.Attributes["name"] == containerId
+            else { continue }
+
+            if let exitCode = event.Actor.Attributes["exitCode"], let code = Int64(exitCode) {
+                return RESTContainerWait(statusCode: code)
+            }
+            let recorded = await ContainerExitCodeStore.shared.get(id: containerId)
+            return RESTContainerWait(statusCode: Int64(recorded ?? 0))
+        }
+        return nil
+    }
+
+    /// Last-resort watcher: only terminal once the container has been observed running, so a
+    /// created-but-not-started container is never mistaken for a finished one.
+    private static func stoppedStateResult(
+        containerId: String,
+        client: ClientContainerProtocol,
+        storeTimeoutNs: UInt64
+    ) async -> RESTContainerWait? {
+        var sawRunning = false
+        let maxPolls = Int(storeTimeoutNs / waitPollIntervalNs)
+
+        for _ in 0..<maxPolls {
+            let container = try? await client.getContainer(id: containerId)
+            if container?.status == .running {
+                sawRunning = true
+            } else if sawRunning {
+                // The container ran and is no longer running: give the recorder a moment to
+                // publish the real code before falling back to a clean exit.
+                try? await Task.sleep(nanoseconds: stoppedGraceNs)
+                let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 0
+                return RESTContainerWait(statusCode: Int64(code))
+            }
+            try? await Task.sleep(nanoseconds: waitPollIntervalNs)
+        }
+        return nil
     }
 }
