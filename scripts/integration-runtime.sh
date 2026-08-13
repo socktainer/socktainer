@@ -109,6 +109,7 @@ conflict="$RUN_ID-port-conflict"
 if docker_api run -d --name "$conflict" --label "$LABEL" -p "127.0.0.1:$web_port:80" "$IMAGE" >/dev/null 2>&1; then
     die "conflicting TCP publication succeeded"
 fi
+docker_api rm -f "$conflict" >/dev/null
 
 udp="$RUN_ID-udp"
 docker_api run -d --name "$udp" --label "$LABEL" -p 127.0.0.1::5353/udp \

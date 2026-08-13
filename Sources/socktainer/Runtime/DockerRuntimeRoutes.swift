@@ -723,7 +723,7 @@ struct DockerRuntimeRoutes: RouteCollection {
         guard let host = object["HostConfig"] as? [String: Any] else { return }
         for key in [
             "Privileged", "ReadonlyRootfs", "OomKillDisable", "PublishAllPorts", "Init", "Memory",
-            "MemorySwap", "MemoryReservation", "MemorySwappiness", "NanoCpus", "CpuShares", "CpuPeriod",
+            "MemorySwap", "MemoryReservation", "NanoCpus", "CpuShares", "CpuPeriod",
             "CpuQuota", "CpuRealtimePeriod", "CpuRealtimeRuntime", "CpusetCpus", "CpusetMems",
             "PidsLimit", "BlkioWeight", "BlkioWeightDevice", "BlkioDeviceReadBps",
             "BlkioDeviceWriteBps", "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps", "CapAdd", "CapDrop",
@@ -732,6 +732,11 @@ struct DockerRuntimeRoutes: RouteCollection {
             "StorageOpt", "CgroupParent",
         ] where host[key].map({ !isDefaultJSONValue($0) }) == true {
             throw Abort(.notImplemented, reason: "HostConfig option \(key) is not implemented")
+        }
+        if let swappiness = host["MemorySwappiness"] as? NSNumber,
+            swappiness.intValue != -1, swappiness.intValue != 0
+        {
+            throw Abort(.notImplemented, reason: "HostConfig option MemorySwappiness is not implemented")
         }
         if let mode = host["NetworkMode"] as? String,
             !mode.isEmpty, mode != "default", mode != "bridge"
