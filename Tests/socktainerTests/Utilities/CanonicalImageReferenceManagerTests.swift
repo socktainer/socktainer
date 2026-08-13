@@ -1286,7 +1286,8 @@ struct CanonicalImageReferenceManagerTests {
             containerSystemConfig: ContainerSystemConfig(),
             identityResolver: resolver,
             mutationCoordinator: coordinator,
-            referenceStore: store
+            referenceStore: store,
+            containerInventoryProvider: EmptyContainerSnapshotInventoryProvider()
         )
 
         let result = try await service.delete(id: configDigest, force: false)
@@ -1321,7 +1322,8 @@ struct CanonicalImageReferenceManagerTests {
             containerSystemConfig: ContainerSystemConfig(),
             identityResolver: resolver,
             mutationCoordinator: coordinator,
-            referenceStore: store
+            referenceStore: store,
+            containerInventoryProvider: EmptyContainerSnapshotInventoryProvider()
         )
 
         let result = try await service.delete(id: owner.digest, force: false)
@@ -1399,6 +1401,7 @@ struct CanonicalImageReferenceManagerTests {
             identityResolver: resolver,
             mutationCoordinator: coordinator,
             referenceStore: store,
+            containerInventoryProvider: EmptyContainerSnapshotInventoryProvider(),
             imageLeaseReservations: reservations
         )
 
@@ -1483,7 +1486,8 @@ struct CanonicalImageReferenceManagerTests {
             containerSystemConfig: ContainerSystemConfig(),
             identityResolver: resolver,
             mutationCoordinator: coordinator,
-            referenceStore: store
+            referenceStore: store,
+            containerInventoryProvider: EmptyContainerSnapshotInventoryProvider()
         )
 
         let result = try await service.delete(
@@ -1515,7 +1519,8 @@ struct CanonicalImageReferenceManagerTests {
             containerSystemConfig: ContainerSystemConfig(),
             identityResolver: resolver,
             mutationCoordinator: coordinator,
-            referenceStore: store
+            referenceStore: store,
+            containerInventoryProvider: EmptyContainerSnapshotInventoryProvider()
         )
         await store.failFirstListAfterDelete()
 
@@ -2251,5 +2256,13 @@ private actor PushWorkProbeCatalog: ImageIdentityCatalog {
 
     func manifest(digest: String) async throws -> Manifest? {
         nil
+    }
+}
+
+private struct EmptyContainerSnapshotInventoryProvider:
+    ContainerSnapshotInventoryProviding
+{
+    func containers() async throws -> [ContainerSnapshot] {
+        []
     }
 }
