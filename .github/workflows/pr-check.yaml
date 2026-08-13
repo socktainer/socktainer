@@ -62,7 +62,17 @@ jobs:
 
       - name: Run Build
         timeout-minutes: 40
-        run: make release
+        env:
+          CI_SWIFT_DIAGNOSTICS_DIR: .ci-diagnostics/build
+        run: scripts/ci-swift-watchdog.sh make release
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: swift-build-diagnostics
+          path: .ci-diagnostics/build
+          if-no-files-found: error
 
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
@@ -116,7 +126,17 @@ jobs:
           fi
 
       - name: Execute test
-        run: make test
+        env:
+          CI_SWIFT_DIAGNOSTICS_DIR: .ci-diagnostics/tests
+        run: scripts/ci-swift-watchdog.sh make test
+
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: swift-test-diagnostics
+          path: .ci-diagnostics/tests
+          if-no-files-found: error
 
       - name: Test guest agent
         run: |
