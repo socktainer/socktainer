@@ -32,7 +32,6 @@ func configure(_ app: Application) async throws {
         eventLoopGroup: app.eventLoopGroup
     )
     let engine = PersistentEngine(controller: engineController)
-    _ = try await engine.readyConnection()
     let bindCacheController = BindCacheInvalidationController(
         source: FSEventsBindHostEventSource(root: SocktainerDirectories.hostHome),
         sink: GuestConnectionBindCacheSink(engine: engine)
@@ -41,7 +40,6 @@ func configure(_ app: Application) async throws {
         events: PersistentEngineBindCacheEventConnector(engine: engine),
         controller: bindCacheController
     )
-    try await bindCacheBridge.start()
     app.lifecycle.use(GuestBindCacheEngineLifecycle(bridge: bindCacheBridge, engine: engine))
     let directPortForwarder = DirectTCPPortForwarder(
         eventLoopGroup: app.eventLoopGroup,
@@ -62,8 +60,16 @@ func configure(_ app: Application) async throws {
     await volumeClient.setReferenceValidator { id in
         (try? await runtime.inspectContainer(id: id)) != nil
     }
-    try await runtime.startEventMonitor()
     app.lifecycle.use(GuestRuntimeLifecycle(runtime: runtime))
+    let readiness = RuntimeReadiness {
+        _ = try await engine.readyConnection()
+        try await bindCacheBridge.start()
+        try await runtime.startEventMonitor()
+    }
+    app.middleware.use(RuntimeReadinessMiddleware(readiness: readiness))
+    // Shutdown runs lifecycle handlers in reverse registration order. Cancel
+    // unfinished initialization before the runtime tears down its connections.
+    app.lifecycle.use(RuntimeReadinessLifecycle(readiness: readiness))
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
