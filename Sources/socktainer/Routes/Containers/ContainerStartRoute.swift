@@ -211,7 +211,8 @@ extension ContainerStartRoute {
             // whichever observer is current, and a container that exited before this one armed
             // was already reported by the attach path's exit monitor — that is how
             // `docker compose up` runs a service. Claiming twice would double every exit.
-            if await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation) {
+            let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
+            if ownsExit {
                 var attrs = labels
                 attrs["exitCode"] = String(code)
                 // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
@@ -224,10 +225,11 @@ extension ContainerStartRoute {
             }
 
             // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
-            // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
-            // gates on the --rm flag and dedups against the foreground attach path, so a
-            // container attached in the foreground does not get a second destroy.
-            if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
+            // reaps them itself (no DELETE arrives), so emit it here. Only the observer that
+            // reported the exit does it: the other one reaches this point while the owner is
+            // still inside its output-flush grace, and would publish `destroy` before the `die`
+            // it belongs to — clients that treat `destroy` as terminal would miss the exit.
+            if ownsExit, await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
                 await ContainerAutoRemoveCleanup.perform(
                     hexId: eventId,
                     nativeId: nativeId,

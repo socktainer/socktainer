@@ -71,9 +71,11 @@ enum ContainerProcessExitMonitor {
         }
 
         // --rm: Apple Container reaps the container itself, so DELETE never arrives to
-        // fire ContainerDeleteRoute's cleanup. consumeAutoRemove both gates on --rm and
-        // dedups against a second observer racing the same exit.
-        if await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
+        // fire ContainerDeleteRoute's cleanup. Only the observer that reported the exit does it,
+        // so `destroy` cannot precede the `die` it belongs to; with no broadcaster at all there
+        // is no ordering to keep and this monitor is the only thing that can clean up.
+        // consumeAutoRemove still gates on --rm and dedups a second observer racing the exit.
+        if ownsDieEvent || broadcaster == nil, await ContainerInfoCache.shared.consumeAutoRemove(id: hexId) {
             await ContainerAutoRemoveCleanup.perform(
                 hexId: hexId,
                 nativeId: nativeId,

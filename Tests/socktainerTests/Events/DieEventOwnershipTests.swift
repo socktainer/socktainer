@@ -278,6 +278,7 @@ struct ContainerProcessExitMonitorDieTests {
     func monitorKeepsOwnershipAfterBroadcast() async {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
+
         let run = await DieEventOwnership.shared.beginRun(id: "monitor-keeps")
 
         _ = await ContainerProcessExitMonitor.run(
@@ -300,5 +301,62 @@ struct ContainerProcessExitMonitorDieTests {
 
         await ContainerExitCodeStore.shared.remove(id: "monitor-keeps")
         await ContainerExitCodeStore.shared.remove(id: "keeps123")
+    }
+    @Test("the loser of the exit claim leaves --rm cleanup to the winner")
+    func onlyTheExitOwnerRunsAutoRemove() async {
+        // `destroy` must follow the `die` it belongs to. The claim loser reaches the auto-remove
+        // gate while the winner is still inside its output-flush grace, so if it performed the
+        // cleanup it would publish `destroy` first and a client treating that as terminal — like
+        // Compose's --abort-on-container-exit — would never see the exit.
+        let broadcaster = EventBroadcaster()
+        let run = await DieEventOwnership.shared.beginRun(id: "monitor-loses-rm")
+        await DieEventOwnership.shared.reserveForStart(id: "monitor-loses-rm", epoch: run, generation: 1)
+        await ContainerInfoCache.shared.markAutoRemove(hexId: "rm123", nativeId: "monitor-loses-rm")
+
+        _ = await ContainerProcessExitMonitor.run(
+            wait: { 0 },
+            hexId: "rm123",
+            nativeId: "monitor-loses-rm",
+            fallbackImage: "alpine:3.20",
+            fallbackLabels: [:],
+            dnsServer: nil,
+            broadcaster: broadcaster,
+            runEpoch: run,
+            outputFlushGraceNs: 1_000_000
+        )
+
+        #expect(
+            await ContainerInfoCache.shared.consumeAutoRemove(id: "rm123"),
+            "the --rm mark must be left for the observer that reports the exit"
+        )
+        await ContainerExitCodeStore.shared.remove(id: "monitor-loses-rm")
+        await ContainerExitCodeStore.shared.remove(id: "rm123")
+    }
+
+    @Test("with no broadcaster the monitor still performs --rm cleanup")
+    func autoRemoveStillRunsWithoutABroadcaster() async {
+        // Nothing can emit events, so there is no ordering to protect — but the container must
+        // still be reaped, since Apple Container never delivers a DELETE for it.
+        let run = await DieEventOwnership.shared.beginRun(id: "no-broadcaster-rm")
+        await ContainerInfoCache.shared.markAutoRemove(hexId: "rm456", nativeId: "no-broadcaster-rm")
+
+        _ = await ContainerProcessExitMonitor.run(
+            wait: { 0 },
+            hexId: "rm456",
+            nativeId: "no-broadcaster-rm",
+            fallbackImage: "alpine:3.20",
+            fallbackLabels: [:],
+            dnsServer: nil,
+            broadcaster: nil,
+            runEpoch: run,
+            outputFlushGraceNs: 1_000_000
+        )
+
+        #expect(
+            await ContainerInfoCache.shared.consumeAutoRemove(id: "rm456") == false,
+            "the monitor must have consumed the --rm mark itself"
+        )
+        await ContainerExitCodeStore.shared.remove(id: "no-broadcaster-rm")
+        await ContainerExitCodeStore.shared.remove(id: "rm456")
     }
 }
