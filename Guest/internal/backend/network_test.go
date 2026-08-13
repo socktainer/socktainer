@@ -3,7 +3,6 @@ package backend
 import (
 	"errors"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -103,7 +102,33 @@ func TestNetworkManagerReportsPreparedPublication(t *testing.T) {
 	}
 }
 
-func TestNetworkManagerPublishesAndRemovesUDP(t *testing.T) {
+func TestNetworkManagerResolvesOnlyPreparedPublishedTargets(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := NewNetworkManager(runner)
+	if _, err := manager.Create("web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Publish("web", []api.PublishedPort{{
+		ContainerPort: 8080, GuestPort: 42000, Protocol: "tcp",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	target, err := manager.PublishedTarget(42000, "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "10.88.0.2:8080" {
+		t.Fatalf("target = %q, want 10.88.0.2:8080", target)
+	}
+	if _, err := manager.PublishedTarget(42001, "tcp"); err == nil {
+		t.Fatal("unpublished guest port resolved")
+	}
+	if strings.Contains(strings.Join(runner.commands, "\n"), "PREROUTING") {
+		t.Fatal("published port installed a native vmnet ingress rule")
+	}
+}
+
+func TestNetworkManagerResolvesAndRemovesUDP(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := NewNetworkManager(runner)
 	if _, err := manager.Create("dns"); err != nil {
@@ -113,19 +138,18 @@ func TestNetworkManagerPublishesAndRemovesUDP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := manager.PublishedTarget(published[0].GuestPort, "udp"); err != nil {
+		t.Fatal(err)
+	}
 	if err := manager.Delete("dns"); err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.Join(runner.commands, "\n")
-	for _, operation := range []string{"-A", "-D"} {
-		want := "iptables -t nat " + operation + " PREROUTING -p udp --dport " + strconv.Itoa(int(published[0].GuestPort))
-		if !strings.Contains(joined, want) {
-			t.Fatalf("UDP DNAT %s is absent:\n%s", operation, joined)
-		}
+	if _, err := manager.PublishedTarget(published[0].GuestPort, "udp"); err == nil {
+		t.Fatal("deleted UDP publication still resolves")
 	}
 }
 
-func TestNetworkManagerRestrictsVmnetIngressToTheHostGateway(t *testing.T) {
+func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := NewNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
@@ -134,18 +158,16 @@ func TestNetworkManagerRestrictsVmnetIngressToTheHostGateway(t *testing.T) {
 	requested := []api.PublishedPort{{
 		ContainerPort: 80, GuestPort: 42000, Protocol: "tcp", HostSource: "192.168.64.1",
 	}}
-	if _, err := manager.Publish("web", requested); err != nil {
+	published, err := manager.Publish("web", requested)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Delete("web"); err != nil {
-		t.Fatal(err)
+	if published[0].HostSource != "192.168.64.1" {
+		t.Fatalf("host source = %q", published[0].HostSource)
 	}
 	joined := strings.Join(runner.commands, "\n")
-	for _, operation := range []string{"-A", "-D"} {
-		want := "iptables -t nat " + operation + " PREROUTING -p tcp -s 192.168.64.1 --dport 42000"
-		if !strings.Contains(joined, want) {
-			t.Fatalf("host-source restriction %s is absent:\n%s", operation, joined)
-		}
+	if strings.Contains(joined, "PREROUTING") {
+		t.Fatalf("native ingress rule is present:\n%s", joined)
 	}
 }
 
@@ -169,7 +191,7 @@ func TestNetworkManagerReusesKnownNamespaceWithoutAProcess(t *testing.T) {
 	}
 }
 
-func TestNetworkManagerDeleteRemovesDNATAndNamespace(t *testing.T) {
+func TestNetworkManagerDeleteRemovesPublicationAndNamespace(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := NewNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
@@ -183,8 +205,8 @@ func TestNetworkManagerDeleteRemovesDNATAndNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(runner.commands, "\n")
-	if !strings.Contains(joined, "iptables -t nat -D PREROUTING -p tcp --dport "+strconv.Itoa(int(published[0].GuestPort))) {
-		t.Fatalf("DNAT delete is absent:\n%s", joined)
+	if _, err := manager.PublishedTarget(published[0].GuestPort, "tcp"); err == nil {
+		t.Fatal("deleted publication still resolves")
 	}
 	if !strings.Contains(joined, "ip netns delete st") {
 		t.Fatalf("namespace delete is absent:\n%s", joined)

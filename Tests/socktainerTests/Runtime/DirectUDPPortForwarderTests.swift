@@ -8,11 +8,9 @@ import Testing
 struct DirectUDPPortForwarderTests {
     @Test("allocates a port, forwards multiple datagrams, and removes idempotently")
     func forwardsAndRemoves() async throws {
-        let backend = try UDPEchoServer.start()
-        defer { backend.close() }
-        let forwarder = DirectUDPPortForwarder()
+        let forwarder = DirectUDPPortForwarder(dialer: FramedUDPGuestProxyDialer())
         let requested = DirectUDPPortMapping(
-            id: "udp-echo", hostAddress: "127.0.0.1", hostPort: 0, guestPort: backend.port)
+            id: "udp-echo", hostAddress: "127.0.0.1", hostPort: 0, guestPort: 42_000)
 
         let published = try await forwarder.add(requested)
         #expect(published.hostPort > 0)
@@ -55,66 +53,30 @@ struct DirectUDPPortForwarderTests {
     }
 }
 
-private final class UDPEchoServer: @unchecked Sendable {
-    let descriptor: Int32
-    let port: Int
-    private let task: Task<Void, Never>
-
-    private init(descriptor: Int32, port: Int, task: Task<Void, Never>) {
-        self.descriptor = descriptor
-        self.port = port
-        self.task = task
-    }
-
-    static func start() throws -> UDPEchoServer {
-        let descriptor = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+private struct FramedUDPGuestProxyDialer: GuestPortConnectionDialing {
+    func dial() async throws -> FileHandle {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        let client = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
+        let peer = descriptors[1]
+        Task.detached {
+            defer { _ = Darwin.close(peer) }
+            var header = [UInt8](repeating: 0, count: 7)
+            guard Darwin.read(peer, &header, header.count) == header.count,
+                header.prefix(5) == [0x53, 0x54, 0x50, 0x31, 0x02]
+            else { return }
+            while true {
+                var length = [UInt8](repeating: 0, count: 2)
+                guard Darwin.read(peer, &length, length.count) == length.count else { return }
+                let count = Int(length[0]) << 8 | Int(length[1])
+                var payload = [UInt8](repeating: 0, count: count)
+                guard Darwin.read(peer, &payload, count) == count else { return }
+                _ = Darwin.write(peer, length, length.count)
+                _ = Darwin.write(peer, payload, count)
             }
         }
-        guard bound == 0 else {
-            let error = POSIXError(.init(rawValue: errno) ?? .EIO)
-            _ = Darwin.close(descriptor)
-            throw error
-        }
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.getsockname(descriptor, $0, &length)
-            }
-        }
-        let task = Task.detached {
-            var buffer = [UInt8](repeating: 0, count: 65_535)
-            while !Task.isCancelled {
-                var peer = sockaddr_storage()
-                var peerLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-                let count = withUnsafeMutablePointer(to: &peer) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        Darwin.recvfrom(descriptor, &buffer, buffer.count, 0, $0, &peerLength)
-                    }
-                }
-                guard count > 0 else { return }
-                _ = withUnsafePointer(to: &peer) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        Darwin.sendto(descriptor, buffer, count, 0, $0, peerLength)
-                    }
-                }
-            }
-        }
-        return UDPEchoServer(
-            descriptor: descriptor,
-            port: Int(UInt16(bigEndian: address.sin_port)),
-            task: task
-        )
-    }
-
-    func close() {
-        _ = Darwin.close(descriptor)
-        task.cancel()
+        return client
     }
 }

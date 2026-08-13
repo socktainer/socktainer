@@ -14,11 +14,14 @@ BIND_MIB=${BENCH_BIND_MIB:-512}
 OUTPUT=${BENCH_OUTPUT:-runtime-benchmark.json}
 MODE=run
 RUN_ID="socktainer-benchmark-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUNS_DIRECTORY=${BENCH_RUNS_DIRECTORY:-"$(dirname "$OUTPUT")/runtime-benchmark-runs"}
+RUN_DIRECTORY="$RUNS_DIRECTORY/$RUN_ID"
 RESULTS_FILE=$(mktemp -t socktainer-benchmark-results.XXXXXX)
 PROCESS_FILE=$(mktemp -t socktainer-benchmark-processes.XXXXXX)
 ENGINE_STATE_DIR=$(mktemp -d /tmp/socktainer-benchmark-engines.XXXXXX)
 BIND_STATE_DIR=$(mktemp -d "$HOME/.socktainer-benchmark-bind.XXXXXX")
 CURRENT_HOST=
+BENCHMARK_COMPLETE=false
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 readonly DD_RESULT_PARSER="$REPO_ROOT/scripts/parse-busybox-dd.awk"
 
@@ -117,7 +120,16 @@ cleanup_host() {
 }
 
 cleanup() {
-    local product host
+    local exit_code=$? product host
+    if [[ -d $RUN_DIRECTORY && $BENCHMARK_COMPLETE != true ]]; then
+        cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
+        cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        jq -cn --arg runId "$RUN_ID" --argjson exitCode "$exit_code" \
+            --arg endedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{status:"incomplete",runId:$runId,exitCode:$exitCode,endedAt:$endedAt}' \
+            > "$RUN_DIRECTORY/status.json.tmp" 2>/dev/null || true
+        mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json" 2>/dev/null || true
+    fi
     IFS=',' read -r -a product_list <<< "$PRODUCTS"
     for product in "${product_list[@]}"; do
         host=$(product_value "$product" DOCKER_HOST)
@@ -129,6 +141,20 @@ cleanup() {
     rm -rf "$BIND_STATE_DIR"
 }
 trap cleanup EXIT
+record_failure() {
+    local exit_code=$? line=${1:-unknown}
+    if [[ -d $RUN_DIRECTORY ]]; then
+        cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
+        cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        jq -cn --arg runId "$RUN_ID" --argjson exitCode "$exit_code" --arg line "$line" \
+            --arg endedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{status:"incomplete",runId:$runId,exitCode:$exitCode,line:$line,endedAt:$endedAt}' \
+            > "$RUN_DIRECTORY/status.json.tmp" 2>/dev/null || true
+        mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json" 2>/dev/null || true
+    fi
+    return "$exit_code"
+}
+trap 'record_failure "$LINENO"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -144,6 +170,112 @@ elapsed = (time.perf_counter_ns() - start) / 1_000_000
 if result.returncode:
     raise SystemExit(result.returncode)
 print(f"{elapsed:.6f}")
+PY
+}
+
+api_ping_fresh_ms() {
+    python3 - "$1" <<'PY'
+import socket, statistics, sys, time
+
+path = sys.argv[1]
+
+def request():
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(2)
+    start = time.perf_counter_ns()
+    try:
+        client.connect(path)
+        client.sendall(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        response = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        headers, separator, body = response.partition(b"\r\n\r\n")
+        if b"transfer-encoding: chunked" in headers.lower():
+            decoded = b""
+            while body:
+                size_line, separator, body = body.partition(b"\r\n")
+                if not separator:
+                    raise RuntimeError("invalid chunk framing")
+                size = int(size_line.split(b";", 1)[0], 16)
+                if size == 0:
+                    break
+                decoded += body[:size]
+                body = body[size + 2:]
+            body = decoded
+        if b" 200 " not in headers or body.strip() != b"OK":
+            raise RuntimeError("invalid /_ping response")
+    finally:
+        client.close()
+    return (time.perf_counter_ns() - start) / 1_000_000
+
+for _ in range(50):
+    request()
+values = [request() for _ in range(500)]
+print(f"{statistics.median(values):.6f}")
+PY
+}
+
+live_wait_registered_ms() {
+    python3 - "$1" "$2" <<'PY'
+import os, socket, subprocess, sys, threading, time
+
+host, name = sys.argv[1:]
+environment = dict(os.environ, DOCKER_HOST=host)
+socket_path = host.removeprefix("unix://")
+registered = threading.Event()
+result = {}
+
+def wait_for_next_exit():
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(30)
+    try:
+        client.connect(socket_path)
+        request = (f"POST /v1.51/containers/{name}/wait?condition=next-exit HTTP/1.1\r\n"
+                   "Host: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        client.sendall(request.encode())
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = client.recv(4096)
+            if not chunk:
+                raise RuntimeError("wait response closed before its headers")
+            response += chunk
+        if b" 200 " not in response.partition(b"\r\n\r\n")[0]:
+            raise RuntimeError(f"wait registration failed: {response[:200]!r}")
+        registered.set()
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        result["response"] = response
+    except BaseException as error:
+        result["error"] = error
+    finally:
+        client.close()
+
+waiter = threading.Thread(target=wait_for_next_exit, daemon=True)
+waiter.start()
+if not registered.wait(timeout=2):
+    raise SystemExit("wait response headers were not received")
+if not waiter.is_alive():
+    raise SystemExit("next-exit wait returned before the created container started")
+start = time.perf_counter_ns()
+starter = subprocess.run(["docker", "start", name], env=environment,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if starter.returncode:
+    raise SystemExit(starter.returncode)
+waiter.join(timeout=30)
+if waiter.is_alive():
+    raise SystemExit("registered wait did not complete")
+if "error" in result:
+    raise result["error"]
+response = result.get("response", b"")
+if b" 200 " not in response or b'"StatusCode"' not in response:
+    raise SystemExit(f"invalid wait response: {response[:200]!r}")
+print(f"{(time.perf_counter_ns() - start) / 1_000_000:.6f}")
 PY
 }
 
@@ -393,7 +525,8 @@ owned_memory_bytes() {
     pids=$(owned_pids "$product")
     [[ -n $pids ]] || { echo 0; return; }
     footprint -f bytes $pids 2>/dev/null \
-        | awk '/^[[:space:]]*phys_footprint:/ {sum += $2} END {print sum + 0}'
+        | awk '/^Summary Footprint:/ {summary=$3} /^[[:space:]]*phys_footprint:/ {single=$2; count++}
+               END {if (summary != "") print summary; else if (count == 1) print single; else exit 1}'
 }
 
 record_process_snapshot() {
@@ -404,7 +537,8 @@ record_process_snapshot() {
         keep[$1] { print }
     ' | jq -Rsc --arg product "$product" --argjson sample "$sample" --arg phase "$phase" '
         split("\n") | map(select(length > 0) | capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<command>.*)$") |
-          {pid:(.pid|tonumber),ppid:(.ppid|tonumber),command:.command}) as $processes |
+          {pid:(.pid|tonumber),ppid:(.ppid|tonumber),command:.command,
+           classification:"engine-owned"}) as $processes |
         {product:$product,sample:$sample,phase:$phase,processes:$processes}
     ' >> "$PROCESS_FILE"
 }
@@ -521,10 +655,20 @@ preflight() {
 }
 
 rotation_for_sample() {
-    local sample=$1 count=${#product_list[@]} offset index
-    offset=$(((sample - 1) % count))
-    for ((index = 0; index < count; index++)); do
-        printf '%s\n' "${product_list[$(((offset + index) % count))]}"
+    local sample=$1 block_index sequence index
+    if ((${#product_list[@]} == 4)); then
+        block_index=$(((sample - 1) % 4))
+        case $block_index in
+            0) sequence='0 1 2 3' ;;
+            1) sequence='1 0 3 2' ;;
+            2) sequence='2 3 0 1' ;;
+            3) sequence='3 2 1 0' ;;
+        esac
+        for index in $sequence; do printf '%s\n' "${product_list[$index]}"; done
+        return
+    fi
+    for ((index = 0; index < ${#product_list[@]}; index++)); do
+        printf '%s\n' "${product_list[$(((sample - 1 + index) % ${#product_list[@]}))]}"
     done
 }
 
@@ -567,9 +711,8 @@ benchmark_product() {
     value=$(docker_elapsed_ms "$host" run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
     append_result "$product" "$sample" "$position" capability_ready "$value" ms
 
-    value=$(curl --silent --output /dev/null --write-out '%{time_total}' --unix-socket "$socket" http://localhost/_ping)
-    value=$(awk -v seconds="$value" 'BEGIN {printf "%.6f", seconds*1000}')
-    append_result "$product" "$sample" "$position" api_ping "$value" ms
+    value=$(api_ping_fresh_ms "$socket")
+    append_result "$product" "$sample" "$position" api_ping_fresh_connection "$value" ms
     record_process_snapshot "$product" "$sample" idle
     append_result "$product" "$sample" "$position" idle_engine_physical_footprint "$(owned_memory_bytes "$product")" bytes
 
@@ -595,10 +738,9 @@ benchmark_product() {
 
     name="$RUN_ID-$sample-$product-live-wait"
     docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" \
-        "$BASE_IMAGE" /bin/sh -c 'sleep 0.2' >/dev/null
-    docker_api start "$name" >/dev/null
-    value=$(docker_elapsed_ms "$host" wait "$name")
-    append_result "$product" "$sample" "$position" live_wait_to_exit "$value" ms
+        "$BASE_IMAGE" /bin/true >/dev/null
+    value=$(live_wait_registered_ms "$host" "$name")
+    append_result "$product" "$sample" "$position" live_wait_registered_start_to_exit "$value" ms
     docker_api rm "$name" >/dev/null
 
     name="$RUN_ID-$sample-$product-remove"
@@ -710,8 +852,9 @@ if [[ $MODE == dry-run ]]; then
     exit 0
 fi
 
-rm -f "$OUTPUT"
-mkdir -p "$(dirname "$OUTPUT")"
+mkdir -p "$RUN_DIRECTORY" "$(dirname "$OUTPUT")"
+jq -cn --arg runId "$RUN_ID" --arg startedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{status:"incomplete",runId:$runId,startedAt:$startedAt}' > "$RUN_DIRECTORY/status.json"
 for ((sample = 1; sample <= SAMPLES; sample++)); do
     position=0
     while IFS= read -r product; do
@@ -721,5 +864,10 @@ for ((sample = 1; sample <= SAMPLES; sample++)); do
 done
 validate_results
 finalize_json
+cp "$OUTPUT" "$RUN_DIRECTORY/complete.json"
+jq -cn --arg runId "$RUN_ID" --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{status:"complete",runId:$runId,completedAt:$completedAt}' > "$RUN_DIRECTORY/status.json.tmp"
+mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json"
+BENCHMARK_COMPLETE=true
 echo "benchmark: wrote $OUTPUT"
 jq -r '.summary[] | "summary: \(.product) \(.metric) median=\(.median) \(.unit) spread=\(.spread)"' "$OUTPUT"

@@ -23,7 +23,6 @@ func configure(_ app: Application) async throws {
     // Define app support path early since it's needed by multiple services
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
-    let healthCheckClient = ClientHealthCheckService()
     let volumeClient = RuntimeVolumeService()
     let registryClient = ClientRegistryService()
     let broadcaster = EventBroadcaster()
@@ -46,10 +45,11 @@ func configure(_ app: Application) async throws {
     app.lifecycle.use(GuestBindCacheEngineLifecycle(bridge: bindCacheBridge, engine: engine))
     let directPortForwarder = DirectTCPPortForwarder(
         eventLoopGroup: app.eventLoopGroup,
+        engine: engine,
         logger: Logger(label: "socktainer.direct-ports")
     )
     app.lifecycle.use(DirectTCPPortForwarderLifecycle(forwarder: directPortForwarder))
-    let directUDPPortForwarder = DirectUDPPortForwarder()
+    let directUDPPortForwarder = DirectUDPPortForwarder(engine: engine)
     app.lifecycle.use(DirectUDPPortForwarderLifecycle(forwarder: directUDPPortForwarder))
     let runtime = GuestRuntime(
         engine: engine,
@@ -71,10 +71,10 @@ func configure(_ app: Application) async throws {
     regexRouter.installMiddleware(on: app)
 
     // /_ping
-    try app.register(collection: HealthCheckPingRoute(client: healthCheckClient))
+    try app.register(collection: HealthCheckPingRoute())
 
     // /events
-    try app.register(collection: EventsRoute(client: healthCheckClient))
+    try app.register(collection: EventsRoute())
 
     try app.register(collection: DockerRuntimeRoutes(backend: runtime, volumeClient: volumeClient))
     try app.register(collection: ExplicitUnsupportedDockerRoutes())

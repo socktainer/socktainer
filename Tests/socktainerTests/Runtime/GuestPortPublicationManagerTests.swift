@@ -19,7 +19,6 @@ struct GuestPortPublicationManagerTests {
                     hostPort: 18_080
                 )
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(published.first?.hostPort == 18_080)
@@ -34,7 +33,6 @@ struct GuestPortPublicationManagerTests {
                     hostPort: 18_080
                 )
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(repeated == published)
@@ -46,7 +44,6 @@ struct GuestPortPublicationManagerTests {
                     id: "nginx:tcp:80:127.0.0.1:18080",
                     hostAddress: "127.0.0.1",
                     hostPort: 18_080,
-                    guestAddress: "192.168.64.2",
                     guestPort: 20_000
                 )
             ]
@@ -63,7 +60,6 @@ struct GuestPortPublicationManagerTests {
             bindings: [
                 .init(containerPort: 53, proto: "udp", hostIP: "127.0.0.1", hostPort: 10_053)
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(udp.first?.id == "dns:udp:53:127.0.0.1:10053")
@@ -77,7 +73,6 @@ struct GuestPortPublicationManagerTests {
                     hostPort: nil
                 )
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(dynamic.first?.hostPort == 0)
@@ -88,7 +83,6 @@ struct GuestPortPublicationManagerTests {
                 .init(containerPort: 80, proto: "tcp", hostIP: "127.0.0.1", hostPort: nil),
                 .init(containerPort: 443, proto: "tcp", hostIP: "127.0.0.1", hostPort: nil),
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000, 20_001]
         )
         #expect(Set(twoDynamic.map(\.id)).count == 2)
@@ -104,7 +98,6 @@ struct GuestPortPublicationManagerTests {
                     hostPort: nil
                 )
             ],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(published.first?.hostPort == 31_000)
@@ -119,7 +112,6 @@ struct GuestPortPublicationManagerTests {
         let published = try await manager.publish(
             containerID: "dns",
             bindings: [.init(containerPort: 53, proto: "udp", hostIP: "127.0.0.1", hostPort: nil)],
-            guestAddress: "192.168.64.2",
             guestPorts: [20_000]
         )
         #expect(published.first?.hostPort == 31_001)
@@ -139,7 +131,6 @@ struct GuestPortPublicationManagerTests {
                     .init(containerPort: 80, proto: "tcp", hostIP: "127.0.0.1", hostPort: 18_080),
                     .init(containerPort: 81, proto: "tcp", hostIP: "127.0.0.1", hostPort: 18_081),
                 ],
-                guestAddress: "192.168.64.2",
                 guestPorts: [20_000, 20_001]
             )
         }
@@ -182,7 +173,6 @@ private actor PortForwarderSpy: DirectTCPPortForwarding {
             id: mapping.id,
             hostAddress: mapping.hostAddress,
             hostPort: 31_000,
-            guestAddress: mapping.guestAddress,
             guestPort: mapping.guestPort
         )
     }

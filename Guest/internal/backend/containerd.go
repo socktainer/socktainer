@@ -339,6 +339,10 @@ func New(address, namespace, snapshotter, runtimeName, runtimeBinary string) (*B
 func (b *Backend) Close() error             { return b.client.Close() }
 func (b *Backend) InitializeNetwork() error { return b.network.Initialize() }
 
+func (b *Backend) PublishedTarget(port uint16, protocol string) (string, error) {
+	return b.network.PublishedTarget(port, protocol)
+}
+
 func (b *Backend) acquireTaskCreation(ctx context.Context) error {
 	select {
 	case b.taskCreates <- struct{}{}:

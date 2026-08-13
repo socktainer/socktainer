@@ -6,6 +6,7 @@ readonly DEFAULT_IMAGE='docker.io/library/nginx@sha256:5616878291a2eed594aee8db4
 readonly DEFAULT_BASE_IMAGE='docker.io/library/alpine@sha256:2c9d26f410d032d5b1525aa8a873e238b05b90c4ae8618743d4311f0cc827e37'
 IMAGE=${INTEGRATION_IMAGE:-$DEFAULT_IMAGE}
 BASE_IMAGE=${INTEGRATION_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
+BIND_ROOT=${INTEGRATION_BIND_ROOT:-$HOME}
 RUN_ID="socktainer-integration-$$"
 LABEL="socktainer.integration.run=$RUN_ID"
 
@@ -17,6 +18,8 @@ Runs a live Docker API lifecycle test against DOCKER_HOST. The test pulls a
 pinned arm64 nginx image by default. Override it with INTEGRATION_IMAGE.
 
 Required: DOCKER_HOST, docker, curl, jq
+
+Set INTEGRATION_BIND_ROOT to a directory that the product shares with its VM.
 EOF
 }
 
@@ -44,6 +47,7 @@ trap 'exit 143' TERM
 preflight() {
     [[ -n ${DOCKER_HOST:-} ]] || die "DOCKER_HOST is required"
     [[ $DOCKER_HOST == unix://* ]] || die "DOCKER_HOST must use unix:// for this test"
+    [[ -d $BIND_ROOT && -w $BIND_ROOT ]] || die "INTEGRATION_BIND_ROOT must be a writable directory"
     [[ $IMAGE == *@sha256:* ]] || die "INTEGRATION_IMAGE must be pinned by digest"
     for tool in docker curl jq python3; do
         command -v "$tool" >/dev/null || die "required tool is not installed: $tool"
@@ -127,7 +131,28 @@ if responses != set(messages):
     raise SystemExit(f"UDP echo responses did not match: {responses!r}")
 PY
 
-bind_dir=$(mktemp -d "$HOME/.socktainer-integration-bind.XXXXXX")
+half_close="$RUN_ID-half-close"
+docker_api run -d --name "$half_close" --label "$LABEL" -p 127.0.0.1::8080 \
+    "$BASE_IMAGE" /bin/sh -c 'while :; do nc -l -p 8080 -e cat; done' >/dev/null
+half_close_port=$(docker_api port "$half_close" 8080/tcp | awk -F: 'END {print $NF}')
+python3 - "$half_close_port" <<'PY'
+import socket, sys
+
+client = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3)
+client.sendall(b"half-close-ok")
+client.shutdown(socket.SHUT_WR)
+response = b""
+while True:
+    chunk = client.recv(1024)
+    if not chunk:
+        break
+    response += chunk
+client.close()
+if response != b"half-close-ok":
+    raise SystemExit(f"TCP half-close response did not match: {response!r}")
+PY
+
+bind_dir=$(mktemp -d "$BIND_ROOT/.socktainer-integration-bind.XXXXXX")
 bind="$RUN_ID-bind"
 docker_api run -d --name "$bind" --label "$LABEL" -v "$bind_dir:/bind" \
     "$BASE_IMAGE" /bin/sh -c 'while :; do sleep 1; done' >/dev/null
@@ -151,7 +176,7 @@ done
 rm -f "$bind_dir/value"
 rm -f "$bind_dir"/host-* "$bind_dir"/guest-*
 rmdir "$bind_dir"
-docker_api rm -f "$web" "$udp" "$bind" >/dev/null
+docker_api rm -f "$web" "$udp" "$half_close" "$bind" >/dev/null
 
 volume="$RUN_ID-volume"
 docker_api volume create --label "$LABEL" "$volume" >/dev/null
@@ -182,4 +207,4 @@ if docker_api ps -aq --filter "label=$LABEL" | grep -q .; then
     die "lifecycle test leaked a container"
 fi
 
-echo "integration: passed lifecycle, attach, exec, TCP/UDP publication, bind coherence, named volumes, and 100 runs at concurrency 16"
+echo "integration: passed lifecycle, attach, exec, TCP/UDP publication and half-close, bind coherence, named volumes, and 100 runs at concurrency 16"

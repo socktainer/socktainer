@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -128,20 +129,28 @@ func (m *NetworkManager) Publish(id string, requested []api.PublishedPort) ([]ap
 			guestPort = m.nextPort
 			m.nextPort++
 		}
-		destination := network.address + ":" + strconv.Itoa(int(port.ContainerPort))
-		arguments := []string{"-t", "nat", "-A", "PREROUTING", "-p", protocol}
-		if port.HostSource != "" {
-			arguments = append(arguments, "-s", port.HostSource)
-		}
-		arguments = append(arguments, "--dport", strconv.Itoa(int(guestPort)), "-j", "DNAT", "--to-destination", destination)
-		if err := m.runner.Run("iptables", arguments...); err != nil {
-			m.removeRules(network, published)
-			return nil, err
-		}
 		published = append(published, api.PublishedPort{ContainerPort: port.ContainerPort, GuestPort: guestPort, Protocol: protocol, HostSource: port.HostSource})
 	}
 	network.guestPorts = published
 	return append([]api.PublishedPort(nil), published...), nil
+}
+
+func (m *NetworkManager) PublishedTarget(guestPort uint16, protocol string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	protocol = strings.ToLower(protocol)
+	for _, network := range m.containers {
+		for _, published := range network.guestPorts {
+			publishedProtocol := strings.ToLower(published.Protocol)
+			if publishedProtocol == "" {
+				publishedProtocol = "tcp"
+			}
+			if published.GuestPort == guestPort && publishedProtocol == protocol {
+				return net.JoinHostPort(network.address, strconv.Itoa(int(published.ContainerPort))), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("published %s port %d does not exist", protocol, guestPort)
 }
 
 func (m *NetworkManager) Published(id string) []api.PublishedPort {
@@ -189,19 +198,6 @@ func (m *NetworkManager) initialize() error {
 }
 
 func (m *NetworkManager) removeRules(network *containerNetwork, ports []api.PublishedPort) {
-	for _, port := range ports {
-		destination := network.address + ":" + strconv.Itoa(int(port.ContainerPort))
-		protocol := strings.ToLower(port.Protocol)
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		arguments := []string{"-t", "nat", "-D", "PREROUTING", "-p", protocol}
-		if port.HostSource != "" {
-			arguments = append(arguments, "-s", port.HostSource)
-		}
-		arguments = append(arguments, "--dport", strconv.Itoa(int(port.GuestPort)), "-j", "DNAT", "--to-destination", destination)
-		_ = m.runner.Run("iptables", arguments...)
-	}
 }
 
 func networkName(id string) string {

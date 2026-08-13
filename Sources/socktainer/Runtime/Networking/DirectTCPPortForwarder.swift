@@ -1,27 +1,25 @@
+import Darwin
+import Foundation
 import Logging
 import NIOCore
-import SocketForwarder
+import NIOPosix
 
-/// A direct host TCP publication. The backend is an address in the persistent
-/// engine VM. No relay VM or intermediate Unix socket is involved.
+/// A host TCP publication connected to the persistent guest over vsock.
 struct DirectTCPPortMapping: Hashable, Sendable {
     let id: String
     let hostAddress: String
     let hostPort: Int
-    let guestAddress: String
     let guestPort: Int
 
     init(
         id: String,
         hostAddress: String,
         hostPort: Int,
-        guestAddress: String,
         guestPort: Int
     ) {
         self.id = id
         self.hostAddress = hostAddress
         self.hostPort = hostPort
-        self.guestAddress = guestAddress
         self.guestPort = guestPort
     }
 }
@@ -42,22 +40,30 @@ protocol DirectTCPListenerFactory: Sendable {
 }
 
 private struct NIOListenerHandle: DirectTCPListenerHandle {
-    let result: SocketForwarderResult
+    let channel: Channel
 
-    var boundPort: Int { result.proxyAddress?.port ?? 0 }
+    var boundPort: Int { channel.localAddress?.port ?? 0 }
 
     func close() async throws {
-        result.close()
+        try await channel.close()
     }
 }
 
-private struct NativeVmnetListenerHandle: DirectTCPListenerHandle {
-    let boundPort: Int
-    func close() async throws {}
+protocol GuestPortConnectionDialing: Sendable {
+    func dial() async throws -> FileHandle
+}
+
+struct PersistentEngineGuestPortDialer: GuestPortConnectionDialing {
+    let engine: PersistentEngine
+
+    func dial() async throws -> FileHandle {
+        try await engine.dialPublishedPortProxy()
+    }
 }
 
 private struct NIODirectTCPListenerFactory: DirectTCPListenerFactory {
     let eventLoopGroup: any EventLoopGroup
+    let dialer: any GuestPortConnectionDialing
     let logger: Logger
 
     func start(_ mapping: DirectTCPPortMapping) async throws -> any DirectTCPListenerHandle {
@@ -65,24 +71,133 @@ private struct NIODirectTCPListenerFactory: DirectTCPListenerFactory {
             ipAddress: mapping.hostAddress,
             port: mapping.hostPort
         )
-        // A custom vmnet shared network does not route direct host connections
-        // to its guest address. Connect explicit host listeners to the
-        // preallocated vmnet loopback forwarding rule instead.
-        let backendAddress =
-            NativeVmnetPortRange.ports.contains(mapping.guestPort)
-            ? "127.0.0.1" : mapping.guestAddress
-        let guest = try SocketAddress(
-            ipAddress: backendAddress,
-            port: mapping.guestPort
-        )
-        let result = try await TCPForwarder(
-            proxyAddress: host,
-            serverAddress: guest,
-            eventLoopGroup: eventLoopGroup,
-            connectTimeout: .seconds(1),
-            log: logger
-        ).run().get()
-        return NIOListenerHandle(result: result)
+        let channel = try await ServerBootstrap(group: eventLoopGroup)
+            .serverChannelOption(
+                ChannelOptions.socket(.init(SOL_SOCKET), .init(SO_REUSEADDR)), value: 1
+            )
+            .childChannelOption(ChannelOptions.autoRead, value: false)
+            .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(
+                    GuestPortConnectHandler(
+                        guestPort: UInt16(mapping.guestPort),
+                        dialer: dialer,
+                        logger: logger
+                    )
+                )
+            }
+            .bind(to: host)
+            .get()
+        return NIOListenerHandle(channel: channel)
+    }
+}
+
+private final class GuestPortConnectHandler: ChannelInboundHandler, RemovableChannelHandler,
+    @unchecked Sendable
+{
+    typealias InboundIn = ByteBuffer
+
+    private let guestPort: UInt16
+    private let dialer: any GuestPortConnectionDialing
+    private let logger: Logger
+
+    init(guestPort: UInt16, dialer: any GuestPortConnectionDialing, logger: Logger) {
+        self.guestPort = guestPort
+        self.dialer = dialer
+        self.logger = logger
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        let dialer = dialer
+        let guestPort = guestPort
+        context.eventLoop.makeFutureWithTask {
+            let handle = try await dialer.dial()
+            let descriptor = Darwin.dup(handle.fileDescriptor)
+            try handle.close()
+            guard descriptor >= 0 else {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
+            return descriptor
+        }.assumeIsolatedUnsafeUnchecked().flatMap { descriptor in
+            ClientBootstrap(group: context.eventLoop)
+                .channelOption(ChannelOptions.autoRead, value: false)
+                .channelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                .withConnectedSocket(descriptor)
+        }.flatMap { peer in
+            var header = peer.allocator.buffer(capacity: 7)
+            header.writeBytes([0x53, 0x54, 0x50, 0x31, 0x01])
+            header.writeInteger(guestPort, endianness: .big)
+            return peer.writeAndFlush(header).map { peer }
+        }.whenComplete { result in
+            switch result {
+            case .success(let peer):
+                self.glue(peer, context: context)
+            case .failure(let error):
+                self.logger.error("guest port proxy connection failed", metadata: ["error": "\(error)"])
+                context.close(promise: nil)
+            }
+        }
+        context.fireChannelActive()
+    }
+
+    private func glue(_ peer: Channel, context: ChannelHandlerContext) {
+        let (frontend, backend) = DirectTCPGlueHandler.matchedPair()
+        do {
+            try context.channel.pipeline.syncOperations.addHandler(frontend)
+            try peer.pipeline.syncOperations.addHandler(backend)
+            context.pipeline.syncOperations.removeHandler(self, promise: nil)
+            try context.channel.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
+            try peer.syncOptions?.setOption(ChannelOptions.autoRead, value: true)
+        } catch {
+            peer.close(promise: nil)
+            context.close(promise: nil)
+        }
+    }
+}
+
+private final class DirectTCPGlueHandler: ChannelDuplexHandler {
+    typealias InboundIn = NIOAny
+    typealias OutboundIn = NIOAny
+    typealias OutboundOut = NIOAny
+
+    private var partner: DirectTCPGlueHandler?
+    private var context: ChannelHandlerContext?
+    private var pendingRead = false
+
+    static func matchedPair() -> (DirectTCPGlueHandler, DirectTCPGlueHandler) {
+        let first = DirectTCPGlueHandler()
+        let second = DirectTCPGlueHandler()
+        first.partner = second
+        second.partner = first
+        return (first, second)
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) { self.context = context }
+    func handlerRemoved(context: ChannelHandlerContext) {
+        self.context = nil
+        partner = nil
+    }
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) { partner?.context?.write(data, promise: nil) }
+    func channelReadComplete(context: ChannelHandlerContext) { partner?.context?.flush() }
+    func channelInactive(context: ChannelHandlerContext) { partner?.context?.close(promise: nil) }
+    func errorCaught(context: ChannelHandlerContext, error: Error) { partner?.context?.close(promise: nil) }
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let event = event as? ChannelEvent, case .inputClosed = event {
+            partner?.context?.close(mode: .output, promise: nil)
+        }
+    }
+    func channelWritabilityChanged(context: ChannelHandlerContext) {
+        if context.channel.isWritable, partner?.pendingRead == true {
+            partner?.pendingRead = false
+            partner?.context?.read()
+        }
+    }
+    func read(context: ChannelHandlerContext) {
+        if partner?.context?.channel.isWritable == true {
+            context.read()
+        } else {
+            pendingRead = true
+        }
     }
 }
 
@@ -107,9 +222,22 @@ actor DirectTCPPortForwarder {
     private let logger: Logger
     private var active: [String: ActivePublication] = [:]
 
-    init(eventLoopGroup: any EventLoopGroup, logger: Logger) {
+    init(eventLoopGroup: any EventLoopGroup, engine: PersistentEngine, logger: Logger) {
+        self.init(
+            eventLoopGroup: eventLoopGroup,
+            dialer: PersistentEngineGuestPortDialer(engine: engine),
+            logger: logger
+        )
+    }
+
+    init(
+        eventLoopGroup: any EventLoopGroup,
+        dialer: any GuestPortConnectionDialing,
+        logger: Logger
+    ) {
         self.factory = NIODirectTCPListenerFactory(
             eventLoopGroup: eventLoopGroup,
+            dialer: dialer,
             logger: logger
         )
         self.logger = logger
@@ -176,7 +304,6 @@ actor DirectTCPPortForwarder {
                     id: mapping.id,
                     hostAddress: mapping.hostAddress,
                     hostPort: listener.boundPort,
-                    guestAddress: mapping.guestAddress,
                     guestPort: mapping.guestPort
                 )
                 let publication = ActivePublication(mapping: realized, listener: listener)
@@ -234,7 +361,6 @@ actor DirectTCPPortForwarder {
                         id: publication.mapping.id,
                         hostAddress: publication.mapping.hostAddress,
                         hostPort: listener.boundPort,
-                        guestAddress: publication.mapping.guestAddress,
                         guestPort: publication.mapping.guestPort
                     ),
                     listener: listener

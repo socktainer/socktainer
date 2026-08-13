@@ -463,7 +463,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         guard
             let allocatedGuestPorts = Self.lowestAvailableGuestPorts(
                 count: request.ports.count,
-                range: NativeVmnetPortRange.ports,
+                range: PublishedPortProxyRange.ports,
                 excluding: reservedGuestPorts
             )
         else {
@@ -623,15 +623,9 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
     }
 
     private func publishPorts(id: String, metadata: Metadata, guestPorts: [Int]) async throws {
-        guard let guestAddress = await engine.address(), !guestAddress.isEmpty else {
-            throw PersistentEngineError.invalidMachineSnapshot(
-                "running engine has no IP address for published ports"
-            )
-        }
         let published = try await portPublisher.publish(
             containerID: id,
             bindings: metadata.ports,
-            guestAddress: guestAddress,
             guestPorts: guestPorts
         )
         self.metadata[id]?.ports = published
@@ -1021,13 +1015,13 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             guard var meta = metadata[container.id] else { continue }
             let reusable =
                 meta.guestPorts.count == meta.ports.count
-                && meta.guestPorts.allSatisfy(NativeVmnetPortRange.ports.contains)
+                && meta.guestPorts.allSatisfy(PublishedPortProxyRange.ports.contains)
                 && Set(meta.guestPorts).isDisjoint(with: reservedGuestPorts)
             if !reusable {
                 guard
                     let replacement = Self.lowestAvailableGuestPorts(
                         count: meta.ports.count,
-                        range: NativeVmnetPortRange.ports,
+                        range: PublishedPortProxyRange.ports,
                         excluding: reservedGuestPorts
                     )
                 else {
@@ -1040,7 +1034,6 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             }
             reservedGuestPorts.formUnion(meta.guestPorts)
         }
-        guard let guestAddress = await engine.address(), !guestAddress.isEmpty else { return }
         for container in payload.containers where container.status == "running" {
             guard let bindings = metadata[container.id]?.ports, !bindings.isEmpty else { continue }
             let guestPorts = container.metadata?.publishedPorts ?? container.publishedPorts ?? []
@@ -1048,7 +1041,6 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             let published = try await portPublisher.publish(
                 containerID: container.id,
                 bindings: bindings,
-                guestAddress: guestAddress,
                 guestPorts: guestPorts.map(\.guestPort)
             )
             metadata[container.id]?.ports = published

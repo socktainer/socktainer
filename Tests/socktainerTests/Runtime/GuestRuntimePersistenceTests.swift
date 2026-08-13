@@ -26,14 +26,11 @@ struct GuestRuntimePersistenceTests {
         )
     }
 
-    @Test("native vmnet allocates a bounded 32-port publication range")
-    func nativeVmnetRangeIsBounded() {
-        #expect(NativeVmnetPortRange.rangeSize == 32)
-        #expect(NativeVmnetPortRange.ports.count == 32)
-        #expect(
-            NativeVmnetPortRange.candidates.allSatisfy { base in
-                base >= 20_000 && base + NativeVmnetPortRange.rangeSize - 1 <= Int(UInt16.max)
-            })
+    @Test("vsock publication identifiers use the available high port range")
+    func publishedPortProxyRange() {
+        #expect(PublishedPortProxyRange.ports.lowerBound == 20_000)
+        #expect(PublishedPortProxyRange.ports.upperBound == Int(UInt16.max))
+        #expect(PublishedPortProxyRange.ports.count == 45_536)
     }
 
     @Test("guest port allocation rejects range exhaustion without partial allocation")

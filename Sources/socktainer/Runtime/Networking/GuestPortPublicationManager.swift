@@ -40,7 +40,6 @@ actor GuestPortPublicationManager {
     func publish(
         containerID: String,
         bindings: [DockerRuntimePortBinding],
-        guestAddress: String,
         guestPorts: [Int]
     ) async throws -> [DockerRuntimePortBinding] {
         if let published = publishedBindingsByContainer[containerID] {
@@ -49,7 +48,6 @@ actor GuestPortPublicationManager {
         let mappings = try Self.mappings(
             containerID: containerID,
             bindings: bindings,
-            guestAddress: guestAddress,
             guestPorts: guestPorts
         )
         var added: [(id: String, protocolName: String)] = []
@@ -126,7 +124,6 @@ actor GuestPortPublicationManager {
     static func mappings(
         containerID: String,
         bindings: [DockerRuntimePortBinding],
-        guestAddress: String,
         guestPorts: [Int]
     ) throws -> [DirectTCPPortMapping] {
         guard bindings.count == guestPorts.count else {
@@ -156,7 +153,6 @@ actor GuestPortPublicationManager {
                 id: id,
                 hostAddress: hostAddress,
                 hostPort: hostPort,
-                guestAddress: guestAddress,
                 guestPort: guestPort
             )
         }

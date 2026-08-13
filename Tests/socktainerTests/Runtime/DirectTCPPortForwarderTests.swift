@@ -118,17 +118,16 @@ struct DirectTCPPortForwarderTests {
     @Test("real listener forwards bytes directly to the configured guest endpoint")
     func forwardsBytesOverLoopback() async throws {
         try await withApp { app in
-            let backend = try LoopbackEchoServer.start()
-            defer { backend.close() }
             let frontendPort = try Self.availableTCPPort()
             let forwarder = DirectTCPPortForwarder(
                 eventLoopGroup: app.eventLoopGroup,
+                dialer: LoopbackGuestProxyDialer(),
                 logger: Logger(label: "socktainer.tests.direct-tcp.integration")
             )
             let mapping = Self.mapping(
                 id: "echo",
                 hostPort: frontendPort,
-                guestPort: backend.port
+                guestPort: 42_000
             )
 
             try await forwarder.add(mapping)
@@ -144,13 +143,12 @@ struct DirectTCPPortForwarderTests {
     @Test("kernel-selected host port is returned and forwards bytes")
     func dynamicHostPort() async throws {
         try await withApp { app in
-            let backend = try LoopbackEchoServer.start()
-            defer { backend.close() }
             let forwarder = DirectTCPPortForwarder(
                 eventLoopGroup: app.eventLoopGroup,
+                dialer: LoopbackGuestProxyDialer(),
                 logger: Logger(label: "socktainer.tests.direct-tcp.dynamic")
             )
-            let requested = Self.mapping(id: "dynamic", hostPort: 0, guestPort: backend.port)
+            let requested = Self.mapping(id: "dynamic", hostPort: 0, guestPort: 42_001)
 
             let published = try await forwarder.add(requested)
             #expect(published.hostPort > 0)
@@ -165,6 +163,30 @@ struct DirectTCPPortForwarderTests {
         }
     }
 
+    @Test("client write half-close preserves the backend response")
+    func clientHalfClose() async throws {
+        try await withApp { app in
+            let forwarder = DirectTCPPortForwarder(
+                eventLoopGroup: app.eventLoopGroup,
+                dialer: HalfCloseGuestProxyDialer(),
+                logger: Logger(label: "socktainer.tests.direct-tcp.half-close")
+            )
+            let mapping = Self.mapping(id: "half-close", hostPort: 0, guestPort: 42_002)
+            let published = try await forwarder.add(mapping)
+
+            let response = try await Task.detached {
+                try Self.roundTrip(
+                    port: published.hostPort,
+                    payload: Data("request-before-eof".utf8),
+                    halfClose: true
+                )
+            }.value
+
+            #expect(response == Data("request-before-eof".utf8))
+            try await forwarder.remove(id: mapping.id)
+        }
+    }
+
     private static func mapping(
         id: String,
         hostPort: Int,
@@ -174,7 +196,6 @@ struct DirectTCPPortForwarderTests {
             id: id,
             hostAddress: "127.0.0.1",
             hostPort: hostPort,
-            guestAddress: "127.0.0.1",
             guestPort: guestPort
         )
     }
@@ -202,7 +223,7 @@ struct DirectTCPPortForwarderTests {
         return Int(UInt16(bigEndian: address.sin_port))
     }
 
-    private static func roundTrip(port: Int, payload: Data) throws -> Data {
+    private static func roundTrip(port: Int, payload: Data, halfClose: Bool = false) throws -> Data {
         let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { _ = Darwin.close(descriptor) }
@@ -223,10 +244,46 @@ struct DirectTCPPortForwarderTests {
                 throw POSIXError(.init(rawValue: errno) ?? .EIO)
             }
         }
+        if halfClose {
+            guard Darwin.shutdown(descriptor, SHUT_WR) == 0 else {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
+        }
         var buffer = [UInt8](repeating: 0, count: payload.count)
         let count = Darwin.read(descriptor, &buffer, buffer.count)
         guard count == payload.count else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         return Data(buffer)
+    }
+}
+
+private struct HalfCloseGuestProxyDialer: GuestPortConnectionDialing {
+    func dial() async throws -> FileHandle {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        let client = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
+        let peer = descriptors[1]
+        Task.detached {
+            defer { _ = Darwin.close(peer) }
+            var header = [UInt8](repeating: 0, count: 7)
+            guard Darwin.read(peer, &header, header.count) == header.count,
+                header.prefix(5) == [0x53, 0x54, 0x50, 0x31, 0x01]
+            else { return }
+            var request = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let count = Darwin.read(peer, &buffer, buffer.count)
+                guard count >= 0 else { return }
+                if count == 0 { break }
+                request.append(buffer, count: count)
+            }
+            request.withUnsafeBytes { bytes in
+                _ = Darwin.write(peer, bytes.baseAddress, bytes.count)
+            }
+            _ = Darwin.shutdown(peer, SHUT_WR)
+        }
+        return client
     }
 }
 
@@ -271,58 +328,27 @@ private struct RecordingTCPListenerHandle: DirectTCPListenerHandle {
     func close() async throws { try await factory.recordClose(id: id) }
 }
 
-private final class LoopbackEchoServer: @unchecked Sendable {
-    let descriptor: Int32
-    let port: Int
-    private let task: Task<Void, Never>
-
-    private init(descriptor: Int32, port: Int, task: Task<Void, Never>) {
-        self.descriptor = descriptor
-        self.port = port
-        self.task = task
-    }
-
-    static func start() throws -> LoopbackEchoServer {
-        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+private struct LoopbackGuestProxyDialer: GuestPortConnectionDialing {
+    func dial() async throws -> FileHandle {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
-        guard bound == 0, Darwin.listen(descriptor, 1) == 0 else {
-            let error = POSIXError(.init(rawValue: errno) ?? .EIO)
-            _ = Darwin.close(descriptor)
-            throw error
-        }
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.getsockname(descriptor, $0, &length)
-            }
-        }
-        let task = Task.detached {
-            let client = Darwin.accept(descriptor, nil, nil)
-            guard client >= 0 else { return }
-            defer { _ = Darwin.close(client) }
+        let client = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
+        let peer = descriptors[1]
+        Task.detached {
+            defer { _ = Darwin.close(peer) }
+            var header = [UInt8](repeating: 0, count: 7)
+            guard Darwin.read(peer, &header, header.count) == header.count,
+                header.prefix(5) == [0x53, 0x54, 0x50, 0x31, 0x01]
+            else { return }
             var buffer = [UInt8](repeating: 0, count: 4096)
-            let count = Darwin.read(client, &buffer, buffer.count)
-            if count > 0 {
-                _ = Darwin.write(client, buffer, count)
+            while true {
+                let count = Darwin.read(peer, &buffer, buffer.count)
+                guard count > 0 else { return }
+                _ = Darwin.write(peer, buffer, count)
             }
         }
-        return LoopbackEchoServer(
-            descriptor: descriptor,
-            port: Int(UInt16(bigEndian: address.sin_port)),
-            task: task
-        )
-    }
-
-    func close() {
-        _ = Darwin.close(descriptor)
-        task.cancel()
+        return client
     }
 }

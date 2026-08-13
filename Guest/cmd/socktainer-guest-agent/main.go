@@ -14,6 +14,7 @@ import (
 	"github.com/mdlayher/vsock"
 	"github.com/socktainer/socktainer/guest/internal/backend"
 	"github.com/socktainer/socktainer/guest/internal/bindcache"
+	"github.com/socktainer/socktainer/guest/internal/portproxy"
 	"github.com/socktainer/socktainer/guest/internal/server"
 )
 
@@ -27,6 +28,7 @@ func main() {
 	runtimeBinary := flag.String("runtime-binary", "/usr/bin/runc", "OCI runtime binary used by the runc v2 shim")
 	unixAddress := flag.String("unix", "", "listen on a Unix socket instead of vsock (tests and diagnostics)")
 	port := flag.Uint("vsock-port", 1025, "guest vsock port")
+	proxyPort := flag.Uint("proxy-vsock-port", 1026, "published port proxy vsock port")
 	bindSource := flag.String("bind-source", "", "Apple virtiofs shared home path")
 	bindCachePath := flag.String("bind-cache", "/run/socktainer-bind-cache", "cached bind mount path")
 	flag.Parse()
@@ -50,16 +52,24 @@ func main() {
 	}
 
 	var listener net.Listener
+	var proxyListener net.Listener
 	if *unixAddress != "" {
 		_ = os.Remove(*unixAddress)
 		listener, err = net.Listen("unix", *unixAddress)
+		if err == nil {
+			proxyListener, err = net.Listen("tcp", "127.0.0.1:0")
+		}
 	} else {
 		listener, err = vsock.Listen(uint32(*port), nil)
+		if err == nil {
+			proxyListener, err = vsock.Listen(uint32(*proxyPort), nil)
+		}
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
+	defer proxyListener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	log.Printf("socktainer guest agent %s listening on %s", version, listener.Addr())
@@ -67,8 +77,20 @@ func main() {
 	if cache != nil {
 		guestServer.WithBindCache(cache)
 	}
-	if err := guestServer.Serve(ctx, listener); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+	errors := make(chan error, 2)
+	go func() { errors <- guestServer.Serve(serveCtx, listener) }()
+	go func() { errors <- portproxy.Serve(serveCtx, proxyListener, b) }()
+	firstError := <-errors
+	cancelServe()
+	secondError := <-errors
+	if firstError != nil {
+		fmt.Fprintln(os.Stderr, firstError)
+		os.Exit(1)
+	}
+	if secondError != nil {
+		fmt.Fprintln(os.Stderr, secondError)
 		os.Exit(1)
 	}
 }

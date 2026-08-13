@@ -370,7 +370,6 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
-		syscall.Sync()
 		exitCode := int32(code)
 		payload, _ := protocol.NewPayload(api.ContainerExitEvent{ID: body.ID, ExitCode: code, ExitedAt: exitedAt})
 		_ = w.Write(protocol.Envelope{ID: request.ID, Kind: protocol.KindEnd, Payload: payload, ExitCode: &exitCode})

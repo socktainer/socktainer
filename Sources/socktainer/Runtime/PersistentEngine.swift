@@ -25,6 +25,7 @@ enum PersistentEngineError: Error, Equatable {
 actor PersistentEngine {
     static let machineID = "socktainer-engine"
     static let guestPort: UInt32 = 1025
+    static let publishedPortProxyPort: UInt32 = 1026
 
     private let controller: any EngineMachineControlling
     private let logger: Logger
@@ -142,6 +143,17 @@ actor PersistentEngine {
 
     func address() -> String? {
         machine?.ipAddress
+    }
+
+    func dialPublishedPortProxy() async throws -> FileHandle {
+        _ = try await readyConnection()
+        guard let machine else {
+            throw PersistentEngineError.invalidMachineSnapshot("engine is unavailable")
+        }
+        return try await controller.dial(
+            containerID: machine.containerID,
+            port: Self.publishedPortProxyPort
+        )
     }
 
 }
