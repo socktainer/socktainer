@@ -447,7 +447,10 @@ struct DockerRuntimeRoutes: RouteCollection {
                     throw DockerStopTimeout()
                 }
                 defer { group.cancelAll() }
-                return try await group.next()!
+                guard let result = try await group.next() else {
+                    throw DockerStopTimeout()
+                }
+                return result
             }
         } catch is DockerStopTimeout {
             try await call { try await backend.killContainer(id: id, signal: 9) }

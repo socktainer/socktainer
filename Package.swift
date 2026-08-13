@@ -38,7 +38,6 @@ let package = Package(
         .executableTarget(
             name: "socktainer",
             dependencies: [
-                .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "ContainerNetworkClient", package: "container"),
                 .product(name: "ContainerPersistence", package: "container"),
@@ -57,9 +56,6 @@ let package = Package(
                 .product(name: "libzstd", package: "zstd"),
                 "CFilteredStream",
                 "BuildInfo",
-            ],
-            swiftSettings: [
-                .unsafeFlags(["-Xllvm", "-sil-print-pass-name"])
             ]
         ),
         .testTarget(
