@@ -611,7 +611,7 @@ struct DockerRuntimeRoutes: RouteCollection {
         if Self.mobyBool(req.query[String.self, at: "stdin"]) {
             throw Abort(.notImplemented, reason: "Interactive attach stdin is not implemented")
         }
-        let container = try await call { try await backend.inspectContainer(id: id) }
+        let tty = try await inspectContainer(id: id).tty
         let backend = self.backend
         let stdout = req.query[String.self, at: "stdout"].map(Self.mobyBool) ?? true
         let stderr = req.query[String.self, at: "stderr"].map(Self.mobyBool) ?? true
@@ -631,7 +631,7 @@ struct DockerRuntimeRoutes: RouteCollection {
                 try await writer.writeBuffer(ByteBuffer())
                 for try await frame in stream {
                     guard frame.exitCode == nil else { continue }
-                    if container.tty {
+                    if tty {
                         try await writer.writeBuffer(ByteBuffer(data: frame.data))
                     } else {
                         let streamID: UInt8 = frame.stream == .stderr ? 2 : 1
@@ -652,6 +652,12 @@ struct DockerRuntimeRoutes: RouteCollection {
             case .invalidRequest(let message): throw Abort(.badRequest, reason: message)
             }
         }
+    }
+
+    private func inspectContainer(id: String) async throws -> DockerRuntimeContainer {
+        // Keep generic error mapping outside the escaping response stream closure.
+        // Swift 6.3.3 otherwise stalls in ClosureLifetimeFixup while compiling attach.
+        try await call { try await backend.inspectContainer(id: id) }
     }
 
     private func requiredParameter(_ name: String, request: Request) throws -> String {
