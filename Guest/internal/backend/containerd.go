@@ -148,24 +148,25 @@ func (b *orderedCleanupBarrier) wait(ctx context.Context) error {
 }
 
 type containerRecord struct {
-	container     containerd.Container
-	snapshotter   string
-	snapshotKey   string
-	mu            sync.Mutex
-	task          containerd.Task
-	taskReaped    bool
-	taskReaping   chan struct{}
-	spec          *specs.Spec
-	prepareDone   chan struct{}
-	prepareNow    chan struct{}
-	prepareStop   chan struct{}
-	prepareOnce   sync.Once
-	stopOnce      sync.Once
-	creatingTask  bool
-	prepareErr    error
-	preparable    bool
-	persistedExit bool
-	persistedCode uint32
+	container      containerd.Container
+	snapshotter    string
+	snapshotKey    string
+	mu             sync.Mutex
+	task           containerd.Task
+	taskReaped     bool
+	taskReaping    chan struct{}
+	spec           *specs.Spec
+	prepareDone    chan struct{}
+	prepareNow     chan struct{}
+	prepareStop    chan struct{}
+	prepareOnce    sync.Once
+	stopOnce       sync.Once
+	creatingTask   bool
+	prepareErr     error
+	preparable     bool
+	publishedPorts []api.PublishedPort
+	persistedExit  bool
+	persistedCode  uint32
 }
 
 func (r *containerRecord) beginPreparation() bool {
@@ -677,21 +678,6 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	default:
 		return api.Container{}, fmt.Errorf("unsupported network mode %q", request.Network.Mode)
 	}
-	networkCommitted := false
-	if privateNetwork {
-		if _, err := b.network.Create(request.ID); err != nil {
-			return api.Container{}, err
-		}
-		if _, err := b.network.Publish(request.ID, request.PublishedPorts); err != nil {
-			_ = b.network.Delete(request.ID)
-			return api.Container{}, err
-		}
-		defer func() {
-			if !networkCommitted {
-				_ = b.network.Delete(request.ID)
-			}
-		}()
-	}
 	ctx = b.ctx(ctx)
 	image, err := b.client.GetImage(ctx, request.Image)
 	if err != nil {
@@ -786,7 +772,10 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	metadata.AutoRemove = metadata.AutoRemove || request.AutoRemove
 	if privateNetwork {
-		metadata.PublishedPorts = b.network.Published(request.ID)
+		// Docker create establishes durable container metadata. The network
+		// namespace is only required when runc creates the task, so prepare it
+		// after the create response instead of delaying this transaction.
+		metadata.PublishedPorts = append([]api.PublishedPort(nil), request.PublishedPorts...)
 	}
 	encodedMetadata, err := encodeRuntimeMetadata(metadata)
 	if err != nil {
@@ -812,18 +801,14 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	container, err := b.client.NewContainer(ctx, request.ID, opts...)
 	if err != nil {
-		if privateNetwork {
-			_ = b.network.Delete(request.ID)
-		}
 		if snapshotCreated {
 			_ = b.client.SnapshotService(snapshotter).Remove(ctx, request.ID)
 		}
 		return api.Container{}, err
 	}
-	networkCommitted = true
 	record := &containerRecord{
 		container: container, snapshotter: snapshotter, snapshotKey: request.ID,
-		preparable: privateNetwork,
+		preparable: privateNetwork, publishedPorts: append([]api.PublishedPort(nil), request.PublishedPorts...),
 	}
 	b.containers.Store(request.ID, record)
 	info, err := container.Info(ctx)
@@ -888,7 +873,7 @@ func (b *Backend) prepareTask(id string, record *containerRecord) {
 			record.finishPreparation(nil, nil)
 			return
 		}
-		if _, err := b.network.Create(id); err != nil {
+		if err := b.prepareNetwork(id, record.publishedPorts); err != nil {
 			record.finishPreparation(nil, err)
 			return
 		}
@@ -931,6 +916,17 @@ func (b *Backend) prepareTask(id string, record *containerRecord) {
 		syscall.Sync()
 		record.finishPreparation(task, nil)
 	}()
+}
+
+func (b *Backend) prepareNetwork(id string, publishedPorts []api.PublishedPort) error {
+	if _, err := b.network.Create(id); err != nil {
+		return err
+	}
+	if _, err := b.network.Publish(id, publishedPorts); err != nil {
+		_ = b.network.Delete(id)
+		return err
+	}
+	return nil
 }
 
 func (b *Backend) persistRunningState(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {

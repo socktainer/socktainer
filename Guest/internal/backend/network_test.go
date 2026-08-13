@@ -185,6 +185,32 @@ func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testin
 	}
 }
 
+func TestDeferredNetworkPreparationCreatesAndPublishesAtomically(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	backend := &Backend{network: manager}
+	want := []api.PublishedPort{{ContainerPort: 80, GuestPort: 42000, Protocol: "tcp"}}
+	if err := backend.prepareNetwork("web", want); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Published("web"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("published ports = %#v, want %#v", got, want)
+	}
+}
+
+func TestDeferredNetworkPreparationRollsBackInvalidPublication(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	backend := &Backend{network: manager}
+	err := backend.prepareNetwork("web", []api.PublishedPort{{ContainerPort: 0, Protocol: "tcp"}})
+	if err == nil {
+		t.Fatal("invalid publication succeeded")
+	}
+	if _, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 80}}); err == nil {
+		t.Fatal("failed deferred preparation left its network behind")
+	}
+}
+
 func TestNetworkManagerReusesKnownNamespaceWithoutAProcess(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := newTestNetworkManager(runner)
