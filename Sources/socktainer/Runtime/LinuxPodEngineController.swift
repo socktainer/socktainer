@@ -58,7 +58,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
             ProcessInfo.processInfo.environment[
                 "SOCKTAINER_ENGINE_STATE_DIRECTORY"
             ].map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? FileManager.default.homeDirectoryForCurrentUser
+            ?? SocktainerDirectories.hostHome
             .appendingPathComponent(
                 "Library/Application Support/Socktainer/engine",
                 isDirectory: true
@@ -85,7 +85,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
         let dataConfiguration = try DirectVZEngineConfiguration(
             id: id,
             stateDirectory: stateDirectory,
-            bindRoot: FileManager.default.homeDirectoryForCurrentUser,
+            bindRoot: SocktainerDirectories.hostHome,
             dataDiskSize: 1024 * 1024 * 1024,
             cpus: Self.configuredCPUCount(),
             memoryInBytes: Self.configuredMemoryInBytes()
@@ -121,7 +121,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
             ]
         }
         try await pod.addContainer(Self.engineContainerID, rootfs: rootfs) { configuration in
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let home = SocktainerDirectories.hostHome.path
             configuration.process.arguments = [
                 "/sbin/init",
                 "--bind-source",

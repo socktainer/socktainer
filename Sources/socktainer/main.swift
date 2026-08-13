@@ -45,13 +45,12 @@ try LoggingSystem.bootstrap(from: &env)
 
 // Create and configure the Vapor application
 let app = try await Application.make(env)
-let homeDirectory = ProcessInfo.processInfo.environment["HOME"]
+let homeDirectory = SocktainerDirectories.hostHome.path
 try prepareUnixSocket(for: app, homeDirectory: homeDirectory)
 if options.dockerContext,
-    let homeDir = homeDirectory,
-    !homeDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    !homeDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 {
-    DockerContextSetup.install(homeDirectory: homeDir)
+    DockerContextSetup.install(homeDirectory: homeDirectory)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
 try await configure(app)

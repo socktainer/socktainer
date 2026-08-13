@@ -35,7 +35,7 @@ func configure(_ app: Application) async throws {
     let engine = PersistentEngine(controller: engineController)
     _ = try await engine.readyConnection()
     let bindCacheController = BindCacheInvalidationController(
-        source: FSEventsBindHostEventSource(root: FileManager.default.homeDirectoryForCurrentUser),
+        source: FSEventsBindHostEventSource(root: SocktainerDirectories.hostHome),
         sink: GuestConnectionBindCacheSink(engine: engine)
     )
     let bindCacheBridge = GuestBindCacheBridge(

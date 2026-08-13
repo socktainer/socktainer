@@ -84,7 +84,7 @@ product_value() {
     fi
     case $field in
         DOCKER_HOST) printf 'unix://%s/socktainer-home/.socktainer/container.sock' "$ENGINE_STATE_DIR" ;;
-        START_CMD) printf 'env HOME=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q SOCKTAINER_GUEST_IMAGE=%q %q --no-check-compatibility --no-docker-context' \
+        START_CMD) printf 'env SOCKTAINER_HOST_HOME_DIRECTORY=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q SOCKTAINER_GUEST_IMAGE=%q %q --no-check-compatibility --no-docker-context' \
             "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
             "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" "$REPO_ROOT/.build/release/socktainer" ;;
         RESET_CMD) printf 'rm -rf %q %q && mkdir -p %q %q' \

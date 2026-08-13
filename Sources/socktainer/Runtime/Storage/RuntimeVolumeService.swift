@@ -52,7 +52,7 @@ actor RuntimeVolumeService: ClientVolumeProtocol {
             ?? ProcessInfo.processInfo.environment["SOCKTAINER_VOLUME_DIRECTORY"].map {
                 URL(fileURLWithPath: $0, isDirectory: true)
             }
-            ?? FileManager.default.homeDirectoryForCurrentUser
+            ?? SocktainerDirectories.hostHome
             .appendingPathComponent("Library/Application Support/Socktainer/volumes", isDirectory: true)
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
