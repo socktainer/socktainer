@@ -10,7 +10,7 @@ mkdir -p /run/containerd /var/lib/containerd
 containerd --config /etc/containerd/config.toml >&2 &
 containerd_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 3000); do
     [ -S /run/containerd/containerd.sock ] && break
     kill -0 "${containerd_pid}" 2>/dev/null || {
         exit 1

@@ -10,8 +10,8 @@ struct RESTVolumesListQuery: Content {
 }
 
 struct VolumeListRoute: RouteCollection {
-    let client: ClientVolumeService
-    init(client: ClientVolumeService) {
+    let client: any ClientVolumeProtocol
+    init(client: any ClientVolumeProtocol) {
         self.client = client
     }
 

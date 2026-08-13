@@ -103,6 +103,52 @@ func TestNetworkManagerReportsPreparedPublication(t *testing.T) {
 	}
 }
 
+func TestNetworkManagerPublishesAndRemovesUDP(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := NewNetworkManager(runner)
+	if _, err := manager.Create("dns"); err != nil {
+		t.Fatal(err)
+	}
+	published, err := manager.Publish("dns", []api.PublishedPort{{ContainerPort: 53, Protocol: "udp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Delete("dns"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(runner.commands, "\n")
+	for _, operation := range []string{"-A", "-D"} {
+		want := "iptables -t nat " + operation + " PREROUTING -p udp --dport " + strconv.Itoa(int(published[0].GuestPort))
+		if !strings.Contains(joined, want) {
+			t.Fatalf("UDP DNAT %s is absent:\n%s", operation, joined)
+		}
+	}
+}
+
+func TestNetworkManagerRestrictsVmnetIngressToTheHostGateway(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := NewNetworkManager(runner)
+	if _, err := manager.Create("web"); err != nil {
+		t.Fatal(err)
+	}
+	requested := []api.PublishedPort{{
+		ContainerPort: 80, GuestPort: 42000, Protocol: "tcp", HostSource: "192.168.64.1",
+	}}
+	if _, err := manager.Publish("web", requested); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Delete("web"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(runner.commands, "\n")
+	for _, operation := range []string{"-A", "-D"} {
+		want := "iptables -t nat " + operation + " PREROUTING -p tcp -s 192.168.64.1 --dport 42000"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("host-source restriction %s is absent:\n%s", operation, joined)
+		}
+	}
+}
+
 func TestNetworkManagerReusesKnownNamespaceWithoutAProcess(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := NewNetworkManager(runner)

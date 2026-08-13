@@ -61,11 +61,6 @@ private struct NIODirectTCPListenerFactory: DirectTCPListenerFactory {
     let logger: Logger
 
     func start(_ mapping: DirectTCPPortMapping) async throws -> any DirectTCPListenerHandle {
-        if mapping.hostPort == 0,
-            NativeVmnetPortRange.ports.contains(mapping.guestPort)
-        {
-            return NativeVmnetListenerHandle(boundPort: mapping.guestPort)
-        }
         let host = try SocketAddress(
             ipAddress: mapping.hostAddress,
             port: mapping.hostPort

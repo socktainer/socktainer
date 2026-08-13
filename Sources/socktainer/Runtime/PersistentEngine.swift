@@ -30,6 +30,11 @@ actor PersistentEngine {
     private let logger: Logger
     private var connection: GuestConnection?
     private var machine: EngineMachine?
+    private struct Readiness {
+        let token: UUID
+        let task: Task<(GuestConnection, EngineMachine), Error>
+    }
+    private var readiness: Readiness?
 
     init(
         controller: any EngineMachineControlling,
@@ -42,6 +47,29 @@ actor PersistentEngine {
     func readyConnection() async throws -> GuestConnection {
         if let connection { return connection }
 
+        let current: Readiness
+        if let readiness {
+            current = readiness
+        } else {
+            current = Readiness(
+                token: UUID(),
+                task: Task { try await self.establishConnection() }
+            )
+            readiness = current
+        }
+        do {
+            let (connection, snapshot) = try await current.task.value
+            if readiness?.token == current.token { readiness = nil }
+            self.machine = snapshot
+            self.connection = connection
+            return connection
+        } catch {
+            if readiness?.token == current.token { readiness = nil }
+            throw error
+        }
+    }
+
+    private func establishConnection() async throws -> (GuestConnection, EngineMachine) {
         var snapshot = try await controller.inspect(id: Self.machineID)
         if snapshot == nil {
             try await controller.provision(id: Self.machineID)
@@ -81,14 +109,15 @@ actor PersistentEngine {
             throw PersistentEngineError.invalidMachineSnapshot("guest ping returned an invalid response")
         }
         self.machine = snapshot
-        self.connection = connection
         logger.info("persistent engine is ready", metadata: ["ip": "\(snapshot.ipAddress)"])
-        return connection
+        return (connection, snapshot)
     }
 
     func invalidateConnection() async {
         await connection?.close()
         connection = nil
+        readiness?.task.cancel()
+        readiness = nil
     }
 
     func invalidateConnection(_ expected: GuestConnection) async {

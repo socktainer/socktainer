@@ -1,6 +1,4 @@
-import ContainerPersistence
 import ContainerResource
-import ContainerizationError
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -25,21 +23,11 @@ func configure(_ app: Application) async throws {
     // Define app support path early since it's needed by multiple services
     let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
     let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
-    let systemConfig: ContainerSystemConfig
-    do {
-        systemConfig = try await ConfigurationLoader.load()
-    } catch let err as ContainerizationError {
-        app.logger.error("System config is malformed — falling back to defaults. Fix your config.toml: \(err)")
-        systemConfig = ContainerSystemConfig()
-    } catch {
-        app.logger.warning("Failed to load system config at startup, using defaults: \(error)")
-        systemConfig = ContainerSystemConfig()
-    }
-
     let healthCheckClient = ClientHealthCheckService()
-    let networkClient = ClientNetworkService()
-    let volumeClient = ClientVolumeService()
+    let volumeClient = RuntimeVolumeService()
     let registryClient = ClientRegistryService()
+    let broadcaster = EventBroadcaster()
+    app.storage[EventBroadcasterKey.self] = broadcaster
     let engineController = LinuxPodEngineController(
         artifact: try EngineGuestImageArtifact.locate(),
         eventLoopGroup: app.eventLoopGroup
@@ -61,10 +49,19 @@ func configure(_ app: Application) async throws {
         logger: Logger(label: "socktainer.direct-ports")
     )
     app.lifecycle.use(DirectTCPPortForwarderLifecycle(forwarder: directPortForwarder))
+    let directUDPPortForwarder = DirectUDPPortForwarder()
+    app.lifecycle.use(DirectUDPPortForwarderLifecycle(forwarder: directUDPPortForwarder))
     let runtime = GuestRuntime(
         engine: engine,
-        portPublisher: GuestPortPublicationManager(forwarder: directPortForwarder)
+        portPublisher: GuestPortPublicationManager(
+            forwarder: directPortForwarder,
+            udpForwarder: directUDPPortForwarder
+        ),
+        broadcaster: broadcaster
     )
+    await volumeClient.setReferenceValidator { id in
+        (try? await runtime.inspectContainer(id: id)) != nil
+    }
     try await runtime.startEventMonitor()
     app.lifecycle.use(GuestRuntimeLifecycle(runtime: runtime))
 
@@ -79,7 +76,8 @@ func configure(_ app: Application) async throws {
     // /events
     try app.register(collection: EventsRoute(client: healthCheckClient))
 
-    try app.register(collection: DockerRuntimeRoutes(backend: runtime))
+    try app.register(collection: DockerRuntimeRoutes(backend: runtime, volumeClient: volumeClient))
+    try app.register(collection: ExplicitUnsupportedDockerRoutes())
 
     // /volumes
     try app.register(collection: VolumeCreateRoute(client: volumeClient))
@@ -97,19 +95,8 @@ func configure(_ app: Application) async throws {
     try app.register(collection: SwarmUnlockRoute())
     try app.register(collection: SwarmUpdateRoute())
 
-    // --- network routes ---
-    try app.register(collection: NetworkConnectRoute())
-    try app.register(collection: NetworkCreateRoute(client: networkClient))
-    try app.register(collection: NetworkDisconnectRoute())
-    try app.register(collection: NetworkInspectRoute(client: networkClient))
-    try app.register(collection: NetworkListRoute())
-    try app.register(collection: NetworkPruneRoute(client: networkClient))
-    try app.register(collection: NetworkDeleteRoute(client: networkClient))
-
     // Build routes are intentionally absent until the guest runtime owns
     // BuildKit. The former builder service created another Apple VM.
-    try app.register(collection: DistributionJsonRoute(systemConfig: systemConfig))
-
     // --- plugin routes ---
     try app.register(collection: PluginsCreateRoute())
     try app.register(collection: PluginsNameDisableRoute())
@@ -157,12 +144,9 @@ func configure(_ app: Application) async throws {
 
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
-    try app.register(collection: CommitRoute())
     try app.register(collection: VersionRoute())
 
     // Initialize broadcaster
-    let broadcaster = EventBroadcaster()
-    app.storage[EventBroadcasterKey.self] = broadcaster
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
 }

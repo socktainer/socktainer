@@ -128,6 +128,83 @@ struct GuestConnectionTests {
         await connection.close()
     }
 
+    @Test("cancels a pending request without closing the connection")
+    func cancelsPendingRequest() async throws {
+        let pair = try SocketPair.make()
+        defer { try? pair.peer.close() }
+        let connection = try await GuestConnection.connect { pair.client }
+
+        let request = Task {
+            try await connection.request(method: "container.wait", payload: .object([:]))
+        }
+        _ = try Self.readAvailable(pair.peer)
+        request.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await request.value
+        }
+
+        let peer = pair.peer
+        Thread.detachNewThread {
+            do {
+                var codec = GuestFrameCodec()
+                var next: GuestFrame?
+                while next == nil {
+                    next = try codec.append(Self.readAvailable(peer)).first { $0.kind == .request }
+                }
+                guard let next else { return }
+                try peer.write(
+                    contentsOf: GuestFrameCodec.encode(
+                        GuestFrame(
+                            id: next.id,
+                            kind: .response,
+                            method: next.method,
+                            payload: .object(["ok": .bool(true)]),
+                            stream: nil,
+                            data: nil,
+                            error: nil,
+                            exitCode: nil
+                        )
+                    )
+                )
+            } catch {
+                Issue.record(error)
+            }
+        }
+        let response = try await connection.request(method: "ping", payload: .object([:]))
+        #expect(response.payload == .object(["ok": .bool(true)]))
+        await connection.close()
+    }
+
+    @Test("broadcasts guest events to every subscriber")
+    func broadcastsEvents() async throws {
+        let pair = try SocketPair.make()
+        defer { try? pair.peer.close() }
+        let connection = try await GuestConnection.connect { pair.client }
+        let first = await connection.events()
+        let second = await connection.events()
+        let event = GuestFrame(
+            id: 0,
+            kind: .event,
+            method: "bind.write.barrier",
+            payload: .object([
+                "barrierId": .string("1"), "paths": .array([.string("project/file")]),
+            ]),
+            stream: nil,
+            data: nil,
+            error: nil,
+            exitCode: nil
+        )
+
+        try pair.peer.write(contentsOf: GuestFrameCodec.encode(event))
+        let firstEvent = await first.first { _ in true }
+        let secondEvent = await second.first { _ in true }
+
+        #expect(firstEvent == event)
+        #expect(secondEvent == event)
+        await connection.close()
+    }
+
     private static func readAvailable(_ handle: FileHandle) throws -> Data {
         var bytes = [UInt8](repeating: 0, count: 4096)
         while true {

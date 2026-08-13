@@ -65,19 +65,10 @@ jobs:
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
 
-      - name: build installer package
-        run: |
-          make installer
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: socktainer-installer
-          path: ./pkginstaller/out/socktainer-installer.pkg
 
   tests-lint-format:
     name: formatters & tests
@@ -121,6 +112,12 @@ jobs:
 
       - name: Execute test
         run: make test
+
+      - name: Test guest agent
+        run: |
+          cd Guest
+          go test -race ./...
+          go vet ./...
 
   integration-test:
     name: integration test
@@ -180,138 +177,58 @@ jobs:
           fi
           sudo container system status
 
-      - name: run socktainer
-        run: |
-          nohup sudo -i $PWD/socktainer > service.log 2>&1 &
-          echo $! > service.pid
-          sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
-          sleep 5
-          cat service.log
-
-      - name: check container root
-        run: |
-          # quay.io/podman/hello has no auth or rate-limit issues and is already
-          # used later in this workflow. Avoids Docker Hub / ECR Public flakiness.
-          sudo container image pull quay.io/podman/hello
-          sudo container image ls
-
       - name: install docker cli
-        run: |
-          brew install docker
+        run: brew install docker
 
-      - name: check docker image with socktainer
+      - name: Build and install the complete product
         run: |
-          # expect that the image pulled above is present
-          sudo docker image ls | grep 'podman/hello'
-          # pull httpd image
-          sudo docker image pull httpd:latest
-          # list images
-          sudo docker image ls | grep httpd
-          # check inspect
-          # Get the image ID
-          IMAGE_ID=$(sudo docker image inspect httpd | jq -r '.[0].Id')
-          echo "Image ID: $IMAGE_ID"
-          # Check and fail if it doesn't start with sha256:
-          [[ $IMAGE_ID == sha256:* ]] || { echo "Error: Image ID does not start with sha256:"; exit 1; }
-          # pull image using digest
-          sudo docker pull quay.io/podman/hello@sha256:41316c18917a27a359ee3191fd8f43559d30592f82a144bbc59d9d44790f6e7a
-          # NOTE: we are not inspecting the image with digest due to
-          # https://github.com/socktainer/socktainer/issues/47
-          # check image is present
-          sudo docker image ls | grep 'quay.io/podman/hello'
-          # Tag images
-          sudo docker image tag httpd test
-          sudo docker image inspect test
-          # Prune images
-          sudo docker image prune --all --force
-          [[ "1" == $(sudo docker image ls | wc -l | xargs) ]]
+          mkdir -p .build/release
+          cp socktainer .build/release/socktainer
+          sudo env PATH="$PATH" make -C Guest image
+          make -C pkginstaller BUILD_VERSION=0.0.0-dev pkginstaller
+          sudo installer -pkg pkginstaller/out/socktainer-installer.pkg -target /
+          test -x /opt/socktainer/bin/socktainer
+          test -s /opt/socktainer/share/socktainer/socktainer-guest.oci.tar
 
-      - name: check docker load with socktainer
+      - name: Run release integration
         run: |
-          # OCI tarballs shaped like real `docker save` output, crafted without Docker.
-          ./scripts/craft-oci-fixtures.sh /tmp/oci-fixtures
-          # single manifest with complete blobs
-          sudo docker load -i /tmp/oci-fixtures/baseline.tar
-          sudo docker image ls | grep 'crafted-baseline'
-          # multi-platform index shipping only one platform's blobs (docker save v25+)
-          sudo docker load -i /tmp/oci-fixtures/sparse.tar
-          sudo docker image ls | grep 'crafted-sparse'
-          # two tags sharing one manifest blob (docker save tag1 tag2)
-          sudo docker load -i /tmp/oci-fixtures/multi-tag.tar
-          sudo docker image ls | grep 'crafted-one'
-          sudo docker image ls | grep 'crafted-two'
-          # a loaded image has its blobs in the content store, so save round-trips
-          sudo docker save crafted-baseline:latest -o /tmp/oci-fixtures/roundtrip.tar
-          sudo docker rmi crafted-baseline:latest crafted-sparse:latest crafted-one:latest crafted-two:latest
-          sudo docker load -i /tmp/oci-fixtures/roundtrip.tar
-          sudo docker image ls | grep 'crafted-baseline'
-          sudo docker rmi crafted-baseline:latest
+          sudo -i sh -c 'nohup /opt/socktainer/bin/socktainer --no-check-compatibility --no-docker-context >/tmp/socktainer.log 2>&1 & echo $! >/tmp/socktainer.pid'
+          for _ in {1..600}; do
+            sudo test -S /var/root/.socktainer/container.sock && break
+            sleep 0.1
+          done
+          sudo test -S /var/root/.socktainer/container.sock
+          sudo -i env DOCKER_HOST=unix:///var/root/.socktainer/container.sock \
+            bash "$GITHUB_WORKSPACE/scripts/integration-runtime.sh"
 
-      # NOTE: Disabling tests for now.
-      #       Most likely calling some internal function that fails
-      #       on CI host.
-      # - name: check system info was returned by socktainer
-      #   run: |
-      #     # expect specific content returned via `/info` endpoint
-      #     sudo docker info | grep 'container-apiserver'
-      #     sudo docker info | grep 'com.apple.container'
-      #     sudo docker info | grep 'socktainer'
-
-      - name: check version info was returned by socktainer
+      - name: Verify restart and crash recovery
         run: |
-          # expect specific content returned via `/version` endpoint
-          sudo docker version | grep 'socktainer'
-          # expect specific Docker engine API versions
-          sudo docker version | grep 'v1.32'
-          sudo docker version | grep 'v1.51'
+          export DOCKER_HOST=unix:///var/root/.socktainer/container.sock
+          IMAGE='docker.io/library/alpine@sha256:2c9d26f410d032d5b1525aa8a873e238b05b90c4ae8618743d4311f0cc827e37'
+          sudo -E docker create --name restart-created "$IMAGE" /bin/true >/dev/null
+          sudo kill -TERM "$(sudo cat /tmp/socktainer.pid)"
+          for _ in {1..300}; do
+            sudo kill -0 "$(sudo cat /tmp/socktainer.pid)" 2>/dev/null || break
+            sleep 0.1
+          done
+          sudo -i sh -c 'nohup /opt/socktainer/bin/socktainer --no-check-compatibility --no-docker-context >/tmp/socktainer.log 2>&1 & echo $! >/tmp/socktainer.pid'
+          for _ in {1..600}; do sudo -E docker ping >/dev/null 2>&1 && break; sleep 0.1; done
+          test "$(sudo -E docker inspect --format '{{.State.Status}}' restart-created)" = created
+          sudo -E docker start restart-created >/dev/null
+          test "$(sudo -E docker wait restart-created)" = 0
+          sudo -E docker rm restart-created >/dev/null
+          sudo -E docker run -d --name restart-running "$IMAGE" sh -c 'while :; do sleep 1; done' >/dev/null
+          sudo kill -KILL "$(sudo cat /tmp/socktainer.pid)"
+          sudo -i sh -c 'nohup /opt/socktainer/bin/socktainer --no-check-compatibility --no-docker-context >/tmp/socktainer.log 2>&1 & echo $! >/tmp/socktainer.pid'
+          for _ in {1..600}; do sudo -E docker ping >/dev/null 2>&1 && break; sleep 0.1; done
+          test "$(sudo -E docker inspect --format '{{.State.Status}}' restart-running)" = exited
+          sudo -E docker rm restart-running >/dev/null
 
-      - name: check network with socktainer
-        run: |
-          # expect default network to be present
-          sudo docker network ls | grep default
-          # inspect the default network
-          NETWORK_ID=$(sudo docker network inspect default | jq -r '.[].Id')
-          echo "Network ID: ${NETWORK_ID}"
-          # Check and fail if it doesn't match 'default':
-          [[ ${NETWORK_ID} == default ]] || { echo "Error: Network ID does not match 'default'"; exit 1; }
-          # create networks
-          sudo docker network create test1
-          sudo docker network create test2
-          sudo docker network create test3
-          sudo docker network create test4
-          sudo docker network create foo
-          # delete network
-          sudo docker network rm foo
-          # prune networks using filter
-          sudo docker network prune --filter 'name=test' --force
-          # ensure only default is left
-          sudo docker network ls | grep 'default'
-          # Create a network with a label
-          sudo docker network create bar --label 'test=true'
-          # expect to get the label back when inspecting the network
-          [[ $(sudo docker network inspect bar | jq -r ".[0].Labels.test // empty") == "true" ]] || { echo "Error: Label 'test=true' not found"; exit 1;}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: socktainer-installer
+          path: ./pkginstaller/out/socktainer-installer.pkg
 
-      # NOTE: Inspecting a volume is not possible in CI
-      - name: check volume with socktainer
-        run: |
-          # create volume with randomly generated name
-          sudo docker volume create
-          # create volume
-          sudo docker volume create test
-          # create volumes with labels
-          sudo docker volume create foo --label 'test=false'
-          sudo docker volume create bar --label 'test=true'
-          # filter volumes by `test` expect 2 volumes to return (extra line for header)
-          [[ "3" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # filter volumes by `test=true` expect a single volume to return (extra line for header)
-          [[ "2" == $(sudo docker volume ls --filter 'label=test=true' | wc -l | xargs) ]]
-          # inspect volume
-          # sudo docker inspect test
-          # delete single volume
-          sudo docker volume rm test
-          # prune containers by labels and ensure it is not present
-          sudo docker volume prune --force --filter 'label=test=true'
-          [[ "2" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # prune all images end ensure no volumes are left
-          sudo docker volume prune --all --force
-          [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+      - name: Show service log on failure
+        if: failure()
+        run: sudo cat /tmp/socktainer.log || true

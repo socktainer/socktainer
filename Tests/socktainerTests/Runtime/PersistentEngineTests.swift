@@ -33,10 +33,31 @@ struct PersistentEngineTests {
         }
         await controller.close()
     }
+
+    @Test("coalesces concurrent readiness calls")
+    func coalescesConcurrentReadiness() async throws {
+        let controller = FakeEngineMachineController(provisionDelay: .milliseconds(20))
+        let engine = PersistentEngine(controller: controller)
+
+        let connections = try await withThrowingTaskGroup(of: GuestConnection.self) { group in
+            for _ in 0..<32 {
+                group.addTask { try await engine.readyConnection() }
+            }
+            return try await group.reduce(into: []) { $0.append($1) }
+        }
+
+        #expect(connections.allSatisfy { $0 === connections[0] })
+        #expect(await controller.provisionCount() == 1)
+        #expect(await controller.bootCount() == 1)
+        #expect(await controller.dialCount() == 1)
+        await engine.invalidateConnection()
+        await controller.close()
+    }
 }
 
 private actor FakeEngineMachineController: EngineMachineControlling {
     private let pingOK: Bool
+    private let provisionDelay: Duration?
     private var provisioned = false
     private var running = false
     private var provisions = 0
@@ -45,8 +66,9 @@ private actor FakeEngineMachineController: EngineMachineControlling {
     private var dialPort: UInt32?
     private var peer: FileHandle?
 
-    init(pingOK: Bool = true) {
+    init(pingOK: Bool = true, provisionDelay: Duration? = nil) {
         self.pingOK = pingOK
+        self.provisionDelay = provisionDelay
     }
 
     func inspect(id: String) -> EngineMachine? {
@@ -59,8 +81,9 @@ private actor FakeEngineMachineController: EngineMachineControlling {
         )
     }
 
-    func provision(id: String) {
+    func provision(id: String) async throws {
         provisions += 1
+        if let provisionDelay { try await Task.sleep(for: provisionDelay) }
         provisioned = true
     }
 

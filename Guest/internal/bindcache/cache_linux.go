@@ -111,6 +111,14 @@ func (c *Cache) Invalidate(paths []string, all bool, barrierID uint64) {
 		})
 	}
 	c.mu.RUnlock()
+	// A barrier originates inside a FUSE mutation. Release that mutation after
+	// the in-process read cache is invalidated, before advisory kernel
+	// notifications. NotifyContent or NotifyEntry can wait for the same in-flight
+	// operation and would otherwise create a circular wait that returns EIO even
+	// though the backing rename or fsync already succeeded.
+	if barrierID != 0 {
+		c.barriers.Acknowledge(barrierID)
+	}
 	for _, item := range invalidations {
 		if item.node != nil {
 			_ = item.node.EmbeddedInode().NotifyContent(0, -1)
@@ -118,9 +126,6 @@ func (c *Cache) Invalidate(paths []string, all bool, barrierID uint64) {
 		if item.parent != nil && item.name != "." {
 			_ = item.parent.EmbeddedInode().NotifyEntry(item.name)
 		}
-	}
-	if barrierID != 0 {
-		c.barriers.Acknowledge(barrierID)
 	}
 }
 
@@ -166,6 +171,71 @@ func (n *cacheNode) Create(ctx context.Context, name string, flags uint32, mode 
 	return inode, &barrierFile{FileHandle: handle, path: path, barriers: n.cache.barriers, reads: n.cache.reads, writer: true}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
+func (n *cacheNode) mutationPath(name string) string {
+	return cleanRelative(filepath.Join(n.cache.track(n), name))
+}
+
+func (n *cacheNode) finishNamespaceMutation(ctx context.Context, paths ...string) syscall.Errno {
+	n.cache.reads.invalidateAll()
+	for _, path := range paths {
+		if err := n.cache.barriers.Wait(ctx, path); err != nil {
+			return syscall.EIO
+		}
+	}
+	return 0
+}
+
+func (n *cacheNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := n.LoopbackNode.Mkdir(ctx, name, mode, out)
+	if errno == 0 {
+		errno = n.finishNamespaceMutation(ctx, n.mutationPath(name))
+	}
+	return inode, errno
+}
+
+func (n *cacheNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	if errno := n.LoopbackNode.Rmdir(ctx, name); errno != 0 {
+		return errno
+	}
+	return n.finishNamespaceMutation(ctx, n.mutationPath(name))
+}
+
+func (n *cacheNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	if errno := n.LoopbackNode.Unlink(ctx, name); errno != 0 {
+		return errno
+	}
+	return n.finishNamespaceMutation(ctx, n.mutationPath(name))
+}
+
+func (n *cacheNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	newNode, ok := newParent.(*cacheNode)
+	if !ok {
+		return syscall.EXDEV
+	}
+	oldPath := n.mutationPath(name)
+	newPath := newNode.mutationPath(newName)
+	if errno := n.LoopbackNode.Rename(ctx, name, &newNode.LoopbackNode, newName, flags); errno != 0 {
+		return errno
+	}
+	return n.finishNamespaceMutation(ctx, oldPath, newPath)
+}
+
+func (n *cacheNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := n.LoopbackNode.Symlink(ctx, target, name, out)
+	if errno == 0 {
+		errno = n.finishNamespaceMutation(ctx, n.mutationPath(name))
+	}
+	return inode, errno
+}
+
+func (n *cacheNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := n.LoopbackNode.Link(ctx, target, name, out)
+	if errno == 0 {
+		errno = n.finishNamespaceMutation(ctx, n.mutationPath(name))
+	}
+	return inode, errno
+}
+
 func (c *Cache) loadReadFile(path string) error {
 	file, err := os.Open(filepath.Join(c.source, path))
 	if err != nil {
@@ -206,6 +276,28 @@ func (n *cacheNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		}
 	}
 	return child, errno
+}
+
+func safeSymlinkTarget(nodePath, target string) bool {
+	if filepath.IsAbs(target) {
+		return false
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(cleanRelative(nodePath)), target))
+	return resolved != ".." && !strings.HasPrefix(resolved, ".."+string(filepath.Separator))
+}
+
+// Readlink enforces containment at the FUSE boundary. This check happens when
+// the kernel follows the link, so a host-side replacement after bind-source
+// validation cannot redirect an OCI mount into guest control paths.
+func (n *cacheNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	target, errno := n.LoopbackNode.Readlink(ctx)
+	if errno != 0 {
+		return nil, errno
+	}
+	if !safeSymlinkTarget(n.cache.track(n), string(target)) {
+		return nil, syscall.EPERM
+	}
+	return target, 0
 }
 
 func (n *cacheNode) OnForget() {

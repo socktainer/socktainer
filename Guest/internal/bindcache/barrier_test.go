@@ -111,3 +111,32 @@ func TestOldEmitterCleanupDoesNotClearNewConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBarrierReachesEveryLiveConnection(t *testing.T) {
+	t.Parallel()
+	barriers := NewBarrierCoordinator(time.Second)
+	first := make(chan WriteBarrier, 1)
+	second := make(chan WriteBarrier, 1)
+	removeFirst := barriers.InstallEmitter(func(event WriteBarrier) error {
+		first <- event
+		return nil
+	})
+	defer removeFirst()
+	removeSecond := barriers.InstallEmitter(func(event WriteBarrier) error {
+		second <- event
+		return nil
+	})
+	defer removeSecond()
+
+	done := make(chan error, 1)
+	go func() { done <- barriers.Wait(context.Background(), "file") }()
+	firstEvent := <-first
+	secondEvent := <-second
+	if firstEvent.BarrierID != secondEvent.BarrierID {
+		t.Fatalf("barrier ids differ: %d != %d", firstEvent.BarrierID, secondEvent.BarrierID)
+	}
+	barriers.Acknowledge(firstEvent.BarrierID)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

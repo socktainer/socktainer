@@ -120,7 +120,7 @@ func (m *NetworkManager) Publish(id string, requested []api.PublishedPort) ([]ap
 		if protocol == "" {
 			protocol = "tcp"
 		}
-		if protocol != "tcp" || port.ContainerPort == 0 {
+		if (protocol != "tcp" && protocol != "udp") || port.ContainerPort == 0 {
 			return nil, fmt.Errorf("unsupported published port %d/%s", port.ContainerPort, protocol)
 		}
 		guestPort := port.GuestPort
@@ -129,11 +129,16 @@ func (m *NetworkManager) Publish(id string, requested []api.PublishedPort) ([]ap
 			m.nextPort++
 		}
 		destination := network.address + ":" + strconv.Itoa(int(port.ContainerPort))
-		if err := m.runner.Run("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", strconv.Itoa(int(guestPort)), "-j", "DNAT", "--to-destination", destination); err != nil {
+		arguments := []string{"-t", "nat", "-A", "PREROUTING", "-p", protocol}
+		if port.HostSource != "" {
+			arguments = append(arguments, "-s", port.HostSource)
+		}
+		arguments = append(arguments, "--dport", strconv.Itoa(int(guestPort)), "-j", "DNAT", "--to-destination", destination)
+		if err := m.runner.Run("iptables", arguments...); err != nil {
 			m.removeRules(network, published)
 			return nil, err
 		}
-		published = append(published, api.PublishedPort{ContainerPort: port.ContainerPort, GuestPort: guestPort, Protocol: protocol})
+		published = append(published, api.PublishedPort{ContainerPort: port.ContainerPort, GuestPort: guestPort, Protocol: protocol, HostSource: port.HostSource})
 	}
 	network.guestPorts = published
 	return append([]api.PublishedPort(nil), published...), nil
@@ -186,7 +191,16 @@ func (m *NetworkManager) initialize() error {
 func (m *NetworkManager) removeRules(network *containerNetwork, ports []api.PublishedPort) {
 	for _, port := range ports {
 		destination := network.address + ":" + strconv.Itoa(int(port.ContainerPort))
-		_ = m.runner.Run("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", strconv.Itoa(int(port.GuestPort)), "-j", "DNAT", "--to-destination", destination)
+		protocol := strings.ToLower(port.Protocol)
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		arguments := []string{"-t", "nat", "-D", "PREROUTING", "-p", protocol}
+		if port.HostSource != "" {
+			arguments = append(arguments, "-s", port.HostSource)
+		}
+		arguments = append(arguments, "--dport", strconv.Itoa(int(port.GuestPort)), "-j", "DNAT", "--to-destination", destination)
+		_ = m.runner.Run("iptables", arguments...)
 	}
 }
 

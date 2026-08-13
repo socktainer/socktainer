@@ -74,10 +74,20 @@ struct DirectVZEngineConfiguration: Sendable, Equatable {
 enum DirectVZEngineController {
     static func prepareDataDisk(_ configuration: DirectVZEngineConfiguration) throws {
         if FileManager.default.fileExists(atPath: configuration.dataDisk.path) {
-            _ = try EXT4.EXT4Reader(
-                blockDevice: FilePath(configuration.dataDisk.path)
-            )
-            return
+            do {
+                _ = try EXT4.EXT4Reader(
+                    blockDevice: FilePath(configuration.dataDisk.path)
+                )
+                return
+            } catch {
+                let quarantine = configuration.stateDirectory.appendingPathComponent(
+                    "data.ext4.corrupt-\(UUID().uuidString)"
+                )
+                try FileManager.default.moveItem(
+                    at: configuration.dataDisk,
+                    to: quarantine
+                )
+            }
         }
         let staging = configuration.stateDirectory.appendingPathComponent(
             ".data-\(UUID().uuidString).ext4"

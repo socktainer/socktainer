@@ -6,8 +6,8 @@ struct RESTVolumesPruneQuery: Content {
 }
 
 struct VolumePruneRoute: RouteCollection {
-    let client: ClientVolumeService
-    init(client: ClientVolumeService) {
+    let client: any ClientVolumeProtocol
+    init(client: any ClientVolumeProtocol) {
         self.client = client
     }
 
@@ -43,7 +43,11 @@ struct VolumePruneRoute: RouteCollection {
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
         for volume in filteredVolumes {
             do {
-                try await client.delete(name: volume.Name)
+                if let runtime = client as? RuntimeVolumeService {
+                    try await runtime.deleteIfUnused(name: volume.Name)
+                } else {
+                    try await client.delete(name: volume.Name)
+                }
                 volumesDeleted.append(volume.Name)
                 // moby fires a `destroy` per removed volume before the aggregate prune.
                 if let broadcaster {

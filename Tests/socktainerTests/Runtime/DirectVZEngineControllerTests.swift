@@ -82,6 +82,28 @@ struct DirectVZEngineControllerTests {
         #expect(firstAttributes[.systemFileNumber] as? NSNumber == secondAttributes[.systemFileNumber] as? NSNumber)
     }
 
+    @Test("corrupt data disk is quarantined and recreated")
+    func corruptDiskRecovery() throws {
+        let root = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("state")
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let configuration = try DirectVZEngineConfiguration(
+            stateDirectory: state,
+            bindRoot: root,
+            dataDiskSize: DirectVZEngineConfiguration.minimumDataDiskSize
+        )
+        try Data("not-an-ext4-filesystem".utf8).write(to: configuration.dataDisk)
+
+        try DirectVZEngineController.prepareDataDisk(configuration)
+
+        _ = try EXT4.EXT4Reader(blockDevice: FilePath(configuration.dataDisk.path))
+        let quarantined = try FileManager.default.contentsOfDirectory(
+            atPath: state.path
+        ).filter { $0.hasPrefix("data.ext4.corrupt-") }
+        #expect(quarantined.count == 1)
+    }
+
     private static func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(
             "socktainer-direct-vz-\(UUID().uuidString)",

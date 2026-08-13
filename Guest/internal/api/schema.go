@@ -23,6 +23,7 @@ const (
 	MethodContainerKill           = "container.kill"
 	MethodContainerDelete         = "container.delete"
 	MethodContainerExec           = "container.exec"
+	MethodContainerAttach         = "container.attach"
 	MethodContainerMetadataUpdate = "container.metadata.update"
 	MethodBindInvalidate          = "bind.invalidate"
 	EventContainerExit            = "container.exit"
@@ -32,6 +33,7 @@ const (
 type ImagePullRequest struct {
 	Reference   string `json:"reference"`
 	Snapshotter string `json:"snapshotter,omitempty"`
+	Platform    string `json:"platform,omitempty"`
 	Username    string `json:"username,omitempty"`
 	Secret      string `json:"secret,omitempty"`
 }
@@ -96,6 +98,7 @@ type PublishedPort struct {
 	ContainerPort uint16 `json:"containerPort"`
 	GuestPort     uint16 `json:"guestPort,omitempty"`
 	Protocol      string `json:"protocol,omitempty"`
+	HostSource    string `json:"hostSource,omitempty"`
 }
 type ContainerKillRequest struct {
 	ID     string `json:"id"`
@@ -105,6 +108,8 @@ type ContainerCreateRequest struct {
 	ID             string            `json:"id"`
 	Image          string            `json:"image"`
 	Args           []string          `json:"args,omitempty"`
+	Entrypoint     *[]string         `json:"entrypoint,omitempty"`
+	Cmd            *[]string         `json:"cmd,omitempty"`
 	Env            []string          `json:"env,omitempty"`
 	Cwd            string            `json:"cwd,omitempty"`
 	User           string            `json:"user,omitempty"`

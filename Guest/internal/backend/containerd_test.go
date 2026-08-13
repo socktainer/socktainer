@@ -3,6 +3,9 @@ package backend
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -355,8 +358,52 @@ func TestRuntimeMetadataDecodeIgnoresMissingAndMalformedLabels(t *testing.T) {
 	}
 }
 
+func TestRegistryCredentialsAreScopedToTheRequestedRegistry(t *testing.T) {
+	t.Parallel()
+	if !sameRegistryHost("docker.io", "registry-1.docker.io") {
+		t.Fatal("Docker Hub aliases must match")
+	}
+	if sameRegistryHost("registry.example.com", "attacker.example") {
+		t.Fatal("credentials must not be shared with another registry")
+	}
+}
+
+func TestResolveImageProcessArgsUsesDockerOverrideRules(t *testing.T) {
+	t.Parallel()
+	imageEntrypoint := []string{"/image-entrypoint"}
+	imageCmd := []string{"image-arg"}
+	overrideEntrypoint := []string{"/override-entrypoint"}
+	overrideCmd := []string{"override-arg"}
+	empty := []string{}
+	tests := []struct {
+		name       string
+		entrypoint *[]string
+		cmd        *[]string
+		want       []string
+	}{
+		{name: "image defaults", want: []string{"/image-entrypoint", "image-arg"}},
+		{name: "command only", cmd: &overrideCmd, want: []string{"/image-entrypoint", "override-arg"}},
+		{name: "entrypoint only", entrypoint: &overrideEntrypoint, want: []string{"/override-entrypoint", "image-arg"}},
+		{name: "both", entrypoint: &overrideEntrypoint, cmd: &overrideCmd, want: []string{"/override-entrypoint", "override-arg"}},
+		{name: "clear entrypoint", entrypoint: &empty, want: []string{"image-arg"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := resolveImageProcessArgs(imageEntrypoint, imageCmd, test.entrypoint, test.cmd)
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("got %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRewriteBindSourceRoutesThroughCache(t *testing.T) {
-	got, err := rewriteBindSource("/Users/person/project", "/Users/person", "/run/bind-cache")
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := rewriteBindSource(project, root, "/run/bind-cache")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,8 +413,19 @@ func TestRewriteBindSourceRoutesThroughCache(t *testing.T) {
 }
 
 func TestRewriteBindSourceRejectsOutsideRoot(t *testing.T) {
-	if _, err := rewriteBindSource("/private/tmp", "/Users/person", "/run/bind-cache"); err == nil {
+	if _, err := rewriteBindSource(os.TempDir(), t.TempDir(), "/run/bind-cache"); err == nil {
 		t.Fatal("expected path escape rejection")
+	}
+}
+
+func TestRewriteBindSourceRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(os.TempDir(), escape); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rewriteBindSource(escape, root, "/run/bind-cache"); err == nil {
+		t.Fatal("expected symlink escape rejection")
 	}
 }
 
@@ -419,5 +477,27 @@ func TestRestartKeepsUnstartedContainerCreated(t *testing.T) {
 	}
 	if _, ok := record.persistedExitResult(); ok {
 		t.Fatal("unstarted record exposed a wait result")
+	}
+}
+
+func TestRestartMarksPreviouslyRunningContainerAsDaemonLost(t *testing.T) {
+	t.Parallel()
+	result := api.Container{Status: "created"}
+	applyPersistedLifecycle(&result, api.ContainerMetadata{LifecycleState: "running"})
+	if result.Status != "exited" || result.ExitCode == nil || *result.ExitCode != daemonLostExitCode {
+		t.Fatalf("lost running lifecycle was not made explicit: %#v", result)
+	}
+}
+
+func TestRunningTaskRequiresForceForRemoval(t *testing.T) {
+	t.Parallel()
+	if err := validateTaskRemoval(false, "running"); err == nil {
+		t.Fatal("non-force removal accepted a running task")
+	}
+	if err := validateTaskRemoval(true, "running"); err != nil {
+		t.Fatalf("force removal was rejected: %v", err)
+	}
+	if err := validateTaskRemoval(false, "stopped"); err != nil {
+		t.Fatalf("stopped task removal was rejected: %v", err)
 	}
 }

@@ -17,12 +17,15 @@ import (
 	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	containerd "github.com/containerd/containerd/v2/client"
 	containerrecords "github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/content"
 	containerimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
+	registryreference "github.com/distribution/reference"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/socktainer/socktainer/guest/internal/api"
@@ -33,6 +36,8 @@ const speculativeTaskPreparationDelay = 100 * time.Millisecond
 const maxConcurrentTaskCreations = 1
 const execCleanupAttempts = 5
 const execCleanupAttemptTimeout = 2 * time.Second
+const networkCleanupAttempts = 5
+const daemonLostExitCode uint32 = 255
 
 func encodeRuntimeMetadata(metadata api.ContainerMetadata) (string, error) {
 	data, err := json.Marshal(metadata)
@@ -74,7 +79,15 @@ func (b *Backend) ConfigureBindCache(source, cache string) {
 }
 
 func rewriteBindSource(source, sharedRoot, cacheRoot string) (string, error) {
-	relative, err := filepath.Rel(sharedRoot, source)
+	resolvedRoot, err := filepath.EvalSymlinks(sharedRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve shared root %q: %w", sharedRoot, err)
+	}
+	resolvedSource, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", fmt.Errorf("resolve bind source %q: %w", source, err)
+	}
+	relative, err := filepath.Rel(resolvedRoot, resolvedSource)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("bind source %q is outside shared root %q", source, sharedRoot)
 	}
@@ -98,16 +111,17 @@ func (b *orderedCleanupBarrier) enqueue(cleanup func() error) {
 	b.tail = result
 	b.mu.Unlock()
 	go func() {
-		var priorErr error
 		if prior != nil {
 			<-prior.done
-			priorErr = prior.err
 		}
-		cleanupErr := cleanup()
-		if priorErr != nil {
-			result.err = priorErr
-		} else {
-			result.err = cleanupErr
+		for attempt := 0; attempt < networkCleanupAttempts; attempt++ {
+			result.err = cleanup()
+			if result.err == nil {
+				break
+			}
+			if attempt+1 < networkCleanupAttempts {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 		close(result.done)
 	}()
@@ -124,6 +138,13 @@ func (b *orderedCleanupBarrier) wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-tail.done:
+		if tail.err != nil {
+			b.mu.Lock()
+			if b.tail == tail {
+				b.tail = nil
+			}
+			b.mu.Unlock()
+		}
 		return tail.err
 	}
 }
@@ -365,21 +386,39 @@ func (b *Backend) Pull(ctx context.Context, request api.ImagePullRequest) (api.I
 	}
 	resolverOptions := docker.ResolverOptions{}
 	if request.Username != "" {
-		resolverOptions.Credentials = func(string) (string, string, error) {
+		named, err := registryreference.ParseNormalizedNamed(request.Reference)
+		if err != nil {
+			return api.ImageResponse{}, fmt.Errorf("parse image reference: %w", err)
+		}
+		registryHost := registryreference.Domain(named)
+		resolverOptions.Credentials = func(host string) (string, string, error) {
+			if !sameRegistryHost(registryHost, host) {
+				return "", "", nil
+			}
 			return request.Username, request.Secret, nil
 		}
 	}
-	image, err := b.client.Pull(
-		b.ctx(ctx),
-		request.Reference,
+	pullOptions := []containerd.RemoteOpt{
 		containerd.WithResolver(docker.NewResolver(resolverOptions)),
 		containerd.WithPullSnapshotter(snapshotter),
 		containerd.WithPullUnpack,
-	)
+	}
+	if request.Platform != "" {
+		pullOptions = append(pullOptions, containerd.WithPlatform(request.Platform))
+	}
+	image, err := b.client.Pull(b.ctx(ctx), request.Reference, pullOptions...)
 	if err != nil {
 		return api.ImageResponse{}, err
 	}
 	return api.ImageResponse{Name: image.Name(), Digest: image.Target().Digest.String()}, nil
+}
+
+func sameRegistryHost(expected, challenged string) bool {
+	if expected == challenged {
+		return true
+	}
+	dockerHub := map[string]bool{"docker.io": true, "registry-1.docker.io": true, "index.docker.io": true}
+	return dockerHub[expected] && dockerHub[challenged]
 }
 
 func (b *Backend) Images(ctx context.Context) ([]api.Image, error) {
@@ -504,7 +543,10 @@ func (b *Backend) PruneImages(ctx context.Context, request api.ImagePruneRequest
 		for _, reference := range append([]string(nil), image.References...) {
 			deleted, err := b.DeleteImage(ctx, api.ImageDeleteRequest{Reference: reference})
 			if err != nil {
-				continue
+				if strings.Contains(err.Error(), "image is used by container") {
+					continue
+				}
+				return result, fmt.Errorf("prune image %s: %w", reference, err)
 			}
 			result.Deleted = append(result.Deleted, deleted.Deleted...)
 			result.Untagged = append(result.Untagged, deleted.Untagged...)
@@ -600,6 +642,12 @@ func (b *Backend) inspect(ctx context.Context, container containerd.Container) (
 }
 
 func applyPersistedLifecycle(result *api.Container, metadata api.ContainerMetadata) {
+	if metadata.LifecycleState == "running" {
+		result.Status = "exited"
+		code := daemonLostExitCode
+		result.ExitCode = &code
+		return
+	}
 	if metadata.LifecycleState != "exited" || metadata.LastExitCode == nil {
 		return
 	}
@@ -629,11 +677,13 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	networkCommitted := false
 	if privateNetwork {
-		go func() {
-			if _, err := b.network.Create(request.ID); err == nil {
-				_, _ = b.network.Publish(request.ID, request.PublishedPorts)
-			}
-		}()
+		if _, err := b.network.Create(request.ID); err != nil {
+			return api.Container{}, err
+		}
+		if _, err := b.network.Publish(request.ID, request.PublishedPorts); err != nil {
+			_ = b.network.Delete(request.ID)
+			return api.Container{}, err
+		}
 		defer func() {
 			if !networkCommitted {
 				_ = b.network.Delete(request.ID)
@@ -661,7 +711,16 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		runtimeBinary = b.runtimeBinary
 	}
 	specOpts := []oci.SpecOpts{oci.WithImageConfig(image)}
-	if len(request.Args) > 0 {
+	if request.Entrypoint != nil || request.Cmd != nil {
+		args, err := resolveProcessArgs(ctx, image, request.Entrypoint, request.Cmd)
+		if err != nil {
+			return api.Container{}, err
+		}
+		if len(args) == 0 {
+			return api.Container{}, errors.New("container command is empty")
+		}
+		specOpts = append(specOpts, oci.WithProcessArgs(args...))
+	} else if len(request.Args) > 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs(request.Args...))
 	}
 	if len(request.Env) > 0 {
@@ -774,13 +833,12 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	networkCommitted = true
 	if privateNetwork {
-		go func() {
-			if _, err := b.network.Create(request.ID); err == nil {
-				if published, err := b.network.Publish(request.ID, request.PublishedPorts); err == nil {
-					_ = b.persistPublishedPorts(context.Background(), container, published)
-				}
-			}
-		}()
+		published := b.network.Published(request.ID)
+		if err := b.persistPublishedPorts(ctx, container, published); err != nil {
+			_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
+			_ = b.network.Delete(request.ID)
+			return api.Container{}, err
+		}
 	}
 	record := &containerRecord{
 		container: container, snapshotter: snapshotter, snapshotKey: request.ID,
@@ -788,6 +846,39 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	b.containers.Store(request.ID, record)
 	return b.inspect(ctx, container)
+}
+
+func resolveProcessArgs(ctx context.Context, image containerd.Image, entrypoint, cmd *[]string) ([]string, error) {
+	descriptor, err := image.Config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !containerimages.IsConfigType(descriptor.MediaType) {
+		return nil, fmt.Errorf("unknown image config media type %s", descriptor.MediaType)
+	}
+	data, err := content.ReadBlob(ctx, image.ContentStore(), descriptor)
+	if err != nil {
+		return nil, err
+	}
+	var imageConfig imagespec.Image
+	if err := json.Unmarshal(data, &imageConfig); err != nil {
+		return nil, err
+	}
+	return resolveImageProcessArgs(
+		imageConfig.Config.Entrypoint, imageConfig.Config.Cmd, entrypoint, cmd,
+	), nil
+}
+
+func resolveImageProcessArgs(imageEntrypoint, imageCmd []string, entrypoint, cmd *[]string) []string {
+	resolvedEntrypoint := imageEntrypoint
+	resolvedCmd := imageCmd
+	if entrypoint != nil {
+		resolvedEntrypoint = *entrypoint
+	}
+	if cmd != nil {
+		resolvedCmd = *cmd
+	}
+	return append(append([]string(nil), resolvedEntrypoint...), resolvedCmd...)
 }
 
 func (b *Backend) BeginTaskPreparation(id string) {
@@ -850,12 +941,21 @@ func (b *Backend) prepareTask(id string, record *containerRecord) {
 		}
 		capture.io = task.IO()
 		b.logCaptures.Store(id, capture)
+		syscall.Sync()
 		record.finishPreparation(task, nil)
 	}()
 }
 
 func (b *Backend) persistPublishedPorts(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {
 	return b.updateRuntimeMetadata(ctx, container, func(metadata *api.ContainerMetadata) {
+		metadata.PublishedPorts = published
+	})
+}
+
+func (b *Backend) persistRunningState(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {
+	return b.updateRuntimeMetadata(ctx, container, func(metadata *api.ContainerMetadata) {
+		metadata.LifecycleState = "running"
+		metadata.LastExitCode = nil
 		metadata.PublishedPorts = published
 	})
 }
@@ -1037,13 +1137,19 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 		b.logCaptures.Store(id, capture)
 	}
 	if err := task.Start(ctx); err != nil {
-		_, _ = task.Delete(ctx, containerd.WithProcessKill)
+		cleanupCtx, cancel := context.WithTimeout(b.ctx(context.Background()), 30*time.Second)
+		_, _ = task.Delete(cleanupCtx, containerd.WithProcessKill)
+		cancel()
+		record.setTask(nil)
 		b.removeLogs(id)
 		return api.Container{}, err
 	}
 	record.setTask(task)
-	if len(published) > 0 {
-		_ = b.persistPublishedPorts(ctx, container, published)
+	if err := b.persistRunningState(ctx, container, published); err != nil {
+		_ = task.Kill(b.ctx(context.Background()), syscall.SIGKILL)
+		_, _ = task.Delete(b.ctx(context.Background()), containerd.WithProcessKill)
+		record.setTask(nil)
+		return api.Container{}, err
 	}
 	info, _ := container.Info(ctx)
 	metadata := decodeRuntimeMetadata(info.Labels)
@@ -1080,6 +1186,15 @@ func (b *Backend) Wait(ctx context.Context, id string) (uint32, time.Time, error
 		}
 		task, err = container.Task(ctx, nil)
 		if err != nil {
+			info, infoErr := container.Info(ctx)
+			if infoErr == nil && decodeRuntimeMetadata(info.Labels).LifecycleState == "running" {
+				persistCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				persistErr := b.persistExitState(persistCtx, record, daemonLostExitCode)
+				cancel()
+				if persistErr == nil {
+					return daemonLostExitCode, time.Time{}, nil
+				}
+			}
 			return 0, time.Time{}, err
 		}
 		record.setTask(task)
@@ -1092,11 +1207,12 @@ func (b *Backend) Wait(ctx context.Context, id string) (uint32, time.Time, error
 	code, exitedAt, err := exit.Result()
 	b.finishLogCapture(id)
 	if err == nil {
-		if persistErr := b.persistExitState(ctx, record, code); persistErr != nil {
+		persistCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		persistErr := b.persistExitState(persistCtx, record, code)
+		cancel()
+		if persistErr == nil {
 			go b.reapTask(record, task)
-			return 0, time.Time{}, persistErr
 		}
-		go b.reapTask(record, task)
 	}
 	return code, exitedAt, err
 }
@@ -1156,19 +1272,45 @@ func (b *Backend) Delete(ctx context.Context, request api.ContainerDeleteRequest
 		task, reaped, _ = record.taskState()
 	}
 	if task != nil && !reaped {
+		if !request.Force {
+			status, err := task.Status(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateTaskRemoval(false, string(status.Status)); err != nil {
+				return err
+			}
+		}
 		if request.Force {
 			_ = task.Kill(ctx, syscall.SIGKILL)
 		}
-		if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
+		deleteOptions := []containerd.ProcessDeleteOpts{}
+		if request.Force {
+			deleteOptions = append(deleteOptions, containerd.WithProcessKill)
+		}
+		if _, err := task.Delete(ctx, deleteOptions...); err != nil && !errdefs.IsNotFound(err) {
 			return err
 		}
 		record.finishTaskReap(true)
 	} else if !ok {
 		if task, taskErr := record.container.Task(ctx, nil); taskErr == nil {
+			if !request.Force {
+				status, err := task.Status(ctx)
+				if err != nil {
+					return err
+				}
+				if err := validateTaskRemoval(false, string(status.Status)); err != nil {
+					return err
+				}
+			}
 			if request.Force {
 				_ = task.Kill(ctx, syscall.SIGKILL)
 			}
-			if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
+			deleteOptions := []containerd.ProcessDeleteOpts{}
+			if request.Force {
+				deleteOptions = append(deleteOptions, containerd.WithProcessKill)
+			}
+			if _, err := task.Delete(ctx, deleteOptions...); err != nil && !errdefs.IsNotFound(err) {
 				return err
 			}
 		}
@@ -1182,6 +1324,13 @@ func (b *Backend) Delete(ctx context.Context, request api.ContainerDeleteRequest
 	}
 	b.removeLogs(request.ID)
 	b.cleanups.enqueue(func() error { return b.network.Delete(request.ID) })
+	return nil
+}
+
+func validateTaskRemoval(force bool, status string) error {
+	if !force && status != string(containerd.Stopped) {
+		return errors.New("cannot remove a running container without force")
+	}
 	return nil
 }
 
@@ -1346,10 +1495,15 @@ func (b *Backend) Exec(ctx context.Context, request api.ContainerExecRequest, st
 	}
 	wait, err := process.Wait(ctx)
 	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(b.ctx(context.Background()), execCleanupAttemptTimeout)
+		_, _ = process.Delete(cleanupCtx, containerd.WithProcessKill)
+		cancel()
 		return 0, err
 	}
 	if err := process.Start(ctx); err != nil {
-		_, _ = process.Delete(ctx, containerd.WithProcessKill)
+		cleanupCtx, cancel := context.WithTimeout(b.ctx(context.Background()), execCleanupAttemptTimeout)
+		_, _ = process.Delete(cleanupCtx, containerd.WithProcessKill)
+		cancel()
 		return 0, err
 	}
 	exit := <-wait

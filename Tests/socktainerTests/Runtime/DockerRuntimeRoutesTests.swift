@@ -186,6 +186,87 @@ struct DockerRuntimeRoutesTests {
         }
     }
 
+    @Test("container list applies exact label filters")
+    func listLabelFilters() async throws {
+        let backend = DockerRuntimeBackendMock()
+        try await withRuntimeRoutes(backend) { app in
+            let matching = "%7B%22label%22:%5B%22test%3Dtrue%22%5D%7D"
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=1&filters=\(matching)") { response async throws in
+                let values = try JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [[String: Any]]
+                #expect(values?.count == 1)
+            }
+            let different = "%7B%22label%22:%5B%22socktainer.benchmark.run%3Dother%22%5D%7D"
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=1&filters=\(different)") { response async throws in
+                let values = try JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [[String: Any]]
+                #expect(values?.isEmpty == true)
+            }
+        }
+    }
+
+    @Test("known unsupported routes return explicit 501 errors")
+    func explicitUnsupportedRoutes() async throws {
+        let backend = DockerRuntimeBackendMock()
+        try await withApp(configure: { _ in }) { app in
+            let router = app.regexRouter(with: app.logger)
+            app.setRegexRouter(router)
+            router.installMiddleware(on: app)
+            try app.register(collection: DockerRuntimeRoutes(backend: backend))
+            try app.register(collection: ExplicitUnsupportedDockerRoutes())
+            try await app.testing().test(.GET, "/v1.51/info") { response async in
+                #expect(response.status == .notImplemented)
+                #expect(response.body.string.contains("not implemented"))
+            }
+            try await app.testing().test(.POST, "/v1.51/containers/container-1/restart") { response async in
+                #expect(response.status == .notImplemented)
+            }
+            try await app.testing().test(.HEAD, "/v1.51/containers/container-1/archive") { response async in
+                #expect(response.status == .notImplemented)
+            }
+            try await app.testing().test(.GET, "/v1.51/containers/container-1/attach/ws") { response async in
+                #expect(response.status == .notImplemented)
+            }
+        }
+    }
+
+    @Test("unsupported create options fail explicitly")
+    func unsupportedCreateOptions() async throws {
+        let backend = DockerRuntimeBackendMock()
+        try await withRuntimeRoutes(backend) { app in
+            for body in [
+                #"{"Image":"fixture","HostConfig":{"Privileged":true}}"#,
+                #"{"Image":"fixture","HostConfig":{"Memory":1048576}}"#,
+                #"{"Image":"fixture","HostConfig":{"RestartPolicy":{"Name":"always"}}}"#,
+                #"{"Image":"fixture","HostConfig":{"NetworkMode":"host"}}"#,
+                #"{"Image":"fixture","OpenStdin":true}"#,
+            ] {
+                try await app.testing().test(
+                    .POST, "/v1.51/containers/create",
+                    headers: ["Content-Type": "application/json"], body: ByteBuffer(string: body)
+                ) { response async in
+                    #expect(response.status == .notImplemented)
+                }
+            }
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(
+                    string: #"{"Image":"fixture","HostConfig":{"Privileged":false,"Memory":0,"NetworkMode":"default"}}"#)
+            ) { response async in
+                #expect(response.status == .created)
+            }
+        }
+    }
+
+    @Test("image import fails explicitly")
+    func unsupportedImageImport() async throws {
+        let backend = DockerRuntimeBackendMock()
+        try await withRuntimeRoutes(backend) { app in
+            try await app.testing().test(.POST, "/v1.51/images/create?fromSrc=-") { response async in
+                #expect(response.status == .notImplemented)
+            }
+        }
+    }
+
     @Test("attach upgrades without starting a created container")
     func attachDoesNotStartContainer() async throws {
         let backend = DockerRuntimeBackendMock()
@@ -240,7 +321,9 @@ private actor DockerRuntimeBackendMock: DockerRuntimeRouteBackend {
     private(set) var startCount = 0
     private var running = false
 
-    func pullImage(reference: String, platform: String?) async throws -> DockerRuntimeImage {
+    func pullImage(
+        reference: String, platform: String?, auth: DockerRegistryAuth?
+    ) async throws -> DockerRuntimeImage {
         lastPull = Pull(reference: reference, platform: platform)
         return DockerRuntimeImage(reference: reference, digest: "sha256:abc")
     }

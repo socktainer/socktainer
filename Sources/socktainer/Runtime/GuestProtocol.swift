@@ -6,6 +6,7 @@ enum GuestFrameKind: String, Codable, Sendable {
     case event
     case stream
     case end
+    case cancel
 }
 
 enum GuestStream: String, Codable, Sendable {
@@ -121,15 +122,38 @@ struct GuestFrameCodec: Sendable {
     private static func validate(_ frame: GuestFrame) throws {
         switch frame.kind {
         case .request:
-            guard frame.id != 0, frame.method?.isEmpty == false else {
+            guard frame.id != 0, frame.method?.isEmpty == false,
+                frame.stream == nil, frame.data == nil, frame.error == nil
+            else {
                 throw GuestFrameCodecError.invalidEnvelope("request requires nonzero id and method")
             }
-        case .response, .stream, .end:
+        case .response:
             guard frame.id != 0 else {
                 throw GuestFrameCodecError.invalidEnvelope("response frame requires nonzero id")
             }
+            guard frame.stream == nil, frame.data == nil else {
+                throw GuestFrameCodecError.invalidEnvelope("response cannot contain stream data")
+            }
+        case .stream:
+            guard frame.id != 0, frame.stream != nil, frame.data != nil,
+                frame.error == nil, frame.payload == nil
+            else {
+                throw GuestFrameCodecError.invalidEnvelope("stream requires id, stream, and data")
+            }
+        case .end:
+            guard frame.id != 0, frame.stream == nil, frame.data == nil else {
+                throw GuestFrameCodecError.invalidEnvelope("end requires id without stream data")
+            }
+        case .cancel:
+            guard frame.id != 0, frame.method == nil, frame.payload == nil,
+                frame.stream == nil, frame.data == nil, frame.error == nil
+            else {
+                throw GuestFrameCodecError.invalidEnvelope("cancel requires only a nonzero id")
+            }
         case .event:
-            guard frame.id == 0, frame.method?.isEmpty == false else {
+            guard frame.id == 0, frame.method?.isEmpty == false,
+                frame.stream == nil, frame.data == nil, frame.error == nil
+            else {
                 throw GuestFrameCodecError.invalidEnvelope("event requires id=0 and method")
             }
         }

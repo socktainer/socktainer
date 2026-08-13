@@ -27,7 +27,7 @@ func TestOrderedCleanupBarrierWaitsForPriorCleanup(t *testing.T) {
 	}
 }
 
-func TestOrderedCleanupBarrierSerializesAndPropagatesFailure(t *testing.T) {
+func TestOrderedCleanupBarrierSerializesAndClearsPriorFailure(t *testing.T) {
 	var barrier orderedCleanupBarrier
 	want := errors.New("cleanup failed")
 	var mu sync.Mutex
@@ -44,12 +44,30 @@ func TestOrderedCleanupBarrierSerializesAndPropagatesFailure(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
-	if err := barrier.wait(context.Background()); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
+	if err := barrier.wait(context.Background()); err != nil {
+		t.Fatalf("later successful cleanup remained poisoned by %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(order) != 2 || order[0] != 1 || order[1] != 2 {
+	if len(order) != networkCleanupAttempts+1 || order[len(order)-1] != 2 {
 		t.Fatalf("cleanup order = %v", order)
+	}
+}
+
+func TestOrderedCleanupBarrierRetriesAndDoesNotPoisonFutureCreates(t *testing.T) {
+	var barrier orderedCleanupBarrier
+	attempts := 0
+	barrier.enqueue(func() error {
+		attempts++
+		return errors.New("cleanup failed")
+	})
+	if err := barrier.wait(context.Background()); err == nil {
+		t.Fatal("expected the bounded cleanup failure")
+	}
+	if attempts != networkCleanupAttempts {
+		t.Fatalf("cleanup attempts = %d, want %d", attempts, networkCleanupAttempts)
+	}
+	if err := barrier.wait(context.Background()); err != nil {
+		t.Fatalf("reported cleanup failure poisoned future creates: %v", err)
 	}
 }

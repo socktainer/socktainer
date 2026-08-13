@@ -81,7 +81,7 @@ struct GuestRuntimePersistenceTests {
     func indexedLifecycleState() {
         #expect(GuestRuntime.requiresStart(.created))
         #expect(!GuestRuntime.requiresStart(.running))
-        #expect(!GuestRuntime.requiresStart(.exited))
+        #expect(GuestRuntime.requiresStart(.exited))
         #expect(
             GuestRuntime.requiresPortPublicationRetry(
                 state: .running, publicationPending: true

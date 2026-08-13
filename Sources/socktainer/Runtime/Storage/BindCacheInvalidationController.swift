@@ -65,15 +65,13 @@ actor BindCacheInvalidationController {
     }
 
     func writeBarrier(id: UInt64, guestPaths: Set<String>, invalidateAll: Bool = false) async throws {
-        // flush() synchronously delivers every FSEvent through the stream's
-        // current point and drains the event source's retained batch. This actor
-        // cannot acknowledge the barrier until the guest completes invalidation.
-        var batch = try source.flush()
-        batch.formUnion(.init(paths: guestPaths, invalidateAll: invalidateAll))
-        if batch.paths.isEmpty && !batch.invalidateAll {
-            batch.invalidateAll = true
-        }
-        try await sink.invalidate(paths: batch.paths, all: batch.invalidateAll, barrierID: id)
+        // The guest emits this event only after its loopback filesystem mutation
+        // returns. A full invalidation closes both the guest-write window and any
+        // host FSEvent that has not reached this process yet. Do not use
+        // FSEventStreamFlushSync here: a synchronous flush can wait behind the
+        // same actor work that must send the acknowledgement, which turns a
+        // successful rename or fsync into EIO at the guest timeout.
+        try await sink.invalidate(paths: guestPaths, all: true, barrierID: id)
     }
 
     private func receive(_ batch: BindHostChangeBatch) async {
@@ -268,6 +266,7 @@ actor PersistentEngineBindCacheEventConnector: BindCacheGuestEventConnecting {
 actor GuestBindCacheBridge {
     private let events: any BindCacheGuestEventConnecting
     private let controller: BindCacheInvalidationController
+    private let logger = Logger(label: "socktainer.bind-cache.bridge")
     private var task: Task<Void, Never>?
     private var reconnect = true
 
@@ -316,6 +315,10 @@ actor GuestBindCacheBridge {
             try await controller.writeBarrier(id: barrierID, guestPaths: paths, invalidateAll: invalidateAll)
         } catch {
             // The guest keeps the barrier closed and returns EIO on its timeout.
+            logger.error(
+                "failed to acknowledge a guest bind write barrier",
+                metadata: ["barrier": "\(barrierID)", "error": "\(error)"]
+            )
         }
     }
 

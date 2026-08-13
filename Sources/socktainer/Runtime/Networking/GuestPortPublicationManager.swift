@@ -18,12 +18,23 @@ enum GuestPortPublicationError: Error, Equatable {
 /// Publication is event-driven: the runtime publishes after a successful start
 /// and removes all listeners after container deletion.
 actor GuestPortPublicationManager {
+    private enum Transport: Sendable { case tcp, udp }
+    private struct ActiveMapping: Sendable {
+        let id: String
+        let transport: Transport
+    }
+
     private let forwarder: any DirectTCPPortForwarding
-    private var mappingIDsByContainer: [String: [String]] = [:]
+    private let udpForwarder: (any DirectUDPPortForwarding)?
+    private var mappingsByContainer: [String: [ActiveMapping]] = [:]
     private var publishedBindingsByContainer: [String: [DockerRuntimePortBinding]] = [:]
 
-    init(forwarder: any DirectTCPPortForwarding) {
+    init(
+        forwarder: any DirectTCPPortForwarding,
+        udpForwarder: (any DirectUDPPortForwarding)? = nil
+    ) {
         self.forwarder = forwarder
+        self.udpForwarder = udpForwarder
     }
 
     func publish(
@@ -41,40 +52,75 @@ actor GuestPortPublicationManager {
             guestAddress: guestAddress,
             guestPorts: guestPorts
         )
-        var added: [DirectTCPPortMapping] = []
+        var added: [(id: String, protocolName: String)] = []
+        var published: [DockerRuntimePortBinding] = []
         do {
-            for mapping in mappings {
-                added.append(try await forwarder.add(mapping))
+            for (binding, mapping) in zip(bindings, mappings) {
+                if binding.proto.lowercased() == "udp" {
+                    guard let udpForwarder else {
+                        throw GuestPortPublicationError.unsupportedProtocol("udp")
+                    }
+                    let result = try await udpForwarder.add(
+                        DirectUDPPortMapping(
+                            id: mapping.id,
+                            hostAddress: mapping.hostAddress,
+                            hostPort: mapping.hostPort,
+                            guestPort: mapping.guestPort
+                        )
+                    )
+                    added.append((mapping.id, "udp"))
+                    published.append(
+                        DockerRuntimePortBinding(
+                            containerPort: binding.containerPort, proto: binding.proto,
+                            hostIP: binding.hostIP, hostPort: result.hostPort
+                        )
+                    )
+                } else {
+                    let result = try await forwarder.add(mapping)
+                    added.append((mapping.id, "tcp"))
+                    published.append(
+                        DockerRuntimePortBinding(
+                            containerPort: binding.containerPort, proto: binding.proto,
+                            hostIP: binding.hostIP, hostPort: result.hostPort
+                        )
+                    )
+                }
             }
         } catch {
             for mapping in added.reversed() {
-                try? await forwarder.remove(id: mapping.id)
+                if mapping.protocolName == "udp" {
+                    await udpForwarder?.remove(id: mapping.id)
+                } else {
+                    try? await forwarder.remove(id: mapping.id)
+                }
             }
             throw error
         }
-        let published = zip(bindings, added).map { binding, mapping in
-            DockerRuntimePortBinding(
-                containerPort: binding.containerPort,
-                proto: binding.proto,
-                hostIP: binding.hostIP,
-                hostPort: mapping.hostPort
+        mappingsByContainer[containerID] = zip(bindings, mappings).map { binding, mapping in
+            ActiveMapping(
+                id: mapping.id,
+                transport: binding.proto.lowercased() == "udp" ? .udp : .tcp
             )
         }
-        mappingIDsByContainer[containerID] = mappings.map(\.id)
         publishedBindingsByContainer[containerID] = published
         return published
     }
 
     func remove(containerID: String) async {
-        let ids = mappingIDsByContainer.removeValue(forKey: containerID) ?? []
+        let mappings = mappingsByContainer.removeValue(forKey: containerID) ?? []
         publishedBindingsByContainer.removeValue(forKey: containerID)
-        for id in ids {
-            try? await forwarder.remove(id: id)
+        for mapping in mappings {
+            switch mapping.transport {
+            case .udp:
+                await udpForwarder?.remove(id: mapping.id)
+            case .tcp:
+                try? await forwarder.remove(id: mapping.id)
+            }
         }
     }
 
     func mappingIDs(containerID: String) -> [String] {
-        mappingIDsByContainer[containerID] ?? []
+        mappingsByContainer[containerID]?.map(\.id) ?? []
     }
 
     static func mappings(
@@ -90,7 +136,8 @@ actor GuestPortPublicationManager {
             )
         }
         return try zip(bindings, guestPorts).map { binding, guestPort in
-            guard binding.proto.lowercased() == "tcp" else {
+            let protocolName = binding.proto.lowercased()
+            guard protocolName == "tcp" || protocolName == "udp" else {
                 throw GuestPortPublicationError.unsupportedProtocol(binding.proto)
             }
             guard (1...65_535).contains(binding.containerPort) else {
@@ -104,7 +151,7 @@ actor GuestPortPublicationManager {
                 throw GuestPortPublicationError.invalidPort(hostPort)
             }
             let hostAddress = binding.hostIP.isEmpty ? "0.0.0.0" : binding.hostIP
-            let id = "\(containerID):tcp:\(hostAddress):\(hostPort)"
+            let id = "\(containerID):\(protocolName):\(binding.containerPort):\(hostAddress):\(hostPort)"
             return DirectTCPPortMapping(
                 id: id,
                 hostAddress: hostAddress,

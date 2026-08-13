@@ -118,8 +118,12 @@ swift-fmt:
 	@$(SWIFT) format --recursive --configuration .swift-format -i $(SWIFT_SRC)
 
 # Installer targets - delegated to pkginstaller subdirectory
+.PHONY: guest-image
+guest-image:
+	@$(MAKE) -C Guest image
+
 .PHONY: installer
-installer: release
+installer: release guest-image
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" pkginstaller
 
 .PHONY: installer-signed

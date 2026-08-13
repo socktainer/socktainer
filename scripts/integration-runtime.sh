@@ -3,7 +3,9 @@
 set -euo pipefail
 
 readonly DEFAULT_IMAGE='docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de'
+readonly DEFAULT_BASE_IMAGE='docker.io/library/alpine@sha256:2c9d26f410d032d5b1525aa8a873e238b05b90c4ae8618743d4311f0cc827e37'
 IMAGE=${INTEGRATION_IMAGE:-$DEFAULT_IMAGE}
+BASE_IMAGE=${INTEGRATION_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
 RUN_ID="socktainer-integration-$$"
 LABEL="socktainer.integration.run=$RUN_ID"
 
@@ -31,6 +33,7 @@ cleanup() {
     local id
     while IFS= read -r id; do
         [[ -n $id ]] || continue
+        [[ $(docker_api inspect --format '{{ index .Config.Labels "socktainer.integration.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
         docker_api rm -f "$id" >/dev/null 2>&1 || true
     done < <(docker_api ps -aq --filter "label=$LABEL" 2>/dev/null || true)
 }
@@ -42,7 +45,7 @@ preflight() {
     [[ -n ${DOCKER_HOST:-} ]] || die "DOCKER_HOST is required"
     [[ $DOCKER_HOST == unix://* ]] || die "DOCKER_HOST must use unix:// for this test"
     [[ $IMAGE == *@sha256:* ]] || die "INTEGRATION_IMAGE must be pinned by digest"
-    for tool in docker curl jq; do
+    for tool in docker curl jq python3; do
         command -v "$tool" >/dev/null || die "required tool is not installed: $tool"
     done
     local socket=${DOCKER_HOST#unix://}
@@ -65,6 +68,7 @@ fi
 
 echo "integration: pulling pinned fixture"
 docker_api pull "$IMAGE" >/dev/null
+docker_api pull "$BASE_IMAGE" >/dev/null
 
 name="$RUN_ID-lifecycle"
 docker_api create --name "$name" --label "$LABEL" "$IMAGE" /bin/sh -c 'printf lifecycle-ok' >/dev/null
@@ -79,6 +83,16 @@ docker_api run -d --name "$runner" --label "$LABEL" "$IMAGE" \
 docker_api exec "$runner" /bin/true
 [[ $(docker_api exec "$runner" /bin/sh -c 'printf exec-ok') == exec-ok ]] \
     || die "docker exec output did not match"
+exec_failures=$(mktemp -t socktainer-integration-exec.XXXXXX)
+for index in $(seq 1 32); do
+    (
+        output=$(docker_api exec "$runner" /bin/sh -c "printf exec-$index")
+        [[ $output == "exec-$index" ]] || echo "$index" >> "$exec_failures"
+    ) &
+done
+wait
+[[ ! -s $exec_failures ]] || die "concurrent exec stress failed"
+rm -f "$exec_failures"
 docker_api stop -t 2 "$runner" >/dev/null
 [[ $(docker_api wait "$runner") == 0 ]] || die "stopped container returned a nonzero exit code"
 docker_api rm "$runner" >/dev/null
@@ -86,8 +100,85 @@ docker_api rm "$runner" >/dev/null
 autoremove_output=$(docker_api run --rm --label "$LABEL" "$IMAGE" /bin/sh -c 'printf autoremove-ok')
 [[ $autoremove_output == autoremove-ok ]] || die "docker run --rm output did not match"
 
+web="$RUN_ID-port"
+docker_api run -d --name "$web" --label "$LABEL" -p 127.0.0.1::80 "$IMAGE" >/dev/null
+web_port=$(docker_api port "$web" 80/tcp | awk -F: 'END {print $NF}')
+curl --silent --show-error --fail "http://127.0.0.1:$web_port/" >/dev/null \
+    || die "published TCP port failed"
+conflict="$RUN_ID-port-conflict"
+if docker_api run -d --name "$conflict" --label "$LABEL" -p "127.0.0.1:$web_port:80" "$IMAGE" >/dev/null 2>&1; then
+    die "conflicting TCP publication succeeded"
+fi
+
+udp="$RUN_ID-udp"
+docker_api run -d --name "$udp" --label "$LABEL" -p 127.0.0.1::5353/udp \
+    "$BASE_IMAGE" /bin/sh -c 'exec nc -u -l -p 5353 -e cat' >/dev/null
+udp_port=$(docker_api port "$udp" 5353/udp | awk -F: 'END {print $NF}')
+python3 - "$udp_port" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+messages = (b"udp-one", b"udp-two")
+for message in messages:
+    s.sendto(message, ("127.0.0.1", int(sys.argv[1])))
+responses = {s.recvfrom(1024)[0] for _ in messages}
+if responses != set(messages):
+    raise SystemExit(f"UDP echo responses did not match: {responses!r}")
+PY
+
+bind_dir=$(mktemp -d "$HOME/.socktainer-integration-bind.XXXXXX")
+bind="$RUN_ID-bind"
+docker_api run -d --name "$bind" --label "$LABEL" -v "$bind_dir:/bind" \
+    "$BASE_IMAGE" /bin/sh -c 'while :; do sleep 1; done' >/dev/null
+docker_api exec "$bind" /bin/sh -c 'printf coherent > /bind/new && sync && mv /bind/new /bind/value'
+[[ $(cat "$bind_dir/value") == coherent ]] || die "guest atomic bind write was not coherent on the host"
+for index in $(seq 1 16); do
+    printf 'host-%s' "$index" > "$bind_dir/host-$index" &
+    docker_api exec "$bind" /bin/sh -c "printf guest-$index > /bind/guest-$index && sync" &
+done
+wait
+for index in $(seq 1 16); do
+    for _ in $(seq 1 100); do
+        guest_value=$(docker_api exec "$bind" /bin/cat "/bind/host-$index" 2>/dev/null || true)
+        [[ $guest_value == "host-$index" ]] && break
+        sleep 0.01
+    done
+    [[ $guest_value == "host-$index" ]] || die "host-to-guest bind coherence failed at $index"
+    [[ $(cat "$bind_dir/guest-$index") == "guest-$index" ]] \
+        || die "guest-to-host bind coherence failed at $index"
+done
+rm -f "$bind_dir/value"
+rm -f "$bind_dir"/host-* "$bind_dir"/guest-*
+rmdir "$bind_dir"
+docker_api rm -f "$web" "$udp" "$bind" >/dev/null
+
+volume="$RUN_ID-volume"
+docker_api volume create --label "$LABEL" "$volume" >/dev/null
+docker_api run --rm --label "$LABEL" -v "$volume:/data" "$BASE_IMAGE" \
+    /bin/sh -c 'printf durable >/data/value && sync' >/dev/null
+docker_api run --rm --label "$LABEL" -v "$volume:/data" "$BASE_IMAGE" \
+    /bin/sh -c 'test "$(cat /data/value)" = durable'
+docker_api volume rm "$volume" >/dev/null
+
+stress_failures=$(mktemp -t socktainer-integration-stress.XXXXXX)
+for batch in $(seq 1 7); do
+    start=$(((batch - 1) * 16 + 1))
+    end=$((batch * 16))
+    ((end > 100)) && end=100
+    for index in $(seq "$start" "$end"); do
+        (
+            output=$(docker_api run --rm --label "$LABEL" "$BASE_IMAGE" /bin/sh -c 'printf stress-ok')
+            [[ $output == stress-ok ]] || echo "$index" >> "$stress_failures"
+        ) &
+    done
+    wait
+    ((end == 100)) && break
+done
+[[ ! -s $stress_failures ]] || die "concurrent lifecycle stress failed"
+rm -f "$stress_failures"
+
 if docker_api ps -aq --filter "label=$LABEL" | grep -q .; then
     die "lifecycle test leaked a container"
 fi
 
-echo "integration: passed create, start, wait, logs, exec, stop, remove, attach, and auto-remove"
+echo "integration: passed lifecycle, attach, exec, TCP/UDP publication, bind coherence, named volumes, and 100 runs at concurrency 16"

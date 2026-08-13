@@ -43,7 +43,7 @@ struct GuestPortPublicationManagerTests {
         #expect(
             await forwarder.added == [
                 .init(
-                    id: "nginx:tcp:127.0.0.1:18080",
+                    id: "nginx:tcp:80:127.0.0.1:18080",
                     hostAddress: "127.0.0.1",
                     hostPort: 18_080,
                     guestAddress: "192.168.64.2",
@@ -52,27 +52,21 @@ struct GuestPortPublicationManagerTests {
             ]
         )
         await manager.remove(containerID: "nginx")
-        #expect(await forwarder.removed == ["nginx:tcp:127.0.0.1:18080"])
+        #expect(await forwarder.removed == ["nginx:tcp:80:127.0.0.1:18080"])
         #expect(await manager.mappingIDs(containerID: "nginx").isEmpty)
     }
 
-    @Test("rejects UDP and requests an ephemeral port when host port is omitted")
+    @Test("supports UDP and requests an ephemeral port when host port is omitted")
     func validation() async throws {
-        #expect(throws: GuestPortPublicationError.unsupportedProtocol("udp")) {
-            try GuestPortPublicationManager.mappings(
-                containerID: "dns",
-                bindings: [
-                    .init(
-                        containerPort: 53,
-                        proto: "udp",
-                        hostIP: "0.0.0.0",
-                        hostPort: 10_053
-                    )
-                ],
-                guestAddress: "192.168.64.2",
-                guestPorts: [20_000]
-            )
-        }
+        let udp = try GuestPortPublicationManager.mappings(
+            containerID: "dns",
+            bindings: [
+                .init(containerPort: 53, proto: "udp", hostIP: "127.0.0.1", hostPort: 10_053)
+            ],
+            guestAddress: "192.168.64.2",
+            guestPorts: [20_000]
+        )
+        #expect(udp.first?.id == "dns:udp:53:127.0.0.1:10053")
         let dynamic = try GuestPortPublicationManager.mappings(
             containerID: "web",
             bindings: [
@@ -87,6 +81,17 @@ struct GuestPortPublicationManagerTests {
             guestPorts: [20_000]
         )
         #expect(dynamic.first?.hostPort == 0)
+
+        let twoDynamic = try GuestPortPublicationManager.mappings(
+            containerID: "web",
+            bindings: [
+                .init(containerPort: 80, proto: "tcp", hostIP: "127.0.0.1", hostPort: nil),
+                .init(containerPort: 443, proto: "tcp", hostIP: "127.0.0.1", hostPort: nil),
+            ],
+            guestAddress: "192.168.64.2",
+            guestPorts: [20_000, 20_001]
+        )
+        #expect(Set(twoDynamic.map(\.id)).count == 2)
 
         let manager = GuestPortPublicationManager(forwarder: PortForwarderSpy())
         let published = try await manager.publish(
@@ -105,6 +110,23 @@ struct GuestPortPublicationManagerTests {
         #expect(published.first?.hostPort == 31_000)
     }
 
+    @Test("publishes and removes UDP mappings")
+    func udpPublishAndRemove() async throws {
+        let udp = UDPPortForwarderSpy()
+        let manager = GuestPortPublicationManager(
+            forwarder: PortForwarderSpy(), udpForwarder: udp
+        )
+        let published = try await manager.publish(
+            containerID: "dns",
+            bindings: [.init(containerPort: 53, proto: "udp", hostIP: "127.0.0.1", hostPort: nil)],
+            guestAddress: "192.168.64.2",
+            guestPorts: [20_000]
+        )
+        #expect(published.first?.hostPort == 31_001)
+        await manager.remove(containerID: "dns")
+        #expect(await udp.removed == ["dns:udp:53:127.0.0.1:0"])
+    }
+
     @Test("rolls back listeners when publication fails")
     func rollback() async {
         let forwarder = PortForwarderSpy(failAtAdd: 2)
@@ -121,9 +143,24 @@ struct GuestPortPublicationManagerTests {
                 guestPorts: [20_000, 20_001]
             )
         }
-        #expect(await forwarder.removed == ["web:tcp:127.0.0.1:18080"])
+        #expect(await forwarder.removed == ["web:tcp:80:127.0.0.1:18080"])
         #expect(await manager.mappingIDs(containerID: "web").isEmpty)
     }
+}
+
+private actor UDPPortForwarderSpy: DirectUDPPortForwarding {
+    private(set) var removed: [String] = []
+
+    func add(_ mapping: DirectUDPPortMapping) -> DirectUDPPortMapping {
+        DirectUDPPortMapping(
+            id: mapping.id,
+            hostAddress: mapping.hostAddress,
+            hostPort: mapping.hostPort == 0 ? 31_001 : mapping.hostPort,
+            guestPort: mapping.guestPort
+        )
+    }
+
+    func remove(id: String) { removed.append(id) }
 }
 
 private actor PortForwarderSpy: DirectTCPPortForwarding {

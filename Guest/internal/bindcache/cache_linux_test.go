@@ -10,6 +10,28 @@ import (
 	"time"
 )
 
+func TestSafeSymlinkTargetRejectsGuestEscape(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		node   string
+		target string
+		want   bool
+	}{
+		{name: "absolute", node: "project/link", target: "/run/containerd", want: false},
+		{name: "parent escape", node: "link", target: "../run/containerd", want: false},
+		{name: "contained parent", node: "project/sub/link", target: "../data", want: true},
+		{name: "contained child", node: "project/link", target: "data/file", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := safeSymlinkTarget(test.node, test.target); got != test.want {
+				t.Fatalf("safeSymlinkTarget(%q, %q) = %t, want %t", test.node, test.target, got, test.want)
+			}
+		})
+	}
+}
+
 func TestCacheWarmReadInvalidationAndWriteThrough(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("/dev/fuse is unavailable")

@@ -109,7 +109,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
             group: eventLoopGroup,
             logger: logger
         )
-        let network = try NativeVmnetNetwork()
+        let network = try NativeVmnetNetwork(stateDirectory: stateDirectory)
         let interface = network.interface
         let pod = try LinuxPod(id, vmm: manager, logger: logger) { configuration in
             configuration.cpus = dataConfiguration.cpus

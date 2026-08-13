@@ -20,6 +20,7 @@ const (
 	KindEvent    Kind = "event"
 	KindStream   Kind = "stream"
 	KindEnd      Kind = "end"
+	KindCancel   Kind = "cancel"
 )
 
 type Stream string
@@ -50,15 +51,30 @@ type Error struct {
 func (e *Envelope) Validate() error {
 	switch e.Kind {
 	case KindRequest:
-		if e.ID == 0 || e.Method == "" {
+		if e.ID == 0 || e.Method == "" || e.Stream != "" || len(e.Data) != 0 || e.Error != nil {
 			return errors.New("request requires nonzero id and method")
 		}
-	case KindResponse, KindStream, KindEnd:
+	case KindResponse:
 		if e.ID == 0 {
 			return fmt.Errorf("%s requires nonzero id", e.Kind)
 		}
+		if e.Stream != "" || len(e.Data) != 0 {
+			return errors.New("response cannot contain stream data")
+		}
+	case KindStream:
+		if e.ID == 0 || e.Stream == "" || e.Data == nil || e.Error != nil || len(e.Payload) != 0 {
+			return errors.New("stream requires id, stream, and data")
+		}
+	case KindEnd:
+		if e.ID == 0 || e.Stream != "" || len(e.Data) != 0 {
+			return errors.New("end requires id without stream data")
+		}
+	case KindCancel:
+		if e.ID == 0 || e.Method != "" || len(e.Payload) != 0 || e.Stream != "" || len(e.Data) != 0 || e.Error != nil {
+			return errors.New("cancel requires only a nonzero id")
+		}
 	case KindEvent:
-		if e.ID != 0 || e.Method == "" {
+		if e.ID != 0 || e.Method == "" || e.Stream != "" || len(e.Data) != 0 || e.Error != nil {
 			return errors.New("event requires id=0 and method")
 		}
 	default:

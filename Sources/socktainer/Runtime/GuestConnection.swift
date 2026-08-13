@@ -10,6 +10,8 @@ actor GuestConnection {
     typealias Connector = @Sendable () async throws -> FileHandle
 
     private let handle: FileHandle
+    private let descriptor: Int32
+    private let writer: GuestSocketWriter
     private var nextID: UInt64 = 1
     private struct PendingRequest {
         let continuation: CheckedContinuation<GuestFrame, Error>
@@ -23,17 +25,21 @@ actor GuestConnection {
     private var reading = false
     private var terminalError: Error?
 
-    private init(handle: FileHandle) {
+    private init(handle: FileHandle) throws {
         self.handle = handle
+        self.descriptor = handle.fileDescriptor
+        self.writer = try GuestSocketWriter(descriptor: descriptor)
     }
 
     static func connect(using connector: Connector) async throws -> GuestConnection {
-        let connection = GuestConnection(handle: try await connector())
+        let connection = try GuestConnection(handle: try await connector())
         await connection.startReader()
         return connection
     }
 
     deinit {
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        writer.close()
         try? handle.close()
     }
 
@@ -47,8 +53,8 @@ actor GuestConnection {
         onStream: @escaping @Sendable (GuestFrame) -> Void
     ) async throws -> GuestFrame {
         if let terminalError { throw terminalError }
-        let id = nextID
-        nextID &+= 1
+        try Task.checkCancellation()
+        let id = allocateRequestID()
         let frame = GuestFrame(
             id: id,
             kind: .request,
@@ -60,20 +66,25 @@ actor GuestConnection {
             exitCode: nil
         )
         let encoded = try GuestFrameCodec.encode(frame)
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = PendingRequest(continuation: continuation, onStream: onStream)
-            do {
-                try Self.writeAll(encoded, to: handle.fileDescriptor)
-            } catch {
-                pending.removeValue(forKey: id)
-                continuation.resume(throwing: error)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pending[id] = PendingRequest(continuation: continuation, onStream: onStream)
+                Task {
+                    do {
+                        try await writer.write(encoded)
+                    } catch {
+                        failRequest(id: id, error: error)
+                    }
+                }
             }
+        } onCancel: {
+            Task { await self.cancelRequest(id: id) }
         }
     }
 
     func events() -> AsyncStream<GuestFrame> {
         let token = UUID()
-        return AsyncStream { continuation in
+        return AsyncStream(bufferingPolicy: .bufferingNewest(4_096)) { continuation in
             eventContinuations[token] = continuation
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeEventContinuation(token) }
@@ -117,28 +128,6 @@ actor GuestConnection {
         }
     }
 
-    private nonisolated static func writeAll(_ data: Data, to descriptor: Int32) throws {
-        try data.withUnsafeBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else { return }
-            var written = 0
-            while written < buffer.count {
-                let count = Darwin.send(
-                    descriptor,
-                    baseAddress.advanced(by: written),
-                    buffer.count - written,
-                    MSG_NOSIGNAL
-                )
-                if count > 0 {
-                    written += count
-                } else if count < 0, errno == EINTR {
-                    continue
-                } else {
-                    throw POSIXError(.init(rawValue: errno) ?? .EIO)
-                }
-            }
-        }
-    }
-
     private func receive(_ frame: GuestFrame) {
         if frame.id == 0 || frame.kind == .event {
             for continuation in eventContinuations.values {
@@ -171,7 +160,8 @@ actor GuestConnection {
         handle.readabilityHandler = nil
         readContinuation?.finish()
         readContinuation = nil
-        _ = Darwin.shutdown(handle.fileDescriptor, SHUT_RDWR)
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        writer.close()
         try? handle.close()
         let continuations = pending.values
         pending.removeAll()
@@ -186,5 +176,83 @@ actor GuestConnection {
 
     private func removeEventContinuation(_ token: UUID) {
         eventContinuations.removeValue(forKey: token)
+    }
+
+    private func allocateRequestID() -> UInt64 {
+        repeat {
+            let candidate = nextID
+            nextID &+= 1
+            if candidate != 0, pending[candidate] == nil {
+                return candidate
+            }
+        } while true
+    }
+
+    private func cancelRequest(id: UInt64) {
+        guard let request = pending.removeValue(forKey: id) else { return }
+        request.continuation.resume(throwing: CancellationError())
+        let cancel = GuestFrame(
+            id: id, kind: .cancel, method: nil, payload: nil, stream: nil,
+            data: nil, error: nil, exitCode: nil
+        )
+        Task { try? await writer.write(GuestFrameCodec.encode(cancel)) }
+    }
+
+    private func failRequest(id: UInt64, error: Error) {
+        pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
+    }
+}
+
+private final class GuestSocketWriter: @unchecked Sendable {
+    private let descriptor: Int32
+    private let queue = DispatchQueue(label: "socktainer.guest-connection.writer")
+    private var closed = false
+
+    init(descriptor: Int32) throws {
+        let duplicate = Darwin.dup(descriptor)
+        guard duplicate >= 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
+        }
+        self.descriptor = duplicate
+    }
+
+    func close() {
+        queue.sync {
+            guard !closed else { return }
+            closed = true
+            Darwin.close(descriptor)
+        }
+    }
+
+    func write(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    guard !self.closed else { throw GuestConnectionError.closed }
+                    try data.withUnsafeBytes { buffer in
+                        guard let baseAddress = buffer.baseAddress else { return }
+                        var written = 0
+                        while written < buffer.count {
+                            let count = Darwin.send(
+                                self.descriptor,
+                                baseAddress.advanced(by: written),
+                                buffer.count - written,
+                                MSG_NOSIGNAL
+                            )
+                            if count > 0 {
+                                written += count
+                            } else if count < 0, errno == EINTR {
+                                continue
+                            } else {
+                                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+                            }
+                        }
+                    }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 }

@@ -205,11 +205,17 @@ The guest uses containerd, overlayfs, runc, and Linux namespaces for all ordinar
 containers. Socktainer does not start one VM per container or use relay sidecar
 VMs.
 
-Published TCP ports use a direct vmnet forwarding rule to the engine VM. The
+Published TCP and UDP ports use direct, address-bound host listeners and vmnet
+forwarding rules to the engine VM. The
 guest applies DNAT from the engine ingress port to the container's private
 network namespace. The guest stores Docker names, labels, commands, and port
 mappings in containerd metadata. Socktainer restores this state and the host
 forwarding rules after a daemon restart.
+
+This alpha runtime does not import containers, images, networks, or transient
+state from the removed per-container-VM architecture. The first start creates a
+new persistent engine data disk. Keep or remove old state separately until you
+confirm that you no longer need it.
 
 ### Volume sync mode
 
@@ -385,7 +391,8 @@ Ownership rules:
 - Intended for **local development and experimentation** 🏠
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
-- Private registry authentication is not yet connected to the guest image pull path.
+- Pull authentication from Docker's `X-Registry-Auth` header is forwarded only
+  to the registry named by the image reference.
 - Privileged containers are not yet implemented.
 - Per-container CPU and memory limits are not yet implemented. All ordinary
   containers share the engine VM allocation.
@@ -394,10 +401,16 @@ Ownership rules:
 - `docker update` does not yet change container resources.
 - Image load, save, history, and push are not connected to the guest content store.
 - Pause, unpause, network connect, and network disconnect are not implemented.
+- Docker network-management endpoints are explicit `501` responses in this
+  alpha. Each container uses the persistent engine's private bridge.
 - Static container IP requests are not yet implemented.
-- UDP published ports are not implemented. TCP published ports are supported.
 - Other unimplemented operations include commit, diff, search, top, archive,
   export, stats, resize, rename, restart, and resource update.
+- Known unsupported Docker endpoints return an explicit `501 Not Implemented`
+  Docker error instead of an accidental router `404`.
+- If the persistent ext4 data disk has an invalid superblock, Socktainer moves
+  it to `data.ext4.corrupt-<UUID>` and creates a new empty disk. This alpha reset
+  policy preserves the corrupt image for diagnosis but does not migrate its data.
 
 ---
 

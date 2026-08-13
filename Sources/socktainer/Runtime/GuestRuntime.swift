@@ -2,11 +2,13 @@ import Foundation
 import Vapor
 
 private final class GuestStreamCollector: @unchecked Sendable {
+    private static let maximumBytes = 16 * 1024 * 1024
     private let lock = NSLock()
     private let collectStdout: Bool
     private let collectStderr: Bool
     private var stdout = Data()
     private var stderr = Data()
+    private var overflowed = false
 
     init(stdout: Bool, stderr: Bool) {
         self.collectStdout = stdout
@@ -17,6 +19,10 @@ private final class GuestStreamCollector: @unchecked Sendable {
         guard let data = frame.data else { return }
         lock.lock()
         defer { lock.unlock() }
+        guard stdout.count + stderr.count + data.count <= Self.maximumBytes else {
+            overflowed = true
+            return
+        }
         switch frame.stream {
         case .stdout where collectStdout: stdout.append(data)
         case .stderr where collectStderr: stderr.append(data)
@@ -25,11 +31,24 @@ private final class GuestStreamCollector: @unchecked Sendable {
         }
     }
 
-    func output(exitCode: Int32) -> DockerRuntimeProcessOutput {
+    func output(exitCode: Int32) throws -> DockerRuntimeProcessOutput {
         lock.lock()
         defer { lock.unlock() }
+        if overflowed {
+            throw DockerRuntimeRouteError.invalidRequest(
+                "exec output exceeded the 16 MiB buffered-output limit"
+            )
+        }
         return DockerRuntimeProcessOutput(stdout: stdout, stderr: stderr, exitCode: exitCode)
     }
+}
+
+private final class GuestStreamRequestControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func set(_ task: Task<Void, Never>) { lock.withLock { self.task = task } }
+    func cancel() { lock.withLock { task?.cancel() } }
 }
 
 private struct GuestContainerPayload: Decodable {
@@ -125,14 +144,21 @@ actor PersistentEngineGuestRuntimeEventConnector: GuestRuntimeEventConnecting {
 
 actor GuestRuntimeEventMonitor {
     typealias Handler = @Sendable (GuestFrame) async -> Void
+    typealias ReconnectHandler = @Sendable () async -> Void
 
     private let connector: any GuestRuntimeEventConnecting
     private let handler: Handler
+    private let onReconnect: ReconnectHandler
     private var task: Task<Void, Never>?
 
-    init(connector: any GuestRuntimeEventConnecting, handler: @escaping Handler) {
+    init(
+        connector: any GuestRuntimeEventConnecting,
+        handler: @escaping Handler,
+        onReconnect: @escaping ReconnectHandler = {}
+    ) {
         self.connector = connector
         self.handler = handler
+        self.onReconnect = onReconnect
     }
 
     func start() async throws {
@@ -157,6 +183,7 @@ actor GuestRuntimeEventMonitor {
             guard !Task.isCancelled else { return }
             do {
                 stream = try await connector.connect()
+                await onReconnect()
             } catch {
                 try? await Task.sleep(for: .milliseconds(10))
             }
@@ -180,6 +207,11 @@ struct GuestExitCodeIndex: Sendable {
     }
 
     func code(for id: String) -> Int32? { codes[id] }
+
+    mutating func remove(id: String) {
+        codes.removeValue(forKey: id)
+        order.removeAll { $0 == id }
+    }
 
     func recoverNotFound(id: String, error: DockerRuntimeRouteError) throws -> Int32 {
         guard case .notFound = error, let code = code(for: id) else { throw error }
@@ -313,13 +345,14 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let image: String
         let createdAt: Date
         var ports: [DockerRuntimePortBinding]
-        let guestPorts: [Int]
+        var guestPorts: [Int]
         var state: EngineContainerState
         var exitCode: Int32?
     }
 
     private let engine: PersistentEngine
     private let portPublisher: GuestPortPublicationManager
+    private let broadcaster: EventBroadcaster?
     private var metadata: [String: Metadata] = [:]
     private var execs: [String: DockerRuntimeExecCreate] = [:]
     private var starting: Set<String> = []
@@ -331,9 +364,14 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
     private let waits = GuestWaitSingleFlight()
     private let removals = GuestRemovalGate()
 
-    init(engine: PersistentEngine, portPublisher: GuestPortPublicationManager) {
+    init(
+        engine: PersistentEngine,
+        portPublisher: GuestPortPublicationManager,
+        broadcaster: EventBroadcaster? = nil
+    ) {
         self.engine = engine
         self.portPublisher = portPublisher
+        self.broadcaster = broadcaster
     }
 
     func startEventMonitor() async throws {
@@ -343,9 +381,12 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             connector: PersistentEngineGuestRuntimeEventConnector(engine: engine)
         ) { [weak self] event in
             await self?.handle(event: event)
+        } onReconnect: { [weak self] in
+            try? await self?.restoreRuntimeState()
         }
         try await monitor.start()
         eventMonitor = monitor
+        try await restoreRuntimeState()
     }
 
     func stopEventMonitor() async {
@@ -353,13 +394,28 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         eventMonitor = nil
     }
 
-    func pullImage(reference: String, platform: String?) async throws -> DockerRuntimeImage {
+    func pullImage(
+        reference: String, platform: String?, auth: DockerRegistryAuth?
+    ) async throws -> DockerRuntimeImage {
         let guestReference = Self.normalizedRegistryReference(reference)
-        let response = try await request(
-            "image.pull",
-            ["reference": .string(guestReference), "snapshotter": .string("overlayfs")]
-        )
+        var requestPayload: [String: JSONValue] = [
+            "reference": .string(guestReference), "snapshotter": .string("overlayfs"),
+        ]
+        if let platform, !platform.isEmpty { requestPayload["platform"] = .string(platform) }
+        if let username = auth?.username, !username.isEmpty {
+            requestPayload["username"] = .string(username)
+            if let secret = auth?.password ?? auth?.identitytoken, !secret.isEmpty {
+                requestPayload["secret"] = .string(secret)
+            }
+        }
+        let response = try await request("image.pull", requestPayload)
         let payload: GuestImagePayload = try decode(response)
+        await broadcaster?.broadcast(
+            DockerEvent.make(
+                type: "image", action: "pull", actorID: payload.digest,
+                attributes: ["name": payload.name]
+            )
+        )
         return DockerRuntimeImage(reference: payload.name, digest: payload.digest)
     }
 
@@ -420,11 +476,13 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
                 reservedGuestPorts.subtract(allocatedGuestPorts)
             }
         }
+        let hostSource = try await vmnetHostSource(required: !request.ports.isEmpty)
         let requestedPorts = zip(request.ports, allocatedGuestPorts).map { port, guestPort in
             JSONValue.object([
                 "containerPort": .number(Double(port.containerPort)),
                 "guestPort": .number(Double(guestPort)),
                 "protocol": .string(port.proto),
+                "hostSource": .string(hostSource),
             ])
         }
         var payload: [String: JSONValue] = [
@@ -458,6 +516,12 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
                 "portBindings": .array(request.ports.map(Self.portBindingJSON)),
             ]),
         ]
+        if let entrypoint = request.entrypoint {
+            payload["entrypoint"] = .array(entrypoint.map(JSONValue.string))
+        }
+        if let cmd = request.cmd {
+            payload["cmd"] = .array(cmd.map(JSONValue.string))
+        }
         if let cwd = request.workingDirectory, !cwd.isEmpty { payload["cwd"] = .string(cwd) }
         if let user = request.user, !user.isEmpty { payload["user"] = .string(user) }
         let response = try await self.request("container.create", payload)
@@ -476,6 +540,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             exitCode: nil
         )
         committedReservation = true
+        await broadcastContainer("create", id: id)
         return dockerContainer(guest.container)
     }
 
@@ -514,21 +579,28 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             await starts.finish(id: resolved, result: .success(()))
             return
         }
+        let hostSource = try await vmnetHostSource(required: meta?.ports.isEmpty == false)
         let confirmedPorts = zip(meta?.ports ?? [], meta?.guestPorts ?? []).map { binding, guestPort in
             JSONValue.object([
                 "containerPort": .number(Double(binding.containerPort)),
                 "guestPort": .number(Double(guestPort)),
                 "protocol": .string(binding.proto),
+                "hostSource": .string(hostSource),
             ])
         }
         do {
+            exitCodes.remove(id: resolved)
+            metadata[resolved]?.state = .created
+            metadata[resolved]?.exitCode = nil
             let response = try await request(
                 "container.start",
                 ["id": .string(resolved), "publishedPorts": .array(confirmedPorts)]
             )
             let started = try decode(response, as: GuestContainerPayload.self).container
-            metadata[resolved]?.state = .running
-            if let meta, !meta.ports.isEmpty {
+            if metadata[resolved]?.state != .exited {
+                metadata[resolved]?.state = .running
+            }
+            if let meta, !meta.ports.isEmpty, metadata[resolved]?.state == .running {
                 pendingPublications.insert(resolved)
                 try await publishPorts(
                     id: resolved,
@@ -541,6 +613,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             throw error
         }
         await starts.finish(id: resolved, result: .success(()))
+        await broadcastContainer("start", id: resolved)
     }
 
     static func requiresPortPublicationRetry(
@@ -563,8 +636,12 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         )
         self.metadata[id]?.ports = published
         pendingPublications.remove(id)
-        Task { [weak self] in
-            try? await self?.persistPortBindings(containerID: id, bindings: published)
+        do {
+            try await persistPortBindings(containerID: id, bindings: published)
+        } catch {
+            await portPublisher.remove(containerID: id)
+            pendingPublications.insert(id)
+            throw error
         }
     }
 
@@ -572,6 +649,9 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let resolved = try await resolve(id)
         _ = try await request(
             "container.kill", ["id": .string(resolved), "signal": .number(Double(signal))]
+        )
+        await broadcastContainer(
+            "kill", id: resolved, extra: ["signal": String(signal)]
         )
     }
 
@@ -648,17 +728,22 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         pendingPublications.remove(resolved)
         metadata.removeValue(forKey: resolved)
         await removals.signal(id: resolved, exitCode: exitCode)
+        await broadcaster?.broadcast(
+            DockerEvent.simpleEvent(
+                id: resolved, type: "container", status: "destroy",
+                image: "", name: resolved
+            )
+        )
     }
 
     func inspectContainer(id: String) async throws -> DockerRuntimeContainer {
         let resolved = try await resolve(id)
-        if let cached = cachedContainer(id: resolved) { return cached }
         let response = try await request("container.inspect", ["id": .string(resolved)])
         return dockerContainer(try decode(response, as: GuestContainerPayload.self).container)
     }
 
     static func requiresStart(_ state: EngineContainerState) -> Bool {
-        state == .created
+        state != .running
     }
 
     func listContainers(showAll: Bool) async throws -> [DockerRuntimeContainer] {
@@ -708,7 +793,100 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let response = try await connection.request(
             method: "container.exec", payload: .object(payload), onStream: collector.append
         )
-        return collector.output(exitCode: response.exitCode ?? -1)
+        let output = try collector.output(exitCode: response.exitCode ?? -1)
+        await broadcastContainer(
+            "exec_die", id: containerID,
+            extra: ["execID": id, "exitCode": String(output.exitCode)]
+        )
+        return output
+    }
+
+    func streamExec(
+        id: String, tty: Bool
+    ) async throws -> AsyncThrowingStream<DockerRuntimeProcessFrame, Error> {
+        guard let exec = execs[id] else { throw DockerRuntimeRouteError.notFound("exec \(id)") }
+        let containerID = try await resolve(exec.containerID)
+        var payload: [String: JSONValue] = [
+            "id": .string(containerID), "execId": .string(id),
+            "args": .array(exec.command.map(JSONValue.string)),
+            "env": .array(exec.environment.map(JSONValue.string)), "terminal": .bool(tty),
+        ]
+        if let cwd = exec.workingDirectory, !cwd.isEmpty { payload["cwd"] = .string(cwd) }
+        if let user = exec.user, !user.isEmpty { payload["user"] = .string(user) }
+        let connection = try await engine.readyConnection()
+        let requestPayload: JSONValue = .object(payload)
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(64)) { continuation in
+            let control = GuestStreamRequestControl()
+            let request = Task {
+                do {
+                    let response = try await connection.request(
+                        method: "container.exec", payload: requestPayload
+                    ) { frame in
+                        guard let data = frame.data else { return }
+                        let result = continuation.yield(
+                            .init(stream: frame.stream, data: data, exitCode: nil)
+                        )
+                        if case .dropped = result {
+                            continuation.finish(
+                                throwing: DockerRuntimeRouteError.invalidRequest(
+                                    "exec client is too slow for the bounded stream buffer"
+                                )
+                            )
+                            control.cancel()
+                        }
+                    }
+                    continuation.yield(
+                        .init(stream: nil, data: Data(), exitCode: response.exitCode ?? -1)
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            control.set(request)
+            continuation.onTermination = { _ in control.cancel() }
+        }
+    }
+
+    func attachContainer(
+        id: String, stdout: Bool, stderr: Bool
+    ) async throws -> AsyncThrowingStream<DockerRuntimeProcessFrame, Error> {
+        let resolved = try await resolve(id)
+        let connection = try await engine.readyConnection()
+        let payload: JSONValue = .object([
+            "id": .string(resolved), "stdout": .bool(stdout), "stderr": .bool(stderr),
+        ])
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(64)) { continuation in
+            let control = GuestStreamRequestControl()
+            let request = Task {
+                do {
+                    let response = try await connection.request(
+                        method: "container.attach", payload: payload
+                    ) { frame in
+                        guard let data = frame.data else { return }
+                        let result = continuation.yield(
+                            .init(stream: frame.stream, data: data, exitCode: nil)
+                        )
+                        if case .dropped = result {
+                            continuation.finish(
+                                throwing: DockerRuntimeRouteError.invalidRequest(
+                                    "attach client is too slow for the bounded stream buffer"
+                                )
+                            )
+                            control.cancel()
+                        }
+                    }
+                    continuation.yield(
+                        .init(stream: nil, data: Data(), exitCode: response.exitCode ?? -1)
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            control.set(request)
+            continuation.onTermination = { _ in control.cancel() }
+        }
     }
 
     func logs(id: String, stdout: Bool, stderr: Bool) async throws -> DockerRuntimeProcessOutput {
@@ -752,6 +930,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             }
             if error.message.contains("used by container") || error.message.contains("multiple tags")
                 || error.message.contains("already exists") || error.message.contains("already in use")
+                || error.message.contains("running container")
             {
                 throw DockerRuntimeRouteError.conflict(error.message)
             }
@@ -767,6 +946,13 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         metadata[exit.id]?.exitCode = Int32(exit.exitCode)
         pendingPublications.remove(exit.id)
         await portPublisher.remove(containerID: exit.id)
+        exitCodes.record(id: exit.id, code: Int32(exit.exitCode))
+        await broadcastContainer(
+            "die", id: exit.id, extra: ["exitCode": String(exit.exitCode)]
+        )
+        if metadata[exit.id]?.autoRemove == true {
+            try? await deleteContainer(id: exit.id, force: true, removeVolumes: true)
+        }
     }
 
     private func dockerContainer(_ guest: GuestContainer) -> DockerRuntimeContainer {
@@ -824,11 +1010,36 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let response = try await request("container.list", [:])
         let payload: GuestContainerListPayload = try decode(response)
         payload.containers.forEach { hydrateMetadata(from: $0) }
-        reservedGuestPorts = Set(
-            payload.containers.flatMap {
-                ($0.metadata?.publishedPorts ?? $0.publishedPorts ?? []).map(\.guestPort)
+        for container in payload.containers
+        where container.status == "stopped" || container.status == "exited" {
+            if metadata[container.id]?.autoRemove == true {
+                try await deleteContainer(id: container.id, force: true, removeVolumes: true)
             }
-        )
+        }
+        reservedGuestPorts.removeAll()
+        for container in payload.containers.sorted(by: { $0.id < $1.id }) {
+            guard var meta = metadata[container.id] else { continue }
+            let reusable =
+                meta.guestPorts.count == meta.ports.count
+                && meta.guestPorts.allSatisfy(NativeVmnetPortRange.ports.contains)
+                && Set(meta.guestPorts).isDisjoint(with: reservedGuestPorts)
+            if !reusable {
+                guard
+                    let replacement = Self.lowestAvailableGuestPorts(
+                        count: meta.ports.count,
+                        range: NativeVmnetPortRange.ports,
+                        excluding: reservedGuestPorts
+                    )
+                else {
+                    throw DockerRuntimeRouteError.conflict(
+                        "published guest port range is exhausted during recovery"
+                    )
+                }
+                meta.guestPorts = replacement
+                metadata[container.id] = meta
+            }
+            reservedGuestPorts.formUnion(meta.guestPorts)
+        }
         guard let guestAddress = await engine.address(), !guestAddress.isEmpty else { return }
         for container in payload.containers where container.status == "running" {
             guard let bindings = metadata[container.id]?.ports, !bindings.isEmpty else { continue }
@@ -855,6 +1066,18 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
                 "portBindings": .array(bindings.map(Self.portBindingJSON)),
             ]
         )
+    }
+
+    private func vmnetHostSource(required: Bool) async throws -> String {
+        guard required else { return "" }
+        guard let address = await engine.address() else {
+            throw PersistentEngineError.invalidMachineSnapshot("engine IP address is unavailable")
+        }
+        let components = address.split(separator: ".")
+        guard components.count == 4 else {
+            throw PersistentEngineError.invalidMachineSnapshot("engine IP address is not IPv4")
+        }
+        return components.dropLast().joined(separator: ".") + ".1"
     }
 
     private static func portBindingJSON(_ binding: DockerRuntimePortBinding) -> JSONValue {
@@ -930,6 +1153,21 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let last = normalized.split(separator: "/").last.map(String.init) ?? normalized
         if !normalized.contains("@"), !last.contains(":") { normalized += ":latest" }
         return normalized
+    }
+
+    private func broadcastContainer(
+        _ action: String,
+        id: String,
+        extra: [String: String] = [:]
+    ) async {
+        guard let broadcaster, let meta = metadata[id] else { return }
+        await broadcaster.broadcast(
+            DockerEvent.simpleEvent(
+                id: id, type: "container", status: action,
+                image: meta.image, name: meta.name, labels: meta.labels,
+                extraAttributes: extra
+            )
+        )
     }
 
 }

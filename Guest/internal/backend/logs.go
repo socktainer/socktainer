@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/socktainer/socktainer/guest/internal/api"
@@ -16,19 +18,28 @@ import (
 const maxLogBytes int64 = 4 << 20
 
 type boundedLogWriter struct {
-	mu        sync.Mutex
-	file      *os.File
-	written   int64
-	truncated bool
+	mu          sync.Mutex
+	file        *os.File
+	written     int64
+	truncated   bool
+	nextID      uint64
+	subscribers map[uint64]*logSubscriber
+}
+
+type logSubscriber struct {
+	chunks chan []byte
+	stop   chan struct{}
 }
 
 func (w *boundedLogWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	originalLength := len(p)
+	live := append([]byte(nil), p...)
 	remaining := maxLogBytes - w.written
 	if remaining <= 0 {
 		w.truncated = w.truncated || originalLength > 0
+		w.publishLocked(live)
 		return originalLength, nil
 	}
 	if int64(len(p)) > remaining {
@@ -40,9 +51,66 @@ func (w *boundedLogWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		return written, err
 	}
+	w.publishLocked(live)
 	// Report the full input as consumed. Once the limit is reached, logs must not
 	// apply backpressure to the container process.
 	return originalLength, nil
+}
+
+func (w *boundedLogWriter) publishLocked(data []byte) {
+	for id, subscriber := range w.subscribers {
+		select {
+		case subscriber.chunks <- append([]byte(nil), data...):
+		default:
+			delete(w.subscribers, id)
+			close(subscriber.stop)
+		}
+	}
+}
+
+func (w *boundedLogWriter) subscribe(subscriber func([]byte) error) (func(), error) {
+	w.mu.Lock()
+	data, err := os.ReadFile(w.file.Name())
+	if err != nil {
+		w.mu.Unlock()
+		return nil, err
+	}
+	w.nextID++
+	id := w.nextID
+	if w.subscribers == nil {
+		w.subscribers = make(map[uint64]*logSubscriber)
+	}
+	entry := &logSubscriber{chunks: make(chan []byte, 64), stop: make(chan struct{})}
+	if len(data) > 0 {
+		entry.chunks <- data
+	}
+	w.subscribers[id] = entry
+	w.mu.Unlock()
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			w.mu.Lock()
+			if w.subscribers[id] == entry {
+				delete(w.subscribers, id)
+				close(entry.stop)
+			}
+			w.mu.Unlock()
+		})
+	}
+	go func() {
+		for {
+			select {
+			case data := <-entry.chunks:
+				if subscriber(data) != nil {
+					unsubscribe()
+					return
+				}
+			case <-entry.stop:
+				return
+			}
+		}
+	}()
+	return unsubscribe, nil
 }
 
 type logCapture struct {
@@ -157,6 +225,78 @@ func (b *Backend) Logs(request api.ContainerLogsRequest) (api.ContainerLogsRespo
 		}
 	}
 	return response, nil
+}
+
+func (b *Backend) Attach(ctx context.Context, request api.ContainerLogsRequest, stream StreamFunc) (uint32, error) {
+	record, ok := b.loadRecord(request.ID)
+	if !ok {
+		container, err := b.client.LoadContainer(b.ctx(ctx), request.ID)
+		if err != nil {
+			return 0, err
+		}
+		record, err = b.record(b.ctx(ctx), request.ID, container)
+		if err != nil {
+			return 0, err
+		}
+	}
+	record.requestPreparation()
+	if err := record.waitPreparation(ctx); err != nil {
+		return 0, err
+	}
+	value, ok := b.logCaptures.Load(request.ID)
+	for !ok {
+		item, err := b.Inspect(ctx, request.ID)
+		if err != nil {
+			return 0, err
+		}
+		if item.Status == "exited" || item.Status == "stopped" {
+			logs, err := b.Logs(request)
+			if err != nil {
+				return 0, err
+			}
+			if request.Stdout && len(logs.Stdout) > 0 {
+				if err := stream("stdout", logs.Stdout); err != nil {
+					return 0, err
+				}
+			}
+			if request.Stderr && len(logs.Stderr) > 0 {
+				if err := stream("stderr", logs.Stderr); err != nil {
+					return 0, err
+				}
+			}
+			code, _, err := b.Wait(ctx, request.ID)
+			return code, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+		value, ok = b.logCaptures.Load(request.ID)
+	}
+	capture := value.(*logCapture)
+	unsubscribers := []func(){}
+	defer func() {
+		for _, unsubscribe := range unsubscribers {
+			unsubscribe()
+		}
+	}()
+	if request.Stdout {
+		unsubscribe, err := capture.stdout.subscribe(func(data []byte) error { return stream("stdout", data) })
+		if err != nil {
+			return 0, err
+		}
+		unsubscribers = append(unsubscribers, unsubscribe)
+	}
+	if request.Stderr {
+		unsubscribe, err := capture.stderr.subscribe(func(data []byte) error { return stream("stderr", data) })
+		if err != nil {
+			return 0, err
+		}
+		unsubscribers = append(unsubscribers, unsubscribe)
+	}
+	code, _, err := b.Wait(ctx, request.ID)
+	return code, err
 }
 
 var _ io.Writer = (*boundedLogWriter)(nil)

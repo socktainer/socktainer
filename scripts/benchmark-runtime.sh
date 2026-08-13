@@ -15,7 +15,8 @@ OUTPUT=${BENCH_OUTPUT:-runtime-benchmark.json}
 MODE=run
 RUN_ID="socktainer-benchmark-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RESULTS_FILE=$(mktemp -t socktainer-benchmark-results.XXXXXX)
-ENGINE_STATE_DIR=$(mktemp -d -t socktainer-benchmark-engines.XXXXXX)
+PROCESS_FILE=$(mktemp -t socktainer-benchmark-processes.XXXXXX)
+ENGINE_STATE_DIR=$(mktemp -d /tmp/socktainer-benchmark-engines.XXXXXX)
 BIND_STATE_DIR=$(mktemp -d "$HOME/.socktainer-benchmark-bind.XXXXXX")
 CURRENT_HOST=
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -37,8 +38,10 @@ For each product NAME, set these uppercase environment variables:
   NAME_START_CMD       Required engine start command.
   NAME_START_MODE      foreground (harness-owned PID) or oneshot (default).
   NAME_STOP_CMD        Stop command. Optional in foreground mode.
+  NAME_RESET_CMD       Required command that resets mutable engine state.
   NAME_OWNED_PIDS_CMD  Optional command that prints additional owned root PIDs.
   NAME_PID_PATTERNS    Optional fallback comma-separated process regexes.
+  NAME_HELPER_PATTERNS Optional helper regexes; only processes born after launch count.
   NAME_STORAGE_PATHS   Required colon-separated paths owned by the product.
   NAME_VERSION_CMD     Required command that prints the product version.
   NAME_RUNTIME_CMD     Optional command that prints runtime component versions.
@@ -80,15 +83,20 @@ product_value() {
         return
     fi
     case $field in
-        DOCKER_HOST) printf 'unix://%s/.socktainer/container.sock' "$HOME" ;;
-        START_CMD) printf 'env SOCKTAINER_GUEST_IMAGE=%q %q --no-check-compatibility --no-docker-context' \
+        DOCKER_HOST) printf 'unix://%s/socktainer-home/.socktainer/container.sock' "$ENGINE_STATE_DIR" ;;
+        START_CMD) printf 'env HOME=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q SOCKTAINER_GUEST_IMAGE=%q %q --no-check-compatibility --no-docker-context' \
+            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
             "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" "$REPO_ROOT/.build/release/socktainer" ;;
+        RESET_CMD) printf 'rm -rf %q %q && mkdir -p %q %q' \
+            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
+            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" ;;
         START_MODE) printf 'foreground' ;;
         VERSION_CMD) printf '%q --version' "$REPO_ROOT/.build/release/socktainer" ;;
         RUNTIME_CMD) printf "printf 'Docker API v1.51; containerd 2.1.5; runc 1.3.4-r1'" ;;
+        HELPER_PATTERNS) printf 'com.apple.Virtualization.VirtualMachine' ;;
         STORAGE_PATHS) printf '%s:%s:%s' "$REPO_ROOT/.build/release/socktainer" \
             "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" \
-            "$HOME/Library/Application Support/Socktainer/engine" ;;
+            "$ENGINE_STATE_DIR/socktainer-state" ;;
     esac
 }
 
@@ -101,6 +109,7 @@ cleanup_host() {
     [[ -n $host ]] || return 0
     while IFS= read -r id; do
         [[ -n $id ]] || continue
+        [[ $(DOCKER_HOST="$host" docker inspect --format '{{ index .Config.Labels "socktainer.benchmark.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
         DOCKER_HOST="$host" docker rm -f "$id" >/dev/null 2>&1 || true
     done < <(DOCKER_HOST="$host" docker ps -aq \
         --filter "label=socktainer.benchmark.run=$RUN_ID" 2>/dev/null || true)
@@ -114,7 +123,7 @@ cleanup() {
         cleanup_host "$host"
         stop_product "$product" || true
     done
-    rm -f "$RESULTS_FILE"
+    rm -f "$RESULTS_FILE" "$PROCESS_FILE"
     rm -rf "$ENGINE_STATE_DIR"
     rm -rf "$BIND_STATE_DIR"
 }
@@ -245,6 +254,7 @@ finalize_json() {
             --arg startMode "$(product_value "$product" START_MODE)" \
             --arg startCommand "$(product_value "$product" START_CMD)" \
             --arg stopCommand "$(product_value "$product" STOP_CMD)" \
+            --arg resetCommand "$(product_value "$product" RESET_CMD)" \
             --arg ownedPIDsCommand "$(product_value "$product" OWNED_PIDS_CMD)" \
             --arg pidPatterns "$(product_value "$product" PID_PATTERNS)" \
             --arg versionCommand "$version_cmd" --arg runtime "$runtime" \
@@ -252,7 +262,7 @@ finalize_json() {
             --arg storagePaths "$(product_value "$product" STORAGE_PATHS)" \
             '$existing + [{name:$name,version:$version,runtime:$runtime,
               dockerHost:$host,startMode:$startMode,startCommand:$startCommand,
-              stopCommand:$stopCommand,ownedPIDsCommand:$ownedPIDsCommand,
+              stopCommand:$stopCommand,resetCommand:$resetCommand,ownedPIDsCommand:$ownedPIDsCommand,
               pidPatterns:$pidPatterns,versionCommand:$versionCommand,
               runtimeCommand:$runtimeCommand,storagePaths:$storagePaths}]')
     done
@@ -276,18 +286,18 @@ finalize_json() {
         --argjson ab_requests "$AB_REQUESTS" \
         --argjson ab_concurrency "$AB_CONCURRENCY" \
         --argjson bind_mib "$BIND_MIB" \
-        --argjson products "$product_info" \
+        --argjson products "$product_info" --slurpfile process_samples "$PROCESS_FILE" \
         'def median: sort as $v | ($v|length) as $n |
             if $n == 0 then null
             elif ($n % 2) == 1 then $v[($n/2)|floor]
             else (($v[$n/2-1] + $v[$n/2]) / 2) end;
          . as $results |
-         {schemaVersion:2,runId:$run_id,generatedAt:$generated_at,
+         {schemaVersion:2,status:"complete",runId:$run_id,generatedAt:$generated_at,
           host:{os:$os,arch:$arch,model:$model,logicalCPUCount:$cpu_count,memoryBytes:$memory_bytes},
           gitCommit:$commit,sourceDirty:$source_dirty,dockerClient:$docker_client,
           provenance:{harnessSHA256:$harness_sha,guestImageSHA256:$guest_sha,
             socktainerBinarySHA256:$binary_sha,sourceDiffSHA256:$source_diff_sha},
-          products:$products,
+          products:$products,processSamples:$process_samples,
           configuration:{baseImage:$base_image,nginxImage:$nginx_image,
             samples:$requested_samples,abRequests:$ab_requests,
             abConcurrency:$ab_concurrency,bindMiB:$bind_mib,
@@ -307,6 +317,20 @@ finalize_json() {
     mv "$tmp_output" "$OUTPUT"
 }
 
+validate_results() {
+    local expected_metrics=21 expected_rows
+    expected_rows=$((SAMPLES * ${#product_list[@]} * expected_metrics))
+    jq -es --argjson expected "$expected_rows" '
+        length == $expected
+        and (map([.product,.sample,.metric] | join("\u0000")) | unique | length) == $expected
+        and all(.[]; (.value | type) == "number")
+    ' "$RESULTS_FILE" | grep -qx true \
+        || die "result matrix is incomplete, duplicated, or non-numeric"
+    jq -es --argjson expected "$((SAMPLES * ${#product_list[@]} * 3))" \
+        'length == $expected and all(.[]; (.processes | type) == "array")' \
+        "$PROCESS_FILE" | grep -qx true || die "process snapshot matrix is incomplete"
+}
+
 first_line() {
     local command=$1 output
     output=$(eval "$command" 2>&1)
@@ -314,21 +338,28 @@ first_line() {
     printf '%s' "$output"
 }
 
-owned_memory_bytes() {
-    local product=$1 patterns pids_cmd roots='' extra_roots pid_file
+owned_pids() {
+    local product=$1 patterns helper_patterns pids_cmd roots='' extra_roots pid_file baseline_file baseline pids
     patterns=$(product_value "$product" PID_PATTERNS)
+    helper_patterns=$(product_value "$product" HELPER_PATTERNS)
     pids_cmd=$(product_value "$product" OWNED_PIDS_CMD)
     pid_file="$ENGINE_STATE_DIR/$product.pid"
+    baseline_file="$ENGINE_STATE_DIR/$product.helper-baseline"
+    baseline=$([[ -f $baseline_file ]] && tr '\n' ' ' < "$baseline_file" || true)
     [[ -s $pid_file ]] && roots=$(tr '\n' ' ' < "$pid_file")
     if [[ -n $pids_cmd ]]; then
         extra_roots=$(eval "$pids_cmd" | tr '\n' ' ')
         roots+=" $extra_roots"
     fi
-    ps -axo pid=,ppid=,rss=,command= | awk -v roots="$roots" -v patterns="$patterns" '
+    pids=$(ps -axo pid=,ppid=,rss=,command= | awk -v roots="$roots" -v patterns="$patterns" \
+        -v helperPatterns="$helper_patterns" -v baseline="$baseline" '
         BEGIN {
             rootCount=split(roots, root, " ")
             patternCount=split(patterns, pattern, ",")
+            helperCount=split(helperPatterns, helperPattern, ",")
+            baselineCount=split(baseline, baselinePID, " ")
             for (i=1; i<=rootCount; i++) if (root[i] ~ /^[0-9]+$/) owned[root[i]]=1
+            for (i=1; i<=baselineCount; i++) if (baselinePID[i] ~ /^[0-9]+$/) existed[baselinePID[i]]=1
         }
         { pid[NR]=$1; ppid[NR]=$2; rss[NR]=$3; command[NR]=$0 }
         END {
@@ -344,21 +375,53 @@ owned_memory_bytes() {
                 if (patterns != "") for (j=1; j<=patternCount; j++) {
                     if (pattern[j] != "" && command[i] ~ pattern[j]) { matched=1; break }
                 }
-                if (owned[pid[i]] || matched) sum += rss[i]
+                if (!matched && !existed[pid[i]] && helperPatterns != "") {
+                    for (j=1; j<=helperCount; j++) if (helperPattern[j] != "" && command[i] ~ helperPattern[j]) {
+                        matched=1; break
+                    }
+                }
+                if (owned[pid[i]] || matched) print pid[i]
             }
-            print (sum + 0) * 1024
         }
-    '
+    ' | sort -n -u | tr '\n' ' ')
+    printf '%s\n' "$pids"
+}
+
+owned_memory_bytes() {
+    local product=$1 pids
+    pids=$(owned_pids "$product")
+    [[ -n $pids ]] || { echo 0; return; }
+    footprint -f bytes $pids 2>/dev/null \
+        | awk '/^[[:space:]]*phys_footprint:/ {sum += $2} END {print sum + 0}'
+}
+
+record_process_snapshot() {
+    local product=$1 sample=$2 phase=$3 pids
+    pids=$(owned_pids "$product")
+    ps -axo pid=,ppid=,command= | awk -v selected="$pids" '
+        BEGIN { count=split(selected, values, " "); for (i=1; i<=count; i++) keep[values[i]]=1 }
+        keep[$1] { print }
+    ' | jq -Rsc --arg product "$product" --argjson sample "$sample" --arg phase "$phase" '
+        split("\n") | map(select(length > 0) | capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<command>.*)$") |
+          {pid:(.pid|tonumber),ppid:(.ppid|tonumber),command:.command}) as $processes |
+        {product:$product,sample:$sample,phase:$phase,processes:$processes}
+    ' >> "$PROCESS_FILE"
 }
 
 launch_product() {
-    local product=$1 command mode pid_file log_file
+    local product=$1 command mode pid_file log_file helper_patterns baseline_file
     command=$(product_value "$product" START_CMD)
     mode=$(product_value "$product" START_MODE)
     mode=${mode:-oneshot}
     pid_file="$ENGINE_STATE_DIR/$product.pid"
     log_file="$ENGINE_STATE_DIR/$product.log"
+    baseline_file="$ENGINE_STATE_DIR/$product.helper-baseline"
+    helper_patterns=$(product_value "$product" HELPER_PATTERNS)
     rm -f "$pid_file"
+    ps -axo pid=,command= | awk -v patterns="$helper_patterns" '
+        BEGIN { count=split(patterns, pattern, ",") }
+        patterns != "" { for (i=1; i<=count; i++) if (pattern[i] != "" && $0 ~ pattern[i]) { print $1; break } }
+    ' > "$baseline_file"
     : > "$ENGINE_STATE_DIR/$product.started"
     if [[ $mode == foreground ]]; then
         /bin/bash -c "exec $command" >"$log_file" 2>&1 &
@@ -386,7 +449,7 @@ stop_product() {
         done
         kill -KILL "$pid" >/dev/null 2>&1 || true
     fi
-    rm -f "$pid_file" "$ENGINE_STATE_DIR/$product.started"
+    rm -f "$pid_file" "$ENGINE_STATE_DIR/$product.started" "$ENGINE_STATE_DIR/$product.helper-baseline"
 }
 
 storage_bytes() {
@@ -405,12 +468,13 @@ storage_bytes() {
 }
 
 preflight_product() {
-    local product=$1 host start_cmd start_mode stop_cmd patterns pids_cmd paths version_cmd socket
+    local product=$1 host start_cmd start_mode stop_cmd reset_cmd patterns pids_cmd paths version_cmd socket
     host=$(product_value "$product" DOCKER_HOST)
     start_cmd=$(product_value "$product" START_CMD)
     start_mode=$(product_value "$product" START_MODE)
     start_mode=${start_mode:-oneshot}
     stop_cmd=$(product_value "$product" STOP_CMD)
+    reset_cmd=$(product_value "$product" RESET_CMD)
     patterns=$(product_value "$product" PID_PATTERNS)
     pids_cmd=$(product_value "$product" OWNED_PIDS_CMD)
     paths=$(product_value "$product" STORAGE_PATHS)
@@ -423,6 +487,7 @@ preflight_product() {
         [[ -n $patterns || -n $pids_cmd ]] || die "${product}: oneshot mode needs NAME_OWNED_PIDS_CMD or NAME_PID_PATTERNS"
     fi
     [[ -n $paths ]] || die "${product}: NAME_STORAGE_PATHS is required"
+    [[ -n $reset_cmd ]] || die "${product}: NAME_RESET_CMD is required for independent samples"
     [[ -n $version_cmd ]] || die "${product}: NAME_VERSION_CMD is required"
     eval "$version_cmd" >/dev/null 2>&1 || die "${product}: NAME_VERSION_CMD failed"
     if [[ $product == socktainer && -z ${SOCKTAINER_START_CMD:-} ]]; then
@@ -435,7 +500,7 @@ preflight_product() {
 
 preflight() {
     local tool product
-    for tool in docker curl jq python3 perl ab awk sed ps du mktemp sysctl; do
+    for tool in docker curl jq python3 perl ab awk sed ps du mktemp sysctl footprint; do
         command -v "$tool" >/dev/null || die "required tool is not installed: $tool"
     done
     [[ $BASE_IMAGE == *@sha256:* ]] || die "BENCH_BASE_IMAGE must be pinned by digest"
@@ -446,6 +511,7 @@ preflight() {
     [[ $BIND_MIB =~ ^[1-9][0-9]*$ ]] || die "BENCH_BIND_MIB must be a positive integer"
     IFS=',' read -r -a product_list <<< "$PRODUCTS"
     [[ ${#product_list[@]} -gt 0 ]] || die "at least one product is required"
+    ((SAMPLES % ${#product_list[@]} == 0)) || die "samples must be divisible by the product count for position balance"
     for product in "${product_list[@]}"; do
         [[ $product =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid product name: $product"
         preflight_product "$product"
@@ -485,6 +551,7 @@ benchmark_product() {
 
     stop_product "$product" force
     wait_for_engine_stop "$socket" || die "$product stop command left the Docker API available"
+    eval "$(product_value "$product" RESET_CMD)"
     start_ns=$(now_ns)
     launch_product "$product"
     if ! value=$(engine_ready_ms "$socket" "$start_ns"); then
@@ -496,10 +563,14 @@ benchmark_product() {
     docker_api pull "$BASE_IMAGE" >/dev/null
     [[ $NGINX_IMAGE == "$BASE_IMAGE" ]] || docker_api pull "$NGINX_IMAGE" >/dev/null
 
+    value=$(docker_elapsed_ms "$host" run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
+    append_result "$product" "$sample" "$position" capability_ready "$value" ms
+
     value=$(curl --silent --output /dev/null --write-out '%{time_total}' --unix-socket "$socket" http://localhost/_ping)
     value=$(awk -v seconds="$value" 'BEGIN {printf "%.6f", seconds*1000}')
     append_result "$product" "$sample" "$position" api_ping "$value" ms
-    append_result "$product" "$sample" "$position" idle_engine_memory "$(owned_memory_bytes "$product")" bytes
+    record_process_snapshot "$product" "$sample" idle
+    append_result "$product" "$sample" "$position" idle_engine_physical_footprint "$(owned_memory_bytes "$product")" bytes
 
     name="$RUN_ID-$sample-$product-create"
     value=$(docker_elapsed_ms "$host" create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
@@ -518,7 +589,15 @@ benchmark_product() {
     docker_api start "$name" >/dev/null
     while [[ $(docker_api inspect --format '{{.State.Running}}' "$name") == true ]]; do sleep 0.005; done
     value=$(docker_elapsed_ms "$host" wait "$name")
-    append_result "$product" "$sample" "$position" container_wait "$value" ms
+    append_result "$product" "$sample" "$position" completed_wait_lookup "$value" ms
+    docker_api rm "$name" >/dev/null
+
+    name="$RUN_ID-$sample-$product-live-wait"
+    docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" \
+        "$BASE_IMAGE" /bin/sh -c 'sleep 0.2' >/dev/null
+    docker_api start "$name" >/dev/null
+    value=$(docker_elapsed_ms "$host" wait "$name")
+    append_result "$product" "$sample" "$position" live_wait_to_exit "$value" ms
     docker_api rm "$name" >/dev/null
 
     name="$RUN_ID-$sample-$product-remove"
@@ -545,7 +624,8 @@ benchmark_product() {
         docker_api start "$runner-$index" >/dev/null
     done
     sleep 1
-    append_result "$product" "$sample" "$position" four_idle_containers_memory "$(owned_memory_bytes "$product")" bytes
+    record_process_snapshot "$product" "$sample" four_containers
+    append_result "$product" "$sample" "$position" four_idle_containers_physical_footprint "$(owned_memory_bytes "$product")" bytes
 
     nginx="$RUN_ID-$sample-$product-nginx"
     readiness=$(nginx_ready_ms "$host" "$nginx" "$NGINX_IMAGE" "socktainer.benchmark.run=$RUN_ID")
@@ -554,6 +634,10 @@ benchmark_product() {
     append_result "$product" "$sample" "$position" nginx_ready "$value" ms
     ab_output=$(ab -k -n "$AB_REQUESTS" -c "$AB_CONCURRENCY" "http://127.0.0.1:$port/")
     failed=$(awk '/Failed requests:/ {print $3}' <<< "$ab_output")
+    complete=$(awk '/Complete requests:/ {print $3}' <<< "$ab_output")
+    non_2xx=$(awk '/Non-2xx responses:/ {print $3}' <<< "$ab_output")
+    [[ $complete == "$AB_REQUESTS" && $failed == 0 && ${non_2xx:-0} == 0 ]] \
+        || die "$product: ab did not complete cleanly (complete=$complete failed=$failed non2xx=${non_2xx:-0})"
     rps=$(awk '/Requests per second:/ {print $4}' <<< "$ab_output")
     append_result "$product" "$sample" "$position" nginx_requests_per_second "$rps" requests_per_second
     append_result "$product" "$sample" "$position" nginx_failed_requests "$failed" count
@@ -574,6 +658,8 @@ benchmark_product() {
         'LC_ALL=C dd if=/bench/data.bin of=/dev/null bs=1048576 2>&1')
     value=$(awk -f "$DD_RESULT_PARSER" <<< "$dd_output") || die "$product: could not parse bind read dd output"
     append_result "$product" "$sample" "$position" bind_cached_read "$value" MiB_per_second
+    record_process_snapshot "$product" "$sample" post_bind_cache
+    append_result "$product" "$sample" "$position" post_bind_cache_physical_footprint "$(owned_memory_bytes "$product")" bytes
     rm -f "$bind_dir/data.bin"
     rmdir "$bind_dir"
 
@@ -621,6 +707,7 @@ if [[ $MODE == dry-run ]]; then
     exit 0
 fi
 
+rm -f "$OUTPUT"
 mkdir -p "$(dirname "$OUTPUT")"
 for ((sample = 1; sample <= SAMPLES; sample++)); do
     position=0
@@ -629,6 +716,7 @@ for ((sample = 1; sample <= SAMPLES; sample++)); do
         benchmark_product "$product" "$sample" "$position"
     done < <(rotation_for_sample "$sample")
 done
+validate_results
 finalize_json
 echo "benchmark: wrote $OUTPUT"
 jq -r '.summary[] | "summary: \(.product) \(.metric) median=\(.median) \(.unit) spread=\(.spread)"' "$OUTPUT"

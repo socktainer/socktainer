@@ -17,22 +17,25 @@ type WriteBarrier struct {
 }
 
 type BarrierCoordinator struct {
-	next    atomic.Uint64
-	timeout time.Duration
-	mu      sync.Mutex
-	emit    func(WriteBarrier) error
-	emitter uint64
-	pending map[uint64]chan struct{}
+	next     atomic.Uint64
+	timeout  time.Duration
+	mu       sync.Mutex
+	emitter  uint64
+	emitters map[uint64]func(WriteBarrier) error
+	pending  map[uint64]chan struct{}
 }
 
 func NewBarrierCoordinator(timeout time.Duration) *BarrierCoordinator {
-	return &BarrierCoordinator{timeout: timeout, pending: make(map[uint64]chan struct{})}
+	return &BarrierCoordinator{
+		timeout: timeout, emitters: make(map[uint64]func(WriteBarrier) error),
+		pending: make(map[uint64]chan struct{}),
+	}
 }
 
 func (b *BarrierCoordinator) SetEmitter(emit func(WriteBarrier) error) {
 	b.mu.Lock()
 	b.emitter++
-	b.emit = emit
+	b.emitters = map[uint64]func(WriteBarrier) error{b.emitter: emit}
 	b.mu.Unlock()
 }
 
@@ -43,13 +46,11 @@ func (b *BarrierCoordinator) InstallEmitter(emit func(WriteBarrier) error) func(
 	b.mu.Lock()
 	b.emitter++
 	generation := b.emitter
-	b.emit = emit
+	b.emitters[generation] = emit
 	b.mu.Unlock()
 	return func() {
 		b.mu.Lock()
-		if b.emitter == generation {
-			b.emit = nil
-		}
+		delete(b.emitters, generation)
 		b.mu.Unlock()
 	}
 }
@@ -58,17 +59,30 @@ func (b *BarrierCoordinator) Wait(ctx context.Context, path string) error {
 	id := b.next.Add(1)
 	done := make(chan struct{})
 	b.mu.Lock()
-	emit := b.emit
-	if emit != nil {
+	emitters := make([]func(WriteBarrier) error, 0, len(b.emitters))
+	for _, emit := range b.emitters {
+		emitters = append(emitters, emit)
+	}
+	if len(emitters) != 0 {
 		b.pending[id] = done
 	}
 	b.mu.Unlock()
-	if emit == nil {
+	if len(emitters) == 0 {
 		return ErrBarrierUnavailable
 	}
-	if err := emit(WriteBarrier{BarrierID: id, Paths: []string{path}}); err != nil {
+	barrier := WriteBarrier{BarrierID: id, Paths: []string{path}}
+	var lastError error
+	sent := false
+	for _, emit := range emitters {
+		if err := emit(barrier); err != nil {
+			lastError = err
+		} else {
+			sent = true
+		}
+	}
+	if !sent {
 		b.remove(id)
-		return err
+		return lastError
 	}
 	timer := time.NewTimer(b.timeout)
 	defer timer.Stop()

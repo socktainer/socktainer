@@ -54,6 +54,11 @@ func (s *Server) monitor(ctx context.Context, id string, state *exitWait, w *pro
 	go func() {
 		state.code, state.exitedAt, state.err = s.backend.Wait(ctx, id)
 		close(state.done)
+		s.waitsMu.Lock()
+		if s.waits[id] == state {
+			delete(s.waits, id)
+		}
+		s.waitsMu.Unlock()
 		if state.err != nil {
 			return
 		}
@@ -92,8 +97,13 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 }
 
 func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	defer conn.Close()
 	r, w := protocol.NewReader(conn), protocol.NewWriter(conn)
+	inFlight := make(chan struct{}, 256)
+	var requestMu sync.Mutex
+	requestCancels := make(map[uint64]context.CancelFunc)
 	if s.bindCache != nil {
 		removeEmitter := s.bindCache.InstallBarrierEmitter(func(barrier bindcache.WriteBarrier) error {
 			payload, err := protocol.NewPayload(api.BindWriteBarrierEvent{
@@ -116,7 +126,35 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
-		go s.handle(ctx, request, w)
+		if request.Kind == protocol.KindCancel {
+			requestMu.Lock()
+			cancel := requestCancels[request.ID]
+			requestMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			continue
+		}
+		select {
+		case inFlight <- struct{}{}:
+		default:
+			_ = writeError(w, request.ID, "too_many_requests", errors.New("connection request limit reached"))
+			continue
+		}
+		requestCtx, requestCancel := context.WithCancel(ctx)
+		requestMu.Lock()
+		requestCancels[request.ID] = requestCancel
+		requestMu.Unlock()
+		go func() {
+			defer func() { <-inFlight }()
+			defer requestCancel()
+			defer func() {
+				requestMu.Lock()
+				delete(requestCancels, request.ID)
+				requestMu.Unlock()
+			}()
+			s.handle(requestCtx, request, w)
+		}()
 	}
 }
 
@@ -200,6 +238,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, image)
 	case api.MethodImageList:
 		items, err := s.backend.Images(ctx)
@@ -231,6 +270,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, result)
 	case api.MethodImagePrune:
 		body, err := decode[api.ImagePruneRequest](request)
@@ -243,6 +283,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, result)
 	case api.MethodImageTag:
 		body, err := decode[api.ImageTagRequest](request)
@@ -255,6 +296,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, image)
 	case api.MethodContainerList:
 		items, err := s.backend.List(ctx)
@@ -274,6 +316,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
 	case api.MethodContainerLogs:
 		body, err := decode[api.ContainerLogsRequest](request)
@@ -298,6 +341,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
 		s.backend.BeginTaskPreparation(body.ID)
 	case api.MethodContainerStart:
@@ -311,6 +355,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		state := s.registerWait(body.ID)
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
 		s.monitor(context.Background(), body.ID, state, w)
@@ -325,6 +370,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		exitCode := int32(code)
 		payload, _ := protocol.NewPayload(api.ContainerExitEvent{ID: body.ID, ExitCode: code, ExitedAt: exitedAt})
 		_ = w.Write(protocol.Envelope{ID: request.ID, Kind: protocol.KindEnd, Payload: payload, ExitCode: &exitCode})
@@ -349,6 +395,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, api.Empty{})
 	case api.MethodContainerDelete:
 		body, err := decode[api.ContainerDeleteRequest](request)
@@ -360,6 +407,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
+		syscall.Sync()
 		_ = writePayload(w, request.ID, api.Empty{})
 	case api.MethodContainerExec:
 		body, err := decode[api.ContainerExecRequest](request)
@@ -375,6 +423,21 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			return
 		}
 		_ = w.Write(protocol.Envelope{ID: request.ID, Kind: protocol.KindEnd, ExitCode: &code})
+	case api.MethodContainerAttach:
+		body, err := decode[api.ContainerLogsRequest](request)
+		if err != nil {
+			fail("invalid_argument", err)
+			return
+		}
+		code, err := s.backend.Attach(ctx, body, func(name string, data []byte) error {
+			return w.Write(protocol.Envelope{ID: request.ID, Kind: protocol.KindStream, Stream: protocol.Stream(name), Data: data})
+		})
+		if err != nil {
+			fail("containerd", err)
+			return
+		}
+		exitCode := int32(code)
+		_ = w.Write(protocol.Envelope{ID: request.ID, Kind: protocol.KindEnd, ExitCode: &exitCode})
 	default:
 		fail("unknown_method", errors.New("unknown method "+strings.TrimSpace(request.Method)))
 	}

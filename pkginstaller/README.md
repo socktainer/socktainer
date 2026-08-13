@@ -1,6 +1,8 @@
 # Socktainer macOS Package Installer
 
-Builds a macOS `.pkg` installer that installs socktainer to `/opt/socktainer/bin/` and adds it to the system PATH.
+Builds a macOS `.pkg` installer that installs Socktainer and its persistent
+containerd guest image under `/opt/socktainer/` and adds the binary directory
+to the system PATH.
 
 ## Quick Start
 
@@ -16,8 +18,8 @@ make APPLE_APPLICATION_ID="Developer ID Application: Your Name" \
 
 ## Prerequisites
 
-- Run `make release` first only when invoking the `pkginstaller` subdirectory
-  directly; the root `make installer` target does this automatically
+- Run `make release guest-image` first only when you invoke the `pkginstaller`
+  subdirectory directly. The root `make installer` target does this automatically.
 - Xcode Command Line Tools installed
 - Developer certificates (for signed builds only)
 
@@ -65,6 +67,7 @@ in-place upgrade by reinstalling the previous package or Homebrew version.
 
 Creates `out/socktainer-installer.pkg` that:
 - Installs binary to `/opt/socktainer/bin/socktainer`
+- Installs the guest OCI image to `/opt/socktainer/share/socktainer/`
 - Adds `/opt/socktainer/bin` to system PATH
 - Shows professional installer UI
 

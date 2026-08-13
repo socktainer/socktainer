@@ -1,7 +1,7 @@
 import Vapor
 
 struct VolumeInspectRoute: RouteCollection {
-    let client: ClientVolumeService
+    let client: any ClientVolumeProtocol
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(.GET, pattern: "/volumes/{name}", use: self.handler)

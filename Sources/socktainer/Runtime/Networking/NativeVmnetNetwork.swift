@@ -37,9 +37,17 @@ struct NativeVmnetNetwork {
     let interface: any Containerization.Interface
     let gateway: IPv4Address
 
-    init() throws {
+    init(stateDirectory: URL? = nil) throws {
         let preferredSubnet = Int(ProcessInfo.processInfo.processIdentifier) % 240
-        for (attempt, portBase) in NativeVmnetPortRange.candidates.enumerated() {
+        let portState = stateDirectory?.appendingPathComponent("vmnet-port-base")
+        let storedBase = portState.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        var candidates = NativeVmnetPortRange.candidates
+        if let storedBase, candidates.contains(storedBase) {
+            candidates.removeAll { $0 == storedBase }
+            candidates.insert(storedBase, at: 0)
+        }
+        for (attempt, portBase) in candidates.enumerated() {
             var status: vmnet_return_t = .VMNET_FAILURE
             guard let configuration = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status) else {
                 continue
@@ -62,17 +70,20 @@ struct NativeVmnetNetwork {
 
             var rulesSucceeded = true
             for port in portBase..<(portBase + NativeVmnetPortRange.rangeSize) {
-                if vmnet_network_configuration_add_port_forwarding_rule(
-                    configuration,
-                    UInt8(IPPROTO_TCP),
-                    sa_family_t(AF_INET),
-                    UInt16(port),
-                    UInt16(port),
-                    &internalAddress
-                ) != .VMNET_SUCCESS {
-                    rulesSucceeded = false
-                    break
+                for `protocol` in [IPPROTO_TCP, IPPROTO_UDP] {
+                    if vmnet_network_configuration_add_port_forwarding_rule(
+                        configuration,
+                        UInt8(`protocol`),
+                        sa_family_t(AF_INET),
+                        UInt16(port),
+                        UInt16(port),
+                        &internalAddress
+                    ) != .VMNET_SUCCESS {
+                        rulesSucceeded = false
+                        break
+                    }
                 }
+                if !rulesSucceeded { break }
             }
             guard rulesSucceeded,
                 let reference = vmnet_network_create(configuration, &status),
@@ -84,6 +95,9 @@ struct NativeVmnetNetwork {
             let address = try CIDRv4("\(addressText)/24")
             let gateway = try IPv4Address(gatewayText)
             NativeVmnetPortRange.select(portBase)
+            if let portState {
+                try Data("\(portBase)\n".utf8).write(to: portState, options: .atomic)
+            }
             self.gateway = gateway
             self.interface = NATNetworkInterface(
                 ipv4Address: address,

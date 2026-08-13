@@ -41,6 +41,7 @@ $(SCRIPTS_DIR): | $(BUILD_DIR)
 setup: validate-config $(BUILD_DIR) $(RESOURCES_DIR) $(SCRIPTS_DIR)
 	@echo "Setting up installer directory structure..."
 	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin
+	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer
 	@mkdir -p $(OUT_DIR)
 	@mkdir -p $(TMP_DIR)
 
@@ -101,6 +102,7 @@ $(SCRIPTS_DIR)/postinstall: Resources/scripts/postinstall.in FORCE | $(SCRIPTS_D
 prepare-root: setup
 	@rm -rf "$(PACKAGE_ROOT)"
 	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin"
+	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer"
 
 .PHONY: copy-binary
 copy-binary: prepare-root
@@ -111,6 +113,12 @@ copy-binary: prepare-root
 	fi
 	@cp ../.build/release/socktainer "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
 	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"
+	@if [ ! -f "../Guest/out/socktainer-guest.oci.tar" ]; then \
+		echo "Error: guest OCI image not found. Run 'make guest-image' in the parent directory first."; \
+		exit 1; \
+	fi
+	@cp ../Guest/out/socktainer-guest.oci.tar \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer/socktainer-guest.oci.tar"
 
 .PHONY: sign-binary
 sign-binary: copy-binary

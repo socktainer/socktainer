@@ -16,7 +16,7 @@ struct BindCacheInvalidationControllerTests {
         try await controller.writeBarrier(id: 7, guestPaths: [])
 
         let calls = await sink.calls
-        #expect(calls.last == .init(paths: ["work/data"], all: false, barrierID: 7))
+        #expect(calls.last == .init(paths: [], all: true, barrierID: 7))
     }
 
     @Test("a host write after a barrier causes another invalidation")
@@ -31,7 +31,7 @@ struct BindCacheInvalidationControllerTests {
         await sink.waitForCallCount(2)
 
         let calls = await sink.calls
-        #expect(calls[0] == .init(paths: ["guest/file"], all: false, barrierID: 8))
+        #expect(calls[0] == .init(paths: ["guest/file"], all: true, barrierID: 8))
         #expect(calls[1] == .init(paths: ["host/file"], all: false, barrierID: nil))
     }
 
@@ -48,8 +48,8 @@ struct BindCacheInvalidationControllerTests {
         #expect(await sink.calls == [.init(paths: [], all: true, barrierID: 9)])
     }
 
-    @Test("no event through the flush point can cross the barrier acknowledgement")
-    func noEventCrossesAcknowledgement() async throws {
+    @Test("a barrier uses full invalidation instead of a blocking FSEvents flush")
+    func barrierDoesNotSynchronouslyFlushFSEvents() async throws {
         let source = FakeBindHostEventSource()
         let sink = RecordingBindCacheGuestSink()
         let controller = BindCacheInvalidationController(source: source, sink: sink)
@@ -61,7 +61,7 @@ struct BindCacheInvalidationControllerTests {
         try await controller.writeBarrier(id: 10, guestPaths: ["guest/write"])
 
         let calls = await sink.calls
-        #expect(calls == [.init(paths: ["concurrent/write", "guest/write"], all: false, barrierID: 10)])
+        #expect(calls == [.init(paths: ["guest/write"], all: true, barrierID: 10)])
     }
 
     @Test("an oversized retained path batch becomes a full invalidation")
@@ -107,8 +107,8 @@ struct BindCacheInvalidationControllerTests {
         await bridge.stop()
 
         let calls = await sink.calls
-        #expect(calls[0] == .init(paths: ["first"], all: false, barrierID: 1))
-        #expect(calls[1] == .init(paths: ["second"], all: false, barrierID: UInt64.max))
+        #expect(calls[0] == .init(paths: ["first"], all: true, barrierID: 1))
+        #expect(calls[1] == .init(paths: ["second"], all: true, barrierID: UInt64.max))
     }
 
     private static func barrierEvent(id: UInt64, path: String) -> GuestFrame {
