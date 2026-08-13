@@ -227,7 +227,7 @@ struct DirectTCPPortForwarderTests {
         let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { _ = Darwin.close(descriptor) }
-        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+        var timeout = timeval(tv_sec: 10, tv_usec: 0)
         _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
@@ -240,8 +240,17 @@ struct DirectTCPPortForwarderTests {
         }
         guard connected == 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         try payload.withUnsafeBytes { bytes in
-            guard Darwin.write(descriptor, bytes.baseAddress, bytes.count) == bytes.count else {
-                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            var written = 0
+            while written < bytes.count {
+                let count = Darwin.write(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: written),
+                    bytes.count - written
+                )
+                guard count > 0 else {
+                    throw POSIXError(.init(rawValue: errno) ?? .EIO)
+                }
+                written += count
             }
         }
         if halfClose {
@@ -250,8 +259,18 @@ struct DirectTCPPortForwarderTests {
             }
         }
         var buffer = [UInt8](repeating: 0, count: payload.count)
-        let count = Darwin.read(descriptor, &buffer, buffer.count)
-        guard count == payload.count else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        var received = 0
+        while received < buffer.count {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: received),
+                    bytes.count - received
+                )
+            }
+            guard count > 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+            received += count
+        }
         return Data(buffer)
     }
 }
