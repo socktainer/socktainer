@@ -94,6 +94,7 @@ product_value() {
         VERSION_CMD) printf '%q --version' "$REPO_ROOT/.build/release/socktainer" ;;
         RUNTIME_CMD) printf "printf 'Docker API v1.51; containerd 2.1.5; runc 1.3.4-r1'" ;;
         HELPER_PATTERNS) printf 'com.apple.Virtualization.VirtualMachine' ;;
+        BIND_ROOT) printf '%s' "$ENGINE_STATE_DIR/socktainer-home" ;;
         STORAGE_PATHS) printf '%s:%s:%s' "$REPO_ROOT/.build/release/socktainer" \
             "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" \
             "$ENGINE_STATE_DIR/socktainer-state" ;;
@@ -541,7 +542,7 @@ wait_for_engine_stop() {
 benchmark_product() {
     local product=$1 sample=$2 position=$3
     local host paths socket start_ns value readiness
-    local name runner nginx port ab_output failed rps bind_dir bind_runner dd_output
+    local name runner nginx port ab_output failed rps bind_root bind_dir bind_runner dd_output
     host=$(product_value "$product" DOCKER_HOST)
     paths=$(product_value "$product" STORAGE_PATHS)
     socket=${host#unix://}
@@ -642,7 +643,9 @@ benchmark_product() {
     append_result "$product" "$sample" "$position" nginx_requests_per_second "$rps" requests_per_second
     append_result "$product" "$sample" "$position" nginx_failed_requests "$failed" count
 
-    bind_dir="$BIND_STATE_DIR/$sample-$product"
+    bind_root=$(product_value "$product" BIND_ROOT)
+    bind_root=${bind_root:-$BIND_STATE_DIR}
+    bind_dir="$bind_root/$sample-$product"
     mkdir -p "$bind_dir"
     bind_runner="$RUN_ID-$sample-$product-bind"
     docker_api create --name "$bind_runner" --label "socktainer.benchmark.run=$RUN_ID" -v "$bind_dir:/bench" "$BASE_IMAGE" \
