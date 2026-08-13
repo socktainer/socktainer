@@ -32,9 +32,8 @@ public func prepareUnixSocket(for app: Application, homeDirectory: String? = nil
     app.http.server.configuration.address = .unixDomainSocket(path: socketPath)
 }
 
-/// The docker.sock relay mirrors this socket's mode onto the root-owned guest-side socket
-/// (apple/container >= 1.1.0), so 0666 is what lets non-root guest processes connect; the
-/// 0700 parent directory keeps other host users out despite the world-writable socket.
+/// Docker clients can connect to this socket regardless of their process umask. The
+/// 0700 parent directory prevents access by other host users.
 public func openUnixSocketToAllUsers(homeDirectory: String?) throws {
     guard let homeDir = homeDirectory else {
         throw UnixSocketError.missingHomeDirectory

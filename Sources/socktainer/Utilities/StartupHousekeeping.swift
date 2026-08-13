@@ -3,7 +3,7 @@ import Foundation
 /// Runs best-effort startup work under a deadline that the work itself cannot
 /// extend or ignore.
 ///
-/// Startup housekeeping (DNS-sidecar adoption, orphaned-network reaping) calls
+/// Startup housekeeping, such as orphaned-network reaping, calls
 /// into Apple Container over XPC, and those calls can hang forever when the
 /// runtime is wedged (apple/container#1884: per-container/network operations
 /// hang indefinitely while reads keep working). Task cancellation can't

@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /run/containerd /var/lib/containerd
+
+containerd --config /etc/containerd/config.toml >&2 &
+containerd_pid=$!
+
+for _ in $(seq 1 200); do
+    [ -S /run/containerd/containerd.sock ] && break
+    kill -0 "${containerd_pid}" 2>/dev/null || {
+        exit 1
+    }
+    sleep 0.01
+done
+
+[ -S /run/containerd/containerd.sock ] || {
+    echo "containerd did not create its socket" >&2
+    exit 1
+}
+
+exec /usr/local/libexec/socktainer-guest-agent "$@"

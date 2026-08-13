@@ -17,63 +17,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
         let networksList = try await networkClient.withClient { try await $0.list() }
-        var allNetworks = networksList.map { RESTNetworkSummary(networkResource: $0) }
-        let containerClient = ClientContainerService()
-        let allContainers = try await containerClient.list(showAll: true, filters: [:])
-
-        // Map containers to networks
-        for i in 0..<allNetworks.count {
-            let network = allNetworks[i]
-            var containersForNetwork: [String: NetworkContainer] = [:]
-            for container in allContainers {
-                // Exclude internal Socktainer DNS sidecars from the Docker API view.
-                // If CoreDNS shows up as an attached container, docker compose down
-                // reports "Resource is still in use" and skips the DELETE /networks/{id}
-                // call — preventing our cleanup hook from firing.
-                guard !ClientContainerService.isInfrastructureSidecar(container) else {
-                    continue
-                }
-                let dockerName = await DockerContainerMetadataStore.shared.name(
-                    nativeID: container.id
-                )
-                let dockerID = DockerContainerID.hexId(for: container)
-                for attachment in container.networks {
-                    if attachment.network == network.Id || attachment.network == network.Name {
-                        let nc = NetworkContainer(
-                            Name: dockerName,
-                            EndpointID: nil,  // Apple container doesn't have a matching field
-                            MacAddress: nil,  // Apple container doesn't have a matching field
-                            IPv4Address: String(describing: attachment.ipv4Address),
-                            IPv6Address: nil
-                        )
-                        containersForNetwork[dockerID] = nc
-                        logger.debug("Container \(dockerName) attached to network \(network.Name) (ID: \(network.Id))")
-                    }
-                }
-            }
-            if !containersForNetwork.isEmpty {
-                allNetworks[i] = RESTNetworkSummary(
-                    Name: network.Name,
-                    Id: network.Id,
-                    Created: network.Created,
-                    Scope: network.Scope,
-                    Driver: network.Driver,
-                    EnableIPv4: network.EnableIPv4,
-                    EnableIPv6: network.EnableIPv6,
-                    Internal: network.Internal,
-                    Attachable: network.Attachable,
-                    Ingress: network.Ingress,
-                    IPAM: network.IPAM,
-                    Options: network.Options,
-                    Containers: containersForNetwork,
-                    ConfigFrom: network.ConfigFrom,
-                    Labels: network.Labels,
-                    Subnet: network.Subnet,
-                    Gateway: network.Gateway
-                )
-            }
-        }
-
+        let allNetworks = networksList.map { RESTNetworkSummary(networkResource: $0) }
         return Self.applyFilters(allNetworks, filters: filters, logger: logger)
     }
 

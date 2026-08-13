@@ -33,7 +33,6 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
         .package(url: "https://github.com/mw99/DataCompression.git", from: "3.9.0"),
         .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
-        .package(url: "https://github.com/socktainer/dns-forwarder.git", exact: "0.2.0"),
     ],
     targets: [
         .executableTarget(
@@ -56,10 +55,8 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "DataCompression", package: "DataCompression"),
                 .product(name: "libzstd", package: "zstd"),
-                .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 "CFilteredStream",
                 "BuildInfo",
-                "CRelayImage",
             ]
         ),
         .testTarget(
@@ -67,7 +64,6 @@ let package = Package(
             dependencies: [
                 .target(name: "socktainer"),
                 .product(name: "ContainerAPIClient", package: "container"),
-                .product(name: "SocktainerDNSImage", package: "dns-forwarder"),
                 .product(name: "VaporTesting", package: "vapor"),
                 .product(name: "libzstd", package: "zstd"),
             ],
@@ -92,11 +88,6 @@ let package = Package(
                 .define("DOCKER_ENGINE_API_MAX_VERSION", to: "\"\(dockerEngineApiMaxVersion)\""),
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(resolvedVersion(for: "container"))\""),
             ]
-        ),
-        .target(
-            name: "CRelayImage",
-            dependencies: [],
-            publicHeadersPath: "include"
         ),
     ]
 

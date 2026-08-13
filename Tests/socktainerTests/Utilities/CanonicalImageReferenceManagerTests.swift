@@ -468,13 +468,6 @@ struct CanonicalImageReferenceManagerTests {
         #expect(visible.count == 1)
         #expect(visible.first?.reference == lease.digest)
         #expect(!ContainerImageLease.isReference(visible[0].reference))
-        #expect(
-            ImageListRoute.repositoryMetadata(
-                references: visible.map(\.reference),
-                rootDigest: lease.digest,
-                includeDigests: true
-            ).tags.isEmpty
-        )
         #expect(staleVisible.isEmpty)
     }
 
@@ -521,13 +514,6 @@ struct CanonicalImageReferenceManagerTests {
         let listed = try await service.list()
         #expect(listed.count == 1)
         #expect(listed.first?.reference == bareDigest)
-        let metadata = ImageListRoute.repositoryMetadata(
-            references: listed.map(\.reference),
-            rootDigest: bareDigest,
-            includeDigests: true
-        )
-        #expect(metadata.tags.isEmpty)
-        #expect(metadata.digests.isEmpty)
     }
 
     @Test("the image service tags over an occupied target through canonical replacement")

@@ -15,7 +15,7 @@ import Testing
 /// **Fix**: capture the image from `get()` and call `delete(reference: image.reference)`
 /// using the normalized key the store actually holds.
 @Suite("ClientImageService — delete reference normalization")
-struct ImageDeleteRouteTests {
+struct ClientImageServiceDeleteTests {
 
     @Test("digest deletion with multiple tags conflicts unless force is set")
     func multipleTagDigestRequiresForce() throws {
