@@ -61,7 +61,7 @@ private struct FramedUDPGuestProxyDialer: GuestPortConnectionDialing {
         }
         let client = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
         let peer = descriptors[1]
-        Task.detached {
+        Thread.detachNewThread {
             defer { _ = Darwin.close(peer) }
             var header = [UInt8](repeating: 0, count: 7)
             guard Darwin.read(peer, &header, header.count) == header.count,
