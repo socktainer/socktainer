@@ -5,7 +5,7 @@ import VaporTesting
 
 @testable import socktainer
 
-@Suite("Direct TCP port forwarder")
+@Suite("Direct TCP port forwarder", .serialized)
 struct DirectTCPPortForwarderTests {
     @Test("add and remove are idempotent")
     func addAndRemoveAreIdempotent() async throws {
@@ -131,9 +131,15 @@ struct DirectTCPPortForwarderTests {
             )
 
             try await forwarder.add(mapping)
-            let response = try await Task.detached {
-                try Self.roundTrip(port: frontendPort, payload: Data("direct-vm-path".utf8))
-            }.value
+            let response: Data
+            do {
+                response = try await Task.detached {
+                    try Self.roundTrip(port: frontendPort, payload: Data("direct-vm-path".utf8))
+                }.value
+            } catch {
+                try? await forwarder.remove(id: mapping.id)
+                throw error
+            }
 
             #expect(response == Data("direct-vm-path".utf8))
             try await forwarder.remove(id: mapping.id)
@@ -152,12 +158,18 @@ struct DirectTCPPortForwarderTests {
 
             let published = try await forwarder.add(requested)
             #expect(published.hostPort > 0)
-            let response = try await Task.detached {
-                try Self.roundTrip(
-                    port: published.hostPort,
-                    payload: Data("dynamic-port".utf8)
-                )
-            }.value
+            let response: Data
+            do {
+                response = try await Task.detached {
+                    try Self.roundTrip(
+                        port: published.hostPort,
+                        payload: Data("dynamic-port".utf8)
+                    )
+                }.value
+            } catch {
+                try? await forwarder.remove(id: requested.id)
+                throw error
+            }
             #expect(response == Data("dynamic-port".utf8))
             try await forwarder.remove(id: requested.id)
         }
