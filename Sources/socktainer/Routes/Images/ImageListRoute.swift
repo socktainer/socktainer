@@ -6,6 +6,7 @@ import Vapor
 struct RESTImageListQuery: Vapor.Content {
     let manifests: Bool?
     let digests: Bool?
+    let filters: String?
 }
 
 struct ImageListRoute: RouteCollection {
@@ -62,6 +63,14 @@ extension ImageListRoute {
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageSummary] {
         { req in
             let query = try req.query.decode(RESTImageListQuery.self)
+            // moby validates the filters before doing any listing work. Key/shape
+            // validation already happens inside the parser; running applyFilters
+            // against an empty list here additionally fail-fasts on an invalid
+            // `dangling` value (e.g. `dangling=bogus`) before the real listing
+            // and image-summary work below, at the cost of a second (cheap,
+            // no-op-on-empty-input) filter pass once the real summaries exist.
+            let filters = try DockerImageFilterUtility.parseImageListFilters(filterParam: query.filters, logger: req.logger)
+            _ = try ImageListRoute.applyFilters([], filters: filters)
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
@@ -176,7 +185,41 @@ extension ImageListRoute {
                 imagesSummaries.append(summary)
             }
 
-            return imagesSummaries
+            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters)
         }
+    }
+
+    /// Applies the `dangling` and `reference` image-ls filters. Different keys
+    /// AND together, matching moby.
+    static func applyFilters(_ summaries: [RESTImageSummary], filters: [String: [String]]) throws -> [RESTImageSummary] {
+        var result = summaries
+        // A present (even empty) `dangling` key is validated, unlike `reference`
+        // (where a present-but-empty filter matches nothing): real Docker 400s
+        // `{"dangling":[]}` outright rather than treating it as "no filter" —
+        // verified live. `!dangling.isEmpty` would treat it as absent instead.
+        if let dangling = filters["dangling"] {
+            // moby's filters.GetBoolOrDefault recognizes only 0/1/true/false
+            // here (stricter than the MobyBool query-parameter semantics) and
+            // rejects the value set if it has no recognized true/false token,
+            // or has both — but does NOT reject an extra unrecognized token
+            // once a real one is present: `dangling=[true,maybe]` behaves as
+            // `dangling=true` on real Docker (verified live), so `maybe` here
+            // is silently irrelevant, not itself invalid.
+            let isTrue = dangling.contains("1") || dangling.contains("true")
+            let isFalse = dangling.contains("0") || dangling.contains("false")
+            guard isTrue != isFalse else {
+                throw Abort(.badRequest, reason: "invalid filter 'dangling=[\(dangling.joined(separator: " "))]'")
+            }
+            result = result.filter { ImageListFilter.isDangling(repoTags: $0.RepoTags) == isTrue }
+        }
+        // A present `reference` key with zero values (an empty array, or a
+        // boolean map with no true entries) is a real Docker filter that
+        // matches nothing — not the same as the key being absent. `contains`
+        // over an empty `patterns` array already returns false for every
+        // image, which is exactly that "matches nothing" behavior.
+        if let patterns = filters["reference"] {
+            result = result.filter { ImageListFilter.referenceMatches(patterns: patterns, repoTags: $0.RepoTags) }
+        }
+        return result
     }
 }
