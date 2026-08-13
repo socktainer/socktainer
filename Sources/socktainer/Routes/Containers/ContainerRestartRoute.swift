@@ -44,7 +44,7 @@ extension ContainerRestartRoute {
             // The restart started a new run of the container. A `die` is claimed per run and the
             // claim is never handed back, so without opening one here the restarted container's
             // exit would find the previous run's claim held and go unreported.
-            let runEpoch = await DieEventOwnership.shared.beginRun(id: snapshot?.id ?? id)
+            let runEpoch = await DieEventOwnership.shared.beginRestartedRun(id: snapshot?.id ?? id)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!
             // Carry the canonical 64-char Docker id, not the raw request

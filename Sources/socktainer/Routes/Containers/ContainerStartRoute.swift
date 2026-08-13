@@ -300,10 +300,10 @@ extension ContainerStartRoute {
             let restartedEpoch: Int
             do {
                 try await client.start(id: nativeId, detachKeys: nil)
-                // A restart is a new run: it needs its own claim. The previous run's observer
-                // keeps the claim it broadcast under (so a late exit monitor cannot double-emit),
-                // so without a new run every restart after the first would report no exit at all.
-                restartedEpoch = await DieEventOwnership.shared.beginRun(id: nativeId)
+                // A restart is a new run: it needs its own claim. The exit that triggered it
+                // ended the previous run, whose observer keeps the claim it broadcast under, so
+                // this must not join it — every restart after the first would go unreported.
+                restartedEpoch = await DieEventOwnership.shared.beginRestartedRun(id: nativeId)
             } catch {
                 await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
                 logger.warning("restart-policy: failed to restart \(nativeId) (attempt \(attempt)): \(error)")
