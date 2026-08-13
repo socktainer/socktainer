@@ -17,6 +17,7 @@ TEST_PARALLELISM ?= $(shell sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sy
 TEST_SWIFT_FLAGS ?= --disable-index-store
 SWIFT_JOBS ?=
 SWIFT_JOB_FLAGS := $(if $(strip $(SWIFT_JOBS)),--jobs $(SWIFT_JOBS),)
+SWIFT_COMPILER_FLAGS ?=
 
 SWIFT := "swift"
 DESTDIR ?= /usr/local/
@@ -43,7 +44,7 @@ all: socktainer
 .PHONY: build
 build:
 	@echo Building socktainer binary...
-	@$(SWIFT) build -c $(BUILD_CONFIGURATION) $(SWIFT_JOB_FLAGS)
+	@$(SWIFT) build -c $(BUILD_CONFIGURATION) $(SWIFT_JOB_FLAGS) $(SWIFT_COMPILER_FLAGS)
 
 .PHONY: socktainer
 socktainer: build 
@@ -85,6 +86,7 @@ help:
 test: lint-pipes
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
 		$(SWIFT_JOB_FLAGS) \
+		$(SWIFT_COMPILER_FLAGS) \
 		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
 
 .PHONY: integration
