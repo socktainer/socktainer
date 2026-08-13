@@ -57,6 +57,9 @@ let package = Package(
                 .product(name: "libzstd", package: "zstd"),
                 "CFilteredStream",
                 "BuildInfo",
+            ],
+            swiftSettings: [
+                .unsafeFlags(["-Xllvm", "-sil-print-pass-name"])
             ]
         ),
         .testTarget(

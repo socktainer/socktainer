@@ -64,6 +64,7 @@ jobs:
         timeout-minutes: 40
         env:
           CI_SWIFT_DIAGNOSTICS_DIR: .ci-diagnostics/build
+          CI_SWIFT_SILENCE_SECONDS: 120
         run: scripts/ci-swift-watchdog.sh make release
 
       - name: Upload build diagnostics
@@ -128,6 +129,7 @@ jobs:
       - name: Execute test
         env:
           CI_SWIFT_DIAGNOSTICS_DIR: .ci-diagnostics/tests
+          CI_SWIFT_SILENCE_SECONDS: 120
         run: scripts/ci-swift-watchdog.sh make test
 
       - name: Upload test diagnostics
