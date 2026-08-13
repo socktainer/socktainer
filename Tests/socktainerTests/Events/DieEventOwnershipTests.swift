@@ -8,39 +8,143 @@ import Testing
 /// while `docker run`, which goes through both attach and start, must still emit exactly one.
 @Suite("DieEventOwnership")
 struct DieEventOwnershipTests {
-    @Test("only the first claimer owns the die event")
-    func singleOwner() async {
+    @Test("the monitor owns an exit nothing else reserved: the compose flow")
+    func monitorOwnsUnreservedRun() async {
         let ownership = DieEventOwnership()
+        let run = await ownership.beginRun(id: "c1")
 
-        #expect(await ownership.claim(id: "c1"))
-        #expect(await ownership.claim(id: "c1") == false)
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run))
     }
 
-    @Test("ownership is reusable after release, so later runs still emit die")
-    func releaseAllowsNextRun() async {
+    @Test("the monitor defers to a start-route reservation: the docker run flow")
+    func startReservationWinsOverMonitor() async {
+        let ownership = DieEventOwnership()
+        let run = await ownership.beginRun(id: "c1")
+        await ownership.reserveForStart(id: "c1", epoch: run, generation: 1)
+
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run) == false)
+        #expect(await ownership.claimForStart(id: "c1", epoch: run, generation: 1))
+    }
+
+    @Test("a redundant /start moves the obligation to the observer that stays current")
+    func newerGenerationSupersedesReservation() async {
+        let ownership = DieEventOwnership()
+        // A redundant /start finds the container already running, so it joins the same run.
+        let run = await ownership.beginRun(id: "c1")
+        #expect(await ownership.currentEpoch(id: "c1") == run)
+
+        await ownership.reserveForStart(id: "c1", epoch: run, generation: 1)
+        await ownership.reserveForStart(id: "c1", epoch: run, generation: 2)
+
+        // The stale observer must not emit even if its generation check somehow passed.
+        #expect(await ownership.claimForStart(id: "c1", epoch: run, generation: 1) == false)
+        #expect(await ownership.claimForStart(id: "c1", epoch: run, generation: 2))
+    }
+
+    @Test("a claimed run stays claimed, so a late observer cannot double-emit")
+    func ownershipSurvivesTheRun() async {
+        let ownership = DieEventOwnership()
+        let run = await ownership.beginRun(id: "c1")
+
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run))
+        // Both losers arrive after the winner already broadcast. Handing the run back after a
+        // broadcast would let either emit a second `die` for the same exit.
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run) == false)
+        await ownership.reserveForStart(id: "c1", epoch: run, generation: 1)
+        #expect(await ownership.claimForStart(id: "c1", epoch: run, generation: 1) == false)
+    }
+
+    @Test("a monitor still resolving one exit cannot silence the next run")
+    func staleMonitorCannotClaimTheNextRun() async {
+        let ownership = DieEventOwnership()
+        let first = await ownership.beginRun(id: "c1")
+
+        // The container exits and restarts while the first run's monitor is still inside
+        // `process.wait()`; it must land on its own run, not steal the live one.
+        let second = await ownership.beginRun(id: "c1")
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: first))
+        #expect(
+            await ownership.claimForMonitor(id: "c1", epoch: second),
+            "the current run must still be claimable after a lagging observer reports an older one"
+        )
+    }
+
+    @Test("each run is claimable again, including consecutive restart-policy restarts")
+    func newRunReopensTheClaim() async {
         let ownership = DieEventOwnership()
 
-        #expect(await ownership.claim(id: "c1"))
-        await ownership.release(id: "c1")
-        #expect(await ownership.claim(id: "c1"), "a container's second run must be claimable again")
+        for generation in 1...3 {
+            let run = await ownership.beginRun(id: "c1")
+            await ownership.reserveForStart(id: "c1", epoch: run, generation: generation)
+            #expect(
+                await ownership.claimForStart(id: "c1", epoch: run, generation: generation),
+                "restart \(generation) must be able to report its own exit"
+            )
+        }
+    }
+
+    @Test("a new run does not inherit the previous run's reservation")
+    func beginRunClearsReservation() async {
+        let ownership = DieEventOwnership()
+        let first = await ownership.beginRun(id: "c1")
+        await ownership.reserveForStart(id: "c1", epoch: first, generation: 1)
+
+        // Re-attached without a /start: the monitor is the only observer of the new run.
+        let second = await ownership.beginRun(id: "c1")
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: second))
     }
 
     @Test("claims are independent per container")
     func independentContainers() async {
         let ownership = DieEventOwnership()
+        let first = await ownership.beginRun(id: "c1")
+        let second = await ownership.beginRun(id: "c2")
 
-        #expect(await ownership.claim(id: "c1"))
-        #expect(await ownership.claim(id: "c2"))
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: first))
+        #expect(await ownership.claimForMonitor(id: "c2", epoch: second))
+    }
+
+    @Test("a container this process never started is claimable at its implicit run")
+    func attachedToForeignContainer() async {
+        let ownership = DieEventOwnership()
+        // Attaching to a container started before socktainer came up: no beginRun ever ran.
+        let run = await ownership.currentEpoch(id: "c1")
+
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run))
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run) == false)
     }
 }
 
 @Suite("ContainerProcessExitMonitor die event")
 struct ContainerProcessExitMonitorDieTests {
+    /// Reads the stream with a deadline: a regression that stops emitting `die` must fail the
+    /// test, not hang the suite waiting for an event that never arrives.
+    private static func firstDieEvent(
+        in stream: AsyncStream<DockerEvent>,
+        withinNs: UInt64 = 2_000_000_000
+    ) async -> DockerEvent? {
+        await withTaskGroup(of: DockerEvent?.self) { group in
+            group.addTask {
+                for await event in stream where event.Action == "die" {
+                    return event
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: withinNs)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
     @Test("emits die with the exit code when nothing else owns the exit")
     func emitsDieWhenUnowned() async {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
-        await DieEventOwnership.shared.release(id: "monitor-die")
+        let run = await DieEventOwnership.shared.beginRun(id: "monitor-die")
 
         _ = await ContainerProcessExitMonitor.run(
             wait: { 7 },
@@ -50,14 +154,11 @@ struct ContainerProcessExitMonitorDieTests {
             fallbackLabels: ["com.docker.compose.project": "demo"],
             dnsServer: nil,
             broadcaster: broadcaster,
+            runEpoch: run,
             outputFlushGraceNs: 1_000_000
         )
 
-        var seen: DockerEvent?
-        for await event in stream where event.Action == "die" {
-            seen = event
-            break
-        }
+        let seen = await Self.firstDieEvent(in: stream)
 
         #expect(seen?.Actor.Attributes["exitCode"] == "7")
         #expect(seen?.Actor.ID == "abc123")
@@ -66,11 +167,12 @@ struct ContainerProcessExitMonitorDieTests {
         await ContainerExitCodeStore.shared.remove(id: "abc123")
     }
 
-    @Test("stays silent when the start route already owns the exit")
-    func silentWhenOwned() async {
+    @Test("stays silent when a start-route observer reserved the exit")
+    func silentWhenReserved() async {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
-        #expect(await DieEventOwnership.shared.claim(id: "monitor-owned"))
+        let run = await DieEventOwnership.shared.beginRun(id: "monitor-owned")
+        await DieEventOwnership.shared.reserveForStart(id: "monitor-owned", epoch: run, generation: 1)
 
         _ = await ContainerProcessExitMonitor.run(
             wait: { 0 },
@@ -80,30 +182,42 @@ struct ContainerProcessExitMonitorDieTests {
             fallbackLabels: [:],
             dnsServer: nil,
             broadcaster: broadcaster,
+            runEpoch: run,
             outputFlushGraceNs: 1_000_000
         )
 
-        // Drain with a bounded read instead of a background collector: the stream stays open,
-        // so a plain loop would block forever waiting for an event that must never arrive.
-        let dieSeen = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                for await event in stream where event.Action == "die" {
-                    return true
-                }
-                return false
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
-        }
+        let seen = await Self.firstDieEvent(in: stream, withinNs: 300_000_000)
 
-        #expect(dieSeen == false)
-        await DieEventOwnership.shared.release(id: "monitor-owned")
+        #expect(seen == nil)
         await ContainerExitCodeStore.shared.remove(id: "monitor-owned")
         await ContainerExitCodeStore.shared.remove(id: "def456")
+    }
+
+    @Test("the monitor's claim survives its broadcast, blocking a late start observer")
+    func monitorKeepsOwnershipAfterBroadcast() async {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let run = await DieEventOwnership.shared.beginRun(id: "monitor-keeps")
+
+        _ = await ContainerProcessExitMonitor.run(
+            wait: { 3 },
+            hexId: "keeps123",
+            nativeId: "monitor-keeps",
+            fallbackImage: "alpine:3.20",
+            fallbackLabels: [:],
+            dnsServer: nil,
+            broadcaster: broadcaster,
+            runEpoch: run,
+            outputFlushGraceNs: 1_000_000
+        )
+
+        #expect(await Self.firstDieEvent(in: stream)?.Actor.Attributes["exitCode"] == "3")
+
+        // A /start arriving after the container already exited must not emit a second event.
+        await DieEventOwnership.shared.reserveForStart(id: "monitor-keeps", epoch: run, generation: 1)
+        #expect(await DieEventOwnership.shared.claimForStart(id: "monitor-keeps", epoch: run, generation: 1) == false)
+
+        await ContainerExitCodeStore.shared.remove(id: "monitor-keeps")
+        await ContainerExitCodeStore.shared.remove(id: "keeps123")
     }
 }

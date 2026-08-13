@@ -144,7 +144,9 @@ extension ContainerWaitRoute {
                     if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
                         return RESTContainerWait(statusCode: Int64(code))
                     }
-                    try? await Task.sleep(nanoseconds: waitPollIntervalNs)
+                    // Cancellation must end this loop: swallowing it would keep polling for the
+                    // rest of the timeout after a sibling source already answered.
+                    guard await sleepUnlessCancelled(waitPollIntervalNs) else { return nil }
                 }
                 return nil
             }
@@ -165,7 +167,27 @@ extension ContainerWaitRoute {
                     return waitResult
                 }
             }
-            return RESTContainerWait(statusCode: 0)
+            // Every source gave up without observing a stop. Reporting `StatusCode: 0` here
+            // would claim a clean exit: Compose would treat a service that never ran as a
+            // successful one. Docker carries the failure alongside the status, so clients
+            // surface the message instead of trusting the code.
+            return RESTContainerWait(
+                statusCode: -1,
+                error: ContainerWaitExitError(
+                    Message: "no exit observed for container \(containerId)"
+                )
+            )
+        }
+    }
+
+    /// Returns false when the surrounding task was cancelled, so a polling loop can stop
+    /// instead of running out its full budget after a sibling already produced a result.
+    private static func sleepUnlessCancelled(_ nanoseconds: UInt64) async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: nanoseconds)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -204,17 +226,18 @@ extension ContainerWaitRoute {
         let maxPolls = Int(storeTimeoutNs / waitPollIntervalNs)
 
         for _ in 0..<maxPolls {
+            if Task.isCancelled { return nil }
             let container = try? await client.getContainer(id: containerId)
             if container?.status == .running {
                 sawRunning = true
             } else if sawRunning {
                 // The container ran and is no longer running: give the recorder a moment to
                 // publish the real code before falling back to a clean exit.
-                try? await Task.sleep(nanoseconds: stoppedGraceNs)
+                guard await sleepUnlessCancelled(stoppedGraceNs) else { return nil }
                 let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 0
                 return RESTContainerWait(statusCode: Int64(code))
             }
-            try? await Task.sleep(nanoseconds: waitPollIntervalNs)
+            guard await sleepUnlessCancelled(waitPollIntervalNs) else { return nil }
         }
         return nil
     }
