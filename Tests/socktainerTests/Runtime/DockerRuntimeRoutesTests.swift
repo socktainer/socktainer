@@ -8,6 +8,17 @@ import VaporTesting
 
 @Suite("Docker runtime v1.51 routes")
 struct DockerRuntimeRoutesTests {
+    @Test("restored port bindings default an omitted host IP")
+    func restoredPortBindingDefaultsHostIP() throws {
+        let binding = try JSONDecoder().decode(
+            DockerRuntimePortBinding.self,
+            from: Data(#"{"containerPort":80,"protocol":"tcp"}"#.utf8)
+        )
+
+        #expect(binding.hostIP == "0.0.0.0")
+        #expect(binding.hostPort == nil)
+    }
+
     @Test("image pull forwards a pinned reference and platform")
     func pullImage() async throws {
         let backend = DockerRuntimeBackendMock()

@@ -138,6 +138,21 @@ struct DockerRuntimePortBinding: Codable, Sendable, Equatable {
         case hostIP
         case hostPort
     }
+
+    init(containerPort: Int, proto: String, hostIP: String, hostPort: Int?) {
+        self.containerPort = containerPort
+        self.proto = proto
+        self.hostIP = hostIP
+        self.hostPort = hostPort
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        containerPort = try values.decode(Int.self, forKey: .containerPort)
+        proto = try values.decodeIfPresent(String.self, forKey: .proto) ?? "tcp"
+        hostIP = try values.decodeIfPresent(String.self, forKey: .hostIP) ?? "0.0.0.0"
+        hostPort = try values.decodeIfPresent(Int.self, forKey: .hostPort)
+    }
 }
 
 struct DockerRuntimeContainerCreate: Sendable, Equatable {
