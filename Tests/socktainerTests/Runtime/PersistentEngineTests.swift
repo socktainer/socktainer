@@ -54,53 +54,7 @@ struct PersistentEngineTests {
         await controller.close()
     }
 
-    @Test("work expands guest memory and idle time returns it to the host")
-    func workCapacityIsReclaimed() async throws {
-        let controller = FakeEngineMachineController()
-        let engine = PersistentEngine(controller: controller)
-        _ = try await engine.readyConnection()
-
-        try await engine.prepareForWork()
-        await engine.finishedWork()
-        try await Task.sleep(for: .milliseconds(300))
-
-        #expect(
-            await controller.memoryTargets() == [
-                PersistentEngine.idleMemoryBytes,
-                PersistentEngine.configuredMemoryBytes,
-                PersistentEngine.idleMemoryBytes,
-            ]
-        )
-        await engine.invalidateConnection()
-        await controller.close()
-    }
-
-    @Test("failed memory expansion does not leave a phantom active request")
-    func failedMemoryExpansionRollsBack() async throws {
-        let controller = FakeEngineMachineController(failingTarget: PersistentEngine.configuredMemoryBytes)
-        let engine = PersistentEngine(controller: controller)
-        _ = try await engine.readyConnection()
-
-        await #expect(throws: TestEngineError.memoryTarget) {
-            try await engine.prepareForWork()
-        }
-        await controller.allowMemoryTargets()
-        try await engine.prepareForWork()
-
-        #expect(
-            await controller.memoryTargets() == [
-                PersistentEngine.idleMemoryBytes,
-                PersistentEngine.configuredMemoryBytes,
-                PersistentEngine.configuredMemoryBytes,
-            ]
-        )
-        await engine.finishedWork()
-        await engine.invalidateConnection()
-        await controller.close()
-    }
 }
-
-private enum TestEngineError: Error { case memoryTarget }
 
 private actor FakeEngineMachineController: EngineMachineControlling {
     private let pingOK: Bool
@@ -112,13 +66,10 @@ private actor FakeEngineMachineController: EngineMachineControlling {
     private var dials = 0
     private var dialPort: UInt32?
     private var peer: FileHandle?
-    private var targets: [UInt64] = []
-    private var failingTarget: UInt64?
 
-    init(pingOK: Bool = true, provisionDelay: Duration? = nil, failingTarget: UInt64? = nil) {
+    init(pingOK: Bool = true, provisionDelay: Duration? = nil) {
         self.pingOK = pingOK
         self.provisionDelay = provisionDelay
-        self.failingTarget = failingTarget
     }
 
     func inspect(id: String) -> EngineMachine? {
@@ -184,20 +135,12 @@ private actor FakeEngineMachineController: EngineMachineControlling {
         return client
     }
 
-    func setMemoryTarget(_ bytes: UInt64) throws {
-        targets.append(bytes)
-        if bytes == failingTarget { throw TestEngineError.memoryTarget }
-    }
-
-    func allowMemoryTargets() { failingTarget = nil }
-
     func stop(id: String) {}
 
     func provisionCount() -> Int { provisions }
     func bootCount() -> Int { boots }
     func dialCount() -> Int { dials }
     func lastDialPort() -> UInt32? { dialPort }
-    func memoryTargets() -> [UInt64] { targets }
 
     private nonisolated static func readAvailable(_ handle: FileHandle) throws -> Data {
         var bytes = [UInt8](repeating: 0, count: 4096)

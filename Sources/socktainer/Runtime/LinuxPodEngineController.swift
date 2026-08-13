@@ -45,7 +45,6 @@ actor LinuxPodEngineController: EngineMachineControlling {
     private var pod: LinuxPod?
     private var interface: (any Containerization.Interface)?
     private var running = false
-    private let memoryBalloon = EngineMemoryBalloon()
 
     init(
         artifact: EngineGuestImageArtifact,
@@ -115,7 +114,6 @@ actor LinuxPodEngineController: EngineMachineControlling {
         let pod = try LinuxPod(id, vmm: manager, logger: logger) { configuration in
             configuration.cpus = dataConfiguration.cpus
             configuration.memoryInBytes = dataConfiguration.memoryInBytes
-            configuration.extensions = [memoryBalloon]
             configuration.interfaces = [interface]
             configuration.dns = DNS(nameservers: ["1.1.1.1", "8.8.8.8"])
             configuration.volumes = [
@@ -126,10 +124,8 @@ actor LinuxPodEngineController: EngineMachineControlling {
             let home = SocktainerDirectories.hostHome.path
             configuration.process.arguments = [
                 "/sbin/init",
-                "--bind-source",
+                "--bind-root",
                 home,
-                "--bind-cache",
-                "/run/socktainer-bind-cache",
             ]
             configuration.process.stdout = guestLog
             configuration.process.stderr = guestLog
@@ -166,13 +162,6 @@ actor LinuxPodEngineController: EngineMachineControlling {
             ipAddress: interface.ipv4Address.address.description,
             running: true
         )
-    }
-
-    func setMemoryTarget(_ bytes: UInt64) async throws {
-        guard running else {
-            throw PersistentEngineError.invalidMachineSnapshot("engine pod is not running")
-        }
-        try await memoryBalloon.setTarget(bytes)
     }
 
     func dial(containerID: String, port: UInt32) async throws -> FileHandle {

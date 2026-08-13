@@ -25,9 +25,7 @@ const (
 	MethodContainerExec           = "container.exec"
 	MethodContainerAttach         = "container.attach"
 	MethodContainerMetadataUpdate = "container.metadata.update"
-	MethodBindInvalidate          = "bind.invalidate"
 	EventContainerExit            = "container.exit"
-	EventBindWriteBarrier         = "bind.write.barrier"
 )
 
 type ImagePullRequest struct {
@@ -74,15 +72,6 @@ type ImageDeleteResponse struct {
 }
 
 type Empty struct{}
-type BindInvalidateRequest struct {
-	Paths     []string `json:"paths,omitempty"`
-	All       bool     `json:"all,omitempty"`
-	BarrierID string   `json:"barrierId,omitempty"`
-}
-type BindWriteBarrierEvent struct {
-	BarrierID string   `json:"barrierId"`
-	Paths     []string `json:"paths"`
-}
 type PingResponse struct {
 	OK bool `json:"ok"`
 }

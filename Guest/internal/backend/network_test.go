@@ -25,9 +25,23 @@ func (r *recordingNetworkRunner) Run(name string, args ...string) error {
 	return nil
 }
 
+type recordingNetworkNamespaces struct{ runner *recordingNetworkRunner }
+
+func (n recordingNetworkNamespaces) Create(name, hostVeth, containerVeth, address string) error {
+	return n.runner.Run("netlink", "create", name, hostVeth, containerVeth, "addr", address+"/16", "dev", "eth0", "route", "default", "via", "10.88.0.1")
+}
+
+func (n recordingNetworkNamespaces) Delete(name string) error {
+	return n.runner.Run("netlink", "delete", name)
+}
+
+func newTestNetworkManager(runner *recordingNetworkRunner) *NetworkManager {
+	return newNetworkManager(runner, recordingNetworkNamespaces{runner: runner})
+}
+
 func TestNetworkManagerCreatesConfiguredNamespace(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	path, err := manager.Create("container-one")
 	if err != nil {
 		t.Fatal(err)
@@ -40,8 +54,8 @@ func TestNetworkManagerCreatesConfiguredNamespace(t *testing.T) {
 		"ip link add socktainer0 type bridge",
 		"sysctl -w net.ipv4.ip_forward=1",
 		"iptables -t nat -A POSTROUTING -s 10.88.0.0/16",
-		"addr add 10.88.0.2/16 dev eth0",
-		"route add default via 10.88.0.1",
+		"addr 10.88.0.2/16 dev eth0",
+		"route default via 10.88.0.1",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("commands do not contain %q:\n%s", expected, joined)
@@ -51,7 +65,7 @@ func TestNetworkManagerCreatesConfiguredNamespace(t *testing.T) {
 
 func TestNetworkManagerUsesUniqueIngressPortsForSameContainerPort(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	for _, id := range []string{"first", "second"} {
 		if _, err := manager.Create(id); err != nil {
 			t.Fatal(err)
@@ -84,7 +98,7 @@ func TestNetworkManagerUsesUniqueIngressPortsForSameContainerPort(t *testing.T) 
 
 func TestNetworkManagerReportsPreparedPublication(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +118,7 @@ func TestNetworkManagerReportsPreparedPublication(t *testing.T) {
 
 func TestNetworkManagerResolvesOnlyPreparedPublishedTargets(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +144,7 @@ func TestNetworkManagerResolvesOnlyPreparedPublishedTargets(t *testing.T) {
 
 func TestNetworkManagerResolvesAndRemovesUDP(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("dns"); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +165,7 @@ func TestNetworkManagerResolvesAndRemovesUDP(t *testing.T) {
 
 func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +187,7 @@ func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testin
 
 func TestNetworkManagerReusesKnownNamespaceWithoutAProcess(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	first, err := manager.Create("reused")
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +207,7 @@ func TestNetworkManagerReusesKnownNamespaceWithoutAProcess(t *testing.T) {
 
 func TestNetworkManagerDeleteRemovesPublicationAndNamespace(t *testing.T) {
 	runner := &recordingNetworkRunner{}
-	manager := NewNetworkManager(runner)
+	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +222,7 @@ func TestNetworkManagerDeleteRemovesPublicationAndNamespace(t *testing.T) {
 	if _, err := manager.PublishedTarget(published[0].GuestPort, "tcp"); err == nil {
 		t.Fatal("deleted publication still resolves")
 	}
-	if !strings.Contains(joined, "ip netns delete st") {
+	if !strings.Contains(joined, "netlink delete st") {
 		t.Fatalf("namespace delete is absent:\n%s", joined)
 	}
 }

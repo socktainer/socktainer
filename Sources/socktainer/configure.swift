@@ -32,15 +32,6 @@ func configure(_ app: Application) async throws {
         eventLoopGroup: app.eventLoopGroup
     )
     let engine = PersistentEngine(controller: engineController)
-    let bindCacheController = BindCacheInvalidationController(
-        source: FSEventsBindHostEventSource(root: SocktainerDirectories.hostHome),
-        sink: GuestConnectionBindCacheSink(engine: engine)
-    )
-    let bindCacheBridge = GuestBindCacheBridge(
-        events: PersistentEngineBindCacheEventConnector(engine: engine),
-        controller: bindCacheController
-    )
-    app.lifecycle.use(GuestBindCacheEngineLifecycle(bridge: bindCacheBridge, engine: engine))
     let directPortForwarder = DirectTCPPortForwarder(
         eventLoopGroup: app.eventLoopGroup,
         engine: engine,
@@ -63,7 +54,6 @@ func configure(_ app: Application) async throws {
     app.lifecycle.use(GuestRuntimeLifecycle(runtime: runtime))
     let readiness = RuntimeReadiness {
         _ = try await engine.readyConnection()
-        try await bindCacheBridge.start()
         try await runtime.startEventMonitor()
     }
     app.middleware.use(RuntimeReadinessMiddleware(readiness: readiness))

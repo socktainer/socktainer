@@ -458,7 +458,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         let id = Self.makeID()
         let containerName = request.name.map(Self.normalizedContainerName) ?? id
         if let name = request.name, !name.isEmpty {
-            try await ensureNameAvailable(name)
+            try ensureNameAvailable(name)
         }
         guard
             let allocatedGuestPorts = Self.lowestAvailableGuestPorts(
@@ -756,14 +756,11 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         return id
     }
 
-    private func ensureNameAvailable(_ requestedName: String) async throws {
+    private func ensureNameAvailable(_ requestedName: String) throws {
         let normalized = Self.normalizedContainerName(requestedName)
-        let response = try await request("container.list", [:])
-        let guest: GuestContainerListPayload = try decode(response)
-        guest.containers.forEach { hydrateMetadata(from: $0) }
-        if let existing = guest.containers.first(where: { metadata[$0.id]?.name == normalized }) {
+        if let existing = metadata.first(where: { $0.value.name == normalized }) {
             throw DockerRuntimeRouteError.conflict(
-                "Conflict. The container name /\(normalized) is already in use by container \(existing.id)."
+                "Conflict. The container name /\(normalized) is already in use by container \(existing.key)."
             )
         }
     }
@@ -916,8 +913,6 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
     }
 
     private func request(_ method: String, _ payload: [String: JSONValue]) async throws -> GuestFrame {
-        try await engine.prepareForWork()
-        defer { Task { await engine.finishedWork() } }
         do {
             return try await engine.readyConnection().request(method: method, payload: .object(payload))
         } catch let error as GuestProtocolError {

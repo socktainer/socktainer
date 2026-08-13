@@ -13,7 +13,6 @@ protocol EngineMachineControlling: Sendable {
     func provision(id: String) async throws
     func boot(id: String) async throws -> EngineMachine
     func dial(containerID: String, port: UInt32) async throws -> FileHandle
-    func setMemoryTarget(_ bytes: UInt64) async throws
     func stop(id: String) async throws
 }
 
@@ -28,7 +27,6 @@ actor PersistentEngine {
     static let guestPort: UInt32 = 1025
     static let publishedPortProxyPort: UInt32 = 1026
     static let configuredMemoryBytes: UInt64 = 1_024 * 1024 * 1024
-    static let idleMemoryBytes: UInt64 = 384 * 1024 * 1024
 
     private let controller: any EngineMachineControlling
     private let logger: Logger
@@ -39,8 +37,6 @@ actor PersistentEngine {
         let task: Task<(GuestConnection, EngineMachine), Error>
     }
     private var readiness: Readiness?
-    private var activeWork = 0
-    private var reclaimTask: Task<Void, Never>?
 
     init(
         controller: any EngineMachineControlling,
@@ -114,13 +110,6 @@ actor PersistentEngine {
             try? await controller.stop(id: Self.machineID)
             throw PersistentEngineError.invalidMachineSnapshot("guest ping returned an invalid response")
         }
-        do {
-            try await controller.setMemoryTarget(Self.idleMemoryBytes)
-        } catch {
-            await connection.close()
-            try? await controller.stop(id: Self.machineID)
-            throw error
-        }
         self.machine = snapshot
         logger.info("persistent engine is ready", metadata: ["ip": "\(snapshot.ipAddress)"])
         return (connection, snapshot)
@@ -140,7 +129,6 @@ actor PersistentEngine {
     }
 
     func shutdown() async {
-        reclaimTask?.cancel()
         if let connection {
             _ = try? await connection.request(method: "engine.sync", payload: .object([:]))
             await connection.close()
@@ -152,30 +140,6 @@ actor PersistentEngine {
         } catch {
             logger.error("failed to stop persistent engine", metadata: ["error": "\(error)"])
         }
-    }
-
-    func prepareForWork() async throws {
-        reclaimTask?.cancel()
-        reclaimTask = nil
-        if activeWork == 0 {
-            try await controller.setMemoryTarget(Self.configuredMemoryBytes)
-        }
-        activeWork += 1
-    }
-
-    func finishedWork() {
-        activeWork = max(0, activeWork - 1)
-        guard activeWork == 0 else { return }
-        reclaimTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled else { return }
-            try? await self?.reclaimIdleMemory()
-        }
-    }
-
-    private func reclaimIdleMemory() async throws {
-        guard activeWork == 0 else { return }
-        try await controller.setMemoryTarget(Self.idleMemoryBytes)
     }
 
     func address() -> String? {

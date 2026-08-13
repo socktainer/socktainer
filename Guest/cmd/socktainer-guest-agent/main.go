@@ -9,11 +9,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/socktainer/socktainer/guest/internal/backend"
-	"github.com/socktainer/socktainer/guest/internal/bindcache"
 	"github.com/socktainer/socktainer/guest/internal/portproxy"
 	"github.com/socktainer/socktainer/guest/internal/server"
 )
@@ -29,8 +27,7 @@ func main() {
 	unixAddress := flag.String("unix", "", "listen on a Unix socket instead of vsock (tests and diagnostics)")
 	port := flag.Uint("vsock-port", 1025, "guest vsock port")
 	proxyPort := flag.Uint("proxy-vsock-port", 1026, "published port proxy vsock port")
-	bindSource := flag.String("bind-source", "", "Apple virtiofs shared home path")
-	bindCachePath := flag.String("bind-cache", "/run/socktainer-bind-cache", "cached bind mount path")
+	bindRoot := flag.String("bind-root", "", "Apple virtiofs shared home path")
 	flag.Parse()
 
 	b, err := backend.New(*containerdAddress, *namespace, *snapshotter, *runtimeName, *runtimeBinary)
@@ -38,14 +35,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer b.Close()
-	var cache *bindcache.Cache
-	if *bindSource != "" {
-		cache, err = bindcache.Mount(*bindSource, *bindCachePath, 10*time.Second)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer cache.Close()
-		b.ConfigureBindCache(*bindSource, *bindCachePath)
+	if *bindRoot != "" {
+		b.ConfigureBindRoot(*bindRoot)
 	}
 	if err := b.InitializeNetwork(); err != nil {
 		log.Fatal(err)
@@ -74,9 +65,6 @@ func main() {
 	defer stop()
 	log.Printf("socktainer guest agent %s listening on %s", version, listener.Addr())
 	guestServer := server.New(b, version)
-	if cache != nil {
-		guestServer.WithBindCache(cache)
-	}
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	errors := make(chan error, 2)

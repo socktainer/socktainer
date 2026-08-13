@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/socktainer/socktainer/guest/internal/api"
 	"github.com/socktainer/socktainer/guest/internal/backend"
-	"github.com/socktainer/socktainer/guest/internal/bindcache"
 	"github.com/socktainer/socktainer/guest/internal/protocol"
 )
 
@@ -23,7 +21,6 @@ type Server struct {
 	agentVersion string
 	waitsMu      sync.Mutex
 	waits        map[string]*exitWait
-	bindCache    *bindcache.Cache
 }
 
 type exitWait struct {
@@ -35,11 +32,6 @@ type exitWait struct {
 
 func New(b *backend.Backend, version string) *Server {
 	return &Server{backend: b, agentVersion: version, waits: make(map[string]*exitWait)}
-}
-
-func (s *Server) WithBindCache(cache *bindcache.Cache) *Server {
-	s.bindCache = cache
-	return s
 }
 
 func (s *Server) registerWait(id string) *exitWait {
@@ -104,20 +96,6 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	inFlight := make(chan struct{}, 256)
 	var requestMu sync.Mutex
 	requestCancels := make(map[uint64]context.CancelFunc)
-	if s.bindCache != nil {
-		removeEmitter := s.bindCache.InstallBarrierEmitter(func(barrier bindcache.WriteBarrier) error {
-			payload, err := protocol.NewPayload(api.BindWriteBarrierEvent{
-				BarrierID: strconv.FormatUint(barrier.BarrierID, 10), Paths: barrier.Paths,
-			})
-			if err != nil {
-				return err
-			}
-			return w.Write(protocol.Envelope{
-				ID: 0, Kind: protocol.KindEvent, Method: api.EventBindWriteBarrier, Payload: payload,
-			})
-		})
-		defer removeEmitter()
-	}
 	for {
 		request, err := r.Read()
 		if err != nil {
@@ -177,46 +155,11 @@ func writeError(w *protocol.Writer, id uint64, code string, err error) error {
 	return w.Write(protocol.Envelope{ID: id, Kind: protocol.KindResponse, Error: &protocol.Error{Code: code, Message: err.Error()}})
 }
 
-func parseBarrierID(value string) (uint64, error) {
-	if value == "" {
-		return 0, nil
-	}
-	for _, digit := range value {
-		if digit < '0' || digit > '9' {
-			return 0, errors.New("barrierId must be an unsigned decimal string")
-		}
-	}
-	id, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || id == 0 {
-		return 0, errors.New("barrierId must be an unsigned decimal string")
-	}
-	return id, nil
-}
-
 func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *protocol.Writer) {
 	fail := func(code string, err error) { _ = writeError(w, request.ID, code, err) }
 	switch request.Method {
 	case api.MethodPing:
 		_ = writePayload(w, request.ID, api.PingResponse{OK: true})
-	case api.MethodBindInvalidate:
-		body, err := decode[api.BindInvalidateRequest](request)
-		if err != nil {
-			fail("invalid_argument", err)
-			return
-		}
-		if !body.All && len(body.Paths) == 0 {
-			fail("invalid_argument", errors.New("bind invalidation requires paths or all=true"))
-			return
-		}
-		barrierID, err := parseBarrierID(body.BarrierID)
-		if err != nil {
-			fail("invalid_argument", err)
-			return
-		}
-		if s.bindCache != nil {
-			s.bindCache.Invalidate(body.Paths, body.All, barrierID)
-		}
-		_ = writePayload(w, request.ID, api.Empty{})
 	case api.MethodVersion:
 		version, err := s.backend.Version(ctx)
 		if err != nil {

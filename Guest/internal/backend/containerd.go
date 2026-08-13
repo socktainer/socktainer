@@ -69,16 +69,14 @@ type Backend struct {
 	network       *NetworkManager
 	taskCreates   chan struct{}
 	cleanups      orderedCleanupBarrier
-	bindSource    string
-	bindCache     string
+	bindRoot      string
 }
 
-func (b *Backend) ConfigureBindCache(source, cache string) {
-	b.bindSource = filepath.Clean(source)
-	b.bindCache = filepath.Clean(cache)
+func (b *Backend) ConfigureBindRoot(root string) {
+	b.bindRoot = filepath.Clean(root)
 }
 
-func rewriteBindSource(source, sharedRoot, cacheRoot string) (string, error) {
+func resolveBindSource(source, sharedRoot string) (string, error) {
 	resolvedRoot, err := filepath.EvalSymlinks(sharedRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve shared root %q: %w", sharedRoot, err)
@@ -91,7 +89,7 @@ func rewriteBindSource(source, sharedRoot, cacheRoot string) (string, error) {
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("bind source %q is outside shared root %q", source, sharedRoot)
 	}
-	return filepath.Join(cacheRoot, relative), nil
+	return resolvedSource, nil
 }
 
 type orderedCleanupBarrier struct {
@@ -703,9 +701,6 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	if snapshotter == "" {
 		snapshotter = b.snapshotter
 	}
-	if err := image.Unpack(ctx, snapshotter); err != nil {
-		return api.Container{}, fmt.Errorf("unpack image for %s: %w", snapshotter, err)
-	}
 	runtimeName := request.Runtime
 	if runtimeName == "" {
 		runtimeName = b.runtime
@@ -750,10 +745,10 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		if mounts[index].Type != "bind" {
 			continue
 		}
-		if b.bindSource == "" {
-			return api.Container{}, errors.New("bind cache is not configured")
+		if b.bindRoot == "" {
+			return api.Container{}, errors.New("bind root is not configured")
 		}
-		mounts[index].Source, err = rewriteBindSource(mounts[index].Source, b.bindSource, b.bindCache)
+		mounts[index].Source, err = resolveBindSource(mounts[index].Source, b.bindRoot)
 		if err != nil {
 			return api.Container{}, err
 		}
@@ -772,19 +767,6 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	b.createMu.Lock()
 	defer b.createMu.Unlock()
-	requestedName := strings.TrimPrefix(request.Metadata.Name, "/")
-	if requestedName != "" {
-		containers, err := b.client.Containers(ctx)
-		if err != nil {
-			return api.Container{}, err
-		}
-		for _, existing := range containers {
-			info, err := existing.Info(ctx)
-			if err == nil && strings.TrimPrefix(decodeRuntimeMetadata(info.Labels).Name, "/") == requestedName {
-				return api.Container{}, fmt.Errorf("container name /%s is already in use by container %s", requestedName, existing.ID())
-			}
-		}
-	}
 	labels := make(map[string]string, len(request.Labels)+1)
 	for key, value := range request.Labels {
 		labels[key] = value
@@ -803,6 +785,9 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		metadata.Labels = request.Labels
 	}
 	metadata.AutoRemove = metadata.AutoRemove || request.AutoRemove
+	if privateNetwork {
+		metadata.PublishedPorts = b.network.Published(request.ID)
+	}
 	encodedMetadata, err := encodeRuntimeMetadata(metadata)
 	if err != nil {
 		return api.Container{}, fmt.Errorf("encode runtime metadata: %w", err)
@@ -836,20 +821,18 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		return api.Container{}, err
 	}
 	networkCommitted = true
-	if privateNetwork {
-		published := b.network.Published(request.ID)
-		if err := b.persistPublishedPorts(ctx, container, published); err != nil {
-			_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
-			_ = b.network.Delete(request.ID)
-			return api.Container{}, err
-		}
-	}
 	record := &containerRecord{
 		container: container, snapshotter: snapshotter, snapshotKey: request.ID,
 		preparable: privateNetwork,
 	}
 	b.containers.Store(request.ID, record)
-	return b.inspect(ctx, container)
+	info, err := container.Info(ctx)
+	if err != nil {
+		return api.Container{}, err
+	}
+	return api.Container{
+		ID: container.ID(), Image: info.Image, Status: "created", CreatedAt: info.CreatedAt, Metadata: metadata,
+	}, nil
 }
 
 func resolveProcessArgs(ctx context.Context, image containerd.Image, entrypoint, cmd *[]string) ([]string, error) {
@@ -948,12 +931,6 @@ func (b *Backend) prepareTask(id string, record *containerRecord) {
 		syscall.Sync()
 		record.finishPreparation(task, nil)
 	}()
-}
-
-func (b *Backend) persistPublishedPorts(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {
-	return b.updateRuntimeMetadata(ctx, container, func(metadata *api.ContainerMetadata) {
-		metadata.PublishedPorts = published
-	})
 }
 
 func (b *Backend) persistRunningState(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {

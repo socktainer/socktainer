@@ -3,7 +3,7 @@ import Foundation
 import Vapor
 
 /// Persistent local volumes for the single guest runtime. Volume data stays in
-/// a host directory that the VM already shares through the bind-cache mount.
+/// a host directory that the VM shares directly through Apple virtiofs.
 actor RuntimeVolumeService: ClientVolumeProtocol {
     private struct Metadata: Codable {
         let name: String

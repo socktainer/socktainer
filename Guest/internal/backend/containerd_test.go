@@ -397,34 +397,38 @@ func TestResolveImageProcessArgsUsesDockerOverrideRules(t *testing.T) {
 	}
 }
 
-func TestRewriteBindSourceRoutesThroughCache(t *testing.T) {
+func TestResolveBindSourceKeepsSharedPath(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
 	if err := os.Mkdir(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got, err := rewriteBindSource(project, root, "/run/bind-cache")
+	got, err := resolveBindSource(project, root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "/run/bind-cache/project" {
+	want, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
 		t.Fatalf("unexpected path %q", got)
 	}
 }
 
-func TestRewriteBindSourceRejectsOutsideRoot(t *testing.T) {
-	if _, err := rewriteBindSource(os.TempDir(), t.TempDir(), "/run/bind-cache"); err == nil {
+func TestResolveBindSourceRejectsOutsideRoot(t *testing.T) {
+	if _, err := resolveBindSource(os.TempDir(), t.TempDir()); err == nil {
 		t.Fatal("expected path escape rejection")
 	}
 }
 
-func TestRewriteBindSourceRejectsSymlinkEscape(t *testing.T) {
+func TestResolveBindSourceRejectsSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	escape := filepath.Join(root, "escape")
 	if err := os.Symlink(os.TempDir(), escape); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rewriteBindSource(escape, root, "/run/bind-cache"); err == nil {
+	if _, err := resolveBindSource(escape, root); err == nil {
 		t.Fatal("expected symlink escape rejection")
 	}
 }

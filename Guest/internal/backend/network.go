@@ -23,6 +23,11 @@ type networkCommandRunner interface {
 	Run(name string, args ...string) error
 }
 
+type networkNamespaceOperations interface {
+	Create(name, hostVeth, containerVeth, address string) error
+	Delete(name string) error
+}
+
 type commandRunner struct{}
 
 func (commandRunner) Run(name string, args ...string) error {
@@ -45,6 +50,7 @@ type containerNetwork struct {
 type NetworkManager struct {
 	mu          sync.Mutex
 	runner      networkCommandRunner
+	namespaces  networkNamespaceOperations
 	initialized bool
 	nextAddress uint32
 	nextPort    uint16
@@ -56,7 +62,11 @@ func (m *NetworkManager) Path(id string) string {
 }
 
 func NewNetworkManager(runner networkCommandRunner) *NetworkManager {
-	return &NetworkManager{runner: runner, nextAddress: 2, nextPort: 41000, containers: make(map[string]*containerNetwork)}
+	return newNetworkManager(runner, nativeNetworkNamespaceOperations{})
+}
+
+func newNetworkManager(runner networkCommandRunner, namespaces networkNamespaceOperations) *NetworkManager {
+	return &NetworkManager{runner: runner, namespaces: namespaces, nextAddress: 2, nextPort: 41000, containers: make(map[string]*containerNetwork)}
 }
 
 func (m *NetworkManager) Initialize() error {
@@ -82,20 +92,8 @@ func (m *NetworkManager) Create(id string) (string, error) {
 	m.nextAddress++
 	hostVeth := "vh" + name[2:]
 	containerVeth := "vc" + name[2:]
-	commands := []string{
-		"ip netns add " + name,
-		"ip link add " + hostVeth + " type veth peer name " + containerVeth,
-		"ip link set " + hostVeth + " master " + bridgeName,
-		"ip link set " + hostVeth + " up",
-		"ip link set " + containerVeth + " netns " + name,
-		"ip -n " + name + " link set lo up",
-		"ip -n " + name + " link set " + containerVeth + " name eth0",
-		"ip -n " + name + " addr add " + address + "/16 dev eth0",
-		"ip -n " + name + " link set eth0 up",
-		"ip -n " + name + " route add default via 10.88.0.1",
-	}
-	if err := m.runner.Run("sh", "-c", strings.Join(commands, " && ")); err != nil {
-		_ = m.runner.Run("ip", "netns", "delete", name)
+	if err := m.namespaces.Create(name, hostVeth, containerVeth, address); err != nil {
+		_ = m.namespaces.Delete(name)
 		return "", err
 	}
 	m.containers[id] = &containerNetwork{name: name, address: address}
@@ -170,7 +168,7 @@ func (m *NetworkManager) Delete(id string) error {
 		return nil
 	}
 	m.removeRules(network, network.guestPorts)
-	if err := m.runner.Run("ip", "netns", "delete", network.name); err != nil {
+	if err := m.namespaces.Delete(network.name); err != nil {
 		return err
 	}
 	delete(m.containers, id)
