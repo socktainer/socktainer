@@ -316,7 +316,6 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
-		syscall.Sync()
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
 	case api.MethodContainerLogs:
 		body, err := decode[api.ContainerLogsRequest](request)
