@@ -174,13 +174,19 @@ struct DirectTCPPortForwarderTests {
             let mapping = Self.mapping(id: "half-close", hostPort: 0, guestPort: 42_002)
             let published = try await forwarder.add(mapping)
 
-            let response = try await Task.detached {
-                try Self.roundTrip(
-                    port: published.hostPort,
-                    payload: Data("request-before-eof".utf8),
-                    halfClose: true
-                )
-            }.value
+            let response: Data
+            do {
+                response = try await Task.detached {
+                    try Self.roundTrip(
+                        port: published.hostPort,
+                        payload: Data("request-before-eof".utf8),
+                        halfClose: true
+                    )
+                }.value
+            } catch {
+                try? await forwarder.remove(id: mapping.id)
+                throw error
+            }
 
             #expect(response == Data("request-before-eof".utf8))
             try await forwarder.remove(id: mapping.id)
