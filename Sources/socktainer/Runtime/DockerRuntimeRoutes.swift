@@ -709,22 +709,53 @@ struct DockerRuntimeRoutes: RouteCollection {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw DockerRuntimeRouteError.invalidRequest("request body must be a JSON object")
         }
-        let supportedTopLevel: Set<String> = [
-            "Image", "Cmd", "Entrypoint", "Env", "WorkingDir", "User", "Hostname", "Labels",
-            "Tty", "HostConfig",
-        ]
-        for (key, value) in object where !supportedTopLevel.contains(key) && !isDefaultJSONValue(value) {
-            throw Abort(.notImplemented, reason: "Container create option (key) is not implemented")
+        for key in [
+            "AttachStdin", "OpenStdin", "StdinOnce", "NetworkDisabled", "Volumes", "Healthcheck",
+            "Domainname", "MacAddress", "OnBuild", "Shell",
+        ] where object[key].map({ !isDefaultJSONValue($0) }) == true {
+            throw Abort(.notImplemented, reason: "Container create option \(key) is not implemented")
+        }
+        if let signal = object["StopSignal"] as? String,
+            !signal.isEmpty, signal.uppercased() != "SIGTERM", signal != "15"
+        {
+            throw Abort(.notImplemented, reason: "Container create option StopSignal is not implemented")
         }
         guard let host = object["HostConfig"] as? [String: Any] else { return }
-        let supportedHost: Set<String> = ["AutoRemove", "Binds", "Mounts", "PortBindings", "NetworkMode"]
-        for (key, value) in host where !supportedHost.contains(key) && !isDefaultJSONValue(value) {
-            throw Abort(.notImplemented, reason: "HostConfig option (key) is not implemented")
+        for key in [
+            "Privileged", "ReadonlyRootfs", "OomKillDisable", "PublishAllPorts", "Init", "Memory",
+            "MemorySwap", "MemoryReservation", "MemorySwappiness", "NanoCpus", "CpuShares", "CpuPeriod",
+            "CpuQuota", "CpuRealtimePeriod", "CpuRealtimeRuntime", "CpusetCpus", "CpusetMems",
+            "PidsLimit", "BlkioWeight", "BlkioWeightDevice", "BlkioDeviceReadBps",
+            "BlkioDeviceWriteBps", "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps", "CapAdd", "CapDrop",
+            "Devices", "DeviceCgroupRules", "DeviceRequests", "Ulimits", "SecurityOpt", "GroupAdd", "Dns",
+            "DnsOptions", "DnsSearch", "ExtraHosts", "Links", "VolumesFrom", "Tmpfs", "Sysctls",
+            "StorageOpt", "CgroupParent",
+        ] where host[key].map({ !isDefaultJSONValue($0) }) == true {
+            throw Abort(.notImplemented, reason: "HostConfig option \(key) is not implemented")
         }
         if let mode = host["NetworkMode"] as? String,
             !mode.isEmpty, mode != "default", mode != "bridge"
         {
-            throw Abort(.notImplemented, reason: "NetworkMode (mode) is not implemented")
+            throw Abort(.notImplemented, reason: "NetworkMode \(mode) is not implemented")
+        }
+        for key in ["PidMode", "UTSMode", "UsernsMode"] {
+            if let value = host[key] as? String, !value.isEmpty {
+                throw Abort(.notImplemented, reason: "HostConfig option \(key) is not implemented")
+            }
+        }
+        if let mode = host["IpcMode"] as? String, !mode.isEmpty, mode != "private" {
+            throw Abort(.notImplemented, reason: "IpcMode \(mode) is not implemented")
+        }
+        if let mode = host["CgroupnsMode"] as? String, !mode.isEmpty, mode != "private" {
+            throw Abort(.notImplemented, reason: "CgroupnsMode \(mode) is not implemented")
+        }
+        if let runtime = host["Runtime"] as? String, !runtime.isEmpty, runtime != "runc" {
+            throw Abort(.notImplemented, reason: "Runtime \(runtime) is not implemented")
+        }
+        if let policy = host["RestartPolicy"] as? [String: Any],
+            let name = policy["Name"] as? String, !name.isEmpty, name != "no"
+        {
+            throw Abort(.notImplemented, reason: "RestartPolicy \(name) is not implemented")
         }
     }
 
