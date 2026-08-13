@@ -178,7 +178,24 @@ struct ExecRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
-            let body = try req.content.decode(CreateExecRequest.self)
+            // `req.content.decode` collects the body with no explicit max, which silently
+            // caps at Vapor's 1<<14 (16 KB) default — `defaultMaxBodySize` is only consulted
+            // by Vapor's registered-route collection, which the RegexRouter bypasses. An
+            // exec-create payload carries the full caller environment (Env), which routinely
+            // exceeds 16 KB for real dev tooling (VS Code Dev Containers' bundled Docker
+            // client hits this on every few exec calls it makes during startup — issue #192).
+            // Honor the configured cap explicitly, matching ContainerCreateRoute.
+            guard let bodyData = try await req.body.collect(max: req.application.routes.defaultMaxBodySize.value).get(),
+                let data = bodyData.getData(at: 0, length: bodyData.readableBytes), !data.isEmpty
+            else {
+                throw Abort(.badRequest, reason: "Request body is required")
+            }
+            let body: CreateExecRequest
+            do {
+                body = try JSONDecoder().decode(CreateExecRequest.self, from: data)
+            } catch {
+                throw Abort(.badRequest, reason: "Invalid JSON request body")
+            }
 
             // Docker rejects an exec with no command at create time, before even
             // resolving the container. Without this guard the empty Cmd is stored
