@@ -916,6 +916,8 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
     }
 
     private func request(_ method: String, _ payload: [String: JSONValue]) async throws -> GuestFrame {
+        try await engine.prepareForWork()
+        defer { Task { await engine.finishedWork() } }
         do {
             return try await engine.readyConnection().request(method: method, payload: .object(payload))
         } catch let error as GuestProtocolError {

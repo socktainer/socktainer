@@ -5,7 +5,6 @@ package bindcache
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,6 @@ type Cache struct {
 	server   *fuse.Server
 	root     *cacheNode
 	barriers *BarrierCoordinator
-	reads    *readCache
 	source   string
 	mu       sync.RWMutex
 	nodes    map[string]*cacheNode
@@ -50,7 +48,6 @@ func Mount(source, target string, barrierTimeout time.Duration) (*Cache, error) 
 	cache := &Cache{
 		barriers: NewBarrierCoordinator(barrierTimeout),
 		nodes:    make(map[string]*cacheNode),
-		reads:    newReadCache(maximumReadCacheBytes),
 		source:   filepath.Clean(source),
 	}
 	data.NewNode = func(root *fs.LoopbackRoot, _ *fs.Inode, _ string, _ *syscall.Stat_t) fs.InodeEmbedder {
@@ -84,13 +81,6 @@ func (c *Cache) InstallBarrierEmitter(emit func(WriteBarrier) error) func() {
 }
 
 func (c *Cache) Invalidate(paths []string, all bool, barrierID uint64) {
-	if all {
-		c.reads.invalidateAll()
-	} else {
-		for _, input := range paths {
-			c.reads.invalidate(cleanRelative(input))
-		}
-	}
 	c.mu.RLock()
 	if all {
 		paths = make([]string, 0, len(c.nodes))
@@ -111,11 +101,9 @@ func (c *Cache) Invalidate(paths []string, all bool, barrierID uint64) {
 		})
 	}
 	c.mu.RUnlock()
-	// A barrier originates inside a FUSE mutation. Release that mutation after
-	// the in-process read cache is invalidated, before advisory kernel
-	// notifications. NotifyContent or NotifyEntry can wait for the same in-flight
-	// operation and would otherwise create a circular wait that returns EIO even
-	// though the backing rename or fsync already succeeded.
+	// A barrier originates inside a FUSE mutation. Release that mutation before
+	// advisory kernel notifications. NotifyContent or NotifyEntry can wait for
+	// the same in-flight operation and would otherwise create a circular wait.
 	if barrierID != 0 {
 		c.barriers.Acknowledge(barrierID)
 	}
@@ -134,27 +122,15 @@ func (c *Cache) Close() error { return c.server.Unmount() }
 func (n *cacheNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	path := n.cache.track(n)
 	readOnly := flags&syscall.O_ACCMODE == syscall.O_RDONLY
-	if !readOnly {
-		n.cache.reads.beginWrite(path)
-	}
 	handle, _, errno := n.LoopbackNode.Open(ctx, flags)
 	if errno != 0 {
-		if !readOnly {
-			n.cache.reads.endWrite(path)
-		}
 		return nil, 0, errno
 	}
-	if !readOnly {
-		// The second generation change closes the window around O_TRUNC and
-		// prevents a concurrent eager load from committing pre-truncate bytes.
-		n.cache.reads.invalidate(path)
-	}
-	barrier := &barrierFile{FileHandle: handle, path: path, barriers: n.cache.barriers, reads: n.cache.reads, writer: !readOnly}
+	barrier := &barrierFile{FileHandle: handle, path: path, barriers: n.cache.barriers}
 	if !readOnly {
 		return barrier, fuse.FOPEN_KEEP_CACHE, 0
 	}
-	_ = n.cache.loadReadFile(path)
-	return &cachedReadFile{barrierFile: barrier}, fuse.FOPEN_DIRECT_IO, 0
+	return barrier, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (n *cacheNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
@@ -164,11 +140,10 @@ func (n *cacheNode) Create(ctx context.Context, name string, flags uint32, mode 
 	}
 	path := filepath.Join(n.cache.track(n), name)
 	path = cleanRelative(path)
-	n.cache.reads.beginWrite(path)
 	if child, ok := inode.Operations().(*cacheNode); ok {
 		n.cache.track(child)
 	}
-	return inode, &barrierFile{FileHandle: handle, path: path, barriers: n.cache.barriers, reads: n.cache.reads, writer: true}, fuse.FOPEN_KEEP_CACHE, 0
+	return inode, &barrierFile{FileHandle: handle, path: path, barriers: n.cache.barriers}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (n *cacheNode) mutationPath(name string) string {
@@ -176,7 +151,6 @@ func (n *cacheNode) mutationPath(name string) string {
 }
 
 func (n *cacheNode) finishNamespaceMutation(ctx context.Context, paths ...string) syscall.Errno {
-	n.cache.reads.invalidateAll()
 	for _, path := range paths {
 		if err := n.cache.barriers.Wait(ctx, path); err != nil {
 			return syscall.EIO
@@ -234,38 +208,6 @@ func (n *cacheNode) Link(ctx context.Context, target fs.InodeEmbedder, name stri
 		errno = n.finishNamespaceMutation(ctx, n.mutationPath(name))
 	}
 	return inode, errno
-}
-
-func (c *Cache) loadReadFile(path string) error {
-	file, err := os.Open(filepath.Join(c.source, path))
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Size() > maximumReadCacheBytes {
-		return errReadCacheEntryTooLarge
-	}
-	return c.reads.load(path, info.Size(), func() ([]byte, error) {
-		data := make([]byte, info.Size())
-		_, err := io.ReadFull(file, data)
-		if errors.Is(err, io.EOF) && len(data) == 0 {
-			err = nil
-		}
-		if err == nil {
-			after, statErr := file.Stat()
-			if statErr != nil {
-				return nil, statErr
-			}
-			if after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
-				return nil, errors.New("bind file changed while loading the read cache")
-			}
-		}
-		return data, err
-	})
 }
 
 func (n *cacheNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -329,39 +271,19 @@ type barrierFile struct {
 	fs.FileHandle
 	path     string
 	barriers *BarrierCoordinator
-	reads    *readCache
-	writer   bool
-}
-
-type cachedReadFile struct{ *barrierFile }
-
-func (f *cachedReadFile) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	if data, ok := f.reads.read(f.path, off, len(dest)); ok {
-		return fuse.ReadResultData(data), 0
-	}
-	return f.barrierFile.Read(ctx, dest, off)
 }
 
 func (f *barrierFile) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	return f.FileHandle.(fs.FileReader).Read(ctx, dest, off)
 }
 func (f *barrierFile) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
-	f.reads.invalidate(f.path)
-	written, errno := f.FileHandle.(fs.FileWriter).Write(ctx, data, off)
-	// Bracket the backing write with generations. A load that starts after the
-	// first invalidation but before pwrite completes cannot publish old bytes.
-	f.reads.invalidate(f.path)
-	return written, errno
+	return f.FileHandle.(fs.FileWriter).Write(ctx, data, off)
 }
 func (f *barrierFile) Flush(ctx context.Context) syscall.Errno {
 	return f.FileHandle.(fs.FileFlusher).Flush(ctx)
 }
 func (f *barrierFile) Release(ctx context.Context) syscall.Errno {
-	errno := f.FileHandle.(fs.FileReleaser).Release(ctx)
-	if f.writer {
-		f.reads.endWrite(f.path)
-	}
-	return errno
+	return f.FileHandle.(fs.FileReleaser).Release(ctx)
 }
 
 func (f *barrierFile) Fsync(ctx context.Context, flags uint32) syscall.Errno {
@@ -399,17 +321,11 @@ func (f *barrierFile) Lseek(ctx context.Context, off uint64, whence uint32) (uin
 }
 
 func (f *barrierFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	f.reads.invalidate(f.path)
-	errno := f.FileHandle.(fs.FileSetattrer).Setattr(ctx, in, out)
-	f.reads.invalidate(f.path)
-	return errno
+	return f.FileHandle.(fs.FileSetattrer).Setattr(ctx, in, out)
 }
 
 func (f *barrierFile) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
-	f.reads.invalidate(f.path)
-	errno := f.FileHandle.(fs.FileAllocater).Allocate(ctx, off, size, mode)
-	f.reads.invalidate(f.path)
-	return errno
+	return f.FileHandle.(fs.FileAllocater).Allocate(ctx, off, size, mode)
 }
 
 func (f *barrierFile) Ioctl(ctx context.Context, cmd uint32, arg uint64, input []byte, output []byte) (int32, syscall.Errno) {

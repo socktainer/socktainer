@@ -45,6 +45,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
     private var pod: LinuxPod?
     private var interface: (any Containerization.Interface)?
     private var running = false
+    private let memoryBalloon = EngineMemoryBalloon()
 
     init(
         artifact: EngineGuestImageArtifact,
@@ -114,6 +115,7 @@ actor LinuxPodEngineController: EngineMachineControlling {
         let pod = try LinuxPod(id, vmm: manager, logger: logger) { configuration in
             configuration.cpus = dataConfiguration.cpus
             configuration.memoryInBytes = dataConfiguration.memoryInBytes
+            configuration.extensions = [memoryBalloon]
             configuration.interfaces = [interface]
             configuration.dns = DNS(nameservers: ["1.1.1.1", "8.8.8.8"])
             configuration.volumes = [
@@ -166,6 +168,13 @@ actor LinuxPodEngineController: EngineMachineControlling {
         )
     }
 
+    func setMemoryTarget(_ bytes: UInt64) async throws {
+        guard running else {
+            throw PersistentEngineError.invalidMachineSnapshot("engine pod is not running")
+        }
+        try await memoryBalloon.setTarget(bytes)
+    }
+
     func dial(containerID: String, port: UInt32) async throws -> FileHandle {
         guard containerID == Self.engineContainerID, let pod, running else {
             throw PersistentEngineError.invalidMachineSnapshot("engine pod is not running")
@@ -206,10 +215,9 @@ actor LinuxPodEngineController: EngineMachineControlling {
             let mebibytes = UInt64(value),
             (96...65_536).contains(mebibytes)
         else {
-            // The coherent bind cache needs enough guest memory to retain the
-            // 512 MiB benchmark working set. VZ maps this memory lazily, so the
-            // idle host footprint remains based on resident pages.
-            return 1_024 * 1024 * 1024
+            // Keep burst capacity at 1 GiB. The memory balloon reduces the
+            // idle target after the guest control plane becomes ready.
+            return PersistentEngine.configuredMemoryBytes
         }
         return mebibytes * 1024 * 1024
     }
