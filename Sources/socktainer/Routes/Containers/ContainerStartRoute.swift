@@ -50,10 +50,10 @@ extension ContainerStartRoute {
                 // If container is already running, return success (Docker CLI behavior)
                 if container.status == .running {
                     req.logger.debug("Container \(id) is already running")
-                    // Deliberately joins the run in progress instead of opening a new one:
+                    // Joins the run the attach route opened rather than starting a new one:
                     // `docker run` bootstraps through attach and then starts, and both observers
                     // must land on the same run for one of them to lose.
-                    runEpoch = await DieEventOwnership.shared.currentEpoch(id: container.id)
+                    runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
                 } else {
                     // Try to start the container
                     try await client.start(id: id, detachKeys: detachKeys)
@@ -76,7 +76,7 @@ extension ContainerStartRoute {
                 }
                 req.logger.debug("Container \(id) was already running or bootstrapped")
                 // Started by whoever won the race — the attach path — so join its run.
-                runEpoch = await DieEventOwnership.shared.currentEpoch(id: preStartSnapshot?.id ?? id)
+                runEpoch = await DieEventOwnership.shared.beginRun(id: preStartSnapshot?.id ?? id)
             }
 
             let startedSnapshot = await ContainerStartRoute.performPostStartSetup(

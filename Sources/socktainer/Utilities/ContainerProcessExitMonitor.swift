@@ -21,8 +21,7 @@ enum ContainerProcessExitMonitor {
         fallbackLabels: [String: String],
         dnsServer: SocktainerDNSServer?,
         broadcaster: EventBroadcaster?,
-        /// Epoch of the run being watched, from `DieEventOwnership.beginRun` (or `currentEpoch`
-        /// when attaching to a container this process did not start).
+        /// Epoch of the run being watched, from `DieEventOwnership.beginRun`.
         runEpoch: Int,
         outputFlushGraceNs: UInt64 = ContainerProcessExitMonitor.outputFlushGraceNs,
         exitCodeRetryDelayNs: UInt64 = 100_000_000

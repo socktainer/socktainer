@@ -31,7 +31,7 @@ struct DieEventOwnershipTests {
         let ownership = DieEventOwnership()
         // A redundant /start finds the container already running, so it joins the same run.
         let run = await ownership.beginRun(id: "c1")
-        #expect(await ownership.currentEpoch(id: "c1") == run)
+        #expect(await ownership.beginRun(id: "c1") == run)
 
         await ownership.reserveForStart(id: "c1", epoch: run, generation: 1)
         await ownership.reserveForStart(id: "c1", epoch: run, generation: 2)
@@ -185,14 +185,87 @@ struct DieEventOwnershipTests {
         #expect(await ownership.claimForMonitor(id: "c2", epoch: second))
     }
 
-    @Test("a container this process never started is claimable at its implicit run")
+    @Test("a container this process never started opens a run when an observer joins it")
     func attachedToForeignContainer() async {
         let ownership = DieEventOwnership()
-        // Attaching to a container started before socktainer came up: no beginRun ever ran.
-        let run = await ownership.currentEpoch(id: "c1")
+        // Attaching to a container started before socktainer came up: no run was ever opened.
+        let run = await ownership.beginRun(id: "c1")
 
         #expect(await ownership.claimForMonitor(id: "c1", epoch: run))
         #expect(await ownership.claimForMonitor(id: "c1", epoch: run) == false)
+    }
+
+    @Test("a recreated container does not inherit the deleted one's run")
+    func recreationDoesNotReuseAnEpoch() async {
+        let ownership = DieEventOwnership()
+        let deleted = await ownership.beginRun(id: "c1")
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: deleted))
+        await ownership.forget(id: "c1")
+
+        // `compose up` after `down` recreates the service's container under the same name. With
+        // per-container numbering it would be handed the same epoch, and the deleted container's
+        // lagging observer could claim it — emitting a stale `die` and leaving this run mute.
+        let recreated = await ownership.beginRun(id: "c1")
+        #expect(recreated != deleted)
+        #expect(
+            await ownership.claimForMonitor(id: "c1", epoch: deleted) == false,
+            "the deleted container's observer must not be able to claim the recreated run"
+        )
+        #expect(
+            await ownership.claimForMonitor(id: "c1", epoch: recreated),
+            "the recreated container must still be able to report its own exit"
+        )
+    }
+
+    @Test("a container recreated after rm -f does not join the dead container's open run")
+    func recreationAfterForceRemoveOpensItsOwnRun() async {
+        let ownership = DieEventOwnership()
+        let dead = await ownership.beginRun(id: "c1")
+
+        // `docker rm -f` deletes a running container: its record stays claimable because the
+        // exit monitor still has to report that exit. The *name* must stop pointing at it, or a
+        // container recreated under the same name shares a run with a dead one — whoever claims
+        // first wins and the other exit is never reported.
+        await ownership.forget(id: "c1")
+
+        let recreated = await ownership.beginRun(id: "c1")
+        #expect(recreated != dead)
+        #expect(
+            await ownership.claimForMonitor(id: "c1", epoch: dead),
+            "the removed container's pending observer must still report its exit"
+        )
+        #expect(
+            await ownership.claimForMonitor(id: "c1", epoch: recreated),
+            "and the recreated container must be able to report its own"
+        )
+        // The removed container's record is released once its exit was reported, so a second
+        // observer of that same exit finds nothing to claim.
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: dead) == false)
+    }
+
+    @Test("a claim naming a run that is no longer tracked is refused")
+    func untrackedRunIsNotClaimable() async {
+        let ownership = DieEventOwnership()
+        let run = await ownership.beginRun(id: "c1")
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run))
+        await ownership.forget(id: "c1")
+
+        // Treating an unknown run as a fresh one is what would let a late observer emit a second
+        // `die` for an exit that was already reported.
+        #expect(await ownership.claimForMonitor(id: "c1", epoch: run) == false)
+        await ownership.reserveForStart(id: "c1", epoch: run, generation: 1)
+        #expect(await ownership.claimForStart(id: "c1", epoch: run, generation: 1) == false)
+    }
+
+    @Test("epochs are unique across containers, not just across a container's runs")
+    func epochsAreGloballyUnique() async {
+        let ownership = DieEventOwnership()
+
+        let first = await ownership.beginRun(id: "c1")
+        let second = await ownership.beginRun(id: "c2")
+        let third = await ownership.beginRestartedRun(id: "c1")
+
+        #expect(Set([first, second, third]).count == 3)
     }
 }
 
