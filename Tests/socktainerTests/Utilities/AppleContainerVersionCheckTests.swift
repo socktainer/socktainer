@@ -99,3 +99,46 @@ struct AppleContainerVersionCheckTests {
         }
     }
 }
+
+@Suite("Apple Container compatibility action")
+struct AppleContainerCompatibilityActionTests {
+
+    @Test("a version mismatch warns and does not abort")
+    func versionMismatchWarnsAndContinues() {
+        let error = AppleContainerVersionCheck.VersionCheckError.incompatibleVersion(
+            detected: "1.2.2",
+            expected: "1.2.0"
+        )
+
+        let action = AppleContainerVersionCheck.compatibilityAction(for: error)
+
+        guard case .proceedWithWarning(let message) = action else {
+            Issue.record("Expected .proceedWithWarning, got \(action)")
+            return
+        }
+        #expect(message.contains("1.2.2"))
+        #expect(message.contains("1.2.0"))
+    }
+
+    @Test("an unreachable Apple Container service still aborts")
+    func unavailableServiceStillAborts() {
+        let action = AppleContainerVersionCheck.compatibilityAction(for: .appleContainerUnavailable)
+
+        guard case .abort = action else {
+            Issue.record("Expected .abort, got \(action)")
+            return
+        }
+    }
+
+    @Test("a version detection failure still aborts")
+    func detectionFailureStillAborts() {
+        let action = AppleContainerVersionCheck.compatibilityAction(
+            for: .versionDetectionFailed("boom")
+        )
+
+        guard case .abort = action else {
+            Issue.record("Expected .abort, got \(action)")
+            return
+        }
+    }
+}
