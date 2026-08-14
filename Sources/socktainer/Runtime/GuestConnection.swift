@@ -96,6 +96,10 @@ actor GuestConnection {
         finish(GuestConnectionError.closed)
     }
 
+    func isTerminal() -> Bool {
+        terminalError != nil
+    }
+
     private func startReader() {
         guard !reading else { return }
         reading = true

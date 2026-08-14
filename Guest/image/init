@@ -5,7 +5,59 @@ mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys 2>/dev/null || true
 mount -t tmpfs tmpfs /run 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-mkdir -p /run/containerd /var/lib/containerd
+mount -t tmpfs -o mode=1777 tmpfs /tmp
+
+: "${SOCKTAINER_GUEST_ADDRESS:?SOCKTAINER_GUEST_ADDRESS is required}"
+: "${SOCKTAINER_GUEST_GATEWAY:?SOCKTAINER_GUEST_GATEWAY is required}"
+: "${SOCKTAINER_GUEST_DNS:?SOCKTAINER_GUEST_DNS is required}"
+ip link set dev eth0 up
+ip address add "${SOCKTAINER_GUEST_ADDRESS}" dev eth0
+ip route add default via "${SOCKTAINER_GUEST_GATEWAY}" dev eth0
+printf 'nameserver %s\n' "${SOCKTAINER_GUEST_DNS}" > /run/resolv.conf
+mount --bind /run/resolv.conf /etc/resolv.conf
+
+host_bind_source=
+excluded_host_bind_source=
+expected_value=
+for argument in "$@"; do
+    if [ -n "${expected_value}" ]; then
+        case "${expected_value}" in
+            host) host_bind_source=${argument} ;;
+            excluded) excluded_host_bind_source=${argument} ;;
+        esac
+        expected_value=
+        continue
+    fi
+    case "${argument}" in
+        --host-bind-source)
+            expected_value=host
+            ;;
+        --host-bind-source=*)
+            host_bind_source=${argument#--host-bind-source=}
+            ;;
+        --excluded-host-bind-source)
+            expected_value=excluded
+            ;;
+        --excluded-host-bind-source=*)
+            excluded_host_bind_source=${argument#--excluded-host-bind-source=}
+            ;;
+    esac
+done
+
+[ -z "${expected_value}" ] || {
+    echo "guest bind option requires a path" >&2
+    exit 1
+}
+for path in "${host_bind_source}" "${excluded_host_bind_source}"; do
+    case "${path}" in
+        /*) ;;
+        *) echo "guest bind sources must be absolute paths" >&2; exit 1 ;;
+    esac
+done
+
+mkdir -p /run/containerd
+mount -t ext4 -o data=ordered /dev/vdb /var/lib/containerd
+mount -t virtiofs socktainer-home /mnt/socktainer-host
 
 containerd --config /etc/containerd/config.toml >&2 &
 containerd_pid=$!
@@ -23,4 +75,7 @@ done
     exit 1
 }
 
-exec /usr/local/libexec/socktainer-guest-agent "$@"
+exec /usr/local/libexec/socktainer-guest-agent \
+    --host-bind-source "${host_bind_source}" \
+    --guest-bind-root /mnt/socktainer-host \
+    --excluded-host-bind-source "${excluded_host_bind_source}"

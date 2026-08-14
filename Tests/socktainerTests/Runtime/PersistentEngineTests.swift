@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -5,103 +6,204 @@ import Testing
 
 @Suite("Persistent engine VM authority")
 struct PersistentEngineTests {
-    @Test("provisions and boots exactly one machine, then reuses one guest connection")
-    func provisionsBootsAndReuses() async throws {
-        let controller = FakeEngineMachineController()
-        let engine = PersistentEngine(controller: controller)
+    @Test("starts one custom machine and reuses one guest connection")
+    func startsAndReuses() async throws {
+        let machine = FakeEngineMachineHost()
+        let engine = PersistentEngine(machine: machine)
 
         let first = try await engine.readyConnection()
         let second = try await engine.readyConnection()
 
         #expect(first === second)
-        #expect(await controller.provisionCount() == 1)
-        #expect(await controller.bootCount() == 1)
-        #expect(await controller.dialCount() == 1)
-        #expect(await controller.lastDialPort() == 1025)
-        #expect(await engine.address() == "192.168.64.2")
-        await engine.invalidateConnection()
-        await controller.close()
+        #expect(await machine.startCount == 1)
+        #expect(await machine.connectCount == 1)
+        #expect(await machine.lastPort == 1025)
+        #expect(await engine.address() == "192.168.72.2")
+        #expect(await engine.hostGatewayAddress() == "192.168.72.1")
+        await engine.shutdown()
     }
 
     @Test("rejects a ping response without the guest ok payload")
     func rejectsInvalidPing() async {
-        let controller = FakeEngineMachineController(pingOK: false)
-        let engine = PersistentEngine(controller: controller)
+        let machine = FakeEngineMachineHost(pingOK: false)
+        let engine = PersistentEngine(machine: machine)
 
         await #expect(throws: PersistentEngineError.self) {
             _ = try await engine.readyConnection()
         }
-        await controller.close()
+        #expect(await machine.stopCount == 1)
     }
 
     @Test("coalesces concurrent readiness calls")
     func coalescesConcurrentReadiness() async throws {
-        let controller = FakeEngineMachineController(provisionDelay: .milliseconds(20))
-        let engine = PersistentEngine(controller: controller)
+        let machine = FakeEngineMachineHost(startDelay: .milliseconds(20))
+        let engine = PersistentEngine(machine: machine)
 
         let connections = try await withThrowingTaskGroup(of: GuestConnection.self) { group in
-            for _ in 0..<32 {
-                group.addTask { try await engine.readyConnection() }
-            }
+            for _ in 0..<32 { group.addTask { try await engine.readyConnection() } }
             return try await group.reduce(into: []) { $0.append($1) }
         }
 
         #expect(connections.allSatisfy { $0 === connections[0] })
-        #expect(await controller.provisionCount() == 1)
-        #expect(await controller.bootCount() == 1)
-        #expect(await controller.dialCount() == 1)
-        await engine.invalidateConnection()
-        await controller.close()
+        #expect(await machine.startCount == 1)
+        #expect(await machine.connectCount == 1)
+        await engine.shutdown()
     }
 
+    @Test("waits for the guest protocol without starting another VM generation")
+    func waitsForGuestProtocol() async throws {
+        let machine = FakeEngineMachineHost(failedConnections: 2)
+        let engine = PersistentEngine(machine: machine)
+
+        _ = try await engine.readyConnection()
+
+        #expect(await machine.startCount == 1)
+        #expect(await machine.connectCount == 3)
+        await engine.shutdown()
+    }
+
+    @Test("replaces a terminal guest connection before the next request")
+    func replacesTerminalConnection() async throws {
+        let machine = FakeEngineMachineHost()
+        let engine = PersistentEngine(machine: machine)
+
+        let first = try await engine.readyConnection()
+        await first.close()
+        let second = try await engine.readyConnection()
+
+        #expect(first !== second)
+        #expect(await machine.connectCount == 2)
+        #expect(await machine.stopCount == 1)
+        await engine.shutdown()
+    }
+
+    @Test("coalesces concurrent replacement of a terminal connection")
+    func coalescesConcurrentTerminalReplacement() async throws {
+        let machine = FakeEngineMachineHost(startDelay: .milliseconds(10))
+        let engine = PersistentEngine(machine: machine)
+        let first = try await engine.readyConnection()
+        await first.close()
+
+        let replacements = try await withThrowingTaskGroup(of: GuestConnection.self) { group in
+            for _ in 0..<64 { group.addTask { try await engine.readyConnection() } }
+            return try await group.reduce(into: []) { $0.append($1) }
+        }
+
+        #expect(replacements.allSatisfy { $0 === replacements[0] })
+        #expect(await machine.startCount == 2)
+        #expect(await machine.connectCount == 2)
+        await engine.shutdown()
+    }
+
+    @Test("stale terminal check cannot discard a concurrent replacement")
+    func staleTerminalCheckPreservesConcurrentReplacement() async throws {
+        let machine = FakeEngineMachineHost()
+        let probe = BlockingTerminalProbe()
+        let engine = PersistentEngine(
+            machine: machine,
+            isConnectionTerminal: { connection in await probe.check(connection) }
+        )
+        let first = try await engine.readyConnection()
+        await first.close()
+        await probe.block(connection: first)
+
+        let staleCaller = Task { try await engine.readyConnection() }
+        await probe.waitUntilBlocked()
+        await engine.invalidateConnection(first)
+        let replacement = try await engine.readyConnection()
+        await probe.release()
+        let staleResult = try await staleCaller.value
+
+        #expect(staleResult === replacement)
+        #expect(await machine.connectCount == 2)
+        await engine.shutdown()
+    }
+
+    @Test("event resubscription keeps the healthy shared connection")
+    func eventResubscriptionKeepsSharedConnection() async throws {
+        let machine = FakeEngineMachineHost()
+        let engine = PersistentEngine(machine: machine)
+        let connector = PersistentEngineGuestRuntimeEventConnector(engine: engine)
+        let connection = try await engine.readyConnection()
+
+        _ = try await connector.connect()
+        _ = try await connector.connect()
+
+        #expect(!(await connection.isTerminal()))
+        #expect(await machine.connectCount == 1)
+        await engine.shutdown()
+    }
 }
 
-private actor FakeEngineMachineController: EngineMachineControlling {
+private actor BlockingTerminalProbe {
+    private weak var blockedConnection: GuestConnection?
+    private var shouldBlock = false
+    private var isBlocked = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func block(connection: GuestConnection) {
+        blockedConnection = connection
+        shouldBlock = true
+    }
+
+    func check(_ connection: GuestConnection) async -> Bool {
+        if shouldBlock, connection === blockedConnection {
+            shouldBlock = false
+            isBlocked = true
+            await withCheckedContinuation { releaseContinuation = $0 }
+        }
+        return await connection.isTerminal()
+    }
+
+    func waitUntilBlocked() async {
+        while !isBlocked { await Task.yield() }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor FakeEngineMachineHost: EngineMachineHosting {
     private let pingOK: Bool
-    private let provisionDelay: Duration?
-    private var provisioned = false
-    private var running = false
-    private var provisions = 0
-    private var boots = 0
-    private var dials = 0
-    private var dialPort: UInt32?
+    private let startDelay: Duration?
+    private var failedConnections: Int
+    private(set) var startCount = 0
+    private(set) var connectCount = 0
+    private(set) var stopCount = 0
+    private(set) var lastPort: UInt32?
     private var peer: FileHandle?
 
-    init(pingOK: Bool = true, provisionDelay: Duration? = nil) {
+    init(
+        pingOK: Bool = true,
+        startDelay: Duration? = nil,
+        failedConnections: Int = 0
+    ) {
         self.pingOK = pingOK
-        self.provisionDelay = provisionDelay
+        self.startDelay = startDelay
+        self.failedConnections = failedConnections
     }
 
-    func inspect(id: String) -> EngineMachine? {
-        guard provisioned else { return nil }
-        return EngineMachine(
-            id: id,
-            containerID: running ? "engine-backing-container" : "",
-            ipAddress: running ? "192.168.64.2" : "",
-            running: running
+    func start() async throws -> RuntimeMachineReady {
+        startCount += 1
+        if let startDelay { try await Task.sleep(for: startDelay) }
+        return RuntimeMachineReady(
+            generation: UUID(),
+            processIdentifier: 62,
+            guestIPv4: "192.168.72.2",
+            hostGatewayIPv4: "192.168.72.1",
+            gvproxyAPI: URL(fileURLWithPath: "/tmp/gvproxy.sock")
         )
     }
 
-    func provision(id: String) async throws {
-        provisions += 1
-        if let provisionDelay { try await Task.sleep(for: provisionDelay) }
-        provisioned = true
-    }
-
-    func boot(id: String) -> EngineMachine {
-        boots += 1
-        running = true
-        return EngineMachine(
-            id: id,
-            containerID: "engine-backing-container",
-            ipAddress: "192.168.64.2",
-            running: true
-        )
-    }
-
-    func dial(containerID: String, port: UInt32) throws -> FileHandle {
-        dials += 1
-        dialPort = port
+    func connect(to port: UInt32) throws -> FileHandle {
+        connectCount += 1
+        lastPort = port
+        if failedConnections > 0 {
+            failedConnections -= 1
+            throw POSIXError(.ECONNREFUSED)
+        }
         var descriptors: [Int32] = [0, 0]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EIO)
@@ -135,12 +237,10 @@ private actor FakeEngineMachineController: EngineMachineControlling {
         return client
     }
 
-    func stop(id: String) {}
-
-    func provisionCount() -> Int { provisions }
-    func bootCount() -> Int { boots }
-    func dialCount() -> Int { dials }
-    func lastDialPort() -> UInt32? { dialPort }
+    func stop() {
+        stopCount += 1
+        try? peer?.close()
+    }
 
     private nonisolated static func readAvailable(_ handle: FileHandle) throws -> Data {
         var bytes = [UInt8](repeating: 0, count: 4096)
@@ -151,9 +251,5 @@ private actor FakeEngineMachineController: EngineMachineControlling {
             if errno == EINTR { continue }
             throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
-    }
-
-    func close() {
-        try? peer?.close()
     }
 }

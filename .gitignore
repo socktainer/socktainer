@@ -3,3 +3,8 @@
 .swiftpm
 RelaySidecar/target/
 RelaySidecar/artifacts/
+VMM/out/
+VMM/vendor/libkrun/linux-sysroot/
+VMM/vendor/libkrun/target/
+runtime-benchmark-*.json
+runtime-benchmark-runs/

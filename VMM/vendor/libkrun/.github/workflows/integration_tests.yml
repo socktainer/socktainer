@@ -1,0 +1,137 @@
+name: Integration tests
+on: [pull_request]
+
+jobs:
+  integration-tests-x86_64:
+    name: Integration Tests (Linux x86_64)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+      
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      
+      - name: Build and install libkrun to test prefix
+        run: make test-prefix NET=1 BLK=1
+      
+      - name: Clippy (test_cases guest)
+        run: |
+          cd tests
+          cargo clippy --locked -p test_cases --features guest -- -D warnings
+      
+      - name: Clippy (test_cases host)
+        run: |
+          cd tests
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
+      
+      - name: Clippy (runner)
+        run: |
+          cd tests
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p runner -- -D warnings
+      
+      - name: Clippy (guest-agent)
+        run: |
+          cd tests
+          cargo clippy --locked --target x86_64-unknown-linux-musl -p guest-agent -- -D warnings
+      
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -a -G kvm $USER
+      
+      - name: Install additional packages
+        run: sudo apt-get install -y --no-install-recommends build-essential patchelf pkg-config net-tools buildah dnsmasq iperf3 e2fsprogs
+      
+      - name: Install passt from source
+        run: |
+          curl -L https://passt.top/passt/snapshot/passt-2026_01_20.386b5f5.tar.gz | tar xz
+          cd passt-2026_01_20.386b5f5
+          make
+          sudo make install
+      
+      - name: Install libkrunfw
+        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-x86_64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
+      
+      - name: Integration tests
+        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-x86_64
+          path: |
+            /tmp/libkrun-tests/
+            !/tmp/libkrun-tests/**/guest-agent
+            !/tmp/libkrun-tests/**/rootfs
+          if-no-files-found: ignore
+
+  integration-tests-aarch64:
+    name: Integration Tests (Linux aarch64)
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+      
+      - name: Add musl target
+        run: rustup target add aarch64-unknown-linux-musl
+      
+      - name: Build and install libkrun to test prefix
+        run: make test-prefix NET=1 BLK=1
+      
+      - name: Clippy (test_cases guest)
+        run: |
+          cd tests
+          cargo clippy --locked -p test_cases --features guest -- -D warnings
+      
+      - name: Clippy (test_cases host)
+        run: |
+          cd tests
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
+      
+      - name: Clippy (runner)
+        run: |
+          cd tests
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p runner -- -D warnings
+      
+      - name: Clippy (guest-agent)
+        run: |
+          cd tests
+          cargo clippy --locked --target aarch64-unknown-linux-musl -p guest-agent -- -D warnings
+      
+      - name: Install additional packages
+        run: sudo apt-get install -y --no-install-recommends build-essential patchelf pkg-config net-tools dnsmasq iperf3 git uidmap e2fsprogs
+      
+      - name: Install passt from source
+        run: |
+          curl -L https://passt.top/passt/snapshot/passt-2026_01_20.386b5f5.tar.gz | tar xz
+          cd passt-2026_01_20.386b5f5
+          make
+          sudo make install
+      
+      - name: Install libkrunfw
+        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-aarch64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
+
+      - name: Clean up tests directory
+        run: rm -fr /tmp/libkrun-tests
+      
+      - name: Integration tests
+        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-aarch64
+          path: |
+            /tmp/libkrun-tests/
+            !/tmp/libkrun-tests/**/guest-agent
+            !/tmp/libkrun-tests/**/rootfs
+          if-no-files-found: ignore

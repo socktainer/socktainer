@@ -32,7 +32,6 @@ import (
 )
 
 const runtimeMetadataLabel = "io.socktainer.runtime-metadata"
-const speculativeTaskPreparationDelay = 100 * time.Millisecond
 const maxConcurrentTaskCreations = 1
 const execCleanupAttempts = 5
 const execCleanupAttemptTimeout = 2 * time.Second
@@ -69,25 +68,55 @@ type Backend struct {
 	network       *NetworkManager
 	taskCreates   chan struct{}
 	cleanups      orderedCleanupBarrier
-	bindRoot      string
+	bindMount     bindMountConfiguration
 }
 
-func (b *Backend) ConfigureBindRoot(root string) {
-	b.bindRoot = filepath.Clean(root)
+type bindMountConfiguration struct {
+	hostSource         string
+	guestRoot          string
+	excludedHostSource string
 }
 
-func resolveBindSource(source, sharedRoot string) (string, error) {
-	resolvedRoot, err := filepath.EvalSymlinks(sharedRoot)
-	if err != nil {
-		return "", fmt.Errorf("resolve shared root %q: %w", sharedRoot, err)
+func (b *Backend) ConfigureBindMount(hostSource, guestRoot, excludedHostSource string) {
+	b.bindMount = bindMountConfiguration{
+		hostSource:         filepath.Clean(hostSource),
+		guestRoot:          filepath.Clean(guestRoot),
+		excludedHostSource: filepath.Clean(excludedHostSource),
 	}
-	resolvedSource, err := filepath.EvalSymlinks(source)
-	if err != nil {
-		return "", fmt.Errorf("resolve bind source %q: %w", source, err)
+}
+
+func pathContains(parent, child string) bool {
+	relative, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func resolveBindSource(source string, configuration bindMountConfiguration) (string, error) {
+	cleanSource := filepath.Clean(source)
+	if pathContains(cleanSource, configuration.excludedHostSource) ||
+		pathContains(configuration.excludedHostSource, cleanSource) {
+		return "", fmt.Errorf("bind source %q overlaps excluded engine state %q", source, configuration.excludedHostSource)
 	}
-	relative, err := filepath.Rel(resolvedRoot, resolvedSource)
+	relative, err := filepath.Rel(configuration.hostSource, cleanSource)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("bind source %q is outside shared root %q", source, sharedRoot)
+		return "", fmt.Errorf("bind source %q is outside host bind source %q", source, configuration.hostSource)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(configuration.guestRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve guest bind root %q: %w", configuration.guestRoot, err)
+	}
+	guestSource := filepath.Join(resolvedRoot, relative)
+	resolvedSource, err := filepath.EvalSymlinks(guestSource)
+	if err != nil {
+		return "", fmt.Errorf("resolve guest bind source %q: %w", guestSource, err)
+	}
+	resolvedRelative, err := filepath.Rel(resolvedRoot, resolvedSource)
+	if err != nil || resolvedRelative == ".." || strings.HasPrefix(resolvedRelative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("bind source %q escapes guest bind root %q", source, configuration.guestRoot)
+	}
+	resolvedHostSource := filepath.Join(configuration.hostSource, resolvedRelative)
+	if pathContains(resolvedHostSource, configuration.excludedHostSource) ||
+		pathContains(configuration.excludedHostSource, resolvedHostSource) {
+		return "", fmt.Errorf("bind source %q resolves into excluded engine state %q", source, configuration.excludedHostSource)
 	}
 	return resolvedSource, nil
 }
@@ -148,110 +177,16 @@ func (b *orderedCleanupBarrier) wait(ctx context.Context) error {
 }
 
 type containerRecord struct {
-	container      containerd.Container
-	snapshotter    string
-	snapshotKey    string
-	mu             sync.Mutex
-	task           containerd.Task
-	taskReaped     bool
-	taskReaping    chan struct{}
-	spec           *specs.Spec
-	prepareDone    chan struct{}
-	prepareNow     chan struct{}
-	prepareStop    chan struct{}
-	prepareOnce    sync.Once
-	stopOnce       sync.Once
-	creatingTask   bool
-	prepareErr     error
-	preparable     bool
-	publishedPorts []api.PublishedPort
-	persistedExit  bool
-	persistedCode  uint32
-}
-
-func (r *containerRecord) beginPreparation() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.prepareDone != nil {
-		return false
-	}
-	r.prepareDone = make(chan struct{})
-	r.prepareNow = make(chan struct{})
-	r.prepareStop = make(chan struct{})
-	return true
-}
-
-func (r *containerRecord) requestPreparation() {
-	r.mu.Lock()
-	now := r.prepareNow
-	r.mu.Unlock()
-	if now != nil {
-		r.prepareOnce.Do(func() { close(now) })
-	}
-}
-
-func (r *containerRecord) cancelPreparation() bool {
-	return r.cancelPreparationTransition(nil)
-}
-
-func (r *containerRecord) cancelPreparationTransition(beforeClose func()) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.prepareDone == nil || r.creatingTask {
-		return false
-	}
-	if beforeClose != nil {
-		beforeClose()
-	}
-	r.stopOnce.Do(func() { close(r.prepareStop) })
-	return true
-}
-
-func (r *containerRecord) preparationCancellation() <-chan struct{} {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.prepareStop
-}
-
-func (r *containerRecord) beginTaskCreation() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	select {
-	case <-r.prepareStop:
-		return false
-	default:
-		r.creatingTask = true
-		return true
-	}
-}
-
-func (r *containerRecord) finishPreparation(task containerd.Task, err error) {
-	r.mu.Lock()
-	if err == nil {
-		r.task = task
-		r.taskReaped = false
-		r.taskReaping = nil
-	}
-	r.prepareErr = err
-	close(r.prepareDone)
-	r.mu.Unlock()
-}
-
-func (r *containerRecord) waitPreparation(ctx context.Context) error {
-	r.mu.Lock()
-	done := r.prepareDone
-	r.mu.Unlock()
-	if done == nil {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return r.prepareErr
-	}
+	container     containerd.Container
+	snapshotter   string
+	snapshotKey   string
+	mu            sync.Mutex
+	task          containerd.Task
+	taskReaped    bool
+	taskReaping   chan struct{}
+	spec          *specs.Spec
+	persistedExit bool
+	persistedCode uint32
 }
 
 func (r *containerRecord) setTask(task containerd.Task) {
@@ -338,27 +273,12 @@ func New(address, namespace, snapshotter, runtimeName, runtimeBinary string) (*B
 func (b *Backend) Close() error             { return b.client.Close() }
 func (b *Backend) InitializeNetwork() error { return b.network.Initialize() }
 
-func (b *Backend) PublishedTarget(port uint16, protocol string) (string, error) {
-	return b.network.PublishedTarget(port, protocol)
-}
-
 func (b *Backend) acquireTaskCreation(ctx context.Context) error {
 	select {
 	case b.taskCreates <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-}
-
-func (b *Backend) acquireTaskPreparation(ctx context.Context, canceled <-chan struct{}) (bool, error) {
-	select {
-	case b.taskCreates <- struct{}{}:
-		return true, nil
-	case <-canceled:
-		return false, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
 	}
 }
 
@@ -731,10 +651,10 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		if mounts[index].Type != "bind" {
 			continue
 		}
-		if b.bindRoot == "" {
-			return api.Container{}, errors.New("bind root is not configured")
+		if b.bindMount.hostSource == "" || b.bindMount.guestRoot == "" || b.bindMount.excludedHostSource == "" {
+			return api.Container{}, errors.New("bind mount translation is not configured")
 		}
-		mounts[index].Source, err = resolveBindSource(mounts[index].Source, b.bindRoot)
+		mounts[index].Source, err = resolveBindSource(mounts[index].Source, b.bindMount)
 		if err != nil {
 			return api.Container{}, err
 		}
@@ -808,7 +728,6 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	record := &containerRecord{
 		container: container, snapshotter: snapshotter, snapshotKey: request.ID,
-		preparable: privateNetwork, publishedPorts: append([]api.PublishedPort(nil), request.PublishedPorts...),
 	}
 	b.containers.Store(request.ID, record)
 	info, err := container.Info(ctx)
@@ -853,82 +772,6 @@ func resolveImageProcessArgs(imageEntrypoint, imageCmd []string, entrypoint, cmd
 	return append(append([]string(nil), resolvedEntrypoint...), resolvedCmd...)
 }
 
-func (b *Backend) BeginTaskPreparation(id string) {
-	if record, ok := b.loadRecord(id); ok && record.preparable {
-		b.prepareTask(id, record)
-	}
-}
-
-func (b *Backend) prepareTask(id string, record *containerRecord) {
-	if !record.beginPreparation() {
-		return
-	}
-	go func() {
-		timer := time.NewTimer(speculativeTaskPreparationDelay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-record.prepareNow:
-		case <-record.prepareStop:
-			record.finishPreparation(nil, nil)
-			return
-		}
-		if err := b.prepareNetwork(id, record.publishedPorts); err != nil {
-			record.finishPreparation(nil, err)
-			return
-		}
-		// Queue before the operation timeout starts. A concurrent Docker run burst
-		// must not consume the runc-create deadline while another shim is starting.
-		acquired, err := b.acquireTaskPreparation(context.Background(), record.preparationCancellation())
-		if err != nil {
-			record.finishPreparation(nil, err)
-			return
-		}
-		if !acquired {
-			record.finishPreparation(nil, nil)
-			return
-		}
-		defer b.releaseTaskCreation()
-		// Keep queued preparation cancelable by an immediate container delete.
-		if !record.beginTaskCreation() {
-			record.finishPreparation(nil, nil)
-			return
-		}
-		ctx, cancel := context.WithTimeout(b.ctx(context.Background()), 30*time.Second)
-		defer cancel()
-		capture, err := b.createLogCapture(id)
-		if err != nil {
-			record.finishPreparation(nil, err)
-			return
-		}
-		task, err := record.container.NewTask(
-			ctx,
-			cio.NewCreator(cio.WithStreams(nil, capture.stdout, capture.stderr)),
-		)
-		if err != nil {
-			capture.close()
-			b.removeLogs(id)
-			record.finishPreparation(nil, err)
-			return
-		}
-		capture.io = task.IO()
-		b.logCaptures.Store(id, capture)
-		syscall.Sync()
-		record.finishPreparation(task, nil)
-	}()
-}
-
-func (b *Backend) prepareNetwork(id string, publishedPorts []api.PublishedPort) error {
-	if _, err := b.network.Create(id); err != nil {
-		return err
-	}
-	if _, err := b.network.Publish(id, publishedPorts); err != nil {
-		_ = b.network.Delete(id)
-		return err
-	}
-	return nil
-}
-
 func (b *Backend) persistRunningState(ctx context.Context, container containerd.Container, published []api.PublishedPort) error {
 	return b.updateRuntimeMetadata(ctx, container, func(metadata *api.ContainerMetadata) {
 		metadata.LifecycleState = "running"
@@ -959,6 +802,18 @@ func (b *Backend) updateRuntimeMetadata(ctx context.Context, container container
 		record.Labels = info.Labels
 		return nil
 	})
+}
+
+func (b *Backend) prepareNetwork(id string, publishedPorts []api.PublishedPort) ([]api.PublishedPort, error) {
+	if _, err := b.network.Create(id); err != nil {
+		return nil, err
+	}
+	published, err := b.network.Publish(id, publishedPorts)
+	if err != nil {
+		_ = b.network.Delete(id)
+		return nil, err
+	}
+	return published, nil
 }
 
 func (b *Backend) persistExitState(ctx context.Context, record *containerRecord, code uint32) error {
@@ -1077,28 +932,25 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 			return api.Container{}, err
 		}
 	}
-	record.requestPreparation()
-	if err := record.waitPreparation(ctx); err != nil {
-		return api.Container{}, err
-	}
-	if _, err := b.network.Create(id); err != nil {
-		return api.Container{}, err
-	}
-	published, err := b.network.Publish(id, request.PublishedPorts)
+	published, err := b.prepareNetwork(id, request.PublishedPorts)
 	if err != nil {
 		return api.Container{}, err
 	}
+	rollbackNetwork := func() { _ = b.network.Delete(id) }
 	task, _, _ := record.taskState()
 	if err := b.clearExitState(ctx, record); err != nil {
+		rollbackNetwork()
 		return api.Container{}, err
 	}
 	if task == nil {
 		if err := b.acquireTaskCreation(ctx); err != nil {
+			rollbackNetwork()
 			return api.Container{}, err
 		}
 		defer b.releaseTaskCreation()
 		capture, err := b.createLogCapture(id)
 		if err != nil {
+			rollbackNetwork()
 			return api.Container{}, err
 		}
 		task, err = container.NewTask(
@@ -1108,6 +960,7 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 		if err != nil {
 			capture.close()
 			b.removeLogs(id)
+			rollbackNetwork()
 			return api.Container{}, err
 		}
 		capture.io = task.IO()
@@ -1119,6 +972,7 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 		cancel()
 		record.setTask(nil)
 		b.removeLogs(id)
+		rollbackNetwork()
 		return api.Container{}, err
 	}
 	record.setTask(task)
@@ -1126,6 +980,7 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 		_ = task.Kill(b.ctx(context.Background()), syscall.SIGKILL)
 		_, _ = task.Delete(b.ctx(context.Background()), containerd.WithProcessKill)
 		record.setTask(nil)
+		rollbackNetwork()
 		return api.Container{}, err
 	}
 	info, _ := container.Info(ctx)
@@ -1234,10 +1089,6 @@ func (b *Backend) Delete(ctx context.Context, request api.ContainerDeleteRequest
 		record = &containerRecord{
 			container: container, snapshotter: info.Snapshotter, snapshotKey: info.SnapshotKey,
 		}
-	}
-	record.cancelPreparation()
-	if err := record.waitPreparation(ctx); err != nil && ctx.Err() != nil {
-		return ctx.Err()
 	}
 	task, reaped, reaping := record.taskState()
 	if reaping != nil {

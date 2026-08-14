@@ -1,10 +1,6 @@
 import ContainerResource
 import Vapor
 
-struct AppleContainerAppSupportUrlKey: StorageKey {
-    typealias Value = URL
-}
-
 func configure(_ app: Application) async throws {
     guard #available(macOS 26.0, *) else {
         throw Abort(.internalServerError, reason: "Socktainer requires macOS 26 or newer")
@@ -20,32 +16,35 @@ func configure(_ app: Application) async throws {
     // outermost so it wraps all routing/error handling. See DockerErrorMiddleware.
     app.middleware.use(DockerErrorMiddleware(), at: .beginning)
 
-    // Define app support path early since it's needed by multiple services
-    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
-    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
     let volumeClient = RuntimeVolumeService()
-    let registryClient = ClientRegistryService()
     let broadcaster = EventBroadcaster()
     app.storage[EventBroadcasterKey.self] = broadcaster
-    let engineController = LinuxPodEngineController(
-        artifact: try EngineGuestImageArtifact.locate(),
-        eventLoopGroup: app.eventLoopGroup
+    let engineStateDirectory = SocktainerDirectories.engineStateDirectory
+    let engineDataDisk = engineStateDirectory.appendingPathComponent("data.ext4")
+    let machineArtifacts = try RuntimeMachineArtifacts.locate()
+    let machine = RuntimeMachine(
+        configuration: try RuntimeMachineConfiguration(
+            helperExecutable: machineArtifacts.helper,
+            stateDirectory: engineStateDirectory,
+            kernel: machineArtifacts.kernel,
+            rootDisk: machineArtifacts.rootDisk,
+            dataDisk: engineDataDisk,
+            bindSource: SocktainerDirectories.hostHome,
+            cpuCount: 6,
+            memoryBytes: PersistentEngine.configuredMemoryBytes
+        )
     )
-    let engine = PersistentEngine(controller: engineController)
-    let directPortForwarder = DirectTCPPortForwarder(
-        eventLoopGroup: app.eventLoopGroup,
-        engine: engine,
-        logger: Logger(label: "socktainer.direct-ports")
+    let engine = PersistentEngine(machine: machine)
+    app.lifecycle.use(PersistentEngineLifecycle(engine: engine))
+    let portPublisher = GuestPortPublicationManager(
+        controller: GVProxyPublishedPortController {
+            try await machine.start()
+        }
     )
-    app.lifecycle.use(DirectTCPPortForwarderLifecycle(forwarder: directPortForwarder))
-    let directUDPPortForwarder = DirectUDPPortForwarder(engine: engine)
-    app.lifecycle.use(DirectUDPPortForwarderLifecycle(forwarder: directUDPPortForwarder))
+    app.lifecycle.use(GuestPortPublicationLifecycle(manager: portPublisher))
     let runtime = GuestRuntime(
         engine: engine,
-        portPublisher: GuestPortPublicationManager(
-            forwarder: directPortForwarder,
-            udpForwarder: directUDPPortForwarder
-        ),
+        portPublisher: portPublisher,
         broadcaster: broadcaster
     )
     await volumeClient.setReferenceValidator { id in
@@ -73,6 +72,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: EventsRoute())
 
     try app.register(collection: DockerRuntimeRoutes(backend: runtime, volumeClient: volumeClient))
+    try app.register(collection: AuthRoute())
     try app.register(collection: ExplicitUnsupportedDockerRoutes())
 
     // /volumes
@@ -139,10 +139,6 @@ func configure(_ app: Application) async throws {
     try app.register(collection: SessionRoute())
 
     // --- miscellaneous ---
-    try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: VersionRoute())
-
-    // Initialize broadcaster
-    app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
 }

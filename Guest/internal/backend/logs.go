@@ -228,21 +228,6 @@ func (b *Backend) Logs(request api.ContainerLogsRequest) (api.ContainerLogsRespo
 }
 
 func (b *Backend) Attach(ctx context.Context, request api.ContainerLogsRequest, stream StreamFunc) (uint32, error) {
-	record, ok := b.loadRecord(request.ID)
-	if !ok {
-		container, err := b.client.LoadContainer(b.ctx(ctx), request.ID)
-		if err != nil {
-			return 0, err
-		}
-		record, err = b.record(b.ctx(ctx), request.ID, container)
-		if err != nil {
-			return 0, err
-		}
-	}
-	record.requestPreparation()
-	if err := record.waitPreparation(ctx); err != nil {
-		return 0, err
-	}
 	value, ok := b.logCaptures.Load(request.ID)
 	for !ok {
 		item, err := b.Inspect(ctx, request.ID)

@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pub(crate) mod args_writer;
+pub(crate) mod proxy;
+
+use super::error::{return_code, start, Error};
+use args_writer::EnclaveArgsWriter;
+use nitro_enclaves::{
+    launch::{ImageType, Launcher, MemoryInfo, PollTimeout, StartFlags},
+    Device,
+};
+use proxy::{
+    net::NetProxy, output::OutputProxy, signal_handler::SignalHandler, DeviceProxy, DeviceProxyList,
+};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    io::{self, Read, Write},
+    os::fd::RawFd,
+    path::{Path, PathBuf},
+    thread::{self, JoinHandle},
+};
+use tar::HeaderMode;
+use vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+
+const KRUN_NITRO_EIF_PATH_ENV_VAR: &str = "KRUN_NITRO_EIF_PATH";
+const KRUN_NITRO_EIF_PATH_DEFAULT: &str = "/krun-awsnitro/krun-awsnitro.eif";
+
+/// Directories within the configured rootfs that will be ignored when writing to the enclave. The
+/// enclave is responsible for initializing these directories within the guest operating system.
+const ROOTFS_DIR_DENYLIST: [&str; 6] = [
+    "proc",          // /proc.
+    "run",           // /run.
+    "tmp",           // /tmp.
+    "dev",           // /dev.
+    "sys",           // /sys.
+    "krun-awsnitro", // Cached EIF file (and possibly other metadata).
+];
+
+/// Nitro Enclave data.
+pub struct NitroEnclave {
+    /// Amount of RAM (in MiB).
+    pub mem_size_mib: usize,
+    /// Number of vCPUs.
+    pub vcpus: u8,
+    /// Enclave rootfs.
+    pub rootfs: String,
+    /// Execution path.
+    pub exec_path: String,
+    /// Execution args.
+    pub exec_args: String,
+    /// Execution environment.
+    pub exec_env: String,
+    /// Network proxy.
+    pub net_unixfd: Option<RawFd>,
+    /// Path to redirect enclave output to.
+    pub output_path: PathBuf,
+    /// Output kernel and initramfs debug logs from enclave.
+    pub debug: bool,
+}
+
+impl NitroEnclave {
+    /// Run an application within a nitro enclave.
+    pub fn run(mut self) -> Result<i32, Error> {
+        // Collect all launch parameters (rootfs, execution arguments, device proxies) and establish
+        // an enclave argument writer to write this data to the nitro enclave when started.
+        let rootfs_archive = self.rootfs_archive().map_err(Error::RootFsArchive)?;
+        let proxies = self.proxies().map_err(Error::DeviceProxy)?;
+
+        let writer = EnclaveArgsWriter::new(
+            &rootfs_archive,
+            &self.exec_path,
+            &self.exec_args,
+            &self.exec_env,
+            &proxies,
+        );
+
+        // Disable signals to launch enclave VM.
+        self.signals(false);
+
+        // Launch the enclave and write the configured launch parameters to the initramfs.
+        let (cid, timeout) = self.start().map_err(Error::Start)?;
+
+        // If debug mode is enabled, attach to the serial console immediately after the enclave VM
+        // is started to get logs.
+        if self.debug {
+            self.start_console_debug(cid).map_err(Error::DeviceProxy)?;
+        }
+
+        writer.write_args(cid, timeout).map_err(Error::ArgsWrite)?;
+
+        // Establish the vsock listener for the application's return code upon termination.
+        let retcode_listener = VsockListener::bind(&VsockAddr::new(
+            VMADDR_CID_ANY,
+            cid + (VsockPortOffset::ReturnCode as u32),
+        ))
+        .map_err(return_code::Error::VsockBind)
+        .map_err(Error::ReturnCodeListener)?;
+
+        // Enable signals now that enclave VM is started.
+        self.signals(true);
+
+        // Run the device proxies. Each proxy is run within its own thread that can only be
+        // terminated by the enclave (by closing the vsock connection).
+        proxies.run(cid).map_err(Error::DeviceProxy)?;
+
+        let ret = self
+            .shutdown_ret(retcode_listener)
+            .map_err(Error::ReturnCodeListener)?;
+
+        Ok(ret)
+    }
+
+    /// Start a nitro enclave.
+    fn start(&mut self) -> Result<(u32, PollTimeout), start::Error> {
+        // Read the cached EIF file required to run the enclave.
+        let eif = {
+            let path = env::var(KRUN_NITRO_EIF_PATH_ENV_VAR)
+                .unwrap_or(KRUN_NITRO_EIF_PATH_DEFAULT.to_string());
+
+            fs::read(path).map_err(start::Error::EifRead)
+        }?;
+
+        // Calculate the poll timeout (based on the size of the EIF file and amount of RAM allocated
+        // to the enclave) for the enclave to indicate that has successfully started.
+        let timeout = PollTimeout::try_from((eif.as_slice(), self.mem_size_mib << 20))
+            .map_err(start::Error::PollTimeoutCalculate)?;
+
+        // Launch an enclave VM with the configured number of vCPUs and amount of RAM.
+        let device = Device::open().map_err(start::Error::DeviceOpen)?;
+
+        let mut launcher = Launcher::new(&device).map_err(start::Error::VmCreate)?;
+
+        let mem = MemoryInfo::new(ImageType::Eif(&eif), self.mem_size_mib);
+        launcher
+            .set_memory(mem)
+            .map_err(start::Error::VmMemorySet)?;
+
+        for _ in 0..self.vcpus {
+            launcher.add_vcpu(None).map_err(start::Error::VcpuAdd)?;
+        }
+
+        // Indicate to the enclave to start in debug mode if configured.
+        let mut start_flags = StartFlags::empty();
+
+        if self.debug {
+            start_flags |= StartFlags::DEBUG;
+        }
+
+        // Start the enclave.
+        let cid = launcher
+            .start(start_flags, None)
+            .map_err(start::Error::VmStart)?;
+
+        // Safe to unwrap.
+        Ok((cid.try_into().unwrap(), timeout))
+    }
+
+    /// Initialize and collect all device proxies used for the enclave.
+    fn proxies(&self) -> Result<DeviceProxyList, proxy::Error> {
+        let mut proxies: Vec<Box<dyn Send + DeviceProxy>> = vec![];
+
+        // Only specify application output proxy if not running in debug mode.
+        if !self.debug {
+            let output = OutputProxy::new(&self.output_path, false)?;
+            proxies.push(Box::new(output));
+        }
+
+        if let Some(fd) = self.net_unixfd {
+            let net = NetProxy::try_from(fd)?;
+            proxies.push(Box::new(net));
+        }
+
+        // All enclaves will include a proxy for signal handling (e.g. forwarding SIGTERM signals to
+        // application running within the enclave).
+        proxies.push(Box::new(SignalHandler::new()?));
+
+        Ok(DeviceProxyList(proxies))
+    }
+
+    /// Produce a tarball of the enclave's rootfs (to be written to and extracted by the enclave
+    /// initramfs).
+    fn rootfs_archive(&self) -> Result<Vec<u8>, io::Error> {
+        let mut tar = tar::Builder::new(Vec::new());
+
+        tar.mode(HeaderMode::Deterministic);
+        tar.follow_symlinks(false);
+
+        let rootfs = self.rootfs.clone();
+        let rootfs = Path::new(&rootfs);
+
+        for entry in fs::read_dir(self.rootfs.clone())? {
+            let entry = entry?;
+            let r#type = entry.file_type()?;
+            let name = entry.file_name().into_string().unwrap();
+            let target = format!("rootfs/{}", name);
+            let rootfs_name = {
+                let name = rootfs.file_name().unwrap_or(OsStr::new("/"));
+
+                name.to_str()
+                    .ok_or(io::Error::other("unable to convert rootfs dirname to str"))
+            }?;
+
+            if !ROOTFS_DIR_DENYLIST.contains(&name.as_str()) && name != rootfs_name {
+                if r#type.is_dir() {
+                    tar.append_dir_all(target, entry.path())?
+                } else {
+                    tar.append_path_with_name(entry.path(), target)?
+                }
+            }
+        }
+
+        tar.into_inner()
+    }
+
+    /// Receive a 4-byte (representing an i32) return code from the enclave via vsock. This
+    /// represents the return code of the application that ran within the enclave.
+    fn shutdown_ret(&self, vsock_listener: VsockListener) -> Result<i32, return_code::Error> {
+        let (mut vsock_stream, _vsock_addr) = vsock_listener
+            .accept()
+            .map_err(return_code::Error::VsockAccept)?;
+
+        let mut buf = [0u8; 4];
+        let _ = vsock_stream
+            .read(&mut buf)
+            .map_err(return_code::Error::VsockRead)?;
+
+        let close_signal: u32 = 0;
+        vsock_stream
+            .write_all(&close_signal.to_ne_bytes())
+            .map_err(return_code::Error::VsockWrite)?;
+
+        Ok(i32::from_ne_bytes(buf))
+    }
+
+    /// Enable or disable all signals.
+    fn signals(&self, enable: bool) {
+        let sig = if enable {
+            libc::SIG_UNBLOCK
+        } else {
+            libc::SIG_BLOCK
+        };
+
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigfillset(&mut set);
+            libc::pthread_sigmask(sig, &set, std::ptr::null_mut());
+        }
+    }
+
+    /// Start the debug output thread, read from the serial console. Run this proxy separate
+    /// from the others, as it is not easily controlled by the user due to the connection to
+    /// the enclave VM's serial console.
+    fn start_console_debug(&self, cid: u32) -> Result<(), proxy::Error> {
+        let mut output = OutputProxy::new(&self.output_path, true)?;
+        let mut vsock_rcv = output.vsock(cid)?;
+        let _: JoinHandle<Result<(), proxy::Error>> = thread::spawn(move || loop {
+            output.rcv(&mut vsock_rcv)?;
+        });
+
+        Ok(())
+    }
+}
+
+/// Each service provided to an enclave is done so via vsock. Each service has a designated port
+/// offset (relative to the enclave VM's CID) to connect to for service. The port number for each of
+/// an enclave's services can be calculated as:
+///
+/// vsock port = (Enclave VM CID + vsock port offset)
+#[repr(u32)]
+pub enum VsockPortOffset {
+    ArgsReader = 1,
+    Net = 2,
+    AppOutput = 3,
+    ReturnCode = 4,
+    SignalHandler = 5,
+    // Not set by krun-awsnitro.
+    Console = 10000,
+}

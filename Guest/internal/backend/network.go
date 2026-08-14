@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -111,8 +110,44 @@ func (m *NetworkManager) Publish(id string, requested []api.PublishedPort) ([]ap
 		return nil, fmt.Errorf("private network does not exist for container %s", id)
 	}
 	if len(network.guestPorts) != 0 {
+		if !publishedRequestMatches(network.guestPorts, requested) {
+			return nil, fmt.Errorf("container %s already has a different published-port set", id)
+		}
 		return append([]api.PublishedPort(nil), network.guestPorts...), nil
 	}
+	published, err := m.normalizePublishedPorts(requested)
+	if err != nil {
+		return nil, err
+	}
+	installed := make([]api.PublishedPort, 0, len(published))
+	selected := make(map[string]struct{}, len(published))
+	for _, port := range published {
+		key := port.Protocol + ":" + strconv.Itoa(int(port.GuestPort))
+		if _, duplicate := selected[key]; duplicate {
+			rollbackError := m.removeRules(network, installed)
+			return nil, errors.Join(
+				fmt.Errorf("published %s port %d is duplicated", port.Protocol, port.GuestPort),
+				rollbackError,
+			)
+		}
+		if conflictID, conflict := m.portOwner(port.GuestPort, port.Protocol); conflict {
+			rollbackError := m.removeRules(network, installed)
+			return nil, errors.Join(
+				fmt.Errorf("published %s port %d is already owned by container %s", port.Protocol, port.GuestPort, conflictID),
+				rollbackError,
+			)
+		}
+		if err := m.addRules(network, port); err != nil {
+			return nil, errors.Join(err, m.removeRules(network, installed))
+		}
+		installed = append(installed, port)
+		selected[key] = struct{}{}
+	}
+	network.guestPorts = published
+	return append([]api.PublishedPort(nil), published...), nil
+}
+
+func (m *NetworkManager) normalizePublishedPorts(requested []api.PublishedPort) ([]api.PublishedPort, error) {
 	published := make([]api.PublishedPort, 0, len(requested))
 	for _, port := range requested {
 		protocol := strings.ToLower(port.Protocol)
@@ -124,31 +159,37 @@ func (m *NetworkManager) Publish(id string, requested []api.PublishedPort) ([]ap
 		}
 		guestPort := port.GuestPort
 		if guestPort == 0 {
-			guestPort = m.nextPort
-			m.nextPort++
+			var found bool
+			for attempts := 0; attempts < 65535-41000+1; attempts++ {
+				candidate := m.nextPort
+				m.nextPort++
+				if m.nextPort < 41000 {
+					m.nextPort = 41000
+				}
+				if _, conflict := m.portOwner(candidate, protocol); !conflict {
+					guestPort = candidate
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, errors.New("published guest port range is exhausted")
+			}
 		}
 		published = append(published, api.PublishedPort{ContainerPort: port.ContainerPort, GuestPort: guestPort, Protocol: protocol, HostSource: port.HostSource})
 	}
-	network.guestPorts = published
-	return append([]api.PublishedPort(nil), published...), nil
+	return published, nil
 }
 
-func (m *NetworkManager) PublishedTarget(guestPort uint16, protocol string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	protocol = strings.ToLower(protocol)
-	for _, network := range m.containers {
+func (m *NetworkManager) portOwner(guestPort uint16, protocol string) (string, bool) {
+	for id, network := range m.containers {
 		for _, published := range network.guestPorts {
-			publishedProtocol := strings.ToLower(published.Protocol)
-			if publishedProtocol == "" {
-				publishedProtocol = "tcp"
-			}
-			if published.GuestPort == guestPort && publishedProtocol == protocol {
-				return net.JoinHostPort(network.address, strconv.Itoa(int(published.ContainerPort))), nil
+			if published.GuestPort == guestPort && published.Protocol == protocol {
+				return id, true
 			}
 		}
 	}
-	return "", fmt.Errorf("published %s port %d does not exist", protocol, guestPort)
+	return "", false
 }
 
 func (m *NetworkManager) Published(id string) []api.PublishedPort {
@@ -167,7 +208,9 @@ func (m *NetworkManager) Delete(id string) error {
 	if network == nil {
 		return nil
 	}
-	m.removeRules(network, network.guestPorts)
+	if err := m.removeRules(network, network.guestPorts); err != nil {
+		return err
+	}
 	if err := m.namespaces.Delete(network.name); err != nil {
 		return err
 	}
@@ -195,7 +238,66 @@ func (m *NetworkManager) initialize() error {
 	return nil
 }
 
-func (m *NetworkManager) removeRules(network *containerNetwork, ports []api.PublishedPort) {
+func (m *NetworkManager) addRules(network *containerNetwork, port api.PublishedPort) error {
+	rules := publicationRuleArguments("-A", network, port)
+	for ruleIndex, rule := range rules {
+		if err := m.runner.Run("iptables", rule...); err != nil {
+			rollback := publicationRuleArguments("-D", network, port)
+			var rollbackError error
+			for installedIndex := ruleIndex - 1; installedIndex >= 0; installedIndex-- {
+				rollbackError = errors.Join(
+					rollbackError,
+					m.runner.Run("iptables", rollback[installedIndex]...),
+				)
+			}
+			return errors.Join(err, rollbackError)
+		}
+	}
+	return nil
+}
+
+func (m *NetworkManager) removeRules(network *containerNetwork, ports []api.PublishedPort) error {
+	var firstError error
+	for portIndex := len(ports) - 1; portIndex >= 0; portIndex-- {
+		rules := publicationRuleArguments("-D", network, ports[portIndex])
+		for ruleIndex := len(rules) - 1; ruleIndex >= 0; ruleIndex-- {
+			if err := m.runner.Run("iptables", rules[ruleIndex]...); err != nil && firstError == nil {
+				firstError = err
+			}
+		}
+	}
+	return firstError
+}
+
+func publicationRuleArguments(operation string, network *containerNetwork, port api.PublishedPort) [][]string {
+	guestPort := strconv.Itoa(int(port.GuestPort))
+	containerPort := strconv.Itoa(int(port.ContainerPort))
+	target := network.address + ":" + containerPort
+	comment := "socktainer:" + network.name + ":" + port.Protocol + ":" + guestPort
+	return [][]string{
+		{"-t", "nat", operation, "PREROUTING", "-i", "eth0", "-p", port.Protocol, "--dport", guestPort, "-m", "comment", "--comment", comment, "-j", "DNAT", "--to-destination", target},
+		{operation, "FORWARD", "-i", "eth0", "-o", bridgeName, "-p", port.Protocol, "-d", network.address, "--dport", containerPort, "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED", "-m", "comment", "--comment", comment, "-j", "ACCEPT"},
+		{operation, "FORWARD", "-i", bridgeName, "-o", "eth0", "-p", port.Protocol, "-s", network.address, "--sport", containerPort, "-m", "conntrack", "--ctstate", "ESTABLISHED", "-m", "comment", "--comment", comment, "-j", "ACCEPT"},
+	}
+}
+
+func publishedRequestMatches(existing, requested []api.PublishedPort) bool {
+	if len(existing) != len(requested) {
+		return false
+	}
+	for index, request := range requested {
+		protocol := strings.ToLower(request.Protocol)
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		if existing[index].ContainerPort != request.ContainerPort ||
+			existing[index].Protocol != protocol ||
+			existing[index].HostSource != request.HostSource ||
+			(request.GuestPort != 0 && existing[index].GuestPort != request.GuestPort) {
+			return false
+		}
+	}
+	return true
 }
 
 func networkName(id string) string {

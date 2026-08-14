@@ -78,7 +78,10 @@ jobs:
     needs: tag
     permissions:
       contents: write
-    runs-on: macos-26
+    # Guest artifacts require Hypervisor.framework. GitHub-hosted Apple Silicon
+    # reports that virtualization is unavailable, so releases use the trusted
+    # physical Apple Silicon builder with the pinned guest-kernel digest.
+    runs-on: [self-hosted, macOS, ARM64, socktainer-vmm-builder]
     timeout-minutes: 60
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,31 +141,6 @@ jobs:
           DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
 
-      - name: Sign binary
-        run: |
-          codesign --force \
-            --sign "${{ secrets.APPLE_APPLICATION_ID}}" \
-            --options runtime \
-            --entitlements entitlements.plist \
-            ./.build/arm64-apple-macosx/release/socktainer
-    
-      - name: zip the binary
-        run: |
-          cd ./.build/arm64-apple-macosx/release/
-          zip -r socktainer.zip socktainer
-
-      - name: Submit for notarization
-        run: |
-          xcrun notarytool submit ./.build/arm64-apple-macosx/release/socktainer.zip \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_ID_PASSWORD" \
-            --wait
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-
       - name: Create & sign the installer
         run: |
           make installer-notarized
@@ -174,10 +152,8 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Upload socktainer binary
+      - name: Upload complete runtime installer
         run: |
-         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
-         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
          gh release upload ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
 
   release:
@@ -196,4 +172,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           id: ${{ needs.tag.outputs.releaseId}}
-

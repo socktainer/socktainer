@@ -40,7 +40,7 @@
   - [Acknowledgements 🙏](#acknowledgements-🙏)
   <!--toc:end-->
 
-Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries 🍏📦.
+Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** through one persistent Linux VM on Apple Silicon 🍏📦.
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
@@ -121,7 +121,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ## Key Features ✨
 
-- Runs one persistent Apple-backed Linux VM 🍏
+- Runs one persistent Linux VM with a custom Hypervisor.framework VMM 🍏
 - Provides **Docker REST API compatibility** 🔄 (partial)
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
 - Uses containerd, overlayfs, runc, and Linux namespaces for containers
@@ -132,22 +132,9 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ## Requirements 📋
 
-- **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 1.2.1** (client and server versions must match the SDK version
-  used to build Socktainer)
-
-Verify both before starting Socktainer:
-
-```bash
-container --version
-container system status
-```
-
-Apple Container's XPC and Swift API schemas can change between patch releases.
-Socktainer keeps those version-specific calls behind one compatibility boundary and
-fails startup on a mismatch instead of risking opaque XPC failures. Every normal
-Socktainer startup performs this check and prints the client/server versions; use
-`--no-check-compatibility` only for deliberate diagnostics.
+- **macOS 26 (Tahoe) on Apple Silicon (arm64)**
+- The installer package, which includes the VMM, guest kernel, root disk, libkrun,
+  and gvproxy runtime artifacts
 
 ---
 
@@ -199,18 +186,18 @@ operations use this one content store.
 
 ### Runtime and published-port recovery
 
-Socktainer runs one persistent Apple-backed Linux VM. The host Docker API maps
+Socktainer runs one persistent Linux VM through its custom VMM. The host Docker API maps
 container operations through one multiplexed vsock connection to a guest agent.
 The guest uses containerd, overlayfs, runc, and Linux namespaces for all ordinary
 containers. Socktainer does not start one VM per container or use relay sidecar
 VMs.
 
-Published TCP and UDP ports use direct, address-bound host listeners and vmnet
-forwarding rules to the engine VM. The
-guest applies DNAT from the engine ingress port to the container's private
-network namespace. The guest stores Docker names, labels, commands, and port
-mappings in containerd metadata. Socktainer restores this state and the host
-forwarding rules after a daemon restart.
+Published TCP and UDP ports use one supervised gvproxy process for each VM
+generation. The VMM connects gvproxy to the guest virtio-net device. The guest
+applies DNAT from the engine ingress port to the container's private network
+namespace. The guest stores Docker names, labels, commands, and port mappings in
+containerd metadata. Socktainer restores this state and the gvproxy forwarding
+rules after a daemon restart.
 
 This alpha runtime does not import containers, images, networks, or transient
 state from the removed per-container-VM architecture. The first start creates a
@@ -268,12 +255,10 @@ intentionally deletes them.
 
 ### Engine resources
 
-All containers share the persistent engine VM. The default engine configuration
-uses 6 virtual CPUs and 1 GiB of guest memory. Virtualization.framework maps the
-guest memory lazily, so idle memory use depends on resident pages. Set
-`SOCKTAINER_ENGINE_CPUS` and
-`SOCKTAINER_ENGINE_MEMORY_MIB` before startup to change these values. Docker
-per-container CPU and memory limits are not implemented.
+All containers share the persistent engine VM. The engine uses 6 virtual CPUs
+and a 1 GiB configured memory ceiling. The VMM reclaims guest pages through the
+virtio balloon device, so configured memory and physical footprint are separate
+measurements. Docker per-container CPU and memory limits are not implemented.
 
 ---
 
@@ -382,7 +367,7 @@ Ownership rules:
 - **stdin**: Apple closes `.read`. You close `.write` when done sending input.
 - `StdioPipes.make()` closes any partial pipes on EMFILE and returns `nil` — always `guard let`.
 
-`make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in any source file other than the one legitimate exception (`ClientRegistryService.swift`, which uses Foundation's own `Process`, not Apple Container APIs).
+`make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in application source.
 
 ---
 
@@ -397,6 +382,10 @@ Ownership rules:
 - Per-container CPU and memory limits are not yet implemented. All ordinary
   containers share the engine VM allocation.
 - Bind-mounting the Docker socket into a container is not implemented.
+- The VMM exports the host home directory to the trusted guest so it can serve
+  arbitrary Docker bind requests. Containers receive only their requested bind
+  paths. Socktainer rejects binds that overlap its engine state, and the
+  virtio-fs server confines all file operations beneath the exported root.
 - Restart policies are not implemented.
 - `docker update` does not yet change container resources.
 - Image load, save, history, and push are not connected to the guest content store.
@@ -408,9 +397,10 @@ Ownership rules:
   export, stats, resize, rename, restart, and resource update.
 - Known unsupported Docker endpoints return an explicit `501 Not Implemented`
   Docker error instead of an accidental router `404`.
-- If the persistent ext4 data disk has an invalid superblock, Socktainer moves
-  it to `data.ext4.corrupt-<UUID>` and creates a new empty disk. This alpha reset
-  policy preserves the corrupt image for diagnosis but does not migrate its data.
+- Socktainer replaces a readable data disk only when it identifies the previous
+  unjournaled alpha format. It preserves that disk as
+  `data.ext4.incompatible-<UUID>`. An unreadable or corrupt disk stops startup
+  and remains unchanged.
 
 ---
 
@@ -430,5 +420,5 @@ See the `LICENSE` file in the repository root.
 
 ## Acknowledgements 🙏
 
-- Built using **Apple containerization libraries** 🍏
+- Built with **Hypervisor.framework, libkrun, and gvproxy** 🍏
 - Enables Docker CLI and other Docker clients to interact with local macOS containers 🐳💻

@@ -126,18 +126,13 @@ protocol GuestRuntimeEventConnecting: Sendable {
 
 actor PersistentEngineGuestRuntimeEventConnector: GuestRuntimeEventConnecting {
     private let engine: PersistentEngine
-    private var previous: GuestConnection?
 
     init(engine: PersistentEngine) {
         self.engine = engine
     }
 
     func connect() async throws -> AsyncStream<GuestFrame> {
-        if let previous {
-            await engine.invalidateConnection(previous)
-        }
         let connection = try await engine.readyConnection()
-        previous = connection
         return await connection.events()
     }
 }
@@ -633,7 +628,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         do {
             try await persistPortBindings(containerID: id, bindings: published)
         } catch {
-            await portPublisher.remove(containerID: id)
+            try await portPublisher.remove(containerID: id)
             pendingPublications.insert(id)
             throw error
         }
@@ -672,7 +667,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             try await performGuestWait(id: resolved)
         }
         if metadata[resolved]?.autoRemove == true {
-            await portPublisher.remove(containerID: resolved)
+            try await portPublisher.remove(containerID: resolved)
         }
         return exitCode
     }
@@ -716,7 +711,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             result: .failure(DockerRuntimeRouteError.notFound("container \(resolved)"))
         )
         if hasPublishedPorts {
-            await portPublisher.remove(containerID: resolved)
+            try await portPublisher.remove(containerID: resolved)
         }
         releaseGuestPorts(containerID: resolved)
         pendingPublications.remove(resolved)
@@ -936,7 +931,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
         metadata[exit.id]?.state = .exited
         metadata[exit.id]?.exitCode = Int32(exit.exitCode)
         pendingPublications.remove(exit.id)
-        await portPublisher.remove(containerID: exit.id)
+        try? await portPublisher.remove(containerID: exit.id)
         exitCodes.record(id: exit.id, code: Int32(exit.exitCode))
         await broadcastContainer(
             "die", id: exit.id, extra: ["exitCode": String(exit.exitCode)]
@@ -1059,14 +1054,10 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
 
     private func vmnetHostSource(required: Bool) async throws -> String {
         guard required else { return "" }
-        guard let address = await engine.address() else {
+        guard let address = await engine.hostGatewayAddress() else {
             throw PersistentEngineError.invalidMachineSnapshot("engine IP address is unavailable")
         }
-        let components = address.split(separator: ".")
-        guard components.count == 4 else {
-            throw PersistentEngineError.invalidMachineSnapshot("engine IP address is not IPv4")
-        }
-        return components.dropLast().joined(separator: ".") + ".1"
+        return address
     }
 
     private static func portBindingJSON(_ binding: DockerRuntimePortBinding) -> JSONValue {

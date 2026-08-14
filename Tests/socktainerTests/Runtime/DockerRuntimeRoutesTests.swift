@@ -140,11 +140,38 @@ struct DockerRuntimeRoutesTests {
         #expect(create.command == ["/bin/true"])
         #expect(create.environment == ["A=B"])
         #expect(create.autoRemove)
-        #expect(create.mounts == [.init(source: "/tmp/source", target: "/data", readOnly: true)])
+        #expect(create.mounts == [.init(source: "/private/tmp/source", target: "/data", readOnly: true)])
         #expect(create.ports == [.init(containerPort: 80, proto: "tcp", hostIP: "127.0.0.1", hostPort: 18080)])
         #expect(await backend.lastWaitCondition == .nextExit)
         #expect(await backend.lastListShowAll == true)
         #expect(await backend.lastDelete == .init(force: true, volumes: true))
+    }
+
+    @Test("container create canonicalizes macOS bind path aliases")
+    func containerCreateCanonicalizesBindPathAliases() async throws {
+        let backend = DockerRuntimeBackendMock()
+        let canonicalSource = "/private/var/tmp/socktainer-bind-\(UUID().uuidString)"
+        let aliasedSource = String(canonicalSource.dropFirst("/private".count))
+        try FileManager.default.createDirectory(
+            atPath: canonicalSource,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(atPath: canonicalSource) }
+
+        try await withRuntimeRoutes(backend) { app in
+            let body = #"{"Image":"fixture@sha256:abc","HostConfig":{"Binds":["\#(aliasedSource):/data"]}}"#
+            try await app.testing().test(
+                .POST,
+                "/v1.51/containers/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: body)
+            ) { response async in
+                #expect(response.status == .created)
+            }
+        }
+
+        let create = try #require(await backend.lastCreate)
+        #expect(create.mounts == [.init(source: canonicalSource, target: "/data", readOnly: false)])
     }
 
     @Test("exec start returns stdcopy frames and records the exit code")

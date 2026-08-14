@@ -1,0 +1,3160 @@
+// Copyright 2019 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use std::collections::btree_map;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::ptr::null_mut;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use crossbeam_channel::{unbounded, Sender};
+use nix::errno::Errno;
+use utils::worker_message::WorkerMessage;
+
+use crate::virtio::fs::filesystem::SecContext;
+
+use super::super::super::linux_errno::{linux_error, LINUX_ERANGE};
+use super::super::bindings;
+use super::super::filesystem::{
+    Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
+    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+};
+use super::super::fuse;
+use super::super::inode_alloc::InodeAllocator;
+use super::super::multikey::MultikeyBTreeMap;
+
+const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
+
+const UID_MAX: u32 = u32::MAX - 1;
+
+// These flags are present in the macOS SDK but are not exposed by every
+// version of the Rust libc crate that libkrun supports.
+const O_RESOLVE_BENEATH: libc::c_int = 0x0000_1000;
+const AT_SYMLINK_NOFOLLOW_ANY: libc::c_int = 0x0800;
+const AT_RESOLVE_BENEATH: libc::c_int = 0x2000;
+
+type Inode = u64;
+type Handle = u64;
+
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+struct InodeAltKey {
+    ino: u64,
+    dev: i32,
+}
+
+struct InodeData {
+    inode: Inode,
+    ino: u64,
+    dev: i32,
+    refcount: AtomicU64,
+    unlinked_fd: AtomicI64,
+}
+
+enum InodeHandle {
+    Fd(RawFd),
+    Path(CString),
+}
+
+struct CachedDirEntry {
+    ino: bindings::ino64_t,
+    name: Box<[u8]>,
+    type_: u8,
+}
+
+struct DirStream {
+    entries: Vec<CachedDirEntry>,
+    ready: bool,
+}
+
+impl DirStream {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            ready: false,
+        }
+    }
+
+    fn get_entry<'a>(&'a self, offset: u64) -> Option<DirEntry<'a>> {
+        self.entries.get(offset as usize).map(|e| DirEntry {
+            ino: e.ino,
+            // offset points to the next entry, not the current one
+            offset: offset + 1,
+            type_: u32::from(e.type_),
+            name: &e.name,
+        })
+    }
+
+    fn fill_from_fd(&mut self, fd: RawFd) -> io::Result<()> {
+        // fdopendir() takes ownership of the fd, so we need to obtain a new one
+        // to be donated.
+        let newfd = unsafe { libc::dup(fd) };
+        if newfd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let dir = unsafe { libc::fdopendir(newfd) };
+        if dir.is_null() {
+            let err = io::Error::last_os_error();
+            let _ = unsafe { libc::close(newfd) };
+            return Err(linux_error(err));
+        }
+
+        loop {
+            // To detect if error happened in readdir we should clear errno
+            // before the call and then verify it after
+            Errno::clear();
+            let dentry = unsafe { libc::readdir(dir) };
+            if dentry.is_null() {
+                let errno = Errno::last_raw();
+                if errno != 0 {
+                    let err = io::Error::from_raw_os_error(errno);
+                    let _ = unsafe { libc::closedir(dir) };
+                    // Error happened in readdir, but we keep the entries we
+                    // already read to handle the partial read.
+                    return Err(linux_error(err));
+                }
+                break;
+            }
+            // SAFETY: dentry is not null.
+            // We trust macOS to return correct number of bytes for the name
+            // length. The lifetime of a slice does not escape the unsafe block
+            // as we copy the data into box right away.
+            let name = unsafe {
+                let name_len = usize::from((*dentry).d_namlen);
+                let name_ptr = (*dentry).d_name.as_ptr().cast();
+                let name = std::slice::from_raw_parts(name_ptr, name_len);
+
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                Box::<[u8]>::from(name)
+            };
+
+            // SAFETY: dentry is not null.
+            let ino = unsafe { (*dentry).d_ino };
+            // SAFETY: dentry is not null. The entry types use the same
+            // exact constants (`libc::DT_*`) on macOS, Linux, and FUSE.
+            let type_ = unsafe { (*dentry).d_type };
+
+            self.entries.push(CachedDirEntry { ino, name, type_ });
+        }
+
+        unsafe { libc::closedir(dir) };
+        Ok(())
+    }
+}
+
+struct HandleData {
+    inode: Inode,
+    file: RwLock<File>,
+    dirstream: Mutex<DirStream>,
+}
+
+fn ebadf() -> io::Error {
+    linux_error(io::Error::from_raw_os_error(libc::EBADF))
+}
+
+fn einval() -> io::Error {
+    linux_error(io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
+    match std::str::from_utf8(item) {
+        Ok(val) => match u32::from_str_radix(val, radix) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                debug!("invalid value: {radix} err={e}");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn get_xattr_common(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut items = buf.split(|c| *c == b':');
+
+    let uid = match items.next() {
+        Some(item) => item_to_value(item, 10),
+        None => None,
+    };
+    let gid = match items.next() {
+        Some(item) => item_to_value(item, 10),
+        None => None,
+    };
+    let mode = match items.next() {
+        Some(item) => item_to_value(item, 8),
+        None => None,
+    };
+
+    Ok((uid, gid, mode))
+}
+
+fn get_xattr_fstat(
+    fd: RawFd,
+    st: bindings::stat64,
+) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut buf: Vec<u8> = vec![0; 32];
+    let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        libc::XATTR_NOFOLLOW
+    } else {
+        0
+    };
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const i8,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            options,
+        )
+    };
+    if res < 0 {
+        debug!("fget_xattr error: {res}");
+        return Ok((None, None, None));
+    }
+
+    buf.resize(res as usize, 0);
+
+    get_xattr_common(&buf)
+}
+
+fn get_xattr_lstat(
+    path: &CString,
+    st: bindings::stat64,
+) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut buf: Vec<u8> = vec![0; 32];
+    let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        libc::XATTR_NOFOLLOW
+    } else {
+        0
+    };
+    let res = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr() as *const i8,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            options,
+        )
+    };
+    if res < 0 {
+        debug!("fget_xattr error: {res}");
+        return Ok((None, None, None));
+    }
+
+    buf.resize(res as usize, 0);
+
+    get_xattr_common(&buf)
+}
+
+fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
+    if let Some(owner) = owner {
+        if owner.0 < UID_MAX && owner.1 < UID_MAX {
+            return true;
+        }
+    }
+
+    false
+}
+
+// We won't need this once expressions like "if let ... &&" are allowed.
+#[allow(clippy::unnecessary_unwrap)]
+fn set_xattr_stat(
+    ctx: &Context,
+    file: &InodeHandle,
+    st: Option<bindings::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    let st = st.unwrap_or(istat(ctx, PermissionSemantics::LinuxComplete, file, true)?);
+    let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        libc::XATTR_NOFOLLOW
+    } else {
+        0
+    };
+
+    let buf = if is_valid_owner(owner) && mode.is_some() {
+        let owner = owner.unwrap();
+        let mode = mode.unwrap();
+        format!("{}:{}:0{:o}", owner.0, owner.1, mode)
+    } else {
+        let (orig_uid, orig_gid, orig_mode) = match file {
+            InodeHandle::Fd(fd) => get_xattr_fstat(*fd, st)?,
+            InodeHandle::Path(ref c_path) => get_xattr_lstat(c_path, st)?,
+        };
+
+        let (uid, gid) = match owner {
+            Some(o) => {
+                let uid = if o.0 < UID_MAX { Some(o.0) } else { orig_uid };
+                let gid = if o.1 < UID_MAX { Some(o.1) } else { orig_gid };
+                (uid, gid)
+            }
+            None => (orig_uid, orig_gid),
+        };
+
+        let mut buf = String::new();
+        if let Some(uid) = uid {
+            buf.push_str(&format!("{uid}"));
+        } else {
+            buf.push('x');
+        }
+        if let Some(gid) = gid {
+            buf.push_str(&format!(":{gid}:"));
+        } else {
+            buf.push_str(":x:");
+        }
+        if let Some(mode) = mode {
+            buf.push_str(&format!("0{:o}", mode));
+        } else if let Some(orig_mode) = orig_mode {
+            buf.push_str(&format!("0{:o}", orig_mode));
+        } else {
+            buf.push('x');
+        }
+        buf
+    };
+
+    let res = match file {
+        InodeHandle::Path(path) => unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                XATTR_KEY.as_ptr() as *const i8,
+                buf.as_ptr() as *mut libc::c_void,
+                buf.len() as libc::size_t,
+                0,
+                options,
+            )
+        },
+        InodeHandle::Fd(fd) => unsafe {
+            libc::fsetxattr(
+                *fd,
+                XATTR_KEY.as_ptr() as *const i8,
+                buf.as_ptr() as *mut libc::c_void,
+                buf.len() as libc::size_t,
+                0,
+                options,
+            )
+        },
+    };
+
+    if res < 0 {
+        Err(linux_error(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_host_stat(
+    file: &InodeHandle,
+    _owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    // We're only using set_host_stat for LinuxSimplified semantics, and in this
+    // mode we ignore the host's owner bits, so don't attempt to write them here.
+
+    if let Some(mode) = mode {
+        let res = match file {
+            InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), mode as u16) },
+            InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, mode as u16) },
+        };
+
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+    }
+
+    Ok(())
+}
+
+fn set_stat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    file: &InodeHandle,
+    st: Option<bindings::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    match semantics {
+        PermissionSemantics::LinuxComplete => set_xattr_stat(ctx, file, st, owner, mode),
+        PermissionSemantics::LinuxSimplified => set_host_stat(file, owner, mode),
+    }
+}
+
+fn stat_xattr_common(
+    st: &mut bindings::stat64,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u32>,
+) -> io::Result<bindings::stat64> {
+    if let Some(uid) = uid {
+        st.st_uid = uid;
+    }
+    if let Some(gid) = gid {
+        st.st_gid = gid;
+    }
+    if let Some(mode) = mode {
+        if mode as u16 & libc::S_IFMT == 0 {
+            st.st_mode = (st.st_mode & libc::S_IFMT) | mode as u16;
+        } else {
+            st.st_mode = mode as u16;
+        }
+    }
+
+    Ok(*st)
+}
+
+fn fstat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    fd: RawFd,
+    host: bool,
+) -> io::Result<bindings::stat64> {
+    let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+
+    // Safe because the kernel will only write data in `st` and we check the return
+    // value.
+    let res = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+    if res >= 0 {
+        // Safe because the kernel guarantees that the struct is now fully initialized.
+        let mut st = unsafe { st.assume_init() };
+        if !host {
+            match semantics {
+                PermissionSemantics::LinuxComplete => {
+                    let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
+                    stat_xattr_common(&mut st, uid, gid, mode)
+                }
+                PermissionSemantics::LinuxSimplified => {
+                    st.st_uid = ctx.uid;
+                    st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+            }
+        } else {
+            Ok(st)
+        }
+    } else {
+        Err(linux_error(io::Error::last_os_error()))
+    }
+}
+
+fn lstat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    c_path: &CString,
+    host: bool,
+) -> io::Result<bindings::stat64> {
+    let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+
+    // Safe because the kernel will only write data in `st` and we check the return
+    // value.
+    let res = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) };
+    if res >= 0 {
+        // Safe because the kernel guarantees that the struct is now fully initialized.
+        let mut st = unsafe { st.assume_init() };
+        if !host {
+            match semantics {
+                PermissionSemantics::LinuxComplete => {
+                    let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
+                    stat_xattr_common(&mut st, uid, gid, mode)
+                }
+                PermissionSemantics::LinuxSimplified => {
+                    st.st_uid = ctx.uid;
+                    st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+            }
+        } else {
+            Ok(st)
+        }
+    } else {
+        Err(linux_error(io::Error::last_os_error()))
+    }
+}
+
+fn istat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    ihandle: &InodeHandle,
+    host: bool,
+) -> io::Result<bindings::stat64> {
+    match ihandle {
+        InodeHandle::Fd(fd) => fstat(ctx, semantics, *fd, host),
+        InodeHandle::Path(ref c_path) => lstat(ctx, semantics, c_path, host),
+    }
+}
+
+/// The caching policy that the file system should report to the FUSE client. By default the FUSE
+/// protocol uses close-to-open consistency. This means that any cached contents of the file are
+/// invalidated the next time that file is opened.
+#[derive(Debug, Default, Clone)]
+pub enum CachePolicy {
+    /// The client should never cache file data and all I/O should be directly forwarded to the
+    /// server. This policy must be selected when file contents may change without the knowledge of
+    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
+    Never,
+
+    /// The client is free to choose when and how to cache file data. This is the default policy and
+    /// uses close-to-open consistency as described in the enum documentation.
+    #[default]
+    Auto,
+
+    /// The client should always cache file data. This means that the FUSE client will not
+    /// invalidate any cached data that was returned by the file system the last time the file was
+    /// opened. This policy should only be selected when the file system has exclusive access to the
+    /// directory.
+    Always,
+}
+
+impl FromStr for CachePolicy {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
+            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
+            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
+            _ => Err("invalid cache policy"),
+        }
+    }
+}
+
+/// The permission semantics to be emulated by this file system personality.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PermissionSemantics {
+    /// Be as close as possible to the common semantics of Linux file systems.
+    #[default]
+    LinuxComplete,
+
+    /// As `LinuxComplete`, with the following simplifications:
+    ///  - Extended attributes are not supported.
+    ///  - Idmaps are not supported.
+    ///  - Ownership bits are ignored, always returning the uid/gid from the process
+    ///    requesting the operation within the guest (obtained from `Context`).
+    ///  - Permissions bits are stored in the host, not as extended attributes.
+    LinuxSimplified,
+}
+
+impl TryFrom<u32> for PermissionSemantics {
+    type Error = ();
+
+    fn try_from(semantics: u32) -> Result<Self, Self::Error> {
+        match semantics {
+            0 => Ok(PermissionSemantics::LinuxComplete),
+            1 => Ok(PermissionSemantics::LinuxSimplified),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Options that configure the behavior of the file system.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// How long the FUSE client should consider directory entries to be valid. If the contents of a
+    /// directory can only be modified by the FUSE client (i.e., the file system has exclusive
+    /// access), then this should be a large value.
+    ///
+    /// The default value for this option is 5 seconds.
+    pub entry_timeout: Duration,
+
+    /// How long the FUSE client should consider file and directory attributes to be valid. If the
+    /// attributes of a file or directory can only be modified by the FUSE client (i.e., the file
+    /// system has exclusive access), then this should be set to a large value.
+    ///
+    /// The default value for this option is 5 seconds.
+    pub attr_timeout: Duration,
+
+    /// The caching policy the file system should use. See the documentation of `CachePolicy` for
+    /// more details.
+    pub cache_policy: CachePolicy,
+
+    /// Whether the file system should enabled writeback caching. This can improve performance as it
+    /// allows the FUSE client to cache and coalesce multiple writes before sending them to the file
+    /// system. However, enabling this option can increase the risk of data corruption if the file
+    /// contents can change without the knowledge of the FUSE client (i.e., the server does **NOT**
+    /// have exclusive access). Additionally, the file system should have read access to all files
+    /// in the directory it is serving as the FUSE client may send read requests even for files
+    /// opened with `O_WRONLY`.
+    ///
+    /// Therefore callers should only enable this option when they can guarantee that: 1) the file
+    /// system has exclusive access to the directory and 2) the file system has read permissions for
+    /// all files in that directory.
+    ///
+    /// The default value for this option is `false`.
+    pub writeback: bool,
+
+    /// The path of the root directory.
+    ///
+    /// The default is `/`.
+    pub root_dir: String,
+
+    /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
+    /// have a significant impact on performance, especially on write parallelism. This is the result
+    /// of FUSE attempting to remove the special file privileges after each write request.
+    ///
+    /// The default value for this options is `false`.
+    pub xattr: bool,
+
+    /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
+    /// here, so there's no need to open it in PassthroughFs::new(). This is specially useful for
+    /// sandboxing.
+    ///
+    /// The default is `None`.
+    pub proc_sfd_rawfd: Option<RawFd>,
+
+    /// ID of this filesystem to uniquely identify exports. Not supported for macos.
+    pub export_fsid: u64,
+
+    /// Table of exported FDs to share with other subsystems. Not supported for macos.
+    pub export_table: Option<ExportTable>,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            entry_timeout: Duration::from_secs(5),
+            attr_timeout: Duration::from_secs(5),
+            cache_policy: Default::default(),
+            writeback: false,
+            root_dir: String::from("/"),
+            xattr: true,
+            proc_sfd_rawfd: None,
+            export_fsid: 0,
+            export_table: None,
+            semantics: PermissionSemantics::LinuxComplete,
+        }
+    }
+}
+
+/// A file system that simply "passes through" all requests it receives to the underlying file
+/// system. To keep the implementation simple it servers the contents of its root directory. Users
+/// that wish to serve only a specific directory should set up the environment so that that
+/// directory ends up as the root of the file system process. One way to accomplish this is via a
+/// combination of mount namespaces and the pivot_root system call.
+pub struct PassthroughFs {
+    // Keep the configured share open. All named operations are resolved from
+    // this descriptor instead of trusting guest-controlled path text.
+    root: File,
+    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    inode_alloc: Arc<InodeAllocator>,
+
+    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    next_handle: AtomicU64,
+
+    map_windows: Mutex<HashMap<u64, u64>>,
+
+    // Whether writeback caching is enabled for this directory. This will only be true when
+    // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
+    writeback: AtomicBool,
+    announce_submounts: AtomicBool,
+    cfg: Config,
+}
+
+impl PassthroughFs {
+    pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
+        let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let fd = unsafe {
+            libc::openat(
+                libc::AT_FDCWD,
+                root.as_ptr(),
+                libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        // Safe because we just opened this descriptor and transfer ownership
+        // to File.
+        let root = unsafe { File::from_raw_fd(fd) };
+
+        Ok(PassthroughFs {
+            root,
+            inodes: RwLock::new(MultikeyBTreeMap::new()),
+            inode_alloc,
+
+            handles: RwLock::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+
+            map_windows: Mutex::new(HashMap::new()),
+
+            writeback: AtomicBool::new(false),
+            announce_submounts: AtomicBool::new(false),
+            cfg,
+        })
+    }
+
+    fn validate_component(name: &CStr) -> io::Result<()> {
+        let bytes = name.to_bytes();
+        if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+            return Err(einval());
+        }
+        Ok(())
+    }
+
+    fn fd_path(fd: RawFd) -> io::Result<Vec<u8>> {
+        let mut path = vec![0_u8; libc::PATH_MAX as usize];
+        let res = unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let path = CStr::from_bytes_until_nul(&path).map_err(|_| einval())?;
+        Ok(path.to_bytes().to_vec())
+    }
+
+    fn relative_to_root(&self, fd: RawFd) -> io::Result<CString> {
+        let root = Self::fd_path(self.root.as_raw_fd())?;
+        let path = Self::fd_path(fd)?;
+        let relative = if path == root {
+            b".".as_slice()
+        } else if root == b"/" {
+            path.strip_prefix(b"/").ok_or_else(ebadf)?
+        } else {
+            let rest = path.strip_prefix(root.as_slice()).ok_or_else(ebadf)?;
+            rest.strip_prefix(b"/").ok_or_else(ebadf)?
+        };
+        CString::new(relative).map_err(|_| einval())
+    }
+
+    fn inode_anchor(&self, data: &InodeData) -> io::Result<File> {
+        let unlinked_fd = data.unlinked_fd.load(Ordering::Acquire);
+        if unlinked_fd >= 0 {
+            let fd = unsafe { libc::dup(unlinked_fd as RawFd) };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+
+        let path =
+            CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).map_err(|_| einval())?;
+        let mut fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP) {
+            fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_SYMLINK,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_contained_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let anchor = self.inode_anchor(&data)?;
+
+        // Unlinked files have no name to resolve. Their retained descriptor was
+        // captured while the inode was still below the share root.
+        if data.unlinked_fd.load(Ordering::Acquire) >= 0 {
+            return Ok(anchor);
+        }
+
+        let relative = self.relative_to_root(anchor.as_raw_fd())?;
+        let fd = unsafe {
+            libc::openat(
+                self.root.as_raw_fd(),
+                relative.as_ptr(),
+                (flags & !libc::O_NOFOLLOW)
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW_ANY
+                    | O_RESOLVE_BENEATH,
+            )
+        };
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let st = fstat(
+            &Context {
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            self.cfg.semantics,
+            file.as_raw_fd(),
+            true,
+        )?;
+        if st.st_dev != data.dev || st.st_ino != data.ino {
+            return Err(ebadf());
+        }
+        Ok(file)
+    }
+
+    fn open_parent(&self, parent: Inode, name: &CStr) -> io::Result<File> {
+        Self::validate_component(name)?;
+        self.open_contained_inode(
+            parent,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    }
+
+    fn create_socket_at(parent_fd: RawFd, name: &CStr) -> io::Result<()> {
+        // Darwin has no bindat(2). Bind in a private host-owned directory,
+        // then move the socket node into the descriptor-rooted destination.
+        // Guest-controlled text is never part of an absolute host path.
+        let mut template = b"/tmp/socktainer-virtiofs.XXXXXX\0".to_vec();
+        let temp_dir = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        if temp_dir.is_null() {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let temp_dir = unsafe { CStr::from_ptr(temp_dir) };
+        let temp_fd = unsafe {
+            libc::open(
+                temp_dir.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if temp_fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe { libc::rmdir(temp_dir.as_ptr()) };
+            return Err(linux_error(error));
+        }
+        let temp_fd = unsafe { File::from_raw_fd(temp_fd) };
+        let socket_name = c"socket";
+        let mut socket_path = temp_dir.to_bytes().to_vec();
+        socket_path.extend_from_slice(b"/socket\0");
+        let socket_path = CStr::from_bytes_with_nul(&socket_path).map_err(|_| einval())?;
+
+        let result = UnixListener::bind(Path::new(std::ffi::OsStr::from_bytes(
+            socket_path.to_bytes(),
+        )))
+        .map_err(linux_error)
+        .and_then(|listener| {
+            drop(listener);
+            let renamed = unsafe {
+                libc::renameat(
+                    temp_fd.as_raw_fd(),
+                    socket_name.as_ptr(),
+                    parent_fd,
+                    name.as_ptr(),
+                )
+            };
+            if renamed < 0 {
+                Err(linux_error(io::Error::last_os_error()))
+            } else {
+                Ok(())
+            }
+        });
+
+        if result.is_err() {
+            unsafe { libc::unlinkat(temp_fd.as_raw_fd(), socket_name.as_ptr(), 0) };
+        }
+        drop(temp_fd);
+        unsafe { libc::rmdir(temp_dir.as_ptr()) };
+        result
+    }
+
+    fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
+        debug!("inode_to_handle: inode={inode}");
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let cstr =
+            CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).map_err(|_| einval())?;
+        debug!("inode_to_handle: path={}", cstr.to_string_lossy());
+
+        if supports_fd {
+            let unlinked_fd = data.unlinked_fd.load(Ordering::Acquire);
+            if unlinked_fd >= 0 {
+                return Ok(InodeHandle::Fd(unlinked_fd as RawFd));
+            }
+        }
+
+        // Reject an inode that the host moved out of the configured share
+        // after lookup. The volfs path is an inode locator, not a containment
+        // mechanism by itself.
+        let anchor = self.inode_anchor(&data)?;
+        self.relative_to_root(anchor.as_raw_fd())?;
+
+        Ok(InodeHandle::Path(cstr))
+    }
+
+    fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
+        // When writeback caching is enabled, the kernel may send read requests even if the
+        // userspace program opened the file write-only. So we need to ensure that we have opened
+        // the file for reading as well as writing.
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
+            flags &= !libc::O_ACCMODE;
+            flags |= libc::O_RDWR;
+        }
+
+        // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
+        // However, this breaks atomicity as the file may have changed on disk, invalidating the
+        // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
+        // the file. Just allow this for now as it is the user's responsibility to enable writeback
+        // caching only for directories that are not shared. It also means that we need to clear the
+        // `O_APPEND` flag.
+        if writeback && flags & libc::O_APPEND != 0 {
+            flags &= !libc::O_APPEND;
+        }
+
+        self.open_contained_inode(inode, flags & (!libc::O_NOFOLLOW) & (!libc::O_EXLOCK))
+    }
+
+    fn do_readdir<F>(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        size: u32,
+        mut offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry) -> io::Result<usize>,
+    {
+        if size == 0 {
+            return Ok(());
+        }
+
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let mut ds = data.dirstream.lock().unwrap();
+
+        // We use offset == 0 as an indicator of this being either a fresh directory
+        // stream or a stream that has been rewound. If that's the case, make sure
+        // the cache will be refreshed.
+        if offset == 0 && ds.ready {
+            let fd = data.file.write().unwrap().as_raw_fd();
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            ds.entries.clear();
+            ds.ready = false;
+        }
+
+        if !ds.ready {
+            // Fill the cache on first call
+            if let Err(e) = ds.fill_from_fd(data.file.write().unwrap().as_raw_fd()) {
+                if ds.entries.is_empty() {
+                    return Err(e);
+                }
+                // If we got some valid entries before error happened,
+                // treat this partial read as success and just log
+                // the error.
+                warn!("virtio-fs: error in readdir {}: {:?}", inode, e);
+            }
+            ds.ready = true;
+        }
+
+        while let Some(entry) = ds.get_entry(offset) {
+            offset += 1;
+
+            let name = entry.name;
+            match add_entry(entry) {
+                Ok(size) => {
+                    if size == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "virtio-fs: error adding entry {}: {:?}",
+                        String::from_utf8_lossy(name),
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn do_open(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let flags = self.parse_open_flags(flags as i32);
+
+        let file = RwLock::new(self.open_inode(inode, flags)?);
+
+        // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability and suid/sgid
+        if (flags & libc::O_TRUNC) != 0 && kill_priv {
+            let fd = file.read().unwrap().as_raw_fd();
+            let ihandle = InodeHandle::Fd(fd);
+
+            remove_security_capability(&ihandle);
+
+            if let Ok(st) = fstat(ctx, self.cfg.semantics, fd, false) {
+                let new_mode = clear_suid_sgid(st.st_mode as u32);
+                if new_mode != st.st_mode as u32 {
+                    if let Err(err) = set_stat(
+                        ctx,
+                        self.cfg.semantics,
+                        &ihandle,
+                        Some(st),
+                        None,
+                        Some(new_mode),
+                    ) {
+                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
+                    }
+                }
+            }
+        }
+
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData {
+            inode,
+            file,
+            dirstream: Mutex::new(DirStream::new()),
+        };
+
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            // We only set the direct I/O option on files.
+            CachePolicy::Never => opts.set(OpenOptions::DIRECT_IO, flags & libc::O_DIRECTORY == 0),
+            CachePolicy::Always => {
+                if flags & libc::O_DIRECTORY == 0 {
+                    opts |= OpenOptions::KEEP_CACHE;
+                } else {
+                    opts |= OpenOptions::CACHE_DIR;
+                }
+            }
+            _ => {}
+        };
+
+        Ok((Some(handle), opts))
+    }
+
+    fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
+        let mut handles = self.handles.write().unwrap();
+
+        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
+            if e.get().inode == inode {
+                // We don't need to close the file here because that will happen automatically when
+                // the last `Arc` is dropped.
+                e.remove();
+                return Ok(());
+            }
+        }
+
+        Err(ebadf())
+    }
+
+    fn do_getattr(&self, ctx: &Context, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
+        let ihandle = self.inode_to_handle(inode, true)?;
+        let st = match ihandle {
+            InodeHandle::Path(c_path) => lstat(ctx, self.cfg.semantics, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(ctx, self.cfg.semantics, fd, false)?,
+        };
+
+        Ok((st, self.cfg.attr_timeout))
+    }
+
+    fn grab_unlinked_fd(&self, parent_fd: RawFd, name: &CStr) -> io::Result<RawFd> {
+        let fd =
+            unsafe { libc::openat(parent_fd, name.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
+    }
+
+    fn store_unlinked_fd(&self, ctx: &Context, unlinked_fd: RawFd) -> io::Result<bool> {
+        let st = fstat(ctx, self.cfg.semantics, unlinked_fd, true)?;
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        };
+        // Hold the read lock across the swap: dropping it earlier would let a
+        // concurrent `forget` remove this inode (closing its then-`-1`
+        // `unlinked_fd`) between our lookup and swap, leaking the fd we store.
+        let inodes = self.inodes.read().unwrap();
+        if let Some(data) = inodes.get_alt(&altkey) {
+            // Swap rather than store so that if this inode already had a
+            // preserved fd (e.g. another hard link was unlinked/overwritten
+            // earlier), we recover and close it instead of leaking it.
+            let old_fd = data.unlinked_fd.swap(unlinked_fd as i64, Ordering::AcqRel);
+            if old_fd >= 0 {
+                unsafe { libc::close(old_fd as RawFd) };
+            }
+            // The tracked inode now owns `unlinked_fd` (closed in `forget_one`).
+            Ok(true)
+        } else {
+            // No tracked inode for this (dev, ino): the caller keeps ownership
+            // of `unlinked_fd` and must close it to avoid a leak.
+            Ok(false)
+        }
+    }
+
+    fn do_unlink(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        flags: libc::c_int,
+    ) -> io::Result<()> {
+        let parent_fd = self.open_parent(parent, name)?;
+        let fd = parent_fd.as_raw_fd();
+
+        // After unlinking this inode, we can't keep relying on getting a "/.vol/..." path
+        // to operate on it. Before unlinking the inode, grab a file descriptor so we can
+        // still operate on it. This one will be closed on "forget_one".
+        let unlinked_fd = match self.grab_unlinked_fd(fd, name) {
+            Ok(fd) => Some(fd),
+            Err(err) => {
+                warn!(
+                    "Couldn't grab a file descriptor for file \"{}\": {err}",
+                    name.to_string_lossy()
+                );
+                None
+            }
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::unlinkat(fd, name.as_ptr(), flags) };
+        let err = io::Error::last_os_error();
+
+        if res == 0 {
+            if let Some(unlinked_fd) = unlinked_fd {
+                match self.store_unlinked_fd(&ctx, unlinked_fd) {
+                    // The tracked inode took ownership of the fd.
+                    Ok(true) => {}
+                    // No tracked inode: we still own the fd and must close it.
+                    Ok(false) => unsafe {
+                        libc::close(unlinked_fd);
+                    },
+                    Err(err) => {
+                        unsafe { libc::close(unlinked_fd) };
+                        warn!("Couldn't store unlinked fd \"{}\": {err}", unlinked_fd);
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            if let Some(unlinked_fd) = unlinked_fd {
+                unsafe { libc::close(unlinked_fd) };
+            }
+            Err(linux_error(err))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod_complete(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let parent_fd = self.open_parent(parent, name)?;
+
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            Err(linux_error(io::Error::last_os_error()))
+        } else {
+            let ihandle = InodeHandle::Fd(fd);
+
+            // Set security context
+            if let Some(secctx) = extensions.secctx {
+                set_secctx(&ihandle, secctx, false)?
+            };
+
+            // For mknod, we're forced to store the mode as xattr even in
+            // simplified mode, since macOS doesn't allow unprivileged users
+            // to create special files (such as sockets or fifos) using mknod.
+            if let Err(e) = set_xattr_stat(
+                &ctx,
+                &ihandle,
+                None,
+                Some((ctx.uid, ctx.gid)),
+                Some(mode & !umask),
+            ) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+
+            unsafe { libc::close(fd) };
+            self.lookup(ctx, parent, name)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod_simplified(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let parent_fd = self.open_parent(parent, name)?;
+
+        // macOS does not create UNIX sockets with mknodat(2).
+        if (mode as u16 & libc::S_IFMT) == libc::S_IFSOCK {
+            Self::create_socket_at(parent_fd.as_raw_fd(), name)?;
+        } else {
+            let res = unsafe {
+                libc::mknodat(
+                    parent_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    (mode & !umask) as u16,
+                    rdev as i32,
+                )
+            };
+            if res < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        // Set security context
+        if let Some(secctx) = extensions.secctx {
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            let ihandle = InodeHandle::Fd(fd);
+            set_secctx(&ihandle, secctx, false)?;
+            unsafe { libc::close(fd) };
+        };
+        self.lookup(ctx, parent, name)
+    }
+
+    fn parse_open_flags(&self, flags: i32) -> i32 {
+        let mut mflags: i32 = flags & 0b11;
+
+        if (flags & bindings::LINUX_O_NONBLOCK) != 0 {
+            mflags |= libc::O_NONBLOCK;
+        }
+        if (flags & bindings::LINUX_O_APPEND) != 0 {
+            mflags |= libc::O_APPEND;
+        }
+        if (flags & bindings::LINUX_O_CREAT) != 0 {
+            mflags |= libc::O_CREAT;
+        }
+        if (flags & bindings::LINUX_O_TRUNC) != 0 {
+            mflags |= libc::O_TRUNC;
+        }
+        if (flags & bindings::LINUX_O_EXCL) != 0 {
+            mflags |= libc::O_EXCL;
+        }
+        if (flags & bindings::LINUX_O_NOFOLLOW) != 0 {
+            mflags |= libc::O_NOFOLLOW;
+        }
+        if (flags & bindings::LINUX_O_CLOEXEC) != 0 {
+            mflags |= libc::O_CLOEXEC;
+        }
+
+        mflags
+    }
+}
+
+fn do_set_secctx(file: &InodeHandle, secctx: &SecContext, options: i32) -> io::Result<()> {
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                secctx.name.as_ptr(),
+                secctx.secctx.as_ptr() as *const libc::c_void,
+                secctx.secctx.len(),
+                0,
+                options,
+            )
+        },
+        InodeHandle::Fd(fd) => unsafe {
+            libc::fsetxattr(
+                *fd,
+                secctx.name.as_ptr(),
+                secctx.secctx.as_ptr() as *const libc::c_void,
+                secctx.secctx.len(),
+                0,
+                options,
+            )
+        },
+    };
+
+    if ret != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn set_secctx(file: &InodeHandle, secctx: SecContext, symlink: bool) -> io::Result<()> {
+    let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
+
+    match do_set_secctx(file, &secctx, options) {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            let err_os = err.raw_os_error();
+            if err_os != Some(libc::EACCES) && err_os != Some(libc::EPERM) {
+                return Err(linux_error(err));
+            }
+        }
+    }
+
+    // The file mode doesn't allow setting xattrs. Temporarily grant the owner
+    // write permission, set the attribute, then restore the original mode.
+    let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) },
+        InodeHandle::Fd(fd) => unsafe { libc::fstat(*fd, st.as_mut_ptr()) },
+    };
+    if ret < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    let st = unsafe { st.assume_init() };
+
+    let tmp_mode = st.st_mode | libc::S_IWUSR;
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), tmp_mode) },
+        InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, tmp_mode) },
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        error!("set_secctx: chmod failed: {}", err);
+        return Err(linux_error(err));
+    }
+
+    let secctx_ret = do_set_secctx(file, &secctx, options);
+
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), st.st_mode) },
+        InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, st.st_mode) },
+    };
+    if ret < 0 {
+        error!(
+            "set_secctx: chmod restore failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    match secctx_ret {
+        Ok(()) => Ok(()),
+        Err(err) => Err(linux_error(err)),
+    }
+}
+
+/// Remove the security.capability extended attribute
+fn remove_security_capability(file: &InodeHandle) {
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe {
+            libc::removexattr(path.as_ptr(), SECURITY_CAPABILITY.as_ptr() as *const i8, 0)
+        },
+        InodeHandle::Fd(fd) => unsafe {
+            libc::fremovexattr(*fd, SECURITY_CAPABILITY.as_ptr() as *const i8, 0)
+        },
+    };
+
+    // ENODATA means the attribute didn't exist, which is fine
+    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
+        warn!("Error removing security.capability from file");
+    }
+}
+
+/// Clear suid/sgid bits from mode.
+/// sgid is cleared only if group executable bit is set.
+fn clear_suid_sgid(mode: u32) -> u32 {
+    let mut new_mode = mode;
+
+    // Clear suid bit
+    new_mode &= !libc::S_ISUID as u32;
+
+    // Clear sgid bit only if group executable bit is set
+    if (mode & libc::S_IXGRP as u32) != 0 {
+        new_mode &= !libc::S_ISGID as u32;
+    }
+
+    new_mode
+}
+
+fn forget_one(
+    inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
+    inode: Inode,
+    count: u64,
+) {
+    if let Some(data) = inodes.get(&inode) {
+        // Acquiring the write lock on the inode map prevents new lookups from incrementing the
+        // refcount but there is the possibility that a previous lookup already acquired a
+        // reference to the inode data and is in the process of updating the refcount so we need
+        // to loop here until we can decrement successfully.
+        loop {
+            let refcount = data.refcount.load(Ordering::Relaxed);
+
+            // Saturating sub because it doesn't make sense for a refcount to go below zero and
+            // we don't want misbehaving clients to cause integer overflow.
+            let new_count = refcount.saturating_sub(count);
+
+            // Synchronizes with the acquire load in `lookup`.
+            if data
+                .refcount
+                .compare_exchange(refcount, new_count, Ordering::Release, Ordering::Relaxed)
+                .unwrap()
+                == refcount
+            {
+                if new_count == 0 {
+                    // If we have unlinked this inode, we have opened a file descriptor to be
+                    // able to operate on it without a path. Close it now.
+                    let fd = data.unlinked_fd.load(Ordering::Acquire);
+                    if fd >= 0 {
+                        unsafe { libc::close(fd as RawFd) };
+                    }
+                    // We just removed the last refcount for this inode. There's no need for an
+                    // acquire fence here because we hold a write lock on the inode map and any
+                    // thread that is waiting to do a forget on the same inode will have to wait
+                    // until we release the lock. So there's is no other release store for us to
+                    // synchronize with before deleting the entry.
+                    inodes.remove(&inode);
+                }
+                break;
+            }
+        }
+    }
+}
+
+impl FileSystem for PassthroughFs {
+    type Inode = Inode;
+    type Handle = Handle;
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Build a fake Context for fstat, it won't be using it anyways
+        // as it'll be only looking at the host's bits.
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let st = fstat(&ctx, self.cfg.semantics, self.root.as_raw_fd(), true)?;
+
+        // Safe because this doesn't modify any memory and there is no need to check the return
+        // value because this system call always succeeds. We need to clear the umask here because
+        // we want the client to be able to set all the bits in the mode.
+        unsafe { libc::umask(0o000) };
+
+        let mut inodes = self.inodes.write().unwrap();
+
+        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+        inodes.insert(
+            fuse::ROOT_ID,
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+            },
+            Arc::new(InodeData {
+                inode: fuse::ROOT_ID,
+                ino: st.st_ino,
+                dev: st.st_dev,
+                refcount: AtomicU64::new(2),
+                unlinked_fd: AtomicI64::new(-1),
+            }),
+        );
+
+        let mut opts = FsOptions::empty();
+        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+            opts |= FsOptions::WRITEBACK_CACHE;
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+
+        if capable.contains(FsOptions::SUBMOUNTS) {
+            opts |= FsOptions::SUBMOUNTS;
+            self.announce_submounts.store(true, Ordering::Relaxed);
+        }
+
+        Ok(opts)
+    }
+
+    fn destroy(&self) {
+        self.handles.write().unwrap().clear();
+        self.inodes.write().unwrap().clear();
+    }
+
+    fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
+        let mut out = MaybeUninit::<bindings::statvfs64>::zeroed();
+
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                bindings::statvfs64(c_path.as_ptr(), out.as_mut_ptr())
+            },
+            InodeHandle::Fd(fd) => unsafe { bindings::fstatvfs64(fd, out.as_mut_ptr()) },
+        };
+        if res == 0 {
+            // Safe because the kernel guarantees that `out` has been initialized.
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let parent_data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let parent_fd = self.open_parent(parent, name)?;
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+        let res = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let mut st = unsafe { st.assume_init() };
+        if !matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) {
+            let open_flags = if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                libc::O_SYMLINK
+            } else {
+                libc::O_EVTONLY | libc::O_NOFOLLOW
+            };
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    open_flags | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
+                st = stat_xattr_common(&mut st, uid, gid, mode)?;
+                unsafe { libc::close(fd) };
+            }
+        } else {
+            st.st_uid = ctx.uid;
+            st.st_gid = ctx.gid;
+        }
+
+        debug!(
+            "lookup: parent={} name={:?} inode={}",
+            parent, name, st.st_ino
+        );
+
+        let mut attr_flags: u32 = 0;
+
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && (st.st_dev != parent_data.dev)
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        };
+        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+
+        let inode = if let Some(data) = data {
+            // Matches with the release store in `forget`.
+            data.refcount.fetch_add(1, Ordering::Acquire);
+            data.inode
+        } else {
+            // There is a possible race here where 2 threads end up adding the same file
+            // into the inode list.  However, since each of those will get a unique Inode
+            // value and unique file descriptors this shouldn't be that much of a problem.
+            let inode = self.inode_alloc.next();
+            self.inodes.write().unwrap().insert(
+                inode,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                },
+                Arc::new(InodeData {
+                    inode,
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    refcount: AtomicU64::new(1),
+                    unlinked_fd: AtomicI64::new(-1),
+                }),
+            );
+
+            inode
+        };
+
+        Ok(Entry {
+            inode,
+            generation: 0,
+            attr: st,
+            attr_flags,
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
+        })
+    }
+
+    fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+        let mut inodes = self.inodes.write().unwrap();
+
+        forget_one(&mut inodes, inode, count)
+    }
+
+    fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
+        let mut inodes = self.inodes.write().unwrap();
+
+        for (inode, count) in requests {
+            forget_one(&mut inodes, inode, count)
+        }
+    }
+
+    fn opendir(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        self.do_open(&ctx, inode, false, flags | libc::O_DIRECTORY as u32)
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _flags: u32,
+        handle: Handle,
+    ) -> io::Result<()> {
+        self.do_release(inode, handle)
+    }
+
+    fn mkdir(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let parent_fd = self.open_parent(parent, name)?;
+
+        let (host_mode, complete) = match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => (0o700, true),
+            PermissionSemantics::LinuxSimplified => ((mode & !umask) as u16, false),
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), host_mode) };
+        if res == 0 {
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            let ihandle = InodeHandle::Fd(fd);
+            // Set security context
+            if let Some(secctx) = extensions.secctx {
+                set_secctx(&ihandle, secctx, false)?
+            };
+
+            if complete {
+                set_stat(
+                    &ctx,
+                    self.cfg.semantics,
+                    &ihandle,
+                    None,
+                    Some((ctx.uid, ctx.gid)),
+                    Some(mode & !umask),
+                )?;
+            }
+            unsafe { libc::close(fd) };
+            self.lookup(ctx, parent, name)
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn rmdir(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.do_unlink(ctx, parent, name, libc::AT_REMOVEDIR)
+    }
+
+    fn readdir<F>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        size: u32,
+        offset: u64,
+        add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry) -> io::Result<usize>,
+    {
+        self.do_readdir(inode, handle, size, offset, add_entry)
+    }
+
+    fn readdirplus<F>(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        size: u32,
+        offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+    {
+        self.do_readdir(inode, handle, size, offset, |dir_entry| {
+            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
+            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
+            // way for us to know exactly how many padding bytes there are. This would cause
+            // `CStr::from_bytes_with_nul` to return an error because it would think there are
+            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
+            // so we'll just skip the checks here.
+            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
+            let entry = self.lookup(ctx, inode, name)?;
+
+            add_entry(dir_entry, entry)
+        })
+    }
+
+    fn open(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        self.do_open(&ctx, inode, kill_priv, flags)
+    }
+
+    fn release(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _flags: u32,
+        handle: Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        self.do_release(inode, handle)
+    }
+
+    fn create(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        let parent_fd = self.open_parent(parent, name)?;
+
+        let flags = self.parse_open_flags(flags as i32);
+        let (host_mode, complete) = match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                let mode = if (flags & libc::O_DIRECTORY) != 0 {
+                    0o700
+                } else {
+                    0o600
+                };
+                (mode, true)
+            }
+            PermissionSemantics::LinuxSimplified => (mode & !(umask & 0o777), false),
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value. We don't
+        // really check `flags` because if the kernel can't handle poorly specified flags then we
+        // have much bigger problems.
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                host_mode,
+            )
+        };
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let ihandle = InodeHandle::Fd(fd);
+
+        if complete {
+            if let Err(e) = set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                None,
+                Some((ctx.uid, ctx.gid)),
+                Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
+            ) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+        }
+
+        // Set security context
+        if let Some(secctx) = extensions.secctx {
+            set_secctx(&ihandle, secctx, false)?
+        };
+
+        // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability.
+        // We don't need to clear suid/sgid here because we've just updated them
+        // unconditionally above.
+        if (flags & libc::O_TRUNC) != 0 && kill_priv {
+            remove_security_capability(&ihandle);
+        }
+
+        // Safe because we just opened this fd.
+        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+
+        let entry = self.lookup(ctx, parent, name)?;
+
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData {
+            inode: entry.inode,
+            file,
+            dirstream: Mutex::new(DirStream::new()),
+        };
+
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        };
+
+        Ok((entry, Some(handle), opts))
+    }
+
+    fn unlink(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.do_unlink(ctx, parent, name, 0)
+    }
+
+    fn read<W: io::Write + ZeroCopyWriter>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mut w: W,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        debug!("read: {inode:?}");
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        // This is safe because write_from uses preadv64, so the underlying file descriptor
+        // offset is not affected by this operation.
+        let f = data.file.read().unwrap();
+        w.write_from(&f, size as usize, offset)
+    }
+
+    fn write<R: io::Read + ZeroCopyReader>(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        // This is safe because read_to uses pwritev64, so the underlying file descriptor
+        // offset is not affected by this operation.
+        let f = data.file.read().unwrap();
+        let result = r.read_to(&f, size as usize, offset);
+
+        // If write succeeded and kill_priv is set, clear security.capability and suid/sgid
+        if result.is_ok() && kill_priv {
+            let fd = f.as_raw_fd();
+            let ihandle = InodeHandle::Fd(fd);
+
+            remove_security_capability(&ihandle);
+
+            if let Ok(st) = fstat(&ctx, self.cfg.semantics, fd, false) {
+                let new_mode = clear_suid_sgid(st.st_mode as u32);
+                if new_mode != st.st_mode as u32 {
+                    // Update mode in xattr
+                    if let Err(err) = set_stat(
+                        &ctx,
+                        self.cfg.semantics,
+                        &ihandle,
+                        Some(st),
+                        None,
+                        Some(new_mode),
+                    ) {
+                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn getattr(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        _handle: Option<Handle>,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        self.do_getattr(&ctx, inode)
+    }
+
+    fn setattr(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        attr: bindings::stat64,
+        handle: Option<Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        // If we have a handle then use it otherwise get a new fd from the inode.
+        let ihandle = if let Some(handle) = handle {
+            let hd = self
+                .handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .filter(|hd| hd.inode == inode)
+                .cloned()
+                .ok_or_else(ebadf)?;
+
+            let fd = hd.file.write().unwrap().as_raw_fd();
+            InodeHandle::Fd(fd)
+        } else {
+            self.inode_to_handle(inode, true)?
+        };
+
+        if valid.contains(SetattrValid::MODE) {
+            set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                None,
+                None,
+                Some(attr.st_mode as u32),
+            )?
+        }
+
+        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+            let uid = if valid.contains(SetattrValid::UID) {
+                attr.st_uid
+            } else {
+                // Cannot use -1 here because these are unsigned values.
+                u32::MAX
+            };
+            let gid = if valid.contains(SetattrValid::GID) {
+                attr.st_gid
+            } else {
+                // Cannot use -1 here because these are unsigned values.
+                u32::MAX
+            };
+
+            remove_security_capability(&ihandle);
+            let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
+
+            // Clear suid/sgid if UID or GID is being changed
+            let new_mode = clear_suid_sgid(st.st_mode as u32);
+            let new_mode = if new_mode != st.st_mode as u32 {
+                Some(new_mode)
+            } else {
+                None
+            };
+            set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                Some(st),
+                Some((uid, gid)),
+                new_mode,
+            )?;
+        }
+
+        if valid.contains(SetattrValid::SIZE) {
+            // Safe because this doesn't modify any memory and we check the return value.
+            match ihandle {
+                InodeHandle::Fd(fd) => {
+                    let res = unsafe { libc::ftruncate(fd, attr.st_size) };
+                    if res < 0 {
+                        return Err(linux_error(io::Error::last_os_error()));
+                    }
+
+                    // Clear security.capability on truncate unconditionally
+                    remove_security_capability(&ihandle);
+                    let st = fstat(&ctx, self.cfg.semantics, fd, false)?;
+                    let new_mode = clear_suid_sgid(st.st_mode as u32);
+                    if new_mode != st.st_mode as u32 {
+                        set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &ihandle,
+                            Some(st),
+                            None,
+                            Some(new_mode),
+                        )?;
+                    }
+                }
+                InodeHandle::Path(_) => {
+                    // There is no `ftruncateat` so we need to get a new fd and truncate it.
+                    let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
+                    let res = unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) };
+                    if res < 0 {
+                        return Err(linux_error(io::Error::last_os_error()));
+                    }
+
+                    // Clear security.capability on truncate unconditionally
+                    //
+                    // Do this here even if it means duplicating the code above to be able to
+                    // reuse the FD we just opened, thus reducing the number of syscalls.
+                    let ihandle = InodeHandle::Fd(f.as_raw_fd());
+                    remove_security_capability(&ihandle);
+                    let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
+                    let new_mode = clear_suid_sgid(st.st_mode as u32);
+                    if new_mode != st.st_mode as u32 {
+                        set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &ihandle,
+                            Some(st),
+                            None,
+                            Some(new_mode),
+                        )?;
+                    }
+                }
+            };
+        }
+
+        if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
+            let mut tvs = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+            ];
+
+            if valid.contains(SetattrValid::ATIME_NOW) {
+                tvs[0].tv_nsec = libc::UTIME_NOW;
+            } else if valid.contains(SetattrValid::ATIME) {
+                tvs[0].tv_sec = attr.st_atime;
+                tvs[0].tv_nsec = attr.st_atime_nsec;
+            }
+
+            if valid.contains(SetattrValid::MTIME_NOW) {
+                tvs[1].tv_nsec = libc::UTIME_NOW;
+            } else if valid.contains(SetattrValid::MTIME) {
+                tvs[1].tv_sec = attr.st_mtime;
+                tvs[1].tv_nsec = attr.st_mtime_nsec;
+            }
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            let res = match ihandle {
+                InodeHandle::Fd(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
+                InodeHandle::Path(ref c_path) => unsafe {
+                    let fd = libc::open(c_path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC);
+                    let res = libc::futimens(fd, tvs.as_ptr());
+                    libc::close(fd);
+                    res
+                },
+            };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        self.do_getattr(&ctx, inode)
+    }
+
+    fn rename(
+        &self,
+        ctx: Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let mut mflags: u32 = 0;
+        if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
+            mflags |= libc::RENAME_EXCL;
+        }
+        if ((flags as i32) & bindings::LINUX_RENAME_EXCHANGE) != 0 {
+            mflags |= libc::RENAME_SWAP;
+        }
+
+        if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0
+            && ((flags as i32) & bindings::LINUX_RENAME_EXCHANGE) != 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        let olddir_fd = self.open_parent(olddir, oldname)?;
+        let newdir_fd = self.open_parent(newdir, newname)?;
+
+        // macOS addresses inodes by their volfs path ("/.vol/{dev}/{ino}"),
+        // which only resolves while the inode still has a directory entry. A
+        // rename that REPLACES an existing target drops that target's last
+        // link, so any inode the guest still holds open there would afterwards
+        // resolve to a dangling volfs path and fail path-based ops
+        // (getattr/open/setattr/...) with ENOENT (e.g. apt/dpkg's atomic
+        // rewrite of /var/lib/dpkg/status, surfaced as
+        // "close (2: No such file or directory)"). `do_unlink` already guards
+        // the unlink case by stashing an fd to the doomed inode in
+        // `InodeData.unlinked_fd`; mirror that for the overwritten target. Grab
+        // it *before* the rename, while its entry still exists. RENAME_SWAP
+        // keeps both inodes linked and RENAME_EXCL never overwrites, so skip
+        // those; best-effort otherwise (a non-overwriting rename finds nothing).
+        let doomed_fd = if (flags as i32)
+            & (bindings::LINUX_RENAME_EXCHANGE | bindings::LINUX_RENAME_NOREPLACE)
+            == 0
+        {
+            self.grab_unlinked_fd(newdir_fd.as_raw_fd(), newname).ok()
+        } else {
+            None
+        };
+
+        let res = unsafe {
+            libc::renameatx_np(
+                olddir_fd.as_raw_fd(),
+                oldname.as_ptr(),
+                newdir_fd.as_raw_fd(),
+                newname.as_ptr(),
+                mflags,
+            )
+        };
+        if res == 0 {
+            // If the rename overwrote a tracked inode, hand its preserved fd to
+            // the inode store so later ops resolve by fd, not the vanished path.
+            // `store_unlinked_fd` takes ownership only when that inode is
+            // tracked; close the fd ourselves otherwise so it is never leaked.
+            if let Some(fd) = doomed_fd {
+                match self.store_unlinked_fd(&ctx, fd) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => unsafe {
+                        libc::close(fd);
+                    },
+                }
+            }
+
+            if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
+                let (host_mode, complete) = match self.cfg.semantics {
+                    PermissionSemantics::LinuxComplete => (0o600, true),
+                    PermissionSemantics::LinuxSimplified => {
+                        (((libc::S_IFCHR | 0o600) as u32), false)
+                    }
+                };
+                let fd = unsafe {
+                    libc::openat(
+                        olddir_fd.as_raw_fd(),
+                        oldname.as_ptr(),
+                        libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        host_mode,
+                    )
+                };
+                if fd > 0 {
+                    if complete {
+                        if let Err(e) = set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &InodeHandle::Fd(fd),
+                            None,
+                            None,
+                            Some((libc::S_IFCHR | 0o600) as u32),
+                        ) {
+                            unsafe { libc::close(fd) };
+                            return Err(e);
+                        }
+                    }
+
+                    unsafe { libc::close(fd) };
+                }
+            }
+
+            let entry = self.lookup(ctx, newdir, newname)?;
+            self.forget(ctx, entry.inode, 1);
+
+            Ok(())
+        } else {
+            if let Some(fd) = doomed_fd {
+                // The rename failed; nothing was overwritten. Drop the fd.
+                unsafe { libc::close(fd) };
+            }
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn mknod(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                self.mknod_complete(ctx, parent, name, mode, rdev, umask, extensions)
+            }
+            PermissionSemantics::LinuxSimplified => {
+                self.mknod_simplified(ctx, parent, name, mode, rdev, umask, extensions)
+            }
+        }
+    }
+
+    fn link(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        newparent: Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        let source_data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let source = self.inode_anchor(&source_data)?;
+        let source_path = self.relative_to_root(source.as_raw_fd())?;
+        let newparent_fd = self.open_parent(newparent, newname)?;
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::linkat(
+                self.root.as_raw_fd(),
+                source_path.as_ptr(),
+                newparent_fd.as_raw_fd(),
+                newname.as_ptr(),
+                AT_SYMLINK_NOFOLLOW_ANY | AT_RESOLVE_BENEATH,
+            )
+        };
+        if res == 0 {
+            self.lookup(ctx, newparent, newname)
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: Inode,
+        name: &CStr,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let parent_fd = self.open_parent(parent, name)?;
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res =
+            unsafe { libc::symlinkat(linkname.as_ptr(), parent_fd.as_raw_fd(), name.as_ptr()) };
+        if res == 0 {
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_SYMLINK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            let ihandle = InodeHandle::Fd(fd);
+
+            // Set security context
+            if let Some(secctx) = extensions.secctx {
+                set_secctx(&ihandle, secctx, true)?
+            };
+
+            let mut entry = self.lookup(ctx, parent, name)?;
+            if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+                let mode = libc::S_IFLNK | 0o777;
+                set_stat(
+                    &ctx,
+                    self.cfg.semantics,
+                    &ihandle,
+                    None,
+                    Some((ctx.uid, ctx.gid)),
+                    Some(mode as u32),
+                )?;
+                entry.attr.st_uid = ctx.uid;
+                entry.attr.st_gid = ctx.gid;
+                entry.attr.st_mode = mode;
+            }
+            unsafe { libc::close(fd) };
+            Ok(entry)
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0; libc::PATH_MAX as usize];
+
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                libc::readlink(
+                    c_path.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::freadlink(fd, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) as isize
+            },
+        };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        buf.resize(res as usize, 0);
+        Ok(buf)
+    }
+
+    fn flush(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        // Since this method is called whenever an fd is closed in the client, we can emulate that
+        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
+        // because this doesn't modify any memory and we check the return values.
+        unsafe {
+            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
+            if newfd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+
+            if libc::close(newfd) < 0 {
+                Err(linux_error(io::Error::last_os_error()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn fsync(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _datasync: bool,
+        handle: Handle,
+    ) -> io::Result<()> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let fd = data.file.write().unwrap().as_raw_fd();
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::fsync(fd) };
+
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn fsyncdir(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        datasync: bool,
+        handle: Handle,
+    ) -> io::Result<()> {
+        self.fsync(ctx, inode, datasync, handle)
+    }
+
+    fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        let st = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.semantics, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.semantics, fd, false)?,
+        };
+
+        let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
+
+        if mode == libc::F_OK {
+            // The file exists since we were able to call `stat(2)` on it.
+            return Ok(());
+        }
+
+        // We use ctx.uid/ctx.gid for these checks, but when idmapped mounts
+        // support is enabled on the guest side, it means that "default_permissions"
+        // flag is set on virtiofs mount and FUSE_ACCESS request should never be
+        // sent to the userspace. Please, refer to the kernel commit
+        // ("fs/fuse: warn if fuse_access is called when idmapped mounts are allowed").
+        // In case when idmapped mounts are not enabled we are good to rely on ctx.uid/ctx.gid values.
+
+        if (mode & libc::R_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
+            && st.st_mode & 0o004 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        if (mode & libc::W_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
+            && st.st_mode & 0o002 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        // root can only execute something if it is executable by one of the owner, the group, or
+        // everyone.
+        if (mode & libc::X_OK) != 0
+            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
+            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
+            && st.st_mode & 0o001 == 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        Ok(())
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        debug!("setxattr: inode={inode} name={name:?} value={value:?}");
+
+        if !self.cfg.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if name.to_bytes() == XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        let mut mflags: i32 = 0;
+        if (flags as i32) & bindings::LINUX_XATTR_CREATE != 0 {
+            mflags |= libc::XATTR_CREATE;
+        }
+        if (flags as i32) & bindings::LINUX_XATTR_REPLACE != 0 {
+            mflags |= libc::XATTR_REPLACE;
+        }
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                libc::setxattr(
+                    c_path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    0,
+                    mflags as libc::c_int,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::fsetxattr(
+                    fd,
+                    name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    0,
+                    mflags as libc::c_int,
+                )
+            },
+        };
+
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        debug!("getxattr: inode={inode} name={name:?}, size={size}");
+
+        if !self.cfg.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if name.to_bytes() == XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        let mut buf = vec![0; size as usize];
+
+        // Safe because this will only modify the contents of `buf`
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                if size == 0 {
+                    libc::getxattr(
+                        c_path.as_ptr(),
+                        name.as_ptr(),
+                        std::ptr::null_mut(),
+                        size as libc::size_t,
+                        0,
+                        0,
+                    )
+                } else {
+                    libc::getxattr(
+                        c_path.as_ptr(),
+                        name.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        size as libc::size_t,
+                        0,
+                        0,
+                    )
+                }
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                if size == 0 {
+                    libc::fgetxattr(
+                        fd,
+                        name.as_ptr(),
+                        std::ptr::null_mut(),
+                        size as libc::size_t,
+                        0,
+                        0,
+                    )
+                } else {
+                    libc::fgetxattr(
+                        fd,
+                        name.as_ptr(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        size as libc::size_t,
+                        0,
+                        0,
+                    )
+                }
+            },
+        };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        if size == 0 {
+            Ok(GetxattrReply::Count(res as u32))
+        } else {
+            buf.resize(res as usize, 0);
+            Ok(GetxattrReply::Value(buf))
+        }
+    }
+
+    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+        if !self.cfg.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        let mut buf = vec![0; 512_usize];
+
+        // Safe because this will only modify the contents of `buf`.
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                libc::listxattr(
+                    c_path.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    512,
+                    0,
+                )
+            },
+            InodeHandle::Fd(fd) => unsafe {
+                libc::flistxattr(fd, buf.as_mut_ptr() as *mut libc::c_char, 512, 0)
+            },
+        };
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        buf.truncate(res as usize);
+
+        if size == 0 {
+            let mut clean_size = res as usize;
+
+            for attr in buf.split(|c| *c == 0) {
+                if attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
+                    clean_size -= XATTR_KEY.len();
+                }
+            }
+
+            Ok(ListxattrReply::Count(clean_size as u32))
+        } else {
+            let mut clean_buf = Vec::new();
+
+            for attr in buf.split(|c| *c == 0) {
+                if attr.is_empty() || attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
+                    continue;
+                }
+
+                clean_buf.extend_from_slice(attr);
+                clean_buf.push(0);
+            }
+
+            clean_buf.shrink_to_fit();
+
+            if clean_buf.len() > size as usize {
+                Err(io::Error::from_raw_os_error(LINUX_ERANGE))
+            } else {
+                Ok(ListxattrReply::Names(clean_buf))
+            }
+        }
+    }
+
+    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+        if !self.cfg.xattr {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        if name.to_bytes() == XATTR_KEY {
+            return Err(linux_error(io::Error::from_raw_os_error(
+                bindings::LINUX_EACCES,
+            )));
+        }
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = match self.inode_to_handle(inode, true)? {
+            InodeHandle::Path(c_path) => unsafe {
+                libc::removexattr(c_path.as_ptr(), name.as_ptr(), 0)
+            },
+            InodeHandle::Fd(fd) => unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) },
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(linux_error(io::Error::last_os_error()))
+        }
+    }
+
+    fn fallocate(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let fd = data.file.write().unwrap().as_raw_fd();
+
+        const SUPPORTED_FLAGS: i32 = bindings::LINUX_FALLOC_FL_ALLOCATE_RANGE
+            | bindings::LINUX_FALLOC_FL_KEEP_SIZE
+            | bindings::LINUX_FALLOC_FL_PUNCH_HOLE;
+
+        if mode as i32 & !SUPPORTED_FLAGS != 0 {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+
+        let keep_size = mode & bindings::LINUX_FALLOC_FL_KEEP_SIZE as u32 != 0;
+        let mode = mode & !bindings::LINUX_FALLOC_FL_KEEP_SIZE as u32;
+
+        match mode as i32 {
+            bindings::LINUX_FALLOC_FL_ALLOCATE_RANGE => {
+                // The closest thing we have on macOS to posix_fallocate is F_PREALLOCATE,
+                // but this one doesn't allow us to allocate arbitrary ranges, only allocate
+                // blocks to the file's end.
+                //
+                // The best thing we can do here is extend the file to (offset + length).
+                // This doesn't adhere to the same semantics, but should work fine (albeit
+                // less performant) for most guest applications.
+                let st = fstat(&ctx, self.cfg.semantics, fd, true)?;
+                let new_length = (offset + length) as i64;
+
+                if keep_size {
+                    // Check the number of allocated blocks instead of the file size.
+                    let disk_size = st.st_blocks * 512_i64;
+                    if disk_size >= new_length {
+                        return Ok(());
+                    }
+                    let mut fs = libc::fstore_t {
+                        fst_flags: libc::F_ALLOCATEALL,
+                        fst_posmode: libc::F_PEOFPOSMODE,
+                        fst_offset: 0,
+                        fst_length: new_length - disk_size,
+                        fst_bytesalloc: 0,
+                    };
+
+                    let res = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut fs as *mut _) };
+                    if res < 0 {
+                        return Err(linux_error(io::Error::last_os_error()));
+                    }
+                } else {
+                    if st.st_size >= new_length {
+                        return Ok(());
+                    }
+                    let res = unsafe { libc::ftruncate(fd, new_length) };
+                    if res < 0 {
+                        return Err(linux_error(io::Error::last_os_error()));
+                    }
+                }
+            }
+            bindings::LINUX_FALLOC_FL_PUNCH_HOLE => {
+                if !keep_size {
+                    // Linux forbids the use of PUNCH_HOLE without KEEP_SIZE.
+                    return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+                }
+
+                let mut hole = libc::fpunchhole_t {
+                    fp_offset: offset as i64,
+                    fp_flags: 0,
+                    reserved: 0,
+                    fp_length: length as i64,
+                };
+
+                let res = unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut hole as *mut _) };
+                if res < 0 {
+                    return Err(linux_error(io::Error::last_os_error()));
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(())
+    }
+
+    fn lseek(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        // SEEK_DATA and SEEK_HOLE have slightly different semantics
+        // in Linux vs. macOS, which means we can't support them.
+        let mwhence = if whence == 3 {
+            // SEEK_DATA
+            return Ok(offset);
+        } else if whence == 4 {
+            // SEEK_HOLE
+            libc::SEEK_END
+        } else {
+            whence as i32
+        };
+
+        let fd = data.file.write().unwrap().as_raw_fd();
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::lseek(fd, offset as bindings::off64_t, mwhence as libc::c_int) };
+        if res < 0 {
+            Err(linux_error(io::Error::last_os_error()))
+        } else {
+            Ok(res as u64)
+        }
+    }
+
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        if map_sender.is_none() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+
+        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+
+        if (moffset + len) > shm_size {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        let guest_addr = guest_shm_base + moffset;
+
+        debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
+
+        let file = self.open_inode(inode, open_flags)?;
+        let fd = file.as_raw_fd();
+
+        let host_addr = unsafe {
+            libc::mmap(
+                null_mut(),
+                len as usize,
+                prot_flags,
+                libc::MAP_SHARED,
+                fd,
+                foffset as libc::off_t,
+            )
+        };
+        if host_addr == libc::MAP_FAILED {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        drop(file);
+
+        // We've checked that map_sender is something above.
+        let sender = map_sender.as_ref().unwrap();
+        let (reply_sender, reply_receiver) = unbounded();
+        sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                host_addr as u64,
+                guest_addr,
+                len,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
+            error!("Error requesting HVF the addition of a DAX window");
+            unsafe { libc::munmap(host_addr, len as usize) };
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        self.map_windows
+            .lock()
+            .unwrap()
+            .insert(guest_addr, host_addr as u64);
+
+        Ok(())
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<fuse::RemovemappingOne>,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        if map_sender.is_none() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        for req in requests {
+            let guest_addr = guest_shm_base + req.moffset;
+            if (req.moffset + req.len) > shm_size {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
+            let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
+                Some(a) => a,
+                None => return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL))),
+            };
+            debug!(
+                "removemapping: guest_addr={:x} len={:?}",
+                guest_addr, req.len
+            );
+
+            let sender = map_sender.as_ref().unwrap();
+            let (reply_sender, reply_receiver) = unbounded();
+            sender
+                .send(WorkerMessage::GpuRemoveMapping(
+                    reply_sender,
+                    guest_addr,
+                    req.len,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() {
+                error!("Error requesting HVF the removal of a DAX window");
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+            }
+
+            let ret = unsafe { libc::munmap(host_addr as *mut libc::c_void, req.len as usize) };
+            if ret == -1 {
+                error!("Error unmapping DAX window");
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::FileTypeExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "libkrun-virtiofs-containment-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            uid: 501,
+            gid: 20,
+            pid: 1,
+        }
+    }
+
+    fn initialized_fs(root: &Path) -> PassthroughFs {
+        let cfg = Config {
+            root_dir: root.to_string_lossy().into_owned(),
+            semantics: PermissionSemantics::LinuxSimplified,
+            ..Config::default()
+        };
+        let filesystem = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new()))
+            .expect("create passthrough filesystem");
+        let st = fstat(
+            &context(),
+            PermissionSemantics::LinuxSimplified,
+            filesystem.root.as_raw_fd(),
+            true,
+        )
+        .expect("stat share root");
+        filesystem.inodes.write().unwrap().insert(
+            fuse::ROOT_ID,
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+            },
+            Arc::new(InodeData {
+                inode: fuse::ROOT_ID,
+                ino: st.st_ino,
+                dev: st.st_dev,
+                refcount: AtomicU64::new(2),
+                unlinked_fd: AtomicI64::new(-1),
+            }),
+        );
+        filesystem
+    }
+
+    #[test]
+    fn rejects_names_that_are_not_one_path_component() {
+        for bytes in [
+            b"".as_slice(),
+            b".",
+            b"..",
+            b"../escape",
+            b"a/b",
+            b"/absolute",
+        ] {
+            let name = CString::new(bytes).unwrap();
+            assert!(
+                PassthroughFs::validate_component(&name).is_err(),
+                "accepted {bytes:?}"
+            );
+        }
+        assert!(PassthroughFs::validate_component(c"ordinary-name").is_ok());
+    }
+
+    #[test]
+    fn lookup_cannot_escape_the_descriptor_root() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("share");
+        fs::create_dir(&root).unwrap();
+        let filesystem = initialized_fs(&root);
+
+        for name in [c"..", c"../outside", c"nested/outside"] {
+            assert!(filesystem.lookup(context(), fuse::ROOT_ID, name).is_err());
+        }
+    }
+
+    #[test]
+    fn socket_node_is_installed_through_the_parent_descriptor() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("share");
+        fs::create_dir(&root).unwrap();
+        let filesystem = initialized_fs(&root);
+
+        PassthroughFs::create_socket_at(filesystem.root.as_raw_fd(), c"guest.sock")
+            .expect("create socket node");
+
+        assert!(fs::symlink_metadata(root.join("guest.sock"))
+            .unwrap()
+            .file_type()
+            .is_socket());
+    }
+
+    #[test]
+    fn moved_parent_is_rejected_before_a_guest_create() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("share");
+        let child = root.join("child");
+        let moved = directory.0.join("moved-outside-share");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&child).unwrap();
+        let filesystem = initialized_fs(&root);
+        let child_entry = filesystem
+            .lookup(context(), fuse::ROOT_ID, c"child")
+            .expect("lookup child");
+
+        fs::rename(&child, &moved).expect("move child outside share");
+        assert!(filesystem
+            .getattr(context(), child_entry.inode, None)
+            .is_err());
+        let result = filesystem.create(
+            context(),
+            child_entry.inode,
+            c"escaped",
+            0o644,
+            false,
+            1,
+            0,
+            Extensions::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(!moved.join("escaped").exists());
+    }
+}

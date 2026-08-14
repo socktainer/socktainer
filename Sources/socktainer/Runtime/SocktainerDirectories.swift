@@ -1,8 +1,23 @@
+import Darwin
 import Foundation
 
 enum SocktainerDirectories {
     static var hostHome: URL {
         hostHome(environment: ProcessInfo.processInfo.environment)
+    }
+
+    static var engineStateDirectory: URL {
+        engineStateDirectory(environment: ProcessInfo.processInfo.environment)
+    }
+
+    static func engineStateDirectory(environment: [String: String]) -> URL {
+        if let override = environment["SOCKTAINER_ENGINE_STATE_DIRECTORY"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true).standardizedFileURL
+        }
+        return URL(
+            fileURLWithPath: "/private/var/tmp/socktainer-\(Darwin.getuid())/engine",
+            isDirectory: true
+        )
     }
 
     static func hostHome(

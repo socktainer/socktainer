@@ -1,68 +1,68 @@
 import Foundation
 import Logging
 
-struct EngineMachine: Sendable, Equatable {
-    let id: String
-    let containerID: String
-    let ipAddress: String
-    let running: Bool
-}
-
-protocol EngineMachineControlling: Sendable {
-    func inspect(id: String) async throws -> EngineMachine?
-    func provision(id: String) async throws
-    func boot(id: String) async throws -> EngineMachine
-    func dial(containerID: String, port: UInt32) async throws -> FileHandle
-    func stop(id: String) async throws
-}
-
 enum PersistentEngineError: Error, Equatable {
     case invalidMachineSnapshot(String)
+    case guestReadinessTimedOut
 }
 
-/// Owns the complete host-side lifecycle of the one persistent engine VM.
-/// Callers learn one operation: obtain a ready multiplexed guest connection.
+/// Owns the application-facing lifecycle of the one persistent custom VM.
+/// Callers obtain one ready multiplexed guest connection and do not learn VMM
+/// provisioning or device details.
 actor PersistentEngine {
-    static let machineID = "socktainer-engine"
     static let guestPort: UInt32 = 1025
-    static let publishedPortProxyPort: UInt32 = 1026
     static let configuredMemoryBytes: UInt64 = 1_024 * 1024 * 1024
 
-    private let controller: any EngineMachineControlling
+    private let machine: any EngineMachineHosting
     private let logger: Logger
+    private let guestReadinessTimeout: Duration
+    private let isConnectionTerminal: @Sendable (GuestConnection) async -> Bool
     private var connection: GuestConnection?
-    private var machine: EngineMachine?
+    private var readyMachine: RuntimeMachineReady?
     private struct Readiness {
         let token: UUID
-        let task: Task<(GuestConnection, EngineMachine), Error>
+        let task: Task<(GuestConnection, RuntimeMachineReady), Error>
     }
     private var readiness: Readiness?
+    private var requiresMachineRestart = false
 
     init(
-        controller: any EngineMachineControlling,
-        logger: Logger = Logger(label: "socktainer.engine")
+        machine: any EngineMachineHosting,
+        logger: Logger = Logger(label: "socktainer.engine"),
+        guestReadinessTimeout: Duration = .seconds(10),
+        isConnectionTerminal: @escaping @Sendable (GuestConnection) async -> Bool = PersistentEngine.connectionIsTerminal
     ) {
-        self.controller = controller
+        self.machine = machine
         self.logger = logger
+        self.guestReadinessTimeout = guestReadinessTimeout
+        self.isConnectionTerminal = isConnectionTerminal
     }
 
     func readyConnection() async throws -> GuestConnection {
-        if let connection { return connection }
-
+        while let candidate = connection {
+            let terminal = await isConnectionTerminal(candidate)
+            guard connection === candidate else { continue }
+            if !terminal { return candidate }
+            self.connection = nil
+            readyMachine = nil
+            requiresMachineRestart = true
+        }
         let current: Readiness
         if let readiness {
             current = readiness
         } else {
+            let restartMachine = requiresMachineRestart
+            requiresMachineRestart = false
             current = Readiness(
                 token: UUID(),
-                task: Task { try await self.establishConnection() }
+                task: Task { try await self.establishConnection(restartMachine: restartMachine) }
             )
             readiness = current
         }
         do {
             let (connection, snapshot) = try await current.task.value
             if readiness?.token == current.token { readiness = nil }
-            self.machine = snapshot
+            readyMachine = snapshot
             self.connection = connection
             return connection
         } catch {
@@ -71,53 +71,73 @@ actor PersistentEngine {
         }
     }
 
-    private func establishConnection() async throws -> (GuestConnection, EngineMachine) {
-        var snapshot = try await controller.inspect(id: Self.machineID)
-        if snapshot == nil {
-            try await controller.provision(id: Self.machineID)
-            snapshot = try await controller.inspect(id: Self.machineID)
+    private nonisolated static func connectionIsTerminal(_ connection: GuestConnection) async
+        -> Bool
+    {
+        await connection.isTerminal()
+    }
+
+    private func establishConnection(restartMachine: Bool) async throws
+        -> (GuestConnection, RuntimeMachineReady)
+    {
+        if restartMachine {
+            try await machine.stop()
         }
-        guard var snapshot else {
-            throw PersistentEngineError.invalidMachineSnapshot("machine does not exist after provisioning")
+        let snapshot = try await machine.start()
+        do {
+            let connection = try await waitForGuestReadiness()
+            logger.info("persistent engine is ready", metadata: ["ip": "\(snapshot.guestIPv4)"])
+            return (connection, snapshot)
+        } catch {
+            try? await machine.stop()
+            throw error
         }
-        if !snapshot.running {
-            snapshot = try await controller.boot(id: Self.machineID)
-        }
-        let containerID = snapshot.containerID
-        let controller = self.controller
-        var lastError: Error?
-        var ready: GuestConnection?
-        for _ in 0..<10_000 {
+    }
+
+    /// Waits until the already-started guest can complete the control protocol
+    /// handshake. libkrun publishes its host listener before the guest binds the
+    /// corresponding vsock port, so socket existence alone is not readiness.
+    /// This loop retries only the read-only startup ping. It never replays a
+    /// Docker operation.
+    private func waitForGuestReadiness() async throws -> GuestConnection {
+        let deadline = ContinuousClock.now + guestReadinessTimeout
+        var delay = Duration.milliseconds(1)
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            var connection: GuestConnection?
             do {
-                ready = try await GuestConnection.connect {
-                    try await controller.dial(containerID: containerID, port: Self.guestPort)
+                let candidate = try await GuestConnection.connect {
+                    try await self.machine.connect(to: Self.guestPort)
                 }
-                break
+                connection = candidate
+                let response = try await candidate.request(method: "ping", payload: .object([:]))
+                guard response.kind == .response,
+                    response.payload == .object(["ok": .bool(true)])
+                else {
+                    await candidate.close()
+                    throw PersistentEngineError.invalidMachineSnapshot(
+                        "guest ping returned an invalid response"
+                    )
+                }
+                return candidate
+            } catch let error as PersistentEngineError {
+                await connection?.close()
+                throw error
             } catch {
-                lastError = error
-                try await Task.sleep(for: .milliseconds(1))
+                await connection?.close()
+                let remaining = deadline - ContinuousClock.now
+                guard remaining > .zero else { break }
+                try await Task.sleep(for: min(delay, remaining))
+                delay = min(delay * 2, .milliseconds(25))
             }
         }
-        guard let connection = ready else {
-            try? await controller.stop(id: Self.machineID)
-            throw lastError ?? GuestConnectionError.closed
-        }
-        let response = try await connection.request(method: "ping", payload: .object([:]))
-        guard response.kind == .response,
-            response.payload == .object(["ok": .bool(true)])
-        else {
-            await connection.close()
-            try? await controller.stop(id: Self.machineID)
-            throw PersistentEngineError.invalidMachineSnapshot("guest ping returned an invalid response")
-        }
-        self.machine = snapshot
-        logger.info("persistent engine is ready", metadata: ["ip": "\(snapshot.ipAddress)"])
-        return (connection, snapshot)
+        throw PersistentEngineError.guestReadinessTimedOut
     }
 
     func invalidateConnection() async {
         await connection?.close()
         connection = nil
+        requiresMachineRestart = true
         readiness?.task.cancel()
         readiness = nil
     }
@@ -126,6 +146,7 @@ actor PersistentEngine {
         guard connection === expected else { return }
         await expected.close()
         connection = nil
+        requiresMachineRestart = true
     }
 
     func shutdown() async {
@@ -134,27 +155,20 @@ actor PersistentEngine {
             await connection.close()
         }
         connection = nil
-        machine = nil
+        readyMachine = nil
         do {
-            try await controller.stop(id: Self.machineID)
+            try await machine.stop()
         } catch {
             logger.error("failed to stop persistent engine", metadata: ["error": "\(error)"])
         }
     }
 
     func address() -> String? {
-        machine?.ipAddress
+        readyMachine?.guestIPv4
     }
 
-    func dialPublishedPortProxy() async throws -> FileHandle {
-        _ = try await readyConnection()
-        guard let machine else {
-            throw PersistentEngineError.invalidMachineSnapshot("engine is unavailable")
-        }
-        return try await controller.dial(
-            containerID: machine.containerID,
-            port: Self.publishedPortProxyPort
-        )
+    func hostGatewayAddress() -> String? {
+        readyMachine?.hostGatewayIPv4
     }
 
 }

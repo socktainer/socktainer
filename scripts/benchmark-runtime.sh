@@ -7,20 +7,25 @@ readonly DEFAULT_NGINX_IMAGE='docker.io/library/nginx@sha256:5616878291a2eed594a
 BASE_IMAGE=${BENCH_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
 NGINX_IMAGE=${BENCH_NGINX_IMAGE:-$DEFAULT_NGINX_IMAGE}
 PRODUCTS=${BENCH_PRODUCTS:-socktainer}
-SAMPLES=${BENCH_SAMPLES:-9}
+SAMPLES=${BENCH_SAMPLES:-12}
 AB_REQUESTS=${BENCH_AB_REQUESTS:-10000}
 AB_CONCURRENCY=${BENCH_AB_CONCURRENCY:-32}
 BIND_MIB=${BENCH_BIND_MIB:-512}
-OUTPUT=${BENCH_OUTPUT:-runtime-benchmark.json}
+OUTPUT=${BENCH_OUTPUT:-}
 MODE=run
 RUN_ID="socktainer-benchmark-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-RUNS_DIRECTORY=${BENCH_RUNS_DIRECTORY:-"$(dirname "$OUTPUT")/runtime-benchmark-runs"}
-RUN_DIRECTORY="$RUNS_DIRECTORY/$RUN_ID"
-RESULTS_FILE=$(mktemp -t socktainer-benchmark-results.XXXXXX)
-PROCESS_FILE=$(mktemp -t socktainer-benchmark-processes.XXXXXX)
-ENGINE_STATE_DIR=$(mktemp -d /tmp/socktainer-benchmark-engines.XXXXXX)
-BIND_STATE_DIR=$(mktemp -d "$HOME/.socktainer-benchmark-bind.XXXXXX")
+RUNS_DIRECTORY=
+RUN_DIRECTORY=
+RESULTS_FILE=
+PROCESS_FILE=
+STORAGE_FILE=
+ENGINE_STATE_DIR=
+BIND_STATE_DIR=
 CURRENT_HOST=
+CURRENT_PRODUCT=
+CURRENT_SAMPLE=0
+CURRENT_POSITION=0
+CURRENT_METRIC=initialization
 BENCHMARK_COMPLETE=false
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 readonly DD_RESULT_PARSER="$REPO_ROOT/scripts/parse-busybox-dd.awk"
@@ -31,9 +36,9 @@ Usage: scripts/benchmark-runtime.sh [options]
 
 Options:
   --preflight          Validate tools and product configuration only.
-  --dry-run            Print the nine-sample Latin rotation and commands.
+  --dry-run            Print the Williams-design order and commands.
   --products LIST      Comma-separated product names (default: socktainer).
-  --samples N          Sample count (default: 9).
+  --samples N          Sample count (default: 12; must be divisible by product count).
   --output FILE        JSON result file.
 
 For each product NAME, set these uppercase environment variables:
@@ -46,6 +51,8 @@ For each product NAME, set these uppercase environment variables:
   NAME_PID_PATTERNS    Optional fallback comma-separated process regexes.
   NAME_HELPER_PATTERNS Optional helper regexes; only processes born after launch count.
   NAME_STORAGE_PATHS   Required colon-separated paths owned by the product.
+  NAME_VM_MEMORY_BYTES Configured VM memory limit. Use 0 only when there is no VM.
+  NAME_VM_ALLOCATED_MEMORY_BYTES Memory allocated to the VM by product settings.
   NAME_VERSION_CMD     Required command that prints the product version.
   NAME_RUNTIME_CMD     Optional command that prints runtime component versions.
 
@@ -54,7 +61,7 @@ standard Docker socket, foreground ownership, and its engine storage paths.
 
 Example:
   SOCKTAINER_DOCKER_HOST=unix:///tmp/socktainer.sock \
-  SOCKTAINER_START_CMD='/path/to/socktainer --no-check-compatibility --no-docker-context' \
+  SOCKTAINER_START_CMD='/path/to/socktainer --no-docker-context' \
   SOCKTAINER_START_MODE=foreground \
   SOCKTAINER_STORAGE_PATHS="$HOME/.socktainer:/path/to/guest-artifacts" \
   BENCH_PRODUCTS=socktainer scripts/benchmark-runtime.sh
@@ -87,20 +94,24 @@ product_value() {
     fi
     case $field in
         DOCKER_HOST) printf 'unix://%s/socktainer-home/.socktainer/container.sock' "$ENGINE_STATE_DIR" ;;
-        START_CMD) printf 'env SOCKTAINER_HOST_HOME_DIRECTORY=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q SOCKTAINER_GUEST_IMAGE=%q %q --no-check-compatibility --no-docker-context' \
+        START_CMD) printf 'env SOCKTAINER_HOST_HOME_DIRECTORY=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q %q --no-docker-context' \
             "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
-            "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" "$REPO_ROOT/.build/release/socktainer" ;;
+            "$REPO_ROOT/.build/release/socktainer" ;;
         RESET_CMD) printf 'rm -rf %q %q && mkdir -p %q %q' \
             "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
             "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" ;;
         START_MODE) printf 'foreground' ;;
         VERSION_CMD) printf '%q --version' "$REPO_ROOT/.build/release/socktainer" ;;
         RUNTIME_CMD) printf "printf 'Docker API v1.51; containerd 2.1.5; runc 1.3.4-r1'" ;;
-        HELPER_PATTERNS) printf 'com.apple.Virtualization.VirtualMachine' ;;
+        HELPER_PATTERNS) printf 'socktainer-vmm,gvproxy' ;;
         BIND_ROOT) printf '%s' "$ENGINE_STATE_DIR/socktainer-home" ;;
-        STORAGE_PATHS) printf '%s:%s:%s' "$REPO_ROOT/.build/release/socktainer" \
-            "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" \
+        STORAGE_PATHS) printf '%s:%s:%s:%s:%s:%s:%s' "$REPO_ROOT/.build/release/socktainer" \
+            "$REPO_ROOT/VMM/out/socktainer-vmm" "$REPO_ROOT/VMM/out/libkrun.1.dylib" \
+            "$REPO_ROOT/VMM/out/gvproxy" "$REPO_ROOT/Guest/out/socktainer-vmlinux" \
+            "$REPO_ROOT/Guest/out/socktainer-root.ext4" \
             "$ENGINE_STATE_DIR/socktainer-state" ;;
+        VM_MEMORY_BYTES) printf '%s' "$((1024 * 1024 * 1024))" ;;
+        VM_ALLOCATED_MEMORY_BYTES) printf '%s' "$((1024 * 1024 * 1024))" ;;
     esac
 }
 
@@ -122,11 +133,15 @@ cleanup_host() {
 cleanup() {
     local exit_code=$? product host
     if [[ -d $RUN_DIRECTORY && $BENCHMARK_COMPLETE != true ]]; then
-        cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
-        cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        [[ -f $RESULTS_FILE ]] && cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
+        [[ -f $PROCESS_FILE ]] && cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        [[ -f $STORAGE_FILE ]] && cp "$STORAGE_FILE" "$RUN_DIRECTORY/storage.ndjson" 2>/dev/null || true
         jq -cn --arg runId "$RUN_ID" --argjson exitCode "$exit_code" \
+            --arg product "$CURRENT_PRODUCT" --argjson sample "$CURRENT_SAMPLE" \
+            --argjson position "$CURRENT_POSITION" --arg metric "$CURRENT_METRIC" \
             --arg endedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{status:"incomplete",runId:$runId,exitCode:$exitCode,endedAt:$endedAt}' \
+            '{status:"incomplete",runId:$runId,exitCode:$exitCode,endedAt:$endedAt,
+              activeCell:{product:$product,sample:$sample,position:$position,metric:$metric}}' \
             > "$RUN_DIRECTORY/status.json.tmp" 2>/dev/null || true
         mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json" 2>/dev/null || true
     fi
@@ -136,19 +151,25 @@ cleanup() {
         cleanup_host "$host"
         stop_product "$product" || true
     done
-    rm -f "$RESULTS_FILE" "$PROCESS_FILE"
-    rm -rf "$ENGINE_STATE_DIR"
-    rm -rf "$BIND_STATE_DIR"
+    [[ -n $RESULTS_FILE ]] && rm -f "$RESULTS_FILE"
+    [[ -n $PROCESS_FILE ]] && rm -f "$PROCESS_FILE"
+    [[ -n $STORAGE_FILE ]] && rm -f "$STORAGE_FILE"
+    [[ -n $ENGINE_STATE_DIR ]] && rm -rf "$ENGINE_STATE_DIR"
+    [[ -n $BIND_STATE_DIR ]] && rm -rf "$BIND_STATE_DIR"
 }
 trap cleanup EXIT
 record_failure() {
     local exit_code=$? line=${1:-unknown}
     if [[ -d $RUN_DIRECTORY ]]; then
-        cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
-        cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        [[ -f $RESULTS_FILE ]] && cp "$RESULTS_FILE" "$RUN_DIRECTORY/results.ndjson" 2>/dev/null || true
+        [[ -f $PROCESS_FILE ]] && cp "$PROCESS_FILE" "$RUN_DIRECTORY/processes.ndjson" 2>/dev/null || true
+        [[ -f $STORAGE_FILE ]] && cp "$STORAGE_FILE" "$RUN_DIRECTORY/storage.ndjson" 2>/dev/null || true
         jq -cn --arg runId "$RUN_ID" --argjson exitCode "$exit_code" --arg line "$line" \
+            --arg product "$CURRENT_PRODUCT" --argjson sample "$CURRENT_SAMPLE" \
+            --argjson position "$CURRENT_POSITION" --arg metric "$CURRENT_METRIC" \
             --arg endedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{status:"incomplete",runId:$runId,exitCode:$exitCode,line:$line,endedAt:$endedAt}' \
+            '{status:"incomplete",runId:$runId,exitCode:$exitCode,line:$line,endedAt:$endedAt,
+              activeCell:{product:$product,sample:$sample,position:$position,metric:$metric}}' \
             > "$RUN_DIRECTORY/status.json.tmp" 2>/dev/null || true
         mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json" 2>/dev/null || true
     fi
@@ -218,14 +239,14 @@ print(f"{statistics.median(values):.6f}")
 PY
 }
 
-live_wait_registered_ms() {
+live_wait_delivery_ms() {
     python3 - "$1" "$2" <<'PY'
 import os, socket, subprocess, sys, threading, time
 
 host, name = sys.argv[1:]
 environment = dict(os.environ, DOCKER_HOST=host)
 socket_path = host.removeprefix("unix://")
-registered = threading.Event()
+request_sent = threading.Event()
 result = {}
 
 def wait_for_next_exit():
@@ -237,14 +258,7 @@ def wait_for_next_exit():
                    "Host: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         client.sendall(request.encode())
         response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = client.recv(4096)
-            if not chunk:
-                raise RuntimeError("wait response closed before its headers")
-            response += chunk
-        if b" 200 " not in response.partition(b"\r\n\r\n")[0]:
-            raise RuntimeError(f"wait registration failed: {response[:200]!r}")
-        registered.set()
+        request_sent.set()
         while True:
             chunk = client.recv(4096)
             if not chunk:
@@ -258,28 +272,30 @@ def wait_for_next_exit():
 
 waiter = threading.Thread(target=wait_for_next_exit, daemon=True)
 waiter.start()
-if not registered.wait(timeout=2):
-    raise SystemExit("wait response headers were not received")
+if not request_sent.wait(timeout=2):
+    raise SystemExit("wait request was not sent")
 if not waiter.is_alive():
-    raise SystemExit("next-exit wait returned before the created container started")
+    raise SystemExit("next-exit wait returned while the container was still running")
+time.sleep(0.010)
 start = time.perf_counter_ns()
-starter = subprocess.run(["docker", "start", name], env=environment,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-if starter.returncode:
-    raise SystemExit(starter.returncode)
+killer = subprocess.run(["docker", "kill", name], env=environment,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if killer.returncode:
+    raise SystemExit(killer.returncode)
 waiter.join(timeout=30)
 if waiter.is_alive():
     raise SystemExit("registered wait did not complete")
 if "error" in result:
     raise result["error"]
 response = result.get("response", b"")
-if b" 200 " not in response or b'"StatusCode"' not in response:
+headers, separator, body = response.partition(b"\r\n\r\n")
+if not separator or b" 200 " not in headers or b'"StatusCode"' not in body:
     raise SystemExit(f"invalid wait response: {response[:200]!r}")
 print(f"{(time.perf_counter_ns() - start) / 1_000_000:.6f}")
 PY
 }
 
-engine_ready_ms() {
+socket_ready_ms() {
     python3 - "$1" "$2" <<'PY'
 import socket, sys, time
 socket_path, started_ns = sys.argv[1], int(sys.argv[2])
@@ -310,6 +326,13 @@ PY
 
 now_ns() {
     perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000000000'
+}
+
+elapsed_since_ms() {
+    python3 - "$1" <<'PY'
+import sys, time
+print(f"{(time.time_ns() - int(sys.argv[1])) / 1_000_000:.6f}")
+PY
 }
 
 nginx_ready_ms() {
@@ -346,25 +369,34 @@ PY
 }
 
 append_result() {
-    local product=$1 sample=$2 position=$3 metric=$4 value=$5 unit=$6
+    local product=$1 sample=$2 position=$3 cohort=$4 metric=$5 value=$6 unit=$7
     jq -cn \
         --arg product "$product" --argjson sample "$sample" \
-        --argjson position "$position" --arg metric "$metric" \
+        --argjson position "$position" --arg cohort "$cohort" --arg metric "$metric" \
         --argjson value "$value" --arg unit "$unit" \
-        '{product:$product,sample:$sample,position:$position,metric:$metric,value:$value,unit:$unit}' \
+        '{product:$product,sample:$sample,position:$position,cohort:$cohort,metric:$metric,value:$value,unit:$unit}' \
         >> "$RESULTS_FILE"
     printf '  %-26s %12s %s\n' "$metric" "$value" "$unit"
 }
 
+begin_metric() {
+    CURRENT_METRIC=$1
+}
+
 finalize_json() {
-    local tmp_output product product_info version version_cmd runtime runtime_cmd source_dirty harness_sha guest_sha binary_sha source_diff_sha
+    local tmp_output product product_info version version_cmd runtime runtime_cmd vm_memory vm_allocated_memory source_dirty harness_sha guest_sha binary_sha source_diff_sha
     tmp_output="$OUTPUT.tmp.$$"
     source_dirty=false
     git diff --quiet --ignore-submodules HEAD -- 2>/dev/null || source_dirty=true
     git diff --cached --quiet --ignore-submodules HEAD -- 2>/dev/null || source_dirty=true
     [[ -z $(git ls-files --others --exclude-standard 2>/dev/null) ]] || source_dirty=true
     harness_sha=$(shasum -a 256 "$REPO_ROOT/scripts/benchmark-runtime.sh" | awk '{print $1}')
-    guest_sha=$(shasum -a 256 "$REPO_ROOT/Guest/out/socktainer-guest.oci.tar" 2>/dev/null | awk '{print $1}')
+    guest_sha=$(
+        {
+            shasum -a 256 "$REPO_ROOT/Guest/out/socktainer-vmlinux" 2>/dev/null
+            shasum -a 256 "$REPO_ROOT/Guest/out/socktainer-root.ext4" 2>/dev/null
+        } | shasum -a 256 | awk '{print $1}'
+    )
     binary_sha=$(shasum -a 256 "$REPO_ROOT/.build/release/socktainer" 2>/dev/null | awk '{print $1}')
     source_diff_sha=$(
         {
@@ -381,6 +413,8 @@ finalize_json() {
         runtime_cmd=$(product_value "$product" RUNTIME_CMD)
         runtime=''
         [[ -n $runtime_cmd ]] && runtime=$(first_line "$runtime_cmd")
+        vm_memory=$(product_value "$product" VM_MEMORY_BYTES)
+        vm_allocated_memory=$(product_value "$product" VM_ALLOCATED_MEMORY_BYTES)
         product_info=$(jq -cn \
             --argjson existing "$product_info" --arg name "$product" \
             --arg version "$version" --arg host "$(product_value "$product" DOCKER_HOST)" \
@@ -393,11 +427,15 @@ finalize_json() {
             --arg versionCommand "$version_cmd" --arg runtime "$runtime" \
             --arg runtimeCommand "$runtime_cmd" \
             --arg storagePaths "$(product_value "$product" STORAGE_PATHS)" \
+            --argjson configuredVMMemoryBytes "$vm_memory" \
+            --argjson allocatedVMMemoryBytes "$vm_allocated_memory" \
             '$existing + [{name:$name,version:$version,runtime:$runtime,
               dockerHost:$host,startMode:$startMode,startCommand:$startCommand,
               stopCommand:$stopCommand,resetCommand:$resetCommand,ownedPIDsCommand:$ownedPIDsCommand,
               pidPatterns:$pidPatterns,versionCommand:$versionCommand,
-              runtimeCommand:$runtimeCommand,storagePaths:$storagePaths}]')
+              runtimeCommand:$runtimeCommand,storagePaths:($storagePaths|split(":")),
+              configuredVMMemoryBytes:$configuredVMMemoryBytes,
+              allocatedVMMemoryBytes:$allocatedVMMemoryBytes}]')
     done
     jq -s \
         --arg run_id "$RUN_ID" \
@@ -419,7 +457,9 @@ finalize_json() {
         --argjson ab_requests "$AB_REQUESTS" \
         --argjson ab_concurrency "$AB_CONCURRENCY" \
         --argjson bind_mib "$BIND_MIB" \
+        --argjson product_count "${#product_list[@]}" \
         --argjson products "$product_info" --slurpfile process_samples "$PROCESS_FILE" \
+        --slurpfile storage_samples "$STORAGE_FILE" \
         'def median: sort as $v | ($v|length) as $n |
             if $n == 0 then null
             elif ($n % 2) == 1 then $v[($n/2)|floor]
@@ -430,13 +470,24 @@ finalize_json() {
           gitCommit:$commit,sourceDirty:$source_dirty,dockerClient:$docker_client,
           provenance:{harnessSHA256:$harness_sha,guestImageSHA256:$guest_sha,
             socktainerBinarySHA256:$binary_sha,sourceDiffSHA256:$source_diff_sha},
-          products:$products,processSamples:$process_samples,
+          products:$products,processSamples:$process_samples,storageSamples:$storage_samples,
           configuration:{baseImage:$base_image,nginxImage:$nginx_image,
             samples:$requested_samples,abRequests:$ab_requests,
             abConcurrency:$ab_concurrency,bindMiB:$bind_mib,
-            timingBoundaries:{lifecycle:"Docker CLI process wall time",
+            experimentalDesign:{name:(if $product_count == 4 then "four-treatment Williams design" else "cyclic position design" end),
+              balance:(if $product_count == 4 then "Each four-sample block balances position and first-order carryover" else "Position balance only; first-order carryover is not claimed" end),
+              orderRecordedPerResult:true},
+            cohorts:{cold:"Engine state and image store reset before each product sample",
+              warm:"Metrics after the first pinned common workload completes",
+              bindCache:"One unmeasured read warms the same working set for every product"},
+            timingBoundaries:{socketReady:"before engine launch through the first valid direct /_ping response",
+              commonCapabilityReady:"before engine launch through pull of both pinned images and successful run --rm true",
+              apiPing:"one fresh Unix-socket connection and direct HTTP request; Docker CLI is excluded",
+              lifecycle:"Docker CLI process wall time",
+              liveWait:"wait request sent while container is running; docker kill start through wait exit delivery",
               nginxReady:"before docker create through first successful HTTP response",
-              bindIO:"BusyBox dd bytes divided by dd-reported in-container elapsed time; write includes conv=fsync; cached read follows one unmeasured warm read"}},
+              bindIO:"BusyBox dd bytes divided by dd-reported in-container elapsed time; write includes conv=fsync; cached read follows one unmeasured warm read",
+              reclaim:"Bind and nginx containers and bind file removed, followed by a fixed five-second free-page/balloon settlement interval"}},
           results:$results,
           summary: ($results | sort_by(.product,.metric) |
             group_by([.product,.metric]) | map(
@@ -451,17 +502,23 @@ finalize_json() {
 }
 
 validate_results() {
-    local expected_metrics=21 expected_rows
+    local expected_metrics=22 expected_rows
     expected_rows=$((SAMPLES * ${#product_list[@]} * expected_metrics))
     jq -es --argjson expected "$expected_rows" '
         length == $expected
         and (map([.product,.sample,.metric] | join("\u0000")) | unique | length) == $expected
         and all(.[]; (.value | type) == "number")
+        and all(.[]; (.cohort == "cold" or .cohort == "warm" or .cohort == "bind_cache" or .cohort == "reclaim"))
     ' "$RESULTS_FILE" | grep -qx true \
         || die "result matrix is incomplete, duplicated, or non-numeric"
-    jq -es --argjson expected "$((SAMPLES * ${#product_list[@]} * 3))" \
+    jq -es --argjson expected "$((SAMPLES * ${#product_list[@]} * 4))" \
         'length == $expected and all(.[]; (.processes | type) == "array")' \
         "$PROCESS_FILE" | grep -qx true || die "process snapshot matrix is incomplete"
+    jq -es --argjson expected "$((SAMPLES * ${#product_list[@]}))" \
+        'length == $expected and all(.[];
+          (.paths | type) == "array" and ([.paths[].allocatedBytes]|add) == .allocatedBytes
+          and ([.paths[].logicalBytes]|add) == .logicalBytes)' \
+        "$STORAGE_FILE" | grep -qx true || die "storage snapshot matrix is incomplete"
 }
 
 first_line() {
@@ -522,9 +579,11 @@ owned_pids() {
 
 owned_memory_bytes() {
     local product=$1 pids
+    local -a pid_list
     pids=$(owned_pids "$product")
     [[ -n $pids ]] || { echo 0; return; }
-    footprint -f bytes $pids 2>/dev/null \
+    read -r -a pid_list <<< "$pids"
+    footprint -f bytes "${pid_list[@]}" 2>/dev/null \
         | awk '/^Summary Footprint:/ {summary=$3} /^[[:space:]]*phys_footprint:/ {single=$2; count++}
                END {if (summary != "") print summary; else if (count == 1) print single; else exit 1}'
 }
@@ -532,13 +591,17 @@ owned_memory_bytes() {
 record_process_snapshot() {
     local product=$1 sample=$2 phase=$3 pids
     pids=$(owned_pids "$product")
-    ps -axo pid=,ppid=,command= | awk -v selected="$pids" '
+    ps -axo pid=,ppid=,rss=,command= | awk -v selected="$pids" '
         BEGIN { count=split(selected, values, " "); for (i=1; i<=count; i++) keep[values[i]]=1 }
         keep[$1] { print }
     ' | jq -Rsc --arg product "$product" --argjson sample "$sample" --arg phase "$phase" '
-        split("\n") | map(select(length > 0) | capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<command>.*)$") |
-          {pid:(.pid|tonumber),ppid:(.ppid|tonumber),command:.command,
-           classification:"engine-owned"}) as $processes |
+        split("\n") | map(select(length > 0) |
+          capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<rssKiB>[0-9]+)\\s+(?<command>.*)$") |
+          {pid:(.pid|tonumber),ppid:(.ppid|tonumber),residentBytes:((.rssKiB|tonumber)*1024),command:.command,
+           classification:(if (.command|test("socktainer-vmm|Virtualization\\.VirtualMachine|qemu-system";"i")) then "virtual-machine"
+             elif (.command|test("gvproxy|vpnkit|slirp";"i")) then "network-helper"
+             elif (.command|test("Docker\\.app|Dory\\.app";"i")) then "user-interface"
+             else "daemon-or-helper" end)}) as $processes |
         {product:$product,sample:$sample,phase:$phase,processes:$processes}
     ' >> "$PROCESS_FILE"
 }
@@ -602,8 +665,29 @@ storage_bytes() {
     printf '%s\n' "$total"
 }
 
+record_storage_snapshot() {
+    local product=$1 sample=$2 paths=$3 path allocated logical details='[]'
+    IFS=':' read -r -a path_list <<< "$paths"
+    for path in "${path_list[@]}"; do
+        if [[ -e $path ]]; then
+            allocated=$(storage_bytes "$path" allocated)
+            logical=$(storage_bytes "$path" logical)
+            details=$(jq -cn --argjson existing "$details" --arg path "$path" \
+                --argjson allocated "$allocated" --argjson logical "$logical" \
+                '$existing + [{path:$path,present:true,allocatedBytes:$allocated,logicalBytes:$logical}]')
+        else
+            details=$(jq -cn --argjson existing "$details" --arg path "$path" \
+                '$existing + [{path:$path,present:false,allocatedBytes:0,logicalBytes:0}]')
+        fi
+    done
+    jq -cn --arg product "$product" --argjson sample "$sample" --argjson paths "$details" \
+        '{product:$product,sample:$sample,paths:$paths,
+          allocatedBytes:($paths|map(.allocatedBytes)|add),
+          logicalBytes:($paths|map(.logicalBytes)|add)}' >> "$STORAGE_FILE"
+}
+
 preflight_product() {
-    local product=$1 host start_cmd start_mode stop_cmd reset_cmd patterns pids_cmd paths version_cmd socket
+    local product=$1 host start_cmd start_mode stop_cmd reset_cmd patterns pids_cmd paths version_cmd vm_memory vm_allocated_memory socket
     host=$(product_value "$product" DOCKER_HOST)
     start_cmd=$(product_value "$product" START_CMD)
     start_mode=$(product_value "$product" START_MODE)
@@ -614,6 +698,8 @@ preflight_product() {
     pids_cmd=$(product_value "$product" OWNED_PIDS_CMD)
     paths=$(product_value "$product" STORAGE_PATHS)
     version_cmd=$(product_value "$product" VERSION_CMD)
+    vm_memory=$(product_value "$product" VM_MEMORY_BYTES)
+    vm_allocated_memory=$(product_value "$product" VM_ALLOCATED_MEMORY_BYTES)
     [[ $host == unix://* ]] || die "${product}: NAME_DOCKER_HOST must use unix://"
     [[ -n $start_cmd ]] || die "${product}: NAME_START_CMD is required"
     [[ $start_mode == foreground || $start_mode == oneshot ]] || die "${product}: NAME_START_MODE must be foreground or oneshot"
@@ -624,17 +710,22 @@ preflight_product() {
     [[ -n $paths ]] || die "${product}: NAME_STORAGE_PATHS is required"
     [[ -n $reset_cmd ]] || die "${product}: NAME_RESET_CMD is required for independent samples"
     [[ -n $version_cmd ]] || die "${product}: NAME_VERSION_CMD is required"
+    [[ $vm_memory =~ ^[0-9]+$ ]] || die "${product}: NAME_VM_MEMORY_BYTES must be a nonnegative integer"
+    [[ $vm_allocated_memory =~ ^[0-9]+$ ]] || die "${product}: NAME_VM_ALLOCATED_MEMORY_BYTES must be a nonnegative integer"
     eval "$version_cmd" >/dev/null 2>&1 || die "${product}: NAME_VERSION_CMD failed"
     if [[ $product == socktainer && -z ${SOCKTAINER_START_CMD:-} ]]; then
         [[ -x $REPO_ROOT/.build/release/socktainer ]] || die "socktainer: run 'make release' first or set SOCKTAINER_START_CMD"
-        [[ -s $REPO_ROOT/Guest/out/socktainer-guest.oci.tar ]] || die "socktainer: guest artifact is missing; build it or set SOCKTAINER_START_CMD"
+        for artifact in VMM/out/socktainer-vmm VMM/out/libkrun.1.dylib VMM/out/gvproxy \
+            Guest/out/socktainer-vmlinux Guest/out/socktainer-root.ext4; do
+            [[ -s $REPO_ROOT/$artifact ]] || die "socktainer: custom VMM artifact is missing: $artifact"
+        done
     fi
     socket=${host#unix://}
     printf 'preflight: %-12s host=%s socket=%s\n' "$product" "$host" "$socket"
 }
 
 preflight() {
-    local tool product
+    local tool product seen_products=','
     for tool in docker curl jq python3 perl ab awk sed ps du mktemp sysctl footprint; do
         command -v "$tool" >/dev/null || die "required tool is not installed: $tool"
     done
@@ -649,6 +740,8 @@ preflight() {
     ((SAMPLES % ${#product_list[@]} == 0)) || die "samples must be divisible by the product count for position balance"
     for product in "${product_list[@]}"; do
         [[ $product =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid product name: $product"
+        [[ $seen_products != *",$product,"* ]] || die "duplicate product name: $product"
+        seen_products+="$product,"
         preflight_product "$product"
     done
     echo "preflight: ok"
@@ -659,10 +752,10 @@ rotation_for_sample() {
     if ((${#product_list[@]} == 4)); then
         block_index=$(((sample - 1) % 4))
         case $block_index in
-            0) sequence='0 1 2 3' ;;
-            1) sequence='1 0 3 2' ;;
-            2) sequence='2 3 0 1' ;;
-            3) sequence='3 2 1 0' ;;
+            0) sequence='0 1 3 2' ;;
+            1) sequence='1 2 0 3' ;;
+            2) sequence='2 3 1 0' ;;
+            3) sequence='3 0 2 1' ;;
         esac
         for index in $sequence; do printf '%s\n' "${product_list[$index]}"; done
         return
@@ -686,11 +779,15 @@ wait_for_engine_stop() {
 benchmark_product() {
     local product=$1 sample=$2 position=$3
     local host paths socket start_ns value readiness
-    local name runner nginx port ab_output failed rps bind_root bind_dir bind_runner dd_output
+    local name runner nginx port ab_output failed complete non_2xx observed_concurrency rps bind_root bind_dir bind_runner dd_output
     host=$(product_value "$product" DOCKER_HOST)
     paths=$(product_value "$product" STORAGE_PATHS)
     socket=${host#unix://}
     CURRENT_HOST=$host
+    CURRENT_PRODUCT=$product
+    CURRENT_SAMPLE=$sample
+    CURRENT_POSITION=$position
+    begin_metric reset_and_launch
     cleanup_host "$host"
     printf '\nsample %d position %d: %s\n' "$sample" "$position" "$product"
 
@@ -699,68 +796,83 @@ benchmark_product() {
     eval "$(product_value "$product" RESET_CMD)"
     start_ns=$(now_ns)
     launch_product "$product"
-    if ! value=$(engine_ready_ms "$socket" "$start_ns"); then
+    begin_metric socket_ready
+    if ! value=$(socket_ready_ms "$socket" "$start_ns"); then
         [[ -f $ENGINE_STATE_DIR/$product.log ]] && tail -50 "$ENGINE_STATE_DIR/$product.log" >&2
         die "$product did not answer /_ping"
     fi
-    append_result "$product" "$sample" "$position" engine_ready "$value" ms
+    append_result "$product" "$sample" "$position" cold socket_ready "$value" ms
 
+    begin_metric api_ping_fresh_connection
+    value=$(api_ping_fresh_ms "$socket")
+    append_result "$product" "$sample" "$position" cold api_ping_fresh_connection "$value" ms
+    begin_metric cold_idle_physical_footprint
+    record_process_snapshot "$product" "$sample" cold_idle
+    append_result "$product" "$sample" "$position" cold cold_idle_physical_footprint "$(owned_memory_bytes "$product")" bytes
+
+    begin_metric common_capability_ready
     docker_api pull "$BASE_IMAGE" >/dev/null
     [[ $NGINX_IMAGE == "$BASE_IMAGE" ]] || docker_api pull "$NGINX_IMAGE" >/dev/null
 
-    value=$(docker_elapsed_ms "$host" run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
-    append_result "$product" "$sample" "$position" capability_ready "$value" ms
+    docker_api run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
+    value=$(elapsed_since_ms "$start_ns")
+    append_result "$product" "$sample" "$position" cold common_capability_ready "$value" ms
 
-    value=$(api_ping_fresh_ms "$socket")
-    append_result "$product" "$sample" "$position" api_ping_fresh_connection "$value" ms
-    record_process_snapshot "$product" "$sample" idle
-    append_result "$product" "$sample" "$position" idle_engine_physical_footprint "$(owned_memory_bytes "$product")" bytes
-
+    begin_metric container_create
     name="$RUN_ID-$sample-$product-create"
     value=$(docker_elapsed_ms "$host" create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
-    append_result "$product" "$sample" "$position" container_create "$value" ms
+    append_result "$product" "$sample" "$position" warm container_create "$value" ms
     docker_api rm "$name" >/dev/null
 
+    begin_metric container_start
     name="$RUN_ID-$sample-$product-start"
     docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     value=$(docker_elapsed_ms "$host" start "$name")
-    append_result "$product" "$sample" "$position" container_start "$value" ms
+    append_result "$product" "$sample" "$position" warm container_start "$value" ms
     docker_api wait "$name" >/dev/null
     docker_api rm "$name" >/dev/null
 
+    begin_metric completed_wait_lookup
     name="$RUN_ID-$sample-$product-wait"
     docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     docker_api start "$name" >/dev/null
     while [[ $(docker_api inspect --format '{{.State.Running}}' "$name") == true ]]; do sleep 0.005; done
     value=$(docker_elapsed_ms "$host" wait "$name")
-    append_result "$product" "$sample" "$position" completed_wait_lookup "$value" ms
+    append_result "$product" "$sample" "$position" warm completed_wait_lookup "$value" ms
     docker_api rm "$name" >/dev/null
 
+    begin_metric live_wait_kill_to_exit_delivery
     name="$RUN_ID-$sample-$product-live-wait"
     docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" \
-        "$BASE_IMAGE" /bin/true >/dev/null
-    value=$(live_wait_registered_ms "$host" "$name")
-    append_result "$product" "$sample" "$position" live_wait_registered_start_to_exit "$value" ms
+        "$BASE_IMAGE" /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
+    docker_api start "$name" >/dev/null
+    value=$(live_wait_delivery_ms "$host" "$name")
+    append_result "$product" "$sample" "$position" warm live_wait_kill_to_exit_delivery "$value" ms
     docker_api rm "$name" >/dev/null
 
+    begin_metric container_remove
     name="$RUN_ID-$sample-$product-remove"
     docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     value=$(docker_elapsed_ms "$host" rm "$name")
-    append_result "$product" "$sample" "$position" container_remove "$value" ms
+    append_result "$product" "$sample" "$position" warm container_remove "$value" ms
 
+    begin_metric run_remove_true
     value=$(docker_elapsed_ms "$host" run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
-    append_result "$product" "$sample" "$position" run_remove_true "$value" ms
+    append_result "$product" "$sample" "$position" warm run_remove_true "$value" ms
 
+    begin_metric exec_true
     runner="$RUN_ID-$sample-$product-runner"
     docker_api create --name "$runner" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
         /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
     docker_api start "$runner" >/dev/null
     value=$(docker_elapsed_ms "$host" exec "$runner" /bin/true)
-    append_result "$product" "$sample" "$position" exec_true "$value" ms
+    append_result "$product" "$sample" "$position" warm exec_true "$value" ms
+    begin_metric sha256_1gib
     value=$(docker_elapsed_ms "$host" exec "$runner" /bin/sh -c 'head -c 1073741824 /dev/zero | sha256sum >/dev/null')
     value=$(awk -v milliseconds="$value" 'BEGIN {printf "%.6f", milliseconds/1000}')
-    append_result "$product" "$sample" "$position" sha256_1gib "$value" seconds
+    append_result "$product" "$sample" "$position" warm sha256_1gib "$value" seconds
 
+    begin_metric four_idle_containers_physical_footprint
     for index in 1 2 3; do
         docker_api create --name "$runner-$index" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
             /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
@@ -768,23 +880,28 @@ benchmark_product() {
     done
     sleep 1
     record_process_snapshot "$product" "$sample" four_containers
-    append_result "$product" "$sample" "$position" four_idle_containers_physical_footprint "$(owned_memory_bytes "$product")" bytes
+    append_result "$product" "$sample" "$position" warm four_idle_containers_physical_footprint "$(owned_memory_bytes "$product")" bytes
 
+    begin_metric nginx_ready
     nginx="$RUN_ID-$sample-$product-nginx"
     readiness=$(nginx_ready_ms "$host" "$nginx" "$NGINX_IMAGE" "socktainer.benchmark.run=$RUN_ID")
     value=${readiness%% *}
     port=${readiness##* }
-    append_result "$product" "$sample" "$position" nginx_ready "$value" ms
+    append_result "$product" "$sample" "$position" warm nginx_ready "$value" ms
+    begin_metric nginx_requests_per_second
     ab_output=$(ab -k -n "$AB_REQUESTS" -c "$AB_CONCURRENCY" "http://127.0.0.1:$port/")
     failed=$(awk '/Failed requests:/ {print $3}' <<< "$ab_output")
     complete=$(awk '/Complete requests:/ {print $3}' <<< "$ab_output")
     non_2xx=$(awk '/Non-2xx responses:/ {print $3}' <<< "$ab_output")
-    [[ $complete == "$AB_REQUESTS" && $failed == 0 && ${non_2xx:-0} == 0 ]] \
-        || die "$product: ab did not complete cleanly (complete=$complete failed=$failed non2xx=${non_2xx:-0})"
+    observed_concurrency=$(awk '/Concurrency Level:/ {print $3}' <<< "$ab_output")
+    [[ $complete == "$AB_REQUESTS" && $failed == 0 && ${non_2xx:-0} == 0 \
+        && $observed_concurrency == "$AB_CONCURRENCY" ]] \
+        || die "$product: ab invalid (complete=$complete failed=$failed non2xx=${non_2xx:-0} concurrency=${observed_concurrency:-missing})"
     rps=$(awk '/Requests per second:/ {print $4}' <<< "$ab_output")
-    append_result "$product" "$sample" "$position" nginx_requests_per_second "$rps" requests_per_second
-    append_result "$product" "$sample" "$position" nginx_failed_requests "$failed" count
+    append_result "$product" "$sample" "$position" warm nginx_requests_per_second "$rps" requests_per_second
+    append_result "$product" "$sample" "$position" warm nginx_failed_requests "$failed" count
 
+    begin_metric bind_write
     bind_root=$(product_value "$product" BIND_ROOT)
     bind_root=${bind_root:-$BIND_STATE_DIR}
     bind_dir="$bind_root/$sample-$product"
@@ -796,20 +913,29 @@ benchmark_product() {
     dd_output=$(docker_api exec "$bind_runner" /bin/sh -c \
         "LC_ALL=C dd if=/dev/zero of=/bench/data.bin bs=1048576 count=$BIND_MIB conv=fsync 2>&1")
     value=$(awk -f "$DD_RESULT_PARSER" <<< "$dd_output") || die "$product: could not parse bind write dd output"
-    append_result "$product" "$sample" "$position" bind_write "$value" MiB_per_second
+    append_result "$product" "$sample" "$position" warm bind_write "$value" MiB_per_second
+    begin_metric bind_cached_read
     docker_api exec "$bind_runner" /bin/sh -c \
         'LC_ALL=C dd if=/bench/data.bin of=/dev/null bs=1048576 >/dev/null 2>&1'
     dd_output=$(docker_api exec "$bind_runner" /bin/sh -c \
         'LC_ALL=C dd if=/bench/data.bin of=/dev/null bs=1048576 2>&1')
     value=$(awk -f "$DD_RESULT_PARSER" <<< "$dd_output") || die "$product: could not parse bind read dd output"
-    append_result "$product" "$sample" "$position" bind_cached_read "$value" MiB_per_second
+    append_result "$product" "$sample" "$position" bind_cache bind_cached_read "$value" MiB_per_second
+    begin_metric post_bind_cache_physical_footprint
     record_process_snapshot "$product" "$sample" post_bind_cache
-    append_result "$product" "$sample" "$position" post_bind_cache_physical_footprint "$(owned_memory_bytes "$product")" bytes
+    append_result "$product" "$sample" "$position" bind_cache post_bind_cache_physical_footprint "$(owned_memory_bytes "$product")" bytes
+    begin_metric post_bind_reclaim_physical_footprint
+    docker_api rm -f "$bind_runner" "$nginx" >/dev/null
     rm -f "$bind_dir/data.bin"
     rmdir "$bind_dir"
+    sleep 5
+    record_process_snapshot "$product" "$sample" post_bind_reclaim
+    append_result "$product" "$sample" "$position" reclaim post_bind_reclaim_physical_footprint "$(owned_memory_bytes "$product")" bytes
 
-    append_result "$product" "$sample" "$position" storage_allocated "$(storage_bytes "$paths" allocated)" bytes
-    append_result "$product" "$sample" "$position" storage_logical "$(storage_bytes "$paths" logical)" bytes
+    begin_metric storage
+    record_storage_snapshot "$product" "$sample" "$paths"
+    append_result "$product" "$sample" "$position" warm storage_allocated "$(storage_bytes "$paths" allocated)" bytes
+    append_result "$product" "$sample" "$position" warm storage_logical "$(storage_bytes "$paths" logical)" bytes
     cleanup_host "$host"
     stop_product "$product"
     wait_for_engine_stop "$socket" || die "$product did not stop after the sample"
@@ -826,6 +952,17 @@ while [[ $# -gt 0 ]]; do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if [[ -z $OUTPUT ]]; then
+    OUTPUT="$PWD/runtime-benchmark-$RUN_ID.json"
+fi
+RUNS_DIRECTORY=${BENCH_RUNS_DIRECTORY:-"$(dirname "$OUTPUT")/runtime-benchmark-runs"}
+RUN_DIRECTORY="$RUNS_DIRECTORY/$RUN_ID"
+RESULTS_FILE=$(mktemp -t socktainer-benchmark-results.XXXXXX)
+PROCESS_FILE=$(mktemp -t socktainer-benchmark-processes.XXXXXX)
+STORAGE_FILE=$(mktemp -t socktainer-benchmark-storage.XXXXXX)
+ENGINE_STATE_DIR=$(mktemp -d /tmp/socktainer-benchmark-engines.XXXXXX)
+BIND_STATE_DIR=$(mktemp -d "$HOME/.socktainer-benchmark-bind.XXXXXX")
 
 preflight
 IFS=',' read -r -a product_list <<< "$PRODUCTS"
@@ -852,6 +989,7 @@ if [[ $MODE == dry-run ]]; then
     exit 0
 fi
 
+[[ ! -e $OUTPUT ]] || die "output already exists; use a unique --output path: $OUTPUT"
 mkdir -p "$RUN_DIRECTORY" "$(dirname "$OUTPUT")"
 jq -cn --arg runId "$RUN_ID" --arg startedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{status:"incomplete",runId:$runId,startedAt:$startedAt}' > "$RUN_DIRECTORY/status.json"
@@ -864,7 +1002,8 @@ for ((sample = 1; sample <= SAMPLES; sample++)); do
 done
 validate_results
 finalize_json
-cp "$OUTPUT" "$RUN_DIRECTORY/complete.json"
+cp "$OUTPUT" "$RUN_DIRECTORY/complete.json.tmp"
+mv "$RUN_DIRECTORY/complete.json.tmp" "$RUN_DIRECTORY/complete.json"
 jq -cn --arg runId "$RUN_ID" --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{status:"complete",runId:$runId,completedAt:$completedAt}' > "$RUN_DIRECTORY/status.json.tmp"
 mv "$RUN_DIRECTORY/status.json.tmp" "$RUN_DIRECTORY/status.json"

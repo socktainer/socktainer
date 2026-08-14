@@ -21,7 +21,3 @@ public func getDockerEngineApiMinVersion() -> String {
 public func getDockerEngineApiMaxVersion() -> String {
     String(cString: get_docker_engine_api_max_version())
 }
-
-public func getAppleContainerVersion() -> String {
-    String(cString: get_apple_container_version())
-}

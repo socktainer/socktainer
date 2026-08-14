@@ -284,7 +284,6 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			return
 		}
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
-		s.backend.BeginTaskPreparation(body.ID)
 	case api.MethodContainerStart:
 		body, err := decode[api.ContainerStartRequest](request)
 		if err != nil {

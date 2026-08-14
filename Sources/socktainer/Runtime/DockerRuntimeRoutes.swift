@@ -908,7 +908,10 @@ struct DockerRuntimeRoutes: RouteCollection {
     }
 
     private func resolveMountSource(_ source: String) async throws -> (path: String, volumeName: String?) {
-        if source.hasPrefix("/") { return (source, nil) }
+        if source.hasPrefix("/") {
+            let canonicalSource = canonicalFileURL(URL(fileURLWithPath: source)).path
+            return (canonicalSource, nil)
+        }
         guard let volumeClient else {
             throw Abort(.notImplemented, reason: "Named volume mounts are not configured")
         }

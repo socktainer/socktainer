@@ -122,16 +122,20 @@ swift-fmt:
 guest-image:
 	@$(MAKE) -C Guest image
 
+.PHONY: vmm
+vmm:
+	@$(MAKE) -C VMM all
+
 .PHONY: installer
-installer: release guest-image
+installer: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" pkginstaller
 
 .PHONY: installer-signed
-installer-signed: release
+installer-signed: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-signed
 
 .PHONY: installer-notarized
-installer-notarized: release
+installer-notarized: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-notarized
 
 .PHONY: installer-help

@@ -113,25 +113,49 @@ copy-binary: prepare-root
 	fi
 	@cp ../.build/release/socktainer "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
 	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"
-	@if [ ! -f "../Guest/out/socktainer-guest.oci.tar" ]; then \
-		echo "Error: guest OCI image not found. Run 'make guest-image' in the parent directory first."; \
-		exit 1; \
-	fi
-	@cp ../Guest/out/socktainer-guest.oci.tar \
-		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer/socktainer-guest.oci.tar"
+	@for artifact in \
+		../VMM/out/socktainer-vmm \
+		../VMM/out/libkrun.1.dylib \
+		../VMM/out/gvproxy \
+		../Guest/out/socktainer-vmlinux \
+		../Guest/out/socktainer-root.ext4; do \
+		if [ ! -f "$$artifact" ]; then \
+			echo "Error: runtime artifact not found: $$artifact"; \
+			exit 1; \
+		fi; \
+	done
+	@cp ../VMM/out/socktainer-vmm ../VMM/out/libkrun.1.dylib ../VMM/out/gvproxy \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
+	@chmod +x \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm" \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"
+	@cp ../Guest/out/socktainer-vmlinux ../Guest/out/socktainer-root.ext4 \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer/"
+	@xattr -cr "$(PACKAGE_ROOT)$(INSTALL_PREFIX)"
 
 .PHONY: sign-binary
 sign-binary: copy-binary
 	@if [ "$(NO_CODESIGN)" != "1" ] && [ "$(APPLE_APPLICATION_ID)" != "-" ]; then \
-		echo "Signing binary..."; \
+		echo "Signing runtime artifacts..."; \
+		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/libkrun.1.dylib"; \
+		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"; \
+		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
+			--entitlements ../VMM/helper/entitlements.plist \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm"; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
 			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"; \
+		for artifact in libkrun.1.dylib gvproxy socktainer-vmm socktainer; do \
+			codesign --verify --strict --verbose=2 \
+				"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/$$artifact"; \
+		done; \
 	fi
 
 .PHONY: component-pkg
 component-pkg: sign-binary scripts
 	@echo "Creating component package..."
-	@pkgbuild --root "$(PACKAGE_ROOT)" \
+	@COPYFILE_DISABLE=1 pkgbuild --root "$(PACKAGE_ROOT)" \
 		--identifier "$(PACKAGE_IDENTIFIER)" \
 		--version $(BUILD_VERSION) \
 		--install-location / \
@@ -142,7 +166,7 @@ component-pkg: sign-binary scripts
 .PHONY: product-pkg
 product-pkg: component-pkg resources
 	@echo "Creating distribution package..."
-	@productbuild --distribution $(BUILD_DIR)/Distribution \
+	@COPYFILE_DISABLE=1 productbuild --distribution $(BUILD_DIR)/Distribution \
 		--resources $(RESOURCES_DIR) \
 		--package-path $(OUT_DIR) \
 		$(OUT_DIR)/socktainer-unsigned.pkg
@@ -231,7 +255,7 @@ help:
 	@echo "       installer-notarized"
 	@echo ""
 	@echo "Prerequisites:"
-	@echo "  - Run 'make release' in the parent directory to build the binary"
+	@echo "  - Run 'make release guest-image vmm' in the parent directory to build the runtime"
 	@echo "  - Ensure Xcode command line tools are installed"
 	@echo "  - For notarization: Apple Developer account with app-specific password"
 

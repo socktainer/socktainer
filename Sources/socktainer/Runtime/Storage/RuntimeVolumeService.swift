@@ -3,7 +3,7 @@ import Foundation
 import Vapor
 
 /// Persistent local volumes for the single guest runtime. Volume data stays in
-/// a host directory that the VM shares directly through Apple virtiofs.
+/// a host directory that the custom VMM shares through its virtio-fs device.
 actor RuntimeVolumeService: ClientVolumeProtocol {
     private struct Metadata: Codable {
         let name: String
@@ -180,7 +180,7 @@ actor RuntimeVolumeService: ClientVolumeProtocol {
 
     private func write(_ metadata: Metadata) throws {
         let url = volumeDirectory(metadata.name).appendingPathComponent("metadata.json", isDirectory: false)
-        try encoder.encode(metadata).write(to: url, options: [.atomic, .completeFileProtection])
+        try encoder.encode(metadata).write(to: url, options: .atomic)
     }
 
     private func metadataEntries() throws -> [URL] {

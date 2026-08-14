@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -116,7 +117,7 @@ func TestNetworkManagerReportsPreparedPublication(t *testing.T) {
 	}
 }
 
-func TestNetworkManagerResolvesOnlyPreparedPublishedTargets(t *testing.T) {
+func TestNetworkManagerInstallsTCPKernelForwardingRules(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
@@ -127,22 +128,21 @@ func TestNetworkManagerResolvesOnlyPreparedPublishedTargets(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	target, err := manager.PublishedTarget(42000, "tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if target != "10.88.0.2:8080" {
-		t.Fatalf("target = %q, want 10.88.0.2:8080", target)
-	}
-	if _, err := manager.PublishedTarget(42001, "tcp"); err == nil {
-		t.Fatal("unpublished guest port resolved")
-	}
-	if strings.Contains(strings.Join(runner.commands, "\n"), "PREROUTING") {
-		t.Fatal("published port installed a native vmnet ingress rule")
+	joined := strings.Join(runner.commands, "\n")
+	for _, expected := range []string{
+		"iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 42000",
+		"-j DNAT --to-destination 10.88.0.2:8080",
+		"iptables -A FORWARD -i eth0 -o socktainer0 -p tcp -d 10.88.0.2 --dport 8080",
+		"iptables -A FORWARD -i socktainer0 -o eth0 -p tcp -s 10.88.0.2 --sport 8080",
+		"--comment socktainer:st",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("kernel rules do not contain %q:\n%s", expected, joined)
+		}
 	}
 }
 
-func TestNetworkManagerResolvesAndRemovesUDP(t *testing.T) {
+func TestNetworkManagerInstallsAndRemovesExactUDPRules(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("dns"); err != nil {
@@ -152,18 +152,24 @@ func TestNetworkManagerResolvesAndRemovesUDP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.PublishedTarget(published[0].GuestPort, "udp"); err != nil {
-		t.Fatal(err)
-	}
 	if err := manager.Delete("dns"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.PublishedTarget(published[0].GuestPort, "udp"); err == nil {
-		t.Fatal("deleted UDP publication still resolves")
+	joined := strings.Join(runner.commands, "\n")
+	guestPort := strconv.Itoa(int(published[0].GuestPort))
+	for _, expected := range []string{
+		"iptables -t nat -A PREROUTING -i eth0 -p udp --dport " + guestPort,
+		"iptables -t nat -D PREROUTING -i eth0 -p udp --dport " + guestPort,
+		"iptables -D FORWARD -i eth0 -o socktainer0 -p udp",
+		"iptables -D FORWARD -i socktainer0 -o eth0 -p udp",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("UDP lifecycle does not contain %q:\n%s", expected, joined)
+		}
 	}
 }
 
-func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testing.T) {
+func TestNetworkManagerPreservesHostSourceMetadataWithKernelIngress(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := newTestNetworkManager(runner)
 	if _, err := manager.Create("web"); err != nil {
@@ -180,8 +186,8 @@ func TestNetworkManagerPreservesHostSourceMetadataWithoutNativeIngress(t *testin
 		t.Fatalf("host source = %q", published[0].HostSource)
 	}
 	joined := strings.Join(runner.commands, "\n")
-	if strings.Contains(joined, "PREROUTING") {
-		t.Fatalf("native ingress rule is present:\n%s", joined)
+	if !strings.Contains(joined, "PREROUTING -i eth0 -p tcp --dport 42000") {
+		t.Fatalf("kernel ingress rule is absent:\n%s", joined)
 	}
 }
 
@@ -190,7 +196,7 @@ func TestDeferredNetworkPreparationCreatesAndPublishesAtomically(t *testing.T) {
 	manager := newTestNetworkManager(runner)
 	backend := &Backend{network: manager}
 	want := []api.PublishedPort{{ContainerPort: 80, GuestPort: 42000, Protocol: "tcp"}}
-	if err := backend.prepareNetwork("web", want); err != nil {
+	if _, err := backend.prepareNetwork("web", want); err != nil {
 		t.Fatal(err)
 	}
 	if got := manager.Published("web"); !reflect.DeepEqual(got, want) {
@@ -202,7 +208,7 @@ func TestDeferredNetworkPreparationRollsBackInvalidPublication(t *testing.T) {
 	runner := &recordingNetworkRunner{}
 	manager := newTestNetworkManager(runner)
 	backend := &Backend{network: manager}
-	err := backend.prepareNetwork("web", []api.PublishedPort{{ContainerPort: 0, Protocol: "tcp"}})
+	_, err := backend.prepareNetwork("web", []api.PublishedPort{{ContainerPort: 0, Protocol: "tcp"}})
 	if err == nil {
 		t.Fatal("invalid publication succeeded")
 	}
@@ -237,7 +243,7 @@ func TestNetworkManagerDeleteRemovesPublicationAndNamespace(t *testing.T) {
 	if _, err := manager.Create("web"); err != nil {
 		t.Fatal(err)
 	}
-	published, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 8080, Protocol: "tcp"}})
+	_, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 8080, Protocol: "tcp"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,10 +251,98 @@ func TestNetworkManagerDeleteRemovesPublicationAndNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(runner.commands, "\n")
-	if _, err := manager.PublishedTarget(published[0].GuestPort, "tcp"); err == nil {
-		t.Fatal("deleted publication still resolves")
-	}
 	if !strings.Contains(joined, "netlink delete st") {
 		t.Fatalf("namespace delete is absent:\n%s", joined)
+	}
+}
+
+func TestNetworkManagerRejectsDuplicateGuestPortAcrossContainers(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	for _, id := range []string{"first", "second"} {
+		if _, err := manager.Create(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	port := []api.PublishedPort{{ContainerPort: 80, GuestPort: 42000, Protocol: "tcp"}}
+	if _, err := manager.Publish("first", port); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Publish("second", port); err == nil || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("duplicate publication error = %v", err)
+	}
+}
+
+func TestNetworkManagerRejectsDuplicateGuestPortInOneRequest(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	if _, err := manager.Create("web"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := manager.Publish("web", []api.PublishedPort{
+		{ContainerPort: 80, GuestPort: 42000, Protocol: "tcp"},
+		{ContainerPort: 81, GuestPort: 42000, Protocol: "tcp"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("duplicate request error = %v", err)
+	}
+	joined := strings.Join(runner.commands, "\n")
+	if !strings.Contains(joined, "iptables -t nat -D PREROUTING") {
+		t.Fatalf("duplicate request did not roll back its first rule set:\n%s", joined)
+	}
+}
+
+func TestNetworkManagerAllowsTCPAndUDPOnSameGuestPort(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	if _, err := manager.Create("dual"); err != nil {
+		t.Fatal(err)
+	}
+	published, err := manager.Publish("dual", []api.PublishedPort{
+		{ContainerPort: 80, GuestPort: 42000, Protocol: "TCP"},
+		{ContainerPort: 53, GuestPort: 42000, Protocol: "udp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published[0].Protocol != "tcp" || published[1].Protocol != "udp" {
+		t.Fatalf("protocols were not normalized: %#v", published)
+	}
+	joined := strings.Join(runner.commands, "\n")
+	if !strings.Contains(joined, "-p tcp --dport 42000") ||
+		!strings.Contains(joined, "-p udp --dport 42000") {
+		t.Fatalf("dual-protocol rules are incomplete:\n%s", joined)
+	}
+}
+
+func TestNetworkManagerRollsBackPartialRuleInstallation(t *testing.T) {
+	runner := &recordingNetworkRunner{failOn: "-A FORWARD -i eth0"}
+	manager := newTestNetworkManager(runner)
+	if _, err := manager.Create("web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 80, GuestPort: 42000, Protocol: "tcp"}}); !errors.Is(err, errRequested) {
+		t.Fatalf("publish error = %v", err)
+	}
+	joined := strings.Join(runner.commands, "\n")
+	if !strings.Contains(joined, "iptables -t nat -D PREROUTING") {
+		t.Fatalf("partial DNAT rule was not rolled back:\n%s", joined)
+	}
+	if got := manager.Published("web"); len(got) != 0 {
+		t.Fatalf("failed publication became visible: %#v", got)
+	}
+}
+
+func TestNetworkManagerRejectsChangedRepublish(t *testing.T) {
+	runner := &recordingNetworkRunner{}
+	manager := newTestNetworkManager(runner)
+	if _, err := manager.Create("web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 80, GuestPort: 42000}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Publish("web", []api.PublishedPort{{ContainerPort: 81, GuestPort: 42000}}); err == nil {
+		t.Fatal("changed publication was treated as idempotent")
 	}
 }

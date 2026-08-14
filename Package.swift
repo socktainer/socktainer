@@ -7,19 +7,6 @@ let buildVersion = ProcessInfo.processInfo.environment["BUILD_VERSION"] ?? "unsp
 let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecified"
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "v1.32"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "v1.51"
-func resolvedVersion(for identity: String) -> String {
-    guard let data = FileManager.default.contents(atPath: "Package.resolved"),
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-        let pins = json["pins"] as? [[String: Any]],
-        let pin = pins.first(where: { ($0["identity"] as? String) == identity }),
-        let state = pin["state"] as? [String: Any],
-        let version = state["version"] as? String
-    else {
-        fatalError("Package.resolved has no resolved version for \(identity)")
-    }
-    return version
-}
-
 let package = Package(
     name: "socktainer",
     platforms: [
@@ -85,7 +72,6 @@ let package = Package(
                 .define("BUILD_TIME", to: "\"\(buildTime)\""),
                 .define("DOCKER_ENGINE_API_MIN_VERSION", to: "\"\(dockerEngineApiMinVersion)\""),
                 .define("DOCKER_ENGINE_API_MAX_VERSION", to: "\"\(dockerEngineApiMaxVersion)\""),
-                .define("APPLE_CONTAINER_VERSION", to: "\"\(resolvedVersion(for: "container"))\""),
             ]
         ),
     ]

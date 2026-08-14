@@ -13,21 +13,6 @@ import (
 	"github.com/socktainer/socktainer/guest/internal/api"
 )
 
-func TestContainerRecordPreparationCompletesOnce(t *testing.T) {
-	t.Parallel()
-	record := &containerRecord{}
-	if !record.beginPreparation() {
-		t.Fatal("first preparation must start")
-	}
-	if record.beginPreparation() {
-		t.Fatal("second preparation must not start")
-	}
-	record.finishPreparation(nil, nil)
-	if err := record.waitPreparation(context.Background()); err != nil {
-		t.Fatalf("wait for successful preparation: %v", err)
-	}
-}
-
 func TestExecCleanupRetriesUntilSuccess(t *testing.T) {
 	t.Parallel()
 	attempts := 0
@@ -80,63 +65,6 @@ func TestExecCleanupSchedulingDoesNotWaitForDelete(t *testing.T) {
 	<-done
 }
 
-func TestContainerRecordDeleteCancelsBeforeTaskCreation(t *testing.T) {
-	t.Parallel()
-	record := &containerRecord{}
-	if !record.beginPreparation() {
-		t.Fatal("preparation must start")
-	}
-	if !record.cancelPreparation() {
-		t.Fatal("delete must cancel before task creation")
-	}
-	if record.beginTaskCreation() {
-		t.Fatal("canceled preparation must not create a task")
-	}
-	record.finishPreparation(nil, nil)
-	if err := record.waitPreparation(context.Background()); err != nil {
-		t.Fatalf("wait for canceled preparation: %v", err)
-	}
-}
-
-func TestContainerRecordCancellationSerializesTaskCreation(t *testing.T) {
-	t.Parallel()
-	record := &containerRecord{}
-	if !record.beginPreparation() {
-		t.Fatal("preparation must start")
-	}
-	cancelOwnsTransition := make(chan struct{})
-	allowCancel := make(chan struct{})
-	canceled := make(chan bool, 1)
-	go func() {
-		canceled <- record.cancelPreparationTransition(func() {
-			close(cancelOwnsTransition)
-			<-allowCancel
-		})
-	}()
-	<-cancelOwnsTransition
-	created := make(chan bool, 1)
-	go func() { created <- record.beginTaskCreation() }()
-	select {
-	case <-created:
-		t.Fatal("task creation crossed an incomplete cancellation transition")
-	default:
-	}
-	close(allowCancel)
-	if !<-canceled {
-		t.Fatal("cancellation did not win the transition")
-	}
-	if <-created {
-		t.Fatal("task creation committed after cancellation won")
-	}
-}
-
-func TestSpeculativePreparationKeepsImmediateDeleteWindow(t *testing.T) {
-	t.Parallel()
-	if speculativeTaskPreparationDelay < 100*time.Millisecond {
-		t.Fatalf("preparation delay %s is too short for immediate Docker rm", speculativeTaskPreparationDelay)
-	}
-}
-
 func TestTaskCreationQueueBoundsConcurrentRuncWork(t *testing.T) {
 	t.Parallel()
 	backend := &Backend{taskCreates: make(chan struct{}, maxConcurrentTaskCreations)}
@@ -178,61 +106,6 @@ func TestTaskCreationTimeoutStartsAfterQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend.releaseTaskCreation()
-}
-
-func TestQueuedTaskPreparationCanBeCanceled(t *testing.T) {
-	t.Parallel()
-	backend := &Backend{taskCreates: make(chan struct{}, maxConcurrentTaskCreations)}
-	if err := backend.acquireTaskCreation(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	canceled := make(chan struct{})
-	result := make(chan bool, 1)
-	go func() {
-		acquired, _ := backend.acquireTaskPreparation(context.Background(), canceled)
-		result <- acquired
-	}()
-	close(canceled)
-	if <-result {
-		t.Fatal("canceled preparation acquired the runc-create slot")
-	}
-	backend.releaseTaskCreation()
-}
-
-func TestContainerRecordStartRequestsSinglePreparation(t *testing.T) {
-	t.Parallel()
-	record := &containerRecord{}
-	if !record.beginPreparation() {
-		t.Fatal("preparation must start")
-	}
-	record.requestPreparation()
-	record.requestPreparation()
-	select {
-	case <-record.prepareNow:
-	default:
-		t.Fatal("start did not release the preparation delay")
-	}
-	if !record.beginTaskCreation() {
-		t.Fatal("start must permit task creation")
-	}
-	if record.cancelPreparation() {
-		t.Fatal("delete cannot cancel after task creation begins")
-	}
-	record.finishPreparation(nil, nil)
-	if err := record.waitPreparation(context.Background()); err != nil {
-		t.Fatalf("wait for requested preparation: %v", err)
-	}
-}
-
-func TestContainerRecordPreparationPropagatesError(t *testing.T) {
-	t.Parallel()
-	record := &containerRecord{}
-	record.beginPreparation()
-	want := errors.New("prepare failed")
-	record.finishPreparation(nil, want)
-	if err := record.waitPreparation(context.Background()); !errors.Is(err, want) {
-		t.Fatalf("got %v, want %v", err, want)
-	}
 }
 
 func TestContainerRecordCoordinatesTaskReaping(t *testing.T) {
@@ -398,12 +271,17 @@ func TestResolveImageProcessArgsUsesDockerOverrideRules(t *testing.T) {
 }
 
 func TestResolveBindSourceKeepsSharedPath(t *testing.T) {
-	root := t.TempDir()
-	project := filepath.Join(root, "project")
+	guestRoot := t.TempDir()
+	project := filepath.Join(guestRoot, "project")
 	if err := os.Mkdir(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveBindSource(project, root)
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          guestRoot,
+		excludedHostSource: "/Users/test/.socktainer/engine",
+	}
+	got, err := resolveBindSource("/Users/test/project", configuration)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,19 +295,75 @@ func TestResolveBindSourceKeepsSharedPath(t *testing.T) {
 }
 
 func TestResolveBindSourceRejectsOutsideRoot(t *testing.T) {
-	if _, err := resolveBindSource(os.TempDir(), t.TempDir()); err == nil {
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          t.TempDir(),
+		excludedHostSource: "/Users/test/.socktainer/engine",
+	}
+	if _, err := resolveBindSource("/private/tmp", configuration); err == nil {
 		t.Fatal("expected path escape rejection")
 	}
 }
 
 func TestResolveBindSourceRejectsSymlinkEscape(t *testing.T) {
-	root := t.TempDir()
-	escape := filepath.Join(root, "escape")
+	guestRoot := t.TempDir()
+	escape := filepath.Join(guestRoot, "escape")
 	if err := os.Symlink(os.TempDir(), escape); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveBindSource(escape, root); err == nil {
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          guestRoot,
+		excludedHostSource: "/Users/test/.socktainer/engine",
+	}
+	if _, err := resolveBindSource("/Users/test/escape", configuration); err == nil {
 		t.Fatal("expected symlink escape rejection")
+	}
+}
+
+func TestResolveBindSourceRejectsHomeContainingEngineState(t *testing.T) {
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          t.TempDir(),
+		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+	}
+	if _, err := resolveBindSource("/Users/test", configuration); err == nil {
+		t.Fatal("expected home bind rejection because it contains engine state")
+	}
+}
+
+func TestResolveBindSourceRejectsEngineStateAndDescendants(t *testing.T) {
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          t.TempDir(),
+		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+	}
+	for _, source := range []string{
+		configuration.excludedHostSource,
+		filepath.Join(configuration.excludedHostSource, "data.ext4"),
+	} {
+		if _, err := resolveBindSource(source, configuration); err == nil {
+			t.Fatalf("expected engine-state bind rejection for %q", source)
+		}
+	}
+}
+
+func TestResolveBindSourceRejectsSymlinkIntoEngineState(t *testing.T) {
+	guestRoot := t.TempDir()
+	engineState := filepath.Join(guestRoot, "Library/Application Support/Socktainer/engine")
+	if err := os.MkdirAll(engineState, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(engineState, filepath.Join(guestRoot, "engine-link")); err != nil {
+		t.Fatal(err)
+	}
+	configuration := bindMountConfiguration{
+		hostSource:         "/Users/test",
+		guestRoot:          guestRoot,
+		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+	}
+	if _, err := resolveBindSource("/Users/test/engine-link", configuration); err == nil {
+		t.Fatal("expected symlink into engine state to be rejected")
 	}
 }
 

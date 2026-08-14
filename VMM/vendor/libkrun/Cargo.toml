@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "src/libkrun",
+    "src/init_blob",
+    "src/input",
+    "src/display",
+    "src/utils",
+    "src/arch_gen",
+    "src/cpuid",
+    "src/smbios",
+    "src/polly",
+    "src/kernel",
+    "src/arch",
+    "src/hvf",
+    "src/devices",
+    "src/vmm",
+    "src/aws_nitro",
+    "src/rutabaga_gfx",
+]
+exclude = ["examples/gtk_display"]
+resolver = "2"
+
+[profile.dev]
+#panic = "abort"
+
+[profile.release]
+#panic = "abort"
+lto = true

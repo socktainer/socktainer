@@ -1,8 +1,8 @@
 # Socktainer macOS Package Installer
 
-Builds a macOS `.pkg` installer that installs Socktainer and its persistent
-containerd guest image under `/opt/socktainer/` and adds the binary directory
-to the system PATH.
+Builds a macOS `.pkg` installer that installs Socktainer, its custom VMM,
+and its persistent containerd guest artifacts under `/opt/socktainer/`. It also
+adds the binary directory to the system PATH.
 
 ## Quick Start
 
@@ -18,7 +18,7 @@ make APPLE_APPLICATION_ID="Developer ID Application: Your Name" \
 
 ## Prerequisites
 
-- Run `make release guest-image` first only when you invoke the `pkginstaller`
+- Run `make release guest-image vmm` first only when you invoke the `pkginstaller`
   subdirectory directly. The root `make installer` target does this automatically.
 - Xcode Command Line Tools installed
 - Developer certificates (for signed builds only)
@@ -66,8 +66,8 @@ in-place upgrade by reinstalling the previous package or Homebrew version.
 ## Output
 
 Creates `out/socktainer-installer.pkg` that:
-- Installs binary to `/opt/socktainer/bin/socktainer`
-- Installs the guest OCI image to `/opt/socktainer/share/socktainer/`
+- Installs the daemon, VMM helper, libkrun, and gvproxy to `/opt/socktainer/bin/`
+- Installs the guest kernel and read-only root disk to `/opt/socktainer/share/socktainer/`
 - Adds `/opt/socktainer/bin` to system PATH
 - Shows professional installer UI
 
