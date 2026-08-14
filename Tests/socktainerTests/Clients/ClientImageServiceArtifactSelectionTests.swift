@@ -107,24 +107,6 @@ struct ClientImageServiceArtifactSelectionTests {
         }
     }
 
-    @Test("artifact-only roots are excluded from Docker image listings")
-    func artifactOnlyRootIsNotDockerImage() {
-        let descriptor = Descriptor(
-            mediaType: MediaTypes.imageManifest,
-            digest: Self.digest("a"),
-            size: 20,
-            artifactType: "application/vnd.example.provenance"
-        )
-        let artifact = ResolvedImageDescriptor(
-            descriptor: descriptor,
-            manifest: nil,
-            kind: .artifact,
-            runnableVariant: nil
-        )
-
-        #expect(ImageListRoute.isDockerImageRoot([artifact]) == false)
-    }
-
     @Test("config-dependent prune filters never select a root without runnable config")
     func pruneRequiresRunnableConfig() {
         #expect(

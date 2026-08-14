@@ -50,6 +50,7 @@ socktainer: build
 release: BUILD_CONFIGURATION = release
 release: BUILD_TIME = $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 release: all
+	@codesign --force --sign - --entitlements entitlements.plist .build/release/socktainer
 
 .PHONY: version
 version:
@@ -66,6 +67,9 @@ help:
 	@echo "  build            - Build in debug mode"
 	@echo "  release          - Build in release mode"
 	@echo "  test             - Run tests"
+	@echo "  integration      - Run live Docker lifecycle integration tests"
+	@echo "  benchmark-preflight - Validate runtime benchmark configuration"
+	@echo "  benchmark        - Run the configured runtime benchmark matrix"
 	@echo "  fmt              - Format source code"
 	@echo "  clean            - Clean build artifacts"
 	@echo "  version          - Show version information"
@@ -79,6 +83,22 @@ help:
 test: lint-pipes
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
 		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
+
+.PHONY: integration
+integration:
+	@bash scripts/integration-runtime.sh
+
+.PHONY: benchmark-preflight
+benchmark-preflight:
+	@bash scripts/benchmark-runtime.sh --preflight
+
+.PHONY: benchmark-test
+benchmark-test:
+	@bash scripts/tests/benchmark-runtime-parser-test.sh
+
+.PHONY: benchmark
+benchmark:
+	@bash scripts/benchmark-runtime.sh
 
 # Prevent Foundation's Pipe() from being used when passing fds to Apple Container
 # APIs (createProcess/bootstrap). Apple closes those fds immediately after duping
@@ -98,16 +118,24 @@ swift-fmt:
 	@$(SWIFT) format --recursive --configuration .swift-format -i $(SWIFT_SRC)
 
 # Installer targets - delegated to pkginstaller subdirectory
+.PHONY: guest-image
+guest-image:
+	@$(MAKE) -C Guest image
+
+.PHONY: vmm
+vmm:
+	@$(MAKE) -C VMM all
+
 .PHONY: installer
-installer: release
+installer: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" pkginstaller
 
 .PHONY: installer-signed
-installer-signed: release
+installer-signed: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-signed
 
 .PHONY: installer-notarized
-installer-notarized: release
+installer-notarized: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-notarized
 
 .PHONY: installer-help

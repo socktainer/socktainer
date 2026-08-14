@@ -39,13 +39,11 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
+          key: ${{ runner.os }}-${{ runner.arch }}-xcode-26.6-spm-release-${{ hashFiles('**/Package.resolved') }}
 
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
-          xcode-version: latest-stable
+          xcode-version: "26.6"
 
       - name: Display swift version
         run: |
@@ -65,19 +63,10 @@ jobs:
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
 
-      - name: build installer package
-        run: |
-          make installer
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: socktainer-installer
-          path: ./pkginstaller/out/socktainer-installer.pkg
 
   tests-lint-format:
     name: formatters & tests
@@ -86,16 +75,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version-file: Guest/go.mod
+          cache-dependency-path: Guest/go.sum
+
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
+          key: ${{ runner.os }}-${{ runner.arch }}-xcode-26.6-spm-debug-${{ hashFiles('**/Package.resolved') }}
 
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
-          xcode-version: latest-stable
+          xcode-version: "26.6"
 
       - name: Display swift version
         run: |
@@ -122,196 +114,8 @@ jobs:
       - name: Execute test
         run: make test
 
-  integration-test:
-    name: integration test
-    needs: build
-    runs-on: macos-26
-    timeout-minutes: 40
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # fetch the artifact from the build job
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: socktainer
-
-      - name: List downloaded artifact
+      - name: Test guest agent
         run: |
-          ls -la
-          chmod 755 socktainer
-
-      - name: fetch apple container
-        run: |
-          APPLE_CONTAINER_VERSION=$(python3 -c "import json; d=json.load(open('Package.resolved')); print([p['state']['version'] for p in d['pins'] if p['identity']=='container'][0])")
-          wget "https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-installer-unsigned.pkg" \
-            -O container-installer-signed.pkg
-
-      - name: install apple container
-        run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
-
-      # `container system start` writes the apiserver launchd plist, then
-      # bootstraps it via a launchctl call whose output and exit status it
-      # discards (ServiceManager.register in apple/container). It derives the
-      # target domain from `launchctl managername` + getuid(): under sudo in
-      # a CI session that yields a domain like user/0 that can't be
-      # bootstrapped into, so the registration silently fails and start dies
-      # at "Testing access to container-apiserver" with an XPC error. tmate
-      # was used here to work around that by providing a session whose
-      # computed domain happened to work, but tmate is deprecated in Homebrew
-      # (disabled 2026-12-11). Instead: when the first start fails, it has
-      # already written the plist - bootstrap it into the system domain
-      # ourselves (Mach lookups chain gui -> user -> system, so a
-      # system-domain service is reachable from any session; the plist's
-      # LimitLoadToSessionType allows System), then re-run start, which now
-      # passes its ping and completes the init-filesystem and kernel setup
-      # it skips on failure. Gated on the first start failing so an eventual
-      # upstream fix doesn't turn the bootstrap into a spurious "already
-      # bootstrapped" error.
-      - name: Start container system
-        run: |
-          if ! sudo container system start --enable-kernel-install; then
-            PLIST="$(sudo find /var/root "$HOME" -maxdepth 6 \
-              -path '*/com.apple.container/apiserver/apiserver.plist' 2>/dev/null | head -1)"
-            [ -n "$PLIST" ] || { echo "apiserver.plist not found" >&2; exit 1; }
-            sudo launchctl bootstrap system "$PLIST"
-            sudo container system start --enable-kernel-install
-          fi
-          sudo container system status
-
-      - name: run socktainer
-        run: |
-          nohup sudo -i $PWD/socktainer > service.log 2>&1 &
-          echo $! > service.pid
-          sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
-          sleep 5
-          cat service.log
-
-      - name: check container root
-        run: |
-          # quay.io/podman/hello has no auth or rate-limit issues and is already
-          # used later in this workflow. Avoids Docker Hub / ECR Public flakiness.
-          sudo container image pull quay.io/podman/hello
-          sudo container image ls
-
-      - name: install docker cli
-        run: |
-          brew install docker
-
-      - name: check docker image with socktainer
-        run: |
-          # expect that the image pulled above is present
-          sudo docker image ls | grep 'podman/hello'
-          # pull httpd image
-          sudo docker image pull httpd:latest
-          # list images
-          sudo docker image ls | grep httpd
-          # check inspect
-          # Get the image ID
-          IMAGE_ID=$(sudo docker image inspect httpd | jq -r '.[0].Id')
-          echo "Image ID: $IMAGE_ID"
-          # Check and fail if it doesn't start with sha256:
-          [[ $IMAGE_ID == sha256:* ]] || { echo "Error: Image ID does not start with sha256:"; exit 1; }
-          # pull image using digest
-          sudo docker pull quay.io/podman/hello@sha256:41316c18917a27a359ee3191fd8f43559d30592f82a144bbc59d9d44790f6e7a
-          # NOTE: we are not inspecting the image with digest due to
-          # https://github.com/socktainer/socktainer/issues/47
-          # check image is present
-          sudo docker image ls | grep 'quay.io/podman/hello'
-          # Tag images
-          sudo docker image tag httpd test
-          sudo docker image inspect test
-          # Prune images
-          sudo docker image prune --all --force
-          [[ "1" == $(sudo docker image ls | wc -l | xargs) ]]
-
-      - name: check docker load with socktainer
-        run: |
-          # OCI tarballs shaped like real `docker save` output, crafted without Docker.
-          ./scripts/craft-oci-fixtures.sh /tmp/oci-fixtures
-          # single manifest with complete blobs
-          sudo docker load -i /tmp/oci-fixtures/baseline.tar
-          sudo docker image ls | grep 'crafted-baseline'
-          # multi-platform index shipping only one platform's blobs (docker save v25+)
-          sudo docker load -i /tmp/oci-fixtures/sparse.tar
-          sudo docker image ls | grep 'crafted-sparse'
-          # two tags sharing one manifest blob (docker save tag1 tag2)
-          sudo docker load -i /tmp/oci-fixtures/multi-tag.tar
-          sudo docker image ls | grep 'crafted-one'
-          sudo docker image ls | grep 'crafted-two'
-          # a loaded image has its blobs in the content store, so save round-trips
-          sudo docker save crafted-baseline:latest -o /tmp/oci-fixtures/roundtrip.tar
-          sudo docker rmi crafted-baseline:latest crafted-sparse:latest crafted-one:latest crafted-two:latest
-          sudo docker load -i /tmp/oci-fixtures/roundtrip.tar
-          sudo docker image ls | grep 'crafted-baseline'
-          sudo docker rmi crafted-baseline:latest
-
-      # NOTE: Disabling tests for now.
-      #       Most likely calling some internal function that fails
-      #       on CI host.
-      # - name: check system info was returned by socktainer
-      #   run: |
-      #     # expect specific content returned via `/info` endpoint
-      #     sudo docker info | grep 'container-apiserver'
-      #     sudo docker info | grep 'com.apple.container'
-      #     sudo docker info | grep 'socktainer'
-
-      - name: check version info was returned by socktainer
-        run: |
-          # expect specific content returned via `/version` endpoint
-          sudo docker version | grep 'socktainer'
-          # expect specific Docker engine API versions
-          sudo docker version | grep 'v1.32'
-          sudo docker version | grep 'v1.51'
-
-      - name: check network with socktainer
-        run: |
-          # expect default network to be present
-          sudo docker network ls | grep default
-          # inspect the default network
-          NETWORK_ID=$(sudo docker network inspect default | jq -r '.[].Id')
-          echo "Network ID: ${NETWORK_ID}"
-          # Check and fail if it doesn't match 'default':
-          [[ ${NETWORK_ID} == default ]] || { echo "Error: Network ID does not match 'default'"; exit 1; }
-          # create networks
-          sudo docker network create test1
-          sudo docker network create test2
-          sudo docker network create test3
-          sudo docker network create test4
-          sudo docker network create foo
-          # delete network
-          sudo docker network rm foo
-          # prune networks using filter
-          sudo docker network prune --filter 'name=test' --force
-          # ensure only default is left
-          sudo docker network ls | grep 'default'
-          # Create a network with a label
-          sudo docker network create bar --label 'test=true'
-          # expect to get the label back when inspecting the network
-          [[ $(sudo docker network inspect bar | jq -r ".[0].Labels.test // empty") == "true" ]] || { echo "Error: Label 'test=true' not found"; exit 1;}
-
-      # NOTE: Inspecting a volume is not possible in CI
-      - name: check volume with socktainer
-        run: |
-          # create volume with randomly generated name
-          sudo docker volume create
-          # create volume
-          sudo docker volume create test
-          # create volumes with labels
-          sudo docker volume create foo --label 'test=false'
-          sudo docker volume create bar --label 'test=true'
-          # filter volumes by `test` expect 2 volumes to return (extra line for header)
-          [[ "3" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # filter volumes by `test=true` expect a single volume to return (extra line for header)
-          [[ "2" == $(sudo docker volume ls --filter 'label=test=true' | wc -l | xargs) ]]
-          # inspect volume
-          # sudo docker inspect test
-          # delete single volume
-          sudo docker volume rm test
-          # prune containers by labels and ensure it is not present
-          sudo docker volume prune --force --filter 'label=test=true'
-          [[ "2" == $(sudo docker volume ls --filter 'label=test' | wc -l | xargs) ]]
-          # prune all images end ensure no volumes are left
-          sudo docker volume prune --all --force
-          [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+          cd Guest
+          go test -race ./...
+          go vet ./...

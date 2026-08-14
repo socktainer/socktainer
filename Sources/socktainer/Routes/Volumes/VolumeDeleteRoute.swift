@@ -32,7 +32,11 @@ struct VolumeDeleteRoute: RouteCollection {
         }
 
         do {
-            try await client.delete(name: name)
+            if let runtime = client as? RuntimeVolumeService {
+                try await runtime.deleteIfUnused(name: name)
+            } else {
+                try await client.delete(name: name)
+            }
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 await broadcaster.broadcast(
                     DockerEvent.make(

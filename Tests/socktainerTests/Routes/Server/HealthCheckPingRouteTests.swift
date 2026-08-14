@@ -4,10 +4,6 @@ import VaporTesting
 
 @testable import socktainer
 
-private struct MockHealthCheckClient: ClientHealthCheckProtocol {
-    func ping() async throws {}
-}
-
 @Suite class HealthCheckPingRouteTests {
 
     private func withRoute(_ test: @escaping (Application) async throws -> Void) async throws {
@@ -15,7 +11,7 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: HealthCheckPingRoute(client: MockHealthCheckClient()))
+            try app.register(collection: HealthCheckPingRoute())
             try await test(app)
         }
     }

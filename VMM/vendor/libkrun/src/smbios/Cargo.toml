@@ -1,0 +1,10 @@
+[package]
+name = "krun-smbios"
+version = "0.1.0-1.19.4"
+edition = "2021"
+description = "SMBIOS table generation for libkrun"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+
+[dependencies]
+vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }

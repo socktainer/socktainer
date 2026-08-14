@@ -9,9 +9,6 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Flag(name: .long, help: "Show version")
     var version: Bool = false
 
-    @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Check Apple Container compatibility on startup")
-    var checkCompatibility: Bool = true
-
     @ArgumentParser.Flag(name: .long, inversion: .prefixedNo, help: "Create or update the 'socktainer' Docker context on startup")
     var dockerContext: Bool = true
 
@@ -31,10 +28,6 @@ if options.version {
     exit(0)
 }
 
-if options.checkCompatibility {
-    await AppleContainerVersionCheck.performCompatibilityCheck()
-}
-
 // Ignore real CLI args for Vapor: always behave like `socktainer serve`
 let executable = CommandLine.arguments.first ?? "socktainer"
 let vaporArgs = [executable, "serve"]
@@ -45,13 +38,16 @@ try LoggingSystem.bootstrap(from: &env)
 
 // Create and configure the Vapor application
 let app = try await Application.make(env)
-let homeDirectory = ProcessInfo.processInfo.environment["HOME"]
+let homeDirectory = SocktainerDirectories.hostHome.path
+let engineStateLock = try EngineStateLock.acquire(
+    directory: SocktainerDirectories.engineStateDirectory
+)
+app.storage[EngineStateLockKey.self] = engineStateLock
 try prepareUnixSocket(for: app, homeDirectory: homeDirectory)
 if options.dockerContext,
-    let homeDir = homeDirectory,
-    !homeDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    !homeDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 {
-    DockerContextSetup.install(homeDirectory: homeDir)
+    DockerContextSetup.install(homeDirectory: homeDirectory)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
 try await configure(app)
@@ -65,3 +61,4 @@ do {
     throw error
 }
 try await app.running?.onStop.get()
+try await app.asyncShutdown()

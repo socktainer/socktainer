@@ -5,9 +5,8 @@ import Logging
 /// Apple Container's `vmnet` state degrades as stale networks accumulate: once enough
 /// orphaned networks pile up, container-to-container routing on newly created networks
 /// fails with `EHOSTUNREACH` (e.g. Supabase services can't reach the DB). socktainer
-/// creates a network — and a `socktainer-dns-*` sidecar — per Docker network, but a
-/// `supabase stop` / `compose down` that removes containers without removing the network
-/// leaves the network behind. Clearing these leftovers at startup keeps vmnet healthy.
+/// can retain a Docker network after `compose down` removes its containers. Clearing
+/// these empty networks at startup keeps Apple network state healthy.
 ///
 /// Safe to run only at startup: a network with live containers has a non-empty
 /// `Containers` map and is kept; an empty non-built-in network at startup is necessarily
@@ -27,8 +26,7 @@ enum OrphanedNetworkReaper {
     }
 
     /// Lists networks and deletes the orphans. Best-effort: per-network failures are
-    /// logged and skipped. Call after stale DNS sidecars have been reaped so that
-    /// networks whose only member was a sidecar appear empty.
+    /// logged and skipped.
     static func reap(networkClient: ClientNetworkProtocol, logger: Logger) async {
         guard let networks = try? await networkClient.list(filters: nil, logger: logger) else { return }
         for id in orphanedNetworkIDs(from: networks) {

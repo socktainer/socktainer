@@ -14,7 +14,7 @@ struct EventsRouteFilterTests {
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
-            try app.register(collection: EventsRoute(client: EventsHealthCheckClient()))
+            try app.register(collection: EventsRoute())
 
             try await app.testing().test(.GET, "/v1.51/events?until=0") { response async in
                 #expect(response.status == .ok)
@@ -111,8 +111,4 @@ struct EventsRouteFilterTests {
         #expect(await iterator.next()?.id == "two")
         #expect(await iterator.next() == nil)
     }
-}
-
-private struct EventsHealthCheckClient: ClientHealthCheckProtocol {
-    func ping() async throws {}
 }

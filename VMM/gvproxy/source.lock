@@ -1,0 +1,7 @@
+repository=https://github.com/containers/gvisor-tap-vsock.git
+version=v0.8.9
+commit=9cfc86f66679ef0feed0f20ba1df558fe2bef5c6
+archive_sha256=c174f2e14868999d81c9ac0b50d8e6c94666091f393dd5f0e14e66aa0392bf07
+go_mod_sha256=75848c190dca5cc7af27ebe017d5a4d59d4a117c97eaa6b8ac0359e58d868eec
+go_sum_sha256=25b1a52ad3181030b6ccf92af5d69a1a4282f8f2342dad5348b5c954c304c4b3
+license=Apache-2.0

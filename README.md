@@ -23,9 +23,10 @@
     - [GitHub Releases](#github-releases)
   - [Usage 🚀](#usage-🚀)
     - [Docker builds and Buildx](#docker-builds-and-buildx)
+    - [Image names, IDs, and repeated builds](#image-names-ids-and-repeated-builds)
+    - [Runtime and published-port recovery](#runtime-and-published-port-recovery)
     - [Volume sync mode](#volume-sync-mode)
-    - [VM memory](#vm-memory)
-    - [Volume compatibility — Postgres](#volume-compatibility--postgres)
+    - [Engine resources](#engine-resources)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
     - [Build & Run](#build-run)
@@ -39,7 +40,7 @@
   - [Acknowledgements 🙏](#acknowledgements-🙏)
   <!--toc:end-->
 
-Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries 🍏📦.
+Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** through one persistent Linux VM on Apple Silicon 🍏📦.
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
@@ -120,34 +121,20 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ## Key Features ✨
 
-- Built on **Apple’s Container Framework** 🍏
+- Runs one persistent Linux VM with a custom Hypervisor.framework VMM 🍏
 - Provides **Docker REST API compatibility** 🔄 (partial)
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
-- Supports container lifecycle operations: inspect, stop, remove 🛠️
-- Supports image listing, pulling, deletion, logs, health checks, container stats. Exec without interactive mode 📄
-- `docker stats` reports memory against the Apple Container VM limit (configurable via `--memory`, default 1 GiB per container), not the host RAM
-- Broadcasts container events for client liveness monitoring 📡
+- Uses containerd, overlayfs, runc, and Linux namespaces for containers
+- Supports create, start, stop, wait, remove, inspect, list, logs, and noninteractive exec
+- Supports containerd-backed image pull, list, inspect, tag, delete, and prune operations
 
 ---
 
 ## Requirements 📋
 
-- **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 1.2.1** (client and server versions must match the SDK version
-  used to build Socktainer)
-
-Verify both before starting Socktainer:
-
-```bash
-container --version
-container system status
-```
-
-Apple Container's XPC and Swift API schemas can change between patch releases.
-Socktainer keeps those version-specific calls behind one compatibility boundary and
-fails startup on a mismatch instead of risking opaque XPC failures. Every normal
-Socktainer startup performs this check and prints the client/server versions; use
-`--no-check-compatibility` only for deliberate diagnostics.
+- **macOS 26 (Tahoe) on Apple Silicon (arm64)**
+- The installer package, which includes the VMM, guest kernel, root disk, libkrun,
+  and gvproxy runtime artifacts
 
 ---
 
@@ -186,111 +173,36 @@ Refer to **Quick Start** above for immediate usage examples.
 
 ### Docker builds and Buildx
 
-Socktainer supports the standard Buildx `docker-container` driver. The driver runs
-an unmodified `moby/buildkit` helper through Socktainer and preserves Dockerfile,
-BuildKit cache, secret, SSH, exporter, and `--load` semantics.
-
-Create a builder once and select it:
-
-```bash
-docker buildx create --name socktainer --driver docker-container \
-  --driver-opt default-load=true --use
-docker buildx inspect --bootstrap
-```
-
-The same builder supports the usual build workflows:
-
-```bash
-docker buildx build --platform linux/arm64 --load -t example:dev .
-BUILDX_BUILDER=socktainer docker build -t example:dev .
-BUILDX_BUILDER=socktainer docker compose build
-```
-
-The Buildx `docker` driver is not available because its `/grpc` endpoint requires
-Moby's embedded BuildKit protocol, while Apple Container exposes a different native
-builder service. Select the `docker-container` builder explicitly when another
-Docker context has previously selected a different builder.
-
-`default-load=true` is a supported prerequisite, not an optional optimization.
-Compose and `docker build` expect a successful build to replace the selected local
-tag. Without the driver option, an invocation that omits `--load` leaves its result
-only in the builder cache, exactly as Buildx documents for non-default drivers.
+Docker builds are not available in this alpha. The old build service started a
+second Apple VM, so the single-VM runtime does not register the Docker build
+endpoints. BuildKit integration must run inside the persistent engine VM before
+Socktainer can support Buildx.
 
 ### Image names, IDs, and repeated builds
 
-Docker has one owner for a normalized tag such as
-`docker.io/library/example:latest`. Apple Container stores exact OCI reference
-strings, so `example:latest` and its normalized spelling can otherwise coexist as
-different roots. Socktainer reconciles that mismatch at its image mutation
-boundary:
+containerd owns image content and tags. Socktainer normalizes familiar image names
+before it sends them to the guest. Image list, inspect, pull, tag, delete, and prune
+operations use this one content store.
 
-- build/load, pull, import, and tag serialize changes to a Docker tag;
-- the normalized reference becomes the sole Docker-visible owner;
-- stale familiar spellings and legacy annotation-only owners are retired; and
-- displaced content remains addressable by its full OCI digest when it no longer
-  has another real tag.
+### Runtime and published-port recovery
 
-Inspect, create, remove, save, history, and tag accept Docker-emitted root,
-manifest, and config digests as well as names. True collisions—such as a digest
-prefix matching multiple roots—still return an ambiguity error rather than picking
-an arbitrary image. Internal digest-retention references are hidden from
-`RepoTags`, so removing a current tag cannot expose an older build under that name.
+Socktainer runs one persistent Linux VM through its custom VMM. The host Docker API maps
+container operations through one multiplexed vsock connection to a guest agent.
+The guest uses containerd, overlayfs, runc, and Linux namespaces for all ordinary
+containers. Socktainer does not start one VM per container or use relay sidecar
+VMs.
 
-Registry credential helpers named in `~/.docker/config.json` must be installed and
-available on `PATH`. A stale `credsStore` entry causes BuildKit registry requests to
-fail before Socktainer is involved; fix the helper or use a dedicated Docker config
-that contains only the settings needed for this runtime.
+Published TCP and UDP ports use one supervised gvproxy process for each VM
+generation. The VMM connects gvproxy to the guest virtio-net device. The guest
+applies DNAT from the engine ingress port to the container's private network
+namespace. The guest stores Docker names, labels, commands, and port mappings in
+containerd metadata. Socktainer restores this state and the gvproxy forwarding
+rules after a daemon restart.
 
-### Container rename and published-port recovery
-
-Apple Container IDs are immutable, while Docker Compose uses container rename to
-complete `up --force-recreate`. Socktainer therefore keeps the Docker-visible name
-in an atomically persisted registry keyed by the immutable Apple ID. Rename keeps
-the Docker object ID, image, mounts, and volume data unchanged; name conflicts are
-serialized and survive a Socktainer restart.
-
-Socktainer owns the Docker-visible host-port listeners, but its Homebrew
-LaunchAgent never connects directly to an Apple guest IP. macOS Local Network
-Privacy allows Terminal children to make that connection but does not
-automatically allow LaunchAgents, which would make a shell-launched test pass and
-the installed service fail with `EHOSTUNREACH`.
-
-For each network that publishes a port, Socktainer starts a small embedded relay
-sidecar. Apple Container publishes the sidecar's Unix socket to the host over
-vsock. The data path is:
-
-```text
-localhost -> Socktainer -> private Unix socket -> Apple vsock -> network relay -> container
-```
-
-The relay accepts only destinations inside its assigned network CIDRs. Its host
-directory is mode `0700`, each socket is `0600`, and relay image identity is
-versioned so upgrades replace stale sidecars. TCP half-close and UDP datagram
-boundaries are preserved. No Local Network privacy grant, root daemon, network
-extension, or terminal-launched service is required.
-
-Desired port mappings are persisted with the Docker name and reconciled after
-container, Socktainer, and Apple Container restarts. Relay sidecars have no user
-volumes and are hidden from Docker container listing and prune semantics. A
-stable instance-owner label and namespaced sidecar ID prevent separately
-configured Socktainer LaunchAgents from adopting or deleting each other's
-relays.
-
-An isolated secondary daemon can additionally set
-`SOCKTAINER_CONTAINER_RECOVERY_SCOPE=metadata`. In that mode it reconciles only
-native containers that are both present in its configured metadata registry and
-carry that registry's instance-owner label, including containers it creates
-later; it neither adopts nor publishes ports for foreign containers visible in
-Apple's shared store. The production default is `all` so
-first-time migration can still adopt containers created by older Socktainer
-versions.
-
-Containers created by an older Socktainer release migrate on their first ordinary
-stop/start after this version is installed. The stopped container's native
-forwarding field is cleared before bootstrap and Socktainer takes ownership of the
-same mapping. The Apple container ID, root filesystem, image descriptor, mounts,
-and named volumes are not recreated. No `down -v` or manual image/volume deletion
-is required.
+This alpha runtime does not import containers, images, networks, or transient
+state from the removed per-container-VM architecture. The first start creates a
+new persistent engine data disk. Keep or remove old state separately until you
+confirm that you no longer need it.
 
 ### Volume sync mode
 
@@ -341,45 +253,12 @@ Valid modes: `nosync` · `fsync` · `full`
 `docker compose down` preserves named volumes; `docker compose down -v`
 intentionally deletes them.
 
-### VM memory
+### Engine resources
 
-Each container runs in its own Apple Container VM with a fixed memory allocation.
-Socktainer honors Docker's `--memory` flag and `mem_limit:` / `deploy.resources.limits.memory:` in Compose files.
-
-```bash
-docker run --memory 2g postgres          # 2 GiB VM
-docker run --memory 512m redis           # 512 MiB VM
-docker run postgres                      # 1 GiB VM (Apple Container default)
-```
-
-> **Note:** Apple Container allocates VM RAM at creation time — this is not a cgroup
-> soft limit. Setting `--memory` too low will cause the process to OOM inside the VM.
->
-> There is no "unlimited" mode: Docker's `--memory 0` (no limit) maps to the Apple
-> Container default of **1 GiB**, not host RAM. To give a container more than 1 GiB,
-> always pass an explicit `--memory` value.
-
-In Docker Compose:
-
-```yaml
-services:
-  kafka:
-    image: confluentinc/cp-kafka
-    mem_limit: 2g
-  redis:
-    image: redis:alpine
-    mem_limit: 256m
-```
-
-### Volume compatibility — Postgres
-
-Apple Container's EXT4 volumes always contain `/lost+found`, which causes
-`initdb` to fail with "directory exists but is not empty". Socktainer
-automatically removes it when a Postgres container is created, before
-`initdb` runs.
-
-**Opt out** — set `SOCKTAINER_CLEAN_VOLUMES=false` globally, or label a
-specific volume with `socktainer.clean-volumes=false`.
+All containers share the persistent engine VM. The engine uses 6 virtual CPUs
+and a 1 GiB configured memory ceiling. The VMM reclaims guest pages through the
+virtio balloon device, so configured memory and physical footprint are separate
+measurements. Docker per-container CPU and memory limits are not implemented.
 
 ---
 
@@ -404,15 +283,12 @@ sudo xcode-select -s /Applications/Xcode-26.app/Contents/Developer
 make
 ```
 
-The reviewed Linux/arm64 relay OCI image is compiled into the executable. To
-change its Rust source, regenerate the embedded C payload explicitly on an Apple
-Container host and commit the source and generated payload together:
+Build the Linux/arm64 guest agent and its deterministic OCI image after a guest
+runtime change:
 
 ```bash
-cd RelaySidecar
-./build-embedded.sh
-cargo test
-cargo clippy --all-targets -- -D warnings
+make -C Guest image
+cd Guest && go test -race ./... && go vet ./...
 ```
 
 2. (Optional) Format the code:
@@ -491,7 +367,7 @@ Ownership rules:
 - **stdin**: Apple closes `.read`. You close `.write` when done sending input.
 - `StdioPipes.make()` closes any partial pipes on EMFILE and returns `nil` — always `guard let`.
 
-`make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in any source file other than the one legitimate exception (`ClientRegistryService.swift`, which uses Foundation's own `Process`, not Apple Container APIs).
+`make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in application source.
 
 ---
 
@@ -500,89 +376,31 @@ Ownership rules:
 - Intended for **local development and experimentation** 🏠
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
-- Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
-- `docker run --privileged` maps to all Linux capabilities because stock BuildKit's
-  `docker-container` driver requires that capability set. Apple Container still
-  provides VM isolation and has no exact equivalent for Docker's remaining
-  privileged-mode behavior (such as broad host-device access).
-- `docker run --cpus` is honored, but Apple Container allocates a **whole vCPU count** to each container's VM rather than throttling a shared kernel's CFS quota. A fractional value is floored to the nearest whole core (minimum 1) — e.g. `--cpus=1.5` gets 1 vCPU, `--cpus=0.5` still gets 1. `--cpu-shares` (relative weighting) and `--cpu-period`/`--cpu-quota` have no equivalent and are not applied.
-- Bind-mounting `/var/run/docker.sock` (e.g. `-v /var/run/docker.sock:/var/run/docker.sock`, used by tools like Supabase's `vector` log collector) is **transparently relayed** to socktainer's own Docker-compatible API, rather than dropped. This matches Docker's own behavior for the same bind mount, and carries the same well-known risk: **any container that requests this mount gets full control of every other container socktainer manages**, not just itself — the same exposure Docker itself has always had with this idiom, not something new to socktainer. This scales with the number of containers that request the mount, since each gets its own fully-privileged, independent connection.
-- `docker export` streams the container's root filesystem; exporting a running container yields a volatile snapshot, same as Docker. One visible difference: the tar contains **no `/.dockerenv`** — Docker's daemon fabricates that file inside every container at start, Apple Container does not. Tools that probe `/.dockerenv` to detect "am I inside a container" won't find it in filesystems exported from socktainer.
-- `docker run --restart` is honored (`no`, `always`, `unless-stopped`, `on-failure[:max-retries]`), matching moby's restart-manager behavior closely, including its quirks:
-  - Backoff between restart attempts doubles on rapid successive crashes (100ms → up to 1 minute), but resets back to 100ms once the container has managed to stay up for at least 10 seconds.
-  - An explicit `docker stop` / `docker kill` only suppresses the next auto-restart for `unless-stopped`. `always` restarts the container anyway, and `on-failure` restarts whenever the exit code is non-zero — regardless of whether a human or a crash caused the exit. Use `unless-stopped` if you don't want a manual stop to be overridden.
-  - **Caveat:** the policy is enforced only by the running `socktainer` process — it does not survive a `socktainer` restart or host reboot, unlike real Docker's daemon-level reconciliation. `always`/`unless-stopped` containers are not automatically resumed on `socktainer` startup.
-
-- `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
-- `docker load` accepts tarballs from real Docker (plain, gzip or zstd compressed). Index entries whose blobs are not in the tarball are dropped on load — `docker save` on real Docker ships only the pulling platform's blobs while keeping the full multi-platform index, so only that platform is imported.
-- `docker save` works for images that were loaded from a tarball, and the `docker save | docker load` round-trip is supported. It fails with `ContentStore missing blob data` for **registry-pulled** images: Apple's Containerization pull stores the image's full multi-platform index but downloads only the local platform's blobs, and save exports the whole index ([platform limitation](https://github.com/apple/containerization)).
-- `docker pause` / `docker unpause` are **not supported** — there is no freezer/checkpoint equivalent for Apple Container VMs.
-- `docker network connect` / `disconnect` are accepted as **no-ops**: Virtualization.framework offers no NIC hotplug and Apple Container has no post-create attach API, so network membership is fixed at container create. Containers on user-created networks reach each other by name through socktainer's DNS, which covers the common Compose use.
-- **Static container IPs** (`--ip`, IPAM per-container config) cannot be honored: Apple Container assigns addresses from a rotating allocator with no way to request a specific one. Name-based discovery via socktainer DNS is the supported alternative; addresses stay stable for a container's lifetime.
-- Not yet implemented (endpoints answer an explicit error instead of pretending): `docker commit`, `docker diff`, `docker search`, `docker top`, and `GET /distribution/{name}/json`.
-
-### Docker Compose — inter-service DNS
-
-Socktainer registers service names in its DNS server so Compose services can
-reach each other by name. Two aliases are created per service:
-
-| Alias | Example | Description |
-|---|---|---|
-| `service` | `db` | Short form — works within a single project |
-| `service.project` | `db.myapp` | Project-qualified — unique across concurrent projects |
-
-Set the project name explicitly via `name:` at the top of your Compose file
-(otherwise Docker Compose derives it from the directory name):
-
-```yaml
-name: myapp   # sets com.docker.compose.project=myapp
-
-services:
-  web:
-    image: nginx:alpine
-    # can reach the database as 'db' or 'db.myapp'
-  db:
-    image: postgres:17
-    environment:
-      POSTGRES_PASSWORD: secret
-```
-
-> **Note:** Apple Container uses a single global hostname namespace. Two
-> Compose projects running simultaneously with identically-named services
-> (e.g. both have a `db` service) will share the short-form alias — last
-> started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
-
-### Container-to-container connections fail with `EHOSTUNREACH`
-
-If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
-
-### Network subnets (IPAM)
-
-Socktainer pins a stable subnet on each network it creates so that inter-container DNS keeps working across a `container system` restart (an unpinned network's subnet is reassigned by `vmnet` on restart, which would leave containers' DNS nameservers pointing at a dead address). An explicit `--subnet` / Compose `ipam.config.subnet` is honored; otherwise a free `192.168.x.0/24` is chosen automatically.
-
-`IPAM.Config` fields other than `Subnet` — `Gateway`, `IPRange`, and `AuxiliaryAddresses` — are **not supported** by the Apple Container backend (the gateway is always the subnet's `.1` and addresses are allocated by `vmnet`). They are ignored, and a `WARNING` is logged when requested.
-
-> **Note:** networks created before this behavior shipped are not pinned retroactively — recreate them (`docker compose down && docker compose up`) to get a stable subnet.
-
-### Label key normalization
-
-Apple Container only accepts lowercase label keys matching `[a-z0-9](?:[a-z0-9\-\.\/]*[a-z0-9])?`. Docker allows mixed-case, underscores, and other characters. Socktainer automatically normalizes label keys at create time:
-
-- Uppercase → lowercase (`sessionId` → `sessionid`)
-- Underscores → hyphens (`my_key` → `my-key`)
-- Other invalid characters are dropped
-- An `INFO` log is emitted for every key that is changed
-- A `WARNING` is logged when a key becomes empty after normalization (dropped) or when two keys normalize to the same string (collision, last value wins)
-
-Original keys are preserved via an internal mapping label (`socktainer.label-original-keys`) that is stored alongside the normalized keys and stripped from all API responses. As a result, `docker inspect`, filter lookups, and Go-template label access all return and match the original key exactly:
-
-```bash
-# Works — original key is restored transparently
-docker inspect --format '{{index .Config.Labels "MyApp"}}' <container>
-docker ps --filter label=MyApp=value
-```
-
-The one edge case: if two keys normalize to the same string (e.g. `MyKey` and `mykey`), the last one wins — a `WARNING` is logged so the loss is visible in Socktainer's output.
+- Pull authentication from Docker's `X-Registry-Auth` header is forwarded only
+  to the registry named by the image reference.
+- Privileged containers are not yet implemented.
+- Per-container CPU and memory limits are not yet implemented. All ordinary
+  containers share the engine VM allocation.
+- Bind-mounting the Docker socket into a container is not implemented.
+- The VMM exports the host home directory to the trusted guest so it can serve
+  arbitrary Docker bind requests. Containers receive only their requested bind
+  paths. Socktainer rejects binds that overlap its engine state, and the
+  virtio-fs server confines all file operations beneath the exported root.
+- Restart policies are not implemented.
+- `docker update` does not yet change container resources.
+- Image load, save, history, and push are not connected to the guest content store.
+- Pause, unpause, network connect, and network disconnect are not implemented.
+- Docker network-management endpoints are explicit `501` responses in this
+  alpha. Each container uses the persistent engine's private bridge.
+- Static container IP requests are not yet implemented.
+- Other unimplemented operations include commit, diff, search, top, archive,
+  export, stats, resize, rename, restart, and resource update.
+- Known unsupported Docker endpoints return an explicit `501 Not Implemented`
+  Docker error instead of an accidental router `404`.
+- Socktainer replaces a readable data disk only when it identifies the previous
+  unjournaled alpha format. It preserves that disk as
+  `data.ext4.incompatible-<UUID>`. An unreadable or corrupt disk stops startup
+  and remains unchanged.
 
 ---
 
@@ -602,5 +420,5 @@ See the `LICENSE` file in the repository root.
 
 ## Acknowledgements 🙏
 
-- Built using **Apple containerization libraries** 🍏
+- Built with **Hypervisor.framework, libkrun, and gvproxy** 🍏
 - Enables Docker CLI and other Docker clients to interact with local macOS containers 🐳💻

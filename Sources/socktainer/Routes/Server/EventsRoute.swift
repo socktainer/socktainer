@@ -96,69 +96,65 @@ struct DockerEventFilter: Sendable {
 }
 
 struct EventsRoute: RouteCollection {
-    let client: ClientHealthCheckProtocol
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/events", use: EventsRoute.handler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/events", use: EventsRoute.handler)
     }
 
 }
 
 extension EventsRoute {
-    static func handler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
-        { req in
-            guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
-                throw Abort(.internalServerError, reason: "EventBroadcaster not configured")
+    static func handler(_ req: Request) async throws -> Response {
+        guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
+            throw Abort(.internalServerError, reason: "EventBroadcaster not configured")
+        }
+        let query = try req.query.decode(EventsQuery.self)
+        let now = Date()
+        let since = try Self.eventTimestamp(query.since, relativeTo: now)
+        let until = try Self.eventTimestamp(query.until, relativeTo: now)
+        let filter = try DockerEventFilter(query.filters)
+        let stream = await broadcaster.stream(since: since, until: until)
+
+        let response = Response(status: .ok)
+        response.headers.add(name: .contentType, value: "application/json")
+
+        response.body = .init(asyncStream: { writer in
+            // Flush the response head immediately. Docker CLI opens /events
+            // before starting no-argument commands such as `docker stats`;
+            // without an initial body write, Vapor waits for the first real
+            // event and the CLI never proceeds to the command's API calls.
+            // JSON decoders accept this newline as leading whitespace.
+            var preamble = req.application.allocator.buffer(capacity: 1)
+            preamble.writeString("\n")
+            do {
+                try await writer.write(.buffer(preamble))
+            } catch {
+                return
             }
-            let query = try req.query.decode(EventsQuery.self)
-            let now = Date()
-            let since = try Self.eventTimestamp(query.since, relativeTo: now)
-            let until = try Self.eventTimestamp(query.until, relativeTo: now)
-            let filter = try DockerEventFilter(query.filters)
-            let stream = await broadcaster.stream(since: since, until: until)
 
-            let response = Response(status: .ok)
-            response.headers.add(name: .contentType, value: "application/json")
-
-            response.body = .init(asyncStream: { writer in
-                // Flush the response head immediately. Docker CLI opens /events
-                // before starting no-argument commands such as `docker stats`;
-                // without an initial body write, Vapor waits for the first real
-                // event and the CLI never proceeds to the command's API calls.
-                // JSON decoders accept this newline as leading whitespace.
-                var preamble = req.application.allocator.buffer(capacity: 1)
-                preamble.writeString("\n")
-                do {
-                    try await writer.write(.buffer(preamble))
-                } catch {
-                    return
-                }
-
-                for await event in stream {
-                    if let until, event.timeNano > until { break }
-                    guard filter.matches(event) else { continue }
-                    if let json = try? JSONEncoder().encode(event) {
-                        var buffer = req.application.allocator.buffer(capacity: json.count + 1)
-                        buffer.writeBytes(json)
-                        buffer.writeString("\n")
-                        do {
-                            try await writer.write(.buffer(buffer))
-                        } catch is IOError {
-                            req.logger.debug("Client disconnected (broken pipe)")
-                            break
-                        } catch let error as ChannelError where error == .ioOnClosedChannel {
-                            req.logger.debug("Client disconnected (closed channel)")
-                            break
-                        } catch {
-                            req.logger.warning("\(event) raised '\(error)'")
-                        }
+            for await event in stream {
+                if let until, event.timeNano > until { break }
+                guard filter.matches(event) else { continue }
+                if let json = try? JSONEncoder().encode(event) {
+                    var buffer = req.application.allocator.buffer(capacity: json.count + 1)
+                    buffer.writeBytes(json)
+                    buffer.writeString("\n")
+                    do {
+                        try await writer.write(.buffer(buffer))
+                    } catch is IOError {
+                        req.logger.debug("Client disconnected (broken pipe)")
+                        break
+                    } catch let error as ChannelError where error == .ioOnClosedChannel {
+                        req.logger.debug("Client disconnected (closed channel)")
+                        break
+                    } catch {
+                        req.logger.warning("\(event) raised '\(error)'")
                     }
                 }
-                _ = try? await writer.write(.end)
-            })
+            }
+            _ = try? await writer.write(.end)
+        })
 
-            return response
-
-        }
+        return response
     }
 
     static func eventTimestamp(_ raw: String?, relativeTo now: Date) throws -> UInt64? {

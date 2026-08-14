@@ -1,10 +1,9 @@
 import Vapor
 
 struct HealthCheckPingRoute: RouteCollection {
-    let client: ClientHealthCheckProtocol
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/_ping", use: HealthCheckPingRoute.handler(client: client))
-        try routes.registerVersionedRoute(.HEAD, pattern: "/_ping", use: HealthCheckPingRoute.headHandler(client: client))
+        try routes.registerVersionedRoute(.GET, pattern: "/_ping", use: HealthCheckPingRoute.handler)
+        try routes.registerVersionedRoute(.HEAD, pattern: "/_ping", use: HealthCheckPingRoute.headHandler)
     }
 }
 
@@ -22,17 +21,11 @@ extension HealthCheckPingRoute {
         return response
     }
 
-    static func handler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
-        { req in
-            try await client.ping()
-            return buildResponse(includeBody: true)
-        }
+    static func handler(_ req: Request) async throws -> Response {
+        buildResponse(includeBody: true)
     }
 
-    static func headHandler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
-        { req in
-            try await client.ping()
-            return buildResponse(includeBody: false)
-        }
+    static func headHandler(_ req: Request) async throws -> Response {
+        buildResponse(includeBody: false)
     }
 }

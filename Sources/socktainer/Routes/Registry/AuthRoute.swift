@@ -1,102 +1,60 @@
+import ContainerizationOCI
 import Vapor
 
-struct AuthRoute: RouteCollection {
-    let client: ClientRegistryService
-    func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/auth", use: AuthRoute.handler(client: client))
+protocol RegistryCredentialValidating: Sendable {
+    func validate(serverAddress: String, username: String, password: String) async throws
+}
+
+struct ContainerRegistryCredentialValidator: RegistryCredentialValidating {
+    func validate(serverAddress: String, username: String, password: String) async throws {
+        let host: String
+        if serverAddress.hasPrefix("http://") || serverAddress.hasPrefix("https://") {
+            guard let parsed = URL(string: serverAddress), let parsedHost = parsed.host else {
+                throw Abort(.badRequest, reason: "Invalid server address")
+            }
+            host = parsedHost
+        } else {
+            host = serverAddress
+        }
+        guard !host.isEmpty else {
+            throw Abort(.badRequest, reason: "Invalid server address")
+        }
+        let authentication = BasicAuthentication(username: username, password: password)
+        try await RegistryClient(host: host, authentication: authentication).ping()
     }
 }
 
-extension AuthRoute {
-    static func handler(client: ClientRegistryService) -> @Sendable (Request) async throws -> Response {
-        { req in
-            // Collect the body for large requests. `collect()` with no max
-            // silently caps at Vapor's 1<<14 (16 KB) default; the RegexRouter
-            // bypasses Vapor's registered-route collection, so honor the
-            // configured `defaultMaxBodySize` cap explicitly instead.
-            guard let buffer = try await req.body.collect(max: req.application.routes.defaultMaxBodySize.value).get(),
-                buffer.readableBytes > 0
+struct AuthRoute: RouteCollection {
+    let validator: any RegistryCredentialValidating
+
+    init(validator: any RegistryCredentialValidating = ContainerRegistryCredentialValidator()) {
+        self.validator = validator
+    }
+
+    func boot(routes: RoutesBuilder) throws {
+        try routes.registerVersionedRoute(.POST, pattern: "/auth") { request in
+            let config = try request.content.decode(AuthConfig.self)
+            guard let username = config.username, !username.isEmpty,
+                let password = config.password, !password.isEmpty,
+                let serverAddress = config.serveraddress, !serverAddress.isEmpty
             else {
-                // Empty POST /auth — bad client input; return 400 rather than
-                // falling through to req.content.decode below and surfacing a 500.
-                let response = Response(status: .badRequest, body: .init(string: #"{"message": "Request body is required"}"#))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                throw Abort(
+                    .unauthorized,
+                    reason: "Username, password, and server address are required"
+                )
             }
-
-            if let data = buffer.getData(at: 0, length: buffer.readableBytes) {
-                do {
-                    _ = try JSONDecoder().decode(AuthConfig.self, from: data)
-                } catch {
-                    req.logger.error("Failed to decode content from buffer: \(error)")
-                }
-            }
-
             do {
-                let authConfig = try req.content.decode(AuthConfig.self)
-
-                guard let username = authConfig.username, !username.isEmpty,
-                    let password = authConfig.password, !password.isEmpty,
-                    let serverAddress = authConfig.serveraddress, !serverAddress.isEmpty
-                else {
-                    let response = Response(status: .unauthorized, body: .init(string: "{\"message\": \"Username, password, and server address are required\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
-                }
-
-                let logger = req.logger
-
-                do {
-                    // Perform complete login process (validation + storage)
-                    let identityToken = try await client.login(
-                        serverAddress: serverAddress,
-                        username: username,
-                        password: password,
-                        logger: logger
-                    )
-
-                    let response = AuthResponse(
-                        Status: "Login Succeeded",
-                        IdentityToken: identityToken
-                    )
-                    return try await response.encodeResponse(status: .ok, for: req)
-
-                } catch ClientRegistryError.invalidServerAddress {
-                    let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid server address\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
-
-                } catch ClientRegistryError.invalidCredentials {
-                    let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid credentials format\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
-
-                } catch ClientRegistryError.storageError(let message) {
-                    logger.error("Failed to store credentials: \(message)")
-                    let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Failed to store credentials\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
-
-                } catch {
-                    logger.error("Unexpected registry error: \(error)")
-                    let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Internal server error\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
-                }
-
-            } catch let DecodingError.dataCorrupted(context) {
-                let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid JSON: \(context.debugDescription)\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
-            } catch let DecodingError.keyNotFound(key, _) {
-                let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Missing required field: \(key.stringValue)\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                try await validator.validate(
+                    serverAddress: serverAddress,
+                    username: username,
+                    password: password
+                )
+            } catch let abort as Abort {
+                throw abort
             } catch {
-                let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Internal server error\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                throw Abort(.unauthorized, reason: "Registry authentication failed")
             }
+            return AuthResponse(Status: "Login Succeeded", IdentityToken: "")
         }
     }
 }
