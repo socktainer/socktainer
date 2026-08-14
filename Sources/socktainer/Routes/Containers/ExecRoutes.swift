@@ -188,7 +188,9 @@ struct ExecRoute: RouteCollection {
             }
 
             guard let container = try await client.getContainer(id: containerId) else {
-                throw Abort(.notFound, reason: "Container not found")
+                // Docker phrasing ("No such container: <id>") is load-bearing — see the
+                // matching comment in ContainerInspectRoute.
+                throw Abort(.notFound, reason: "No such container: \(containerId)")
             }
 
             do {
@@ -262,7 +264,9 @@ struct ExecRoute: RouteCollection {
             }
 
             guard let container = try await client.getContainer(id: config.containerId) else {
-                throw Abort(.notFound, reason: "Container not found")
+                // Docker phrasing ("No such container: <id>") is load-bearing — see the
+                // matching comment in ContainerInspectRoute.
+                throw Abort(.notFound, reason: "No such container: \(config.containerId)")
             }
 
             try client.enforceContainerRunning(container: container)
