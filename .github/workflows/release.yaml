@@ -81,7 +81,7 @@ jobs:
     # Guest artifacts require Hypervisor.framework. GitHub-hosted Apple Silicon
     # reports that virtualization is unavailable, so releases use the trusted
     # physical Apple Silicon builder with the pinned guest-kernel digest.
-    runs-on: [self-hosted, macOS, ARM64, socktainer-vmm-builder]
+    runs-on: [self-hosted, macOS, ARM64, glassdock-vmm-builder]
     timeout-minutes: 60
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -154,7 +154,7 @@ jobs:
 
       - name: Upload complete runtime installer
         run: |
-         gh release upload ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
+         gh release upload ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/glassdock-installer.pkg
 
   release:
     needs: [tag, build]

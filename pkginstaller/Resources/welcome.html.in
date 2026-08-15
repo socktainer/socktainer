@@ -2,20 +2,20 @@
 <html lang="en">
 <head>
     <meta charset="utf-8"/>
-    <title>Welcome to Socktainer __VERSION__</title>
+    <title>Welcome to Glass Dock __VERSION__</title>
 </head>
 <body>
 <div style="font-family: Helvetica; padding: 20px;">
-    <h2>Welcome to Socktainer __VERSION__</h2>
-    <p>This installer will install socktainer, a Docker Engine API compatible server for containers.</p>
+    <h2>Welcome to Glass Dock __VERSION__</h2>
+    <p>This installer will install glassdock, a Docker Engine API compatible server for containers.</p>
     
-    <h3>What is Socktainer?</h3>
-    <p>Socktainer is a lightweight, Docker-compatible container runtime that provides Docker Engine API compatibility</p>
+    <h3>What is Glass Dock?</h3>
+    <p>Glass Dock is a lightweight, Docker-compatible container runtime that provides Docker Engine API compatibility</p>
     
     <h3>Installation Details</h3>
-    <p>The socktainer binary will be installed to <code>__INSTALL_PREFIX__/bin/socktainer</code></p>
+    <p>The glassdock binary will be installed to <code>__INSTALL_PREFIX__/bin/glassdock</code></p>
     <p>When PATH installation is enabled, the installation directory is added to the system PATH.</p>
-    <p>Otherwise, invoke Socktainer using the full installation path shown above.</p>
+    <p>Otherwise, invoke Glass Dock using the full installation path shown above.</p>
     
     <p><strong>Click Continue to proceed with the installation.</strong></p>
 </div>

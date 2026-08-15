@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
 func TestBoundedLogWriterConsumesWithoutExceedingLimit(t *testing.T) {

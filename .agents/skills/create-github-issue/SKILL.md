@@ -39,7 +39,7 @@ gh issue create \
 ## Environment
 
 - macOS: <version>
-- socktainer: <version>
+- glassdock: <version>
 - Docker CLI: <version>
 - Apple Container: <version, if known>
 

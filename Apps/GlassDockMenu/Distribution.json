@@ -1,0 +1,14 @@
+{
+  "bundleIdentifier": "io.github.glassdock.menu",
+  "category": "public.app-category.developer-tools",
+  "distribution": "Developer ID",
+  "minimumSystemVersion": "26.0",
+  "name": "Glass Dock",
+  "privacy": {
+    "collectsData": false,
+    "tracking": false
+  },
+  "supportedArchitectures": [
+    "arm64"
+  ]
+}

@@ -8,9 +8,16 @@ let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecifie
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "v1.32"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "v1.51"
 let package = Package(
-    name: "socktainer",
+    name: "GlassDock",
     platforms: [
         .macOS(.v15)
+    ],
+    products: [
+        .library(name: "GlassDockControl", targets: ["GlassDockControl"]),
+        .library(name: "GlassDockMenuKit", targets: ["GlassDockMenuKit"]),
+        .executable(name: "glassdock", targets: ["GlassDock"]),
+        .executable(name: "glassdockctl", targets: ["glassdockctl"]),
+        .executable(name: "GlassDockMenu", targets: ["GlassDockMenu"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", exact: "1.2.1"),
@@ -22,8 +29,11 @@ let package = Package(
         .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
     ],
     targets: [
+        .target(
+            name: "GlassDockControl"
+        ),
         .executableTarget(
-            name: "socktainer",
+            name: "GlassDock",
             dependencies: [
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "ContainerNetworkClient", package: "container"),
@@ -46,14 +56,37 @@ let package = Package(
                 "BuildInfo",
             ]
         ),
-        .testTarget(
-            name: "socktainerTests",
+        .executableTarget(
+            name: "glassdockctl",
             dependencies: [
-                .target(name: "socktainer"),
+                "GlassDockControl",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
+        .executableTarget(
+            name: "GlassDockMenu",
+            dependencies: ["GlassDockMenuKit"]
+        ),
+        .target(
+            name: "GlassDockMenuKit",
+            dependencies: ["GlassDockControl"]
+        ),
+        .testTarget(
+            name: "GlassDockTests",
+            dependencies: [
+                .target(name: "GlassDock"),
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "VaporTesting", package: "vapor"),
                 .product(name: "libzstd", package: "zstd"),
             ],
+        ),
+        .testTarget(
+            name: "GlassDockControlTests",
+            dependencies: ["GlassDockControl"]
+        ),
+        .testTarget(
+            name: "GlassDockMenuKitTests",
+            dependencies: ["GlassDockMenuKit"]
         ),
         .target(
             name: "CFilteredStream",
@@ -80,5 +113,4 @@ let package = Package(
             ]
         ),
     ]
-
 )

@@ -1,7 +1,0 @@
-libkrun 1.19.4
-Upstream commit: 728df8125077d0db44265f6e997c72b81b65c015
-Upstream repository: https://github.com/libkrun/libkrun
-License: Apache-2.0
-
-Socktainer vendors this source to implement its single persistent macOS VMM.
-The examples/snp-example-data-disk.img fixture is omitted from this copy.

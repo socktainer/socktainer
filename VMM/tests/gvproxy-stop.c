@@ -35,11 +35,11 @@ int main(void) {
     // Let the child install its handler before stop sends SIGTERM.
     struct timespec settle = {.tv_nsec = 100000000};
     nanosleep(&settle, NULL);
-    struct socktainer_gvproxy gvproxy = {.pid = child};
+    struct glassdock_gvproxy gvproxy = {.pid = child};
     struct timespec start;
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    socktainer_gvproxy_stop(&gvproxy);
+    glassdock_gvproxy_stop(&gvproxy);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     if (gvproxy.pid != -1) {

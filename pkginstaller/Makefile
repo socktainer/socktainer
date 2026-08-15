@@ -1,9 +1,9 @@
-# Makefile for building the Socktainer macOS package installer
+# Makefile for building the Glass Dock macOS package installer
 SHELL := bash
 
 # Configuration variables
 BUILD_VERSION ?= 0.0.0-dev
-PKG_NAME ?= socktainer-installer.pkg
+PKG_NAME ?= glassdock-installer.pkg
 APPLE_APPLICATION_ID ?= -
 APPLE_PRODUCT_ID ?= mock
 NO_CODESIGN ?= 1
@@ -11,9 +11,11 @@ NO_NOTARIZE ?= 1
 NOTARIZE_USERNAME ?=
 NOTARIZE_PASSWORD ?=
 NOTARIZE_TEAM ?=
-INSTALL_PREFIX ?= /opt/socktainer
-PACKAGE_IDENTIFIER ?= io.github.socktainer
-PATHS_D_NAME ?= socktainer
+INSTALL_PREFIX ?= /opt/glassdock
+PACKAGE_IDENTIFIER ?= io.github.glassdock
+PATHS_D_NAME ?= glassdock
+NOTARYTOOL_PROFILE ?=
+RELEASE_APPROVAL ?=
 INSTALL_PATHS_D ?= 1
 SIGNING_KEYCHAIN ?=
 
@@ -41,7 +43,7 @@ $(SCRIPTS_DIR): | $(BUILD_DIR)
 setup: validate-config $(BUILD_DIR) $(RESOURCES_DIR) $(SCRIPTS_DIR)
 	@echo "Setting up installer directory structure..."
 	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin
-	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer
+	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock
 	@mkdir -p $(OUT_DIR)
 	@mkdir -p $(TMP_DIR)
 
@@ -102,35 +104,42 @@ $(SCRIPTS_DIR)/postinstall: Resources/scripts/postinstall.in FORCE | $(SCRIPTS_D
 prepare-root: setup
 	@rm -rf "$(PACKAGE_ROOT)"
 	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin"
-	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer"
+	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock"
 
 .PHONY: copy-binary
 copy-binary: prepare-root
-	@echo "Copying socktainer binary..."
-	@if [ ! -f "../.build/release/socktainer" ]; then \
-		echo "Error: socktainer binary not found. Run 'make release' in the parent directory first."; \
+	@echo "Copying Glass Dock binaries..."
+	@if [ ! -f "../.build/release/glassdock" ]; then \
+		echo "Error: glassdock binary not found. Run 'make release' in the parent directory first."; \
 		exit 1; \
 	fi
-	@cp ../.build/release/socktainer "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
-	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"
+	@if [ ! -f "../.build/release/glassdockctl" ]; then \
+		echo "Error: glassdockctl binary not found. Run 'make release' in the parent directory first."; \
+		exit 1; \
+	fi
+	@cp ../.build/release/glassdock ../.build/release/glassdockctl \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
+	@chmod +x \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock" \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdockctl"
 	@for artifact in \
-		../VMM/out/socktainer-vmm \
+		../VMM/out/glassdock-vmm \
 		../VMM/out/libkrun.1.dylib \
 		../VMM/out/gvproxy \
-		../Guest/out/socktainer-vmlinux \
-		../Guest/out/socktainer-root.ext4; do \
+		../Guest/out/glassdock-vmlinux \
+		../Guest/out/glassdock-root.ext4; do \
 		if [ ! -f "$$artifact" ]; then \
 			echo "Error: runtime artifact not found: $$artifact"; \
 			exit 1; \
 		fi; \
 	done
-	@cp ../VMM/out/socktainer-vmm ../VMM/out/libkrun.1.dylib ../VMM/out/gvproxy \
+	@cp ../VMM/out/glassdock-vmm ../VMM/out/libkrun.1.dylib ../VMM/out/gvproxy \
 		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
 	@chmod +x \
-		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm" \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock-vmm" \
 		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"
-	@cp ../Guest/out/socktainer-vmlinux ../Guest/out/socktainer-root.ext4 \
-		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer/"
+	@cp ../Guest/out/glassdock-vmlinux ../Guest/out/glassdock-root.ext4 \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock/"
 	@xattr -cr "$(PACKAGE_ROOT)$(INSTALL_PREFIX)"
 
 .PHONY: sign-binary
@@ -143,10 +152,12 @@ sign-binary: copy-binary
 			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
 			--entitlements ../VMM/helper/entitlements.plist \
-			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm"; \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock-vmm"; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
-			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"; \
-		for artifact in libkrun.1.dylib gvproxy socktainer-vmm socktainer; do \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock"; \
+		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdockctl"; \
+		for artifact in libkrun.1.dylib gvproxy glassdock-vmm glassdock glassdockctl; do \
 			codesign --verify --strict --verbose=2 \
 				"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/$$artifact"; \
 		done; \
@@ -161,7 +172,7 @@ component-pkg: sign-binary scripts
 		--install-location / \
 		--scripts "$(SCRIPTS_DIR)" \
 		--ownership preserve \
-		$(OUT_DIR)/socktainer.pkg
+		$(OUT_DIR)/glassdock.pkg
 
 .PHONY: product-pkg
 product-pkg: component-pkg resources
@@ -169,35 +180,38 @@ product-pkg: component-pkg resources
 	@COPYFILE_DISABLE=1 productbuild --distribution $(BUILD_DIR)/Distribution \
 		--resources $(RESOURCES_DIR) \
 		--package-path $(OUT_DIR) \
-		$(OUT_DIR)/socktainer-unsigned.pkg
+		$(OUT_DIR)/glassdock-unsigned.pkg
 
 .PHONY: sign-pkg
 sign-pkg: product-pkg
 	@if [ "$(NO_CODESIGN)" = "1" ]; then \
-		mv $(OUT_DIR)/socktainer-unsigned.pkg $(OUT_DIR)/$(PKG_NAME); \
+		mv $(OUT_DIR)/glassdock-unsigned.pkg $(OUT_DIR)/$(PKG_NAME); \
 		echo "✅ Unsigned installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	else \
 		echo "Signing installer package..."; \
 		productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
-			$(OUT_DIR)/socktainer-unsigned.pkg \
+			$(OUT_DIR)/glassdock-unsigned.pkg \
 			$(OUT_DIR)/$(PKG_NAME); \
-		rm $(OUT_DIR)/socktainer-unsigned.pkg; \
+		rm $(OUT_DIR)/glassdock-unsigned.pkg; \
 		echo "✅ Signed installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	fi
-	@rm -f $(OUT_DIR)/socktainer.pkg
+	@rm -f $(OUT_DIR)/glassdock.pkg
 
 # Notarize the signed package
 .PHONY: notarize
 notarize: sign-pkg
-	@if [ -z "$(APPLE_ID)" ] || [ -z "$(APPLE_ID_PASSWORD)" ] || [ -z "$(APPLE_TEAM_ID)" ]; then \
-		echo "❌ Missing notarization credentials. Set APPLE_ID, APPLE_ID_PASSWORD, and APPLE_TEAM_ID"; \
+	@if [ "$(SOCKTAINER_RELEASE_APPROVED)" != "YES" ] || [ "$(RELEASE_APPROVAL)" != "FINAL-APPROVAL" ]; then \
+		echo "❌ Notarization needs separate final approval"; \
+		echo "   Set SOCKTAINER_RELEASE_APPROVED=YES and RELEASE_APPROVAL=FINAL-APPROVAL after approval"; \
+		exit 1; \
+	fi
+	@if [ -z "$(NOTARYTOOL_PROFILE)" ]; then \
+		echo "❌ Missing NOTARYTOOL_PROFILE Keychain profile name"; \
 		exit 1; \
 	fi
 	@echo "Submitting installer for notarization..."
 	@xcrun notarytool submit $(OUT_DIR)/$(PKG_NAME) \
-		--apple-id "$(APPLE_ID)" \
-		--password "$(APPLE_ID_PASSWORD)" \
-		--team-id "$(APPLE_TEAM_ID)" \
+		--keychain-profile "$(NOTARYTOOL_PROFILE)" \
 		--wait
 	@echo "Stapling notarization ticket..."
 	@xcrun stapler staple $(OUT_DIR)/$(PKG_NAME)
@@ -216,7 +230,7 @@ installer-notarized: notarize
 
 .PHONY: help
 help:
-	@echo "Socktainer macOS Package Installer"
+	@echo "Glass Dock macOS Package Installer"
 	@echo ""
 	@echo "Targets:"
 	@echo "  pkginstaller       - Build unsigned .pkg installer (default)"
@@ -233,9 +247,8 @@ help:
 	@echo "  NO_CODESIGN=1             - Skip code signing (default)"
 	@echo "  APPLE_APPLICATION_ID=<id>    - Code signing identity"
 	@echo "  APPLE_PRODUCT_ID=<id> - Product signing identity"
-	@echo "  APPLE_ID=<email> - Apple ID for notarization"
-	@echo "  APPLE_ID_PASSWORD=<pass>  - App-specific password for notarization"
-	@echo "  APPLE_TEAM_ID=<team_id>   - Team ID for notarization"
+	@echo "  NOTARYTOOL_PROFILE=<name> - notarytool Keychain profile"
+	@echo "  RELEASE_APPROVAL=FINAL-APPROVAL - final submission gate"
 	@echo "  INSTALL_PREFIX=/path      - Installation prefix (default: $(INSTALL_PREFIX))"
 	@echo "  PACKAGE_IDENTIFIER=id     - Package receipt identifier (default: $(PACKAGE_IDENTIFIER))"
 	@echo "  PATHS_D_NAME=name         - /etc/paths.d entry name (default: $(PATHS_D_NAME))"
@@ -247,17 +260,16 @@ help:
 	@echo "       NO_CODESIGN=0 pkginstaller"
 	@echo ""
 	@echo "Example notarized build:"
-	@echo "  make APPLE_APPLICATION_ID='Developer ID Application: Your Name' \\"
+	@echo "  SOCKTAINER_RELEASE_APPROVED=YES make APPLE_APPLICATION_ID='Developer ID Application: Your Name' \\"
 	@echo "       APPLE_PRODUCT_ID='Developer ID Installer: Your Name' \\"
-	@echo "       APPLE_ID='your@email.com' \\"
-	@echo "       APPLE_ID_PASSWORD='app-specific-password' \\"
-	@echo "       APPLE_TEAM_ID='TEAM123ID' \\"
+	@echo "       NOTARYTOOL_PROFILE='glassdock-notary' \\"
+	@echo "       RELEASE_APPROVAL=FINAL-APPROVAL \\"
 	@echo "       installer-notarized"
 	@echo ""
 	@echo "Prerequisites:"
 	@echo "  - Run 'make release guest-image vmm' in the parent directory to build the runtime"
 	@echo "  - Ensure Xcode command line tools are installed"
-	@echo "  - For notarization: Apple Developer account with app-specific password"
+	@echo "  - For notarization: a notarytool Keychain profile and final approval"
 
 .PHONY: clean-legacy
 clean-legacy:

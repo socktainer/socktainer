@@ -6,7 +6,7 @@ readonly DEFAULT_BASE_IMAGE='docker.io/library/alpine@sha256:2c9d26f410d032d5b15
 readonly DEFAULT_NGINX_IMAGE='docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de'
 BASE_IMAGE=${BENCH_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
 NGINX_IMAGE=${BENCH_NGINX_IMAGE:-$DEFAULT_NGINX_IMAGE}
-PRODUCTS=${BENCH_PRODUCTS:-socktainer}
+PRODUCTS=${BENCH_PRODUCTS:-glassdock}
 SAMPLES=${BENCH_SAMPLES:-10}
 AB_REQUESTS=${BENCH_AB_REQUESTS:-10000}
 AB_CONCURRENCY=${BENCH_AB_CONCURRENCY:-32}
@@ -22,7 +22,7 @@ MODE=run
 ALLOW_EXTERNAL_RESET=false
 ALLOW_UNMATCHED_RESOURCES=false
 IMAGE_CACHE_POLICIES_MATCH=true
-RUN_ID="socktainer-benchmark-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_ID="glassdock-benchmark-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUNS_DIRECTORY=
 RUN_DIRECTORY=
 RESULTS_FILE=
@@ -51,13 +51,13 @@ Options:
   --discover           Report known product availability without changing state.
   --preflight          Validate tools and product configuration only.
   --dry-run            Print the Williams-design order and commands.
-  --products LIST      Comma-separated product names (default: socktainer).
+  --products LIST      Comma-separated product names (default: glassdock).
   --suites LIST        Comma-separated suites (default: all).
   --samples N          Sample count (default: 10; design size depends on products).
   --seed N             Recorded schedule and bootstrap seed (default: 1).
   --config FILE        Source a trusted local product configuration file.
   --allow-external-reset
-                       Permit configured reset commands for non-Socktainer products.
+                       Permit configured reset commands for non-Glass Dock products.
   --allow-unmatched-resources
                        Permit a diagnostic comparison with different CPU or memory limits.
   --output FILE        JSON result file.
@@ -70,7 +70,7 @@ Suites:
   resources    Process footprint at four workload phases.
   storage      Allocated and logical product storage.
   diagnostics  CPU hashing and cached bind-read measurements. These are not
-               Socktainer optimization goals.
+               Glass Dock optimization goals.
 
 For each product NAME, set these uppercase environment variables:
   NAME_DOCKER_HOST     Required unix:// Docker API socket.
@@ -95,15 +95,15 @@ For each product NAME, set these uppercase environment variables:
   NAME_RESET_POLICY    Description of state removed by NAME_RESET_CMD.
   NAME_IMAGE_CACHE_POLICY reset or retained.
 
-Socktainer defaults to the repository release binary, pinned guest artifact,
+Glass Dock defaults to the repository release binary, pinned guest artifact,
 standard Docker socket, foreground ownership, and its engine storage paths.
 
 Example:
-  SOCKTAINER_DOCKER_HOST=unix:///tmp/socktainer.sock \
-  SOCKTAINER_START_CMD='/path/to/socktainer --no-docker-context' \
-  SOCKTAINER_START_MODE=foreground \
-  SOCKTAINER_STORAGE_PATHS="$HOME/.socktainer:/path/to/guest-artifacts" \
-  BENCH_PRODUCTS=socktainer scripts/benchmark-runtime.sh
+  GLASSDOCK_DOCKER_HOST=unix:///tmp/glassdock.sock \
+  GLASSDOCK_START_CMD='/path/to/glassdock --no-docker-context' \
+  GLASSDOCK_START_MODE=foreground \
+  GLASSDOCK_STORAGE_PATHS="$HOME/.glassdock:/path/to/guest-artifacts" \
+  BENCH_PRODUCTS=glassdock scripts/benchmark-runtime.sh
 
 External reset commands can remove product-owned benchmark state. Live runs with
 external products require --allow-external-reset. Review the configuration and
@@ -171,35 +171,35 @@ product_value() {
     prefix=$(upper_name "$1")
     variable="${prefix}_$field"
     value=${!variable:-}
-    if [[ -n $value || $product != socktainer ]]; then
+    if [[ -n $value || $product != glassdock ]]; then
         printf '%s' "$value"
         return
     fi
     case $field in
-        DOCKER_HOST) printf 'unix://%s/socktainer-home/.socktainer/container.sock' "$ENGINE_STATE_DIR" ;;
-        START_CMD) printf 'env SOCKTAINER_HOST_HOME_DIRECTORY=%q SOCKTAINER_ENGINE_STATE_DIRECTORY=%q %q --no-docker-context' \
-            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
-            "$REPO_ROOT/.build/release/socktainer" ;;
+        DOCKER_HOST) printf 'unix://%s/glassdock-home/.glassdock/container.sock' "$ENGINE_STATE_DIR" ;;
+        START_CMD) printf 'env GLASSDOCK_HOST_HOME_DIRECTORY=%q GLASSDOCK_ENGINE_STATE_DIRECTORY=%q %q --no-docker-context' \
+            "$ENGINE_STATE_DIR/glassdock-home" "$ENGINE_STATE_DIR/glassdock-state" \
+            "$REPO_ROOT/.build/release/glassdock" ;;
         RESET_CMD) printf 'rm -rf %q %q && mkdir -p %q %q' \
-            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" \
-            "$ENGINE_STATE_DIR/socktainer-home" "$ENGINE_STATE_DIR/socktainer-state" ;;
+            "$ENGINE_STATE_DIR/glassdock-home" "$ENGINE_STATE_DIR/glassdock-state" \
+            "$ENGINE_STATE_DIR/glassdock-home" "$ENGINE_STATE_DIR/glassdock-state" ;;
         START_MODE) printf 'foreground' ;;
-        VERSION_CMD) printf '%q --version' "$REPO_ROOT/.build/release/socktainer" ;;
+        VERSION_CMD) printf '%q --version' "$REPO_ROOT/.build/release/glassdock" ;;
         RUNTIME_CMD) printf "printf 'Docker API v1.51; containerd 2.1.5; runc 1.3.4-r1'" ;;
-        HELPER_PATTERNS) printf 'socktainer-vmm,gvproxy' ;;
-        BIND_ROOT) printf '%s' "$ENGINE_STATE_DIR/socktainer-home" ;;
-        STORAGE_PATHS) printf '%s:%s:%s:%s:%s:%s:%s' "$REPO_ROOT/.build/release/socktainer" \
-            "$REPO_ROOT/VMM/out/socktainer-vmm" "$REPO_ROOT/VMM/out/libkrun.1.dylib" \
-            "$REPO_ROOT/VMM/out/gvproxy" "$REPO_ROOT/Guest/out/socktainer-vmlinux" \
-            "$REPO_ROOT/Guest/out/socktainer-root.ext4" \
-            "$ENGINE_STATE_DIR/socktainer-state" ;;
-        STORAGE_SCOPE) printf 'Socktainer executable, VMM, guest artifacts, and isolated mutable engine state' ;;
+        HELPER_PATTERNS) printf 'glassdock-vmm,gvproxy' ;;
+        BIND_ROOT) printf '%s' "$ENGINE_STATE_DIR/glassdock-home" ;;
+        STORAGE_PATHS) printf '%s:%s:%s:%s:%s:%s:%s' "$REPO_ROOT/.build/release/glassdock" \
+            "$REPO_ROOT/VMM/out/glassdock-vmm" "$REPO_ROOT/VMM/out/libkrun.1.dylib" \
+            "$REPO_ROOT/VMM/out/gvproxy" "$REPO_ROOT/Guest/out/glassdock-vmlinux" \
+            "$REPO_ROOT/Guest/out/glassdock-root.ext4" \
+            "$ENGINE_STATE_DIR/glassdock-state" ;;
+        STORAGE_SCOPE) printf 'Glass Dock executable, VMM, guest artifacts, and isolated mutable engine state' ;;
         VM_MEMORY_BYTES) printf '%s' "$((1024 * 1024 * 1024))" ;;
         VM_ALLOCATED_MEMORY_BYTES) printf '%s' "$((1024 * 1024 * 1024))" ;;
         CPU_COUNT) printf '6' ;;
         VARIANT) printf 'custom-vmm' ;;
         CONFIG_CMD) printf "printf 'cpu=6; memory_bytes=1073741824; architecture=custom-vmm'" ;;
-        RESET_POLICY) printf 'full isolated Socktainer state, including the image store' ;;
+        RESET_POLICY) printf 'full isolated Glass Dock state, including the image store' ;;
         IMAGE_CACHE_POLICY) printf 'reset' ;;
     esac
 }
@@ -239,7 +239,7 @@ verify_native_architecture() {
     bind_root=${bind_root:-$BIND_STATE_DIR}
     verification_dir="$bind_root/.native-$RUN_ID-$CURRENT_SAMPLE-$CURRENT_PRODUCT"
     mkdir -p "$verification_dir"
-    docker_api run --rm --label "socktainer.benchmark.run=$RUN_ID" \
+    docker_api run --rm --label "glassdock.benchmark.run=$RUN_ID" \
         -v "$verification_dir:/benchmark-verify" "$image" \
         /bin/sh -c 'uname -m > /benchmark-verify/architecture'
     architecture=$(tr -d '[:space:]' < "$verification_dir/architecture")
@@ -254,10 +254,10 @@ cleanup_host() {
     [[ -n $host ]] || return 0
     while IFS= read -r id; do
         [[ -n $id ]] || continue
-        [[ $(DOCKER_HOST="$host" docker inspect --format '{{ index .Config.Labels "socktainer.benchmark.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
+        [[ $(DOCKER_HOST="$host" docker inspect --format '{{ index .Config.Labels "glassdock.benchmark.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
         DOCKER_HOST="$host" docker rm -f "$id" >/dev/null 2>&1 || true
     done < <(DOCKER_HOST="$host" docker ps -aq \
-        --filter "label=socktainer.benchmark.run=$RUN_ID" 2>/dev/null || true)
+        --filter "label=glassdock.benchmark.run=$RUN_ID" 2>/dev/null || true)
 }
 
 cleanup() {
@@ -544,7 +544,7 @@ begin_metric() {
 }
 
 finalize_json() {
-    local tmp_output product product_info version version_cmd runtime runtime_cmd config config_cmd cpu_count variant reset_policy image_cache_policy vm_memory vm_allocated_memory source_dirty harness_sha support_sha guest_sha vmm_sha binary_sha source_diff_sha socktainer_artifacts_present
+    local tmp_output product product_info version version_cmd runtime runtime_cmd config config_cmd cpu_count variant reset_policy image_cache_policy vm_memory vm_allocated_memory source_dirty harness_sha support_sha guest_sha vmm_sha binary_sha source_diff_sha glassdock_artifacts_present
     tmp_output="$OUTPUT.tmp.$$"
     source_dirty=false
     git diff --quiet --ignore-submodules HEAD -- 2>/dev/null || source_dirty=true
@@ -552,17 +552,17 @@ finalize_json() {
     [[ -z $(git ls-files --others --exclude-standard 2>/dev/null) ]] || source_dirty=true
     harness_sha=$(shasum -a 256 "$REPO_ROOT/scripts/benchmark-runtime.sh" | awk '{print $1}')
     support_sha=$(shasum -a 256 "$BENCHMARK_SUPPORT" | awk '{print $1}')
-    guest_sha=$(hash_artifact_set "$REPO_ROOT/Guest/out/socktainer-vmlinux" "$REPO_ROOT/Guest/out/socktainer-root.ext4")
-    vmm_sha=$(hash_artifact_set "$REPO_ROOT/VMM/out/socktainer-vmm" "$REPO_ROOT/VMM/out/libkrun.1.dylib" "$REPO_ROOT/VMM/out/gvproxy")
-    binary_sha=$(hash_artifact_set "$REPO_ROOT/.build/release/socktainer")
-    socktainer_artifacts_present=false
-    if [[ -x $REPO_ROOT/.build/release/socktainer \
-        && -s $REPO_ROOT/VMM/out/socktainer-vmm \
+    guest_sha=$(hash_artifact_set "$REPO_ROOT/Guest/out/glassdock-vmlinux" "$REPO_ROOT/Guest/out/glassdock-root.ext4")
+    vmm_sha=$(hash_artifact_set "$REPO_ROOT/VMM/out/glassdock-vmm" "$REPO_ROOT/VMM/out/libkrun.1.dylib" "$REPO_ROOT/VMM/out/gvproxy")
+    binary_sha=$(hash_artifact_set "$REPO_ROOT/.build/release/glassdock")
+    glassdock_artifacts_present=false
+    if [[ -x $REPO_ROOT/.build/release/glassdock \
+        && -s $REPO_ROOT/VMM/out/glassdock-vmm \
         && -s $REPO_ROOT/VMM/out/libkrun.1.dylib \
         && -s $REPO_ROOT/VMM/out/gvproxy \
-        && -s $REPO_ROOT/Guest/out/socktainer-vmlinux \
-        && -s $REPO_ROOT/Guest/out/socktainer-root.ext4 ]]; then
-        socktainer_artifacts_present=true
+        && -s $REPO_ROOT/Guest/out/glassdock-vmlinux \
+        && -s $REPO_ROOT/Guest/out/glassdock-root.ext4 ]]; then
+        glassdock_artifacts_present=true
     fi
     source_diff_sha=$(
         {
@@ -628,7 +628,7 @@ finalize_json() {
         --argjson source_dirty "$source_dirty" \
         --arg harness_sha "$harness_sha" --arg support_sha "$support_sha" \
         --arg guest_sha "$guest_sha" \
-        --arg vmm_sha "$vmm_sha" --argjson socktainer_artifacts_present "$socktainer_artifacts_present" \
+        --arg vmm_sha "$vmm_sha" --argjson glassdock_artifacts_present "$glassdock_artifacts_present" \
         --arg binary_sha "$binary_sha" \
         --arg source_diff_sha "$source_diff_sha" \
         --arg os "$(sw_vers -productVersion)" --arg os_build "$(sw_vers -buildVersion)" \
@@ -668,9 +668,9 @@ finalize_json() {
             apacheBench:$ab_version,bash:$bash_version},
           gitCommit:$commit,sourceDirty:$source_dirty,
           provenance:{harnessSHA256:$harness_sha,supportSHA256:$support_sha,
-            socktainerArtifactsPresent:$socktainer_artifacts_present,
+            glassdockArtifactsPresent:$glassdock_artifacts_present,
             guestArtifactsSHA256:$guest_sha,vmmArtifactsSHA256:$vmm_sha,
-            socktainerBinarySHA256:$binary_sha,sourceDiffSHA256:$source_diff_sha},
+            glassdockBinarySHA256:$binary_sha,sourceDiffSHA256:$source_diff_sha},
           products:$products,schedule:$schedule,runtimeSamples:$runtime_samples,
           processSamples:$process_samples,storageSamples:$storage_samples,
           configuration:{baseImage:$base_image,nginxImage:$nginx_image,
@@ -818,7 +818,7 @@ record_process_snapshot() {
         split("\n") | map(select(length > 0) |
           capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<rssKiB>[0-9]+)\\s+(?<command>.*)$") |
           {pid:(.pid|tonumber),ppid:(.ppid|tonumber),residentBytes:((.rssKiB|tonumber)*1024),command:.command,
-           classification:(if (.command|test("socktainer-vmm|Virtualization\\.VirtualMachine|qemu-system";"i")) then "virtual-machine"
+           classification:(if (.command|test("glassdock-vmm|Virtualization\\.VirtualMachine|qemu-system";"i")) then "virtual-machine"
              elif (.command|test("gvproxy|vpnkit|slirp";"i")) then "network-helper"
              elif (.command|test("Docker\\.app|Dory\\.app";"i")) then "user-interface"
              else "daemon-or-helper" end)}) as $processes |
@@ -956,11 +956,11 @@ preflight_product() {
     validate_command_executable "$product" RESET_CMD "$reset_cmd"
     eval "$version_cmd" >/dev/null 2>&1 || die "${product}: NAME_VERSION_CMD failed"
     eval "$config_cmd" >/dev/null 2>&1 || die "${product}: NAME_CONFIG_CMD failed"
-    if [[ $product == socktainer && -z ${SOCKTAINER_START_CMD:-} ]]; then
-        [[ -x $REPO_ROOT/.build/release/socktainer ]] || die "socktainer: run 'make release' first or set SOCKTAINER_START_CMD"
-        for artifact in VMM/out/socktainer-vmm VMM/out/libkrun.1.dylib VMM/out/gvproxy \
-            Guest/out/socktainer-vmlinux Guest/out/socktainer-root.ext4; do
-            [[ -s $REPO_ROOT/$artifact ]] || die "socktainer: custom VMM artifact is missing: $artifact"
+    if [[ $product == glassdock && -z ${GLASSDOCK_START_CMD:-} ]]; then
+        [[ -x $REPO_ROOT/.build/release/glassdock ]] || die "glassdock: run 'make release' first or set GLASSDOCK_START_CMD"
+        for artifact in VMM/out/glassdock-vmm VMM/out/libkrun.1.dylib VMM/out/gvproxy \
+            Guest/out/glassdock-vmlinux Guest/out/glassdock-root.ext4; do
+            [[ -s $REPO_ROOT/$artifact ]] || die "glassdock: custom VMM artifact is missing: $artifact"
         done
     fi
     socket=${host#unix://}
@@ -969,12 +969,12 @@ preflight_product() {
 
 discover_products() {
     local name state detail
-    for name in socktainer dory docker-stable docker-vmm orbstack; do
+    for name in glassdock dory docker-stable docker-vmm orbstack; do
         state=unavailable
         detail='not installed or not built'
         case $name in
-            socktainer)
-                if [[ -x $REPO_ROOT/.build/release/socktainer ]]; then
+            glassdock)
+                if [[ -x $REPO_ROOT/.build/release/glassdock ]]; then
                     state=available
                     detail='release binary exists; custom VMM artifacts are checked by preflight'
                 else
@@ -1053,7 +1053,7 @@ preflight() {
         host=$(product_value "$product" DOCKER_HOST)
         [[ $seen_hosts != *",$host,"* ]] || die "products must not share a Docker host in one campaign: $host"
         seen_hosts+="$host,"
-        if [[ $MODE == run && $product != socktainer && $ALLOW_EXTERNAL_RESET != true ]]; then
+        if [[ $MODE == run && $product != glassdock && $ALLOW_EXTERNAL_RESET != true ]]; then
             die "external products require --allow-external-reset after reset commands are reviewed"
         fi
         preflight_product "$product"
@@ -1158,13 +1158,13 @@ benchmark_product() {
     if suite_enabled lifecycle; then
     begin_metric container_create
     name="$RUN_ID-$sample-$product-create"
-    value=$(docker_elapsed_ms "$host" create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
+    value=$(docker_elapsed_ms "$host" create --name "$name" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
     append_result "$product" "$sample" "$position" warm container_create "$value" ms
     docker_api rm "$name" >/dev/null
 
     begin_metric container_start
     name="$RUN_ID-$sample-$product-start"
-    docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
+    docker_api create --name "$name" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     value=$(docker_elapsed_ms "$host" start "$name")
     append_result "$product" "$sample" "$position" warm container_start "$value" ms
     [[ $(docker_api wait "$name") == 0 ]] || die "$product: started fixture returned a nonzero exit code"
@@ -1172,7 +1172,7 @@ benchmark_product() {
 
     begin_metric completed_wait_lookup
     name="$RUN_ID-$sample-$product-wait"
-    docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
+    docker_api create --name "$name" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     docker_api start "$name" >/dev/null
     while [[ $(docker_api inspect --format '{{.State.Running}}' "$name") == true ]]; do sleep 0.005; done
     value=$(docker_elapsed_ms "$host" wait "$name")
@@ -1183,7 +1183,7 @@ benchmark_product() {
 
     begin_metric live_wait_kill_to_exit_delivery
     name="$RUN_ID-$sample-$product-live-wait"
-    docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" \
+    docker_api create --name "$name" --label "glassdock.benchmark.run=$RUN_ID" \
         "$BASE_IMAGE" /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
     docker_api start "$name" >/dev/null
     value=$(live_wait_delivery_ms "$host" "$name")
@@ -1192,29 +1192,29 @@ benchmark_product() {
 
     begin_metric container_remove
     name="$RUN_ID-$sample-$product-remove"
-    docker_api create --name "$name" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
+    docker_api create --name "$name" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true >/dev/null
     value=$(docker_elapsed_ms "$host" rm "$name")
     append_result "$product" "$sample" "$position" warm container_remove "$value" ms
 
     begin_metric run_remove_true
-    value=$(docker_elapsed_ms "$host" run --rm --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
+    value=$(docker_elapsed_ms "$host" run --rm --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" /bin/true)
     append_result "$product" "$sample" "$position" warm run_remove_true "$value" ms
 
     begin_metric exec_true
     runner="$RUN_ID-$sample-$product-runner"
-    docker_api create --name "$runner" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
+    docker_api create --name "$runner" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
         /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
     docker_api start "$runner" >/dev/null
     value=$(docker_elapsed_ms "$host" exec "$runner" /bin/true)
     append_result "$product" "$sample" "$position" warm exec_true "$value" ms
     begin_metric overall_lifecycle_throughput
-    value=$(lifecycle_throughput "$host" "$BASE_IMAGE" "socktainer.benchmark.run=$RUN_ID" "$THROUGHPUT_OPERATIONS")
+    value=$(lifecycle_throughput "$host" "$BASE_IMAGE" "glassdock.benchmark.run=$RUN_ID" "$THROUGHPUT_OPERATIONS")
     append_result "$product" "$sample" "$position" warm overall_lifecycle_throughput "$value" operations_per_second
     fi
 
     if [[ -z $runner ]] && { suite_enabled diagnostics || suite_enabled resources; }; then
         runner="$RUN_ID-$sample-$product-runner"
-        docker_api create --name "$runner" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
+        docker_api create --name "$runner" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
             /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
         docker_api start "$runner" >/dev/null
     fi
@@ -1229,7 +1229,7 @@ benchmark_product() {
     if suite_enabled resources; then
     begin_metric four_idle_containers_physical_footprint
     for index in 1 2 3; do
-        docker_api create --name "$runner-$index" --label "socktainer.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
+        docker_api create --name "$runner-$index" --label "glassdock.benchmark.run=$RUN_ID" "$BASE_IMAGE" \
             /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
         docker_api start "$runner-$index" >/dev/null
     done
@@ -1241,7 +1241,7 @@ benchmark_product() {
     if suite_enabled nginx || suite_enabled resources; then
     begin_metric nginx_ready
     nginx="$RUN_ID-$sample-$product-nginx"
-    readiness=$(nginx_ready_ms "$host" "$nginx" "$NGINX_IMAGE" "socktainer.benchmark.run=$RUN_ID")
+    readiness=$(nginx_ready_ms "$host" "$nginx" "$NGINX_IMAGE" "glassdock.benchmark.run=$RUN_ID")
     value=${readiness%% *}
     port=${readiness##* }
     if suite_enabled nginx; then
@@ -1271,7 +1271,7 @@ benchmark_product() {
     bind_dir="$bind_root/$sample-$product"
     mkdir -p "$bind_dir"
     bind_runner="$RUN_ID-$sample-$product-bind"
-    docker_api create --name "$bind_runner" --label "socktainer.benchmark.run=$RUN_ID" -v "$bind_dir:/bench" "$BASE_IMAGE" \
+    docker_api create --name "$bind_runner" --label "glassdock.benchmark.run=$RUN_ID" -v "$bind_dir:/bench" "$BASE_IMAGE" \
         /bin/sh -c 'trap "exit 0" TERM INT; while :; do sleep 1; done' >/dev/null
     docker_api start "$bind_runner" >/dev/null
     dd_output=$(docker_api exec "$bind_runner" /bin/sh -c \
@@ -1363,14 +1363,14 @@ if [[ -z $OUTPUT ]]; then
 fi
 RUNS_DIRECTORY=${BENCH_RUNS_DIRECTORY:-"$(dirname "$OUTPUT")/runtime-benchmark-runs"}
 RUN_DIRECTORY="$RUNS_DIRECTORY/$RUN_ID"
-RESULTS_FILE=$(mktemp -t socktainer-benchmark-results.XXXXXX)
-PROCESS_FILE=$(mktemp -t socktainer-benchmark-processes.XXXXXX)
-STORAGE_FILE=$(mktemp -t socktainer-benchmark-storage.XXXXXX)
-RUNTIME_FILE=$(mktemp -t socktainer-benchmark-runtimes.XXXXXX)
-SUMMARY_FILE=$(mktemp -t socktainer-benchmark-summary.XXXXXX)
-SCHEDULE_FILE=$(mktemp -t socktainer-benchmark-schedule.XXXXXX)
-ENGINE_STATE_DIR=$(mktemp -d /tmp/socktainer-benchmark-engines.XXXXXX)
-BIND_STATE_DIR=$(mktemp -d "$HOME/.socktainer-benchmark-bind.XXXXXX")
+RESULTS_FILE=$(mktemp -t glassdock-benchmark-results.XXXXXX)
+PROCESS_FILE=$(mktemp -t glassdock-benchmark-processes.XXXXXX)
+STORAGE_FILE=$(mktemp -t glassdock-benchmark-storage.XXXXXX)
+RUNTIME_FILE=$(mktemp -t glassdock-benchmark-runtimes.XXXXXX)
+SUMMARY_FILE=$(mktemp -t glassdock-benchmark-summary.XXXXXX)
+SCHEDULE_FILE=$(mktemp -t glassdock-benchmark-schedule.XXXXXX)
+ENGINE_STATE_DIR=$(mktemp -d /tmp/glassdock-benchmark-engines.XXXXXX)
+BIND_STATE_DIR=$(mktemp -d "$HOME/.glassdock-benchmark-bind.XXXXXX")
 
 preflight
 IFS=',' read -r -a product_list <<< "$PRODUCTS"

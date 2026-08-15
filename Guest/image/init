@@ -7,13 +7,13 @@ mount -t tmpfs tmpfs /run 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 
-: "${SOCKTAINER_GUEST_ADDRESS:?SOCKTAINER_GUEST_ADDRESS is required}"
-: "${SOCKTAINER_GUEST_GATEWAY:?SOCKTAINER_GUEST_GATEWAY is required}"
-: "${SOCKTAINER_GUEST_DNS:?SOCKTAINER_GUEST_DNS is required}"
+: "${GLASSDOCK_GUEST_ADDRESS:?GLASSDOCK_GUEST_ADDRESS is required}"
+: "${GLASSDOCK_GUEST_GATEWAY:?GLASSDOCK_GUEST_GATEWAY is required}"
+: "${GLASSDOCK_GUEST_DNS:?GLASSDOCK_GUEST_DNS is required}"
 ip link set dev eth0 up
-ip address add "${SOCKTAINER_GUEST_ADDRESS}" dev eth0
-ip route add default via "${SOCKTAINER_GUEST_GATEWAY}" dev eth0
-printf 'nameserver %s\n' "${SOCKTAINER_GUEST_DNS}" > /run/resolv.conf
+ip address add "${GLASSDOCK_GUEST_ADDRESS}" dev eth0
+ip route add default via "${GLASSDOCK_GUEST_GATEWAY}" dev eth0
+printf 'nameserver %s\n' "${GLASSDOCK_GUEST_DNS}" > /run/resolv.conf
 mount --bind /run/resolv.conf /etc/resolv.conf
 
 host_bind_source=
@@ -57,7 +57,7 @@ done
 
 mkdir -p /run/containerd
 mount -t ext4 -o data=ordered /dev/vdb /var/lib/containerd
-mount -t virtiofs socktainer-home /mnt/socktainer-host
+mount -t virtiofs glassdock-home /mnt/glassdock-host
 
 containerd --config /etc/containerd/config.toml >&2 &
 containerd_pid=$!
@@ -75,7 +75,7 @@ done
     exit 1
 }
 
-exec /usr/local/libexec/socktainer-guest-agent \
+exec /usr/local/libexec/glassdock-guest-agent \
     --host-bind-source "${host_bind_source}" \
-    --guest-bind-root /mnt/socktainer-host \
+    --guest-bind-root /mnt/glassdock-host \
     --excluded-host-bind-source "${excluded_host_bind_source}"

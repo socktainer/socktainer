@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
 var errRequested = errors.New("requested failure")
@@ -52,7 +52,7 @@ func TestNetworkManagerCreatesConfiguredNamespace(t *testing.T) {
 	}
 	joined := strings.Join(runner.commands, "\n")
 	for _, expected := range []string{
-		"ip link add socktainer0 type bridge",
+		"ip link add glassdock0 type bridge",
 		"sysctl -w net.ipv4.ip_forward=1",
 		"iptables -t nat -A POSTROUTING -s 10.88.0.0/16",
 		"addr 10.88.0.2/16 dev eth0",
@@ -132,9 +132,9 @@ func TestNetworkManagerInstallsTCPKernelForwardingRules(t *testing.T) {
 	for _, expected := range []string{
 		"iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 42000",
 		"-j DNAT --to-destination 10.88.0.2:8080",
-		"iptables -A FORWARD -i eth0 -o socktainer0 -p tcp -d 10.88.0.2 --dport 8080",
-		"iptables -A FORWARD -i socktainer0 -o eth0 -p tcp -s 10.88.0.2 --sport 8080",
-		"--comment socktainer:st",
+		"iptables -A FORWARD -i eth0 -o glassdock0 -p tcp -d 10.88.0.2 --dport 8080",
+		"iptables -A FORWARD -i glassdock0 -o eth0 -p tcp -s 10.88.0.2 --sport 8080",
+		"--comment glassdock:st",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("kernel rules do not contain %q:\n%s", expected, joined)
@@ -160,8 +160,8 @@ func TestNetworkManagerInstallsAndRemovesExactUDPRules(t *testing.T) {
 	for _, expected := range []string{
 		"iptables -t nat -A PREROUTING -i eth0 -p udp --dport " + guestPort,
 		"iptables -t nat -D PREROUTING -i eth0 -p udp --dport " + guestPort,
-		"iptables -D FORWARD -i eth0 -o socktainer0 -p udp",
-		"iptables -D FORWARD -i socktainer0 -o eth0 -p udp",
+		"iptables -D FORWARD -i eth0 -o glassdock0 -p udp",
+		"iptables -D FORWARD -i glassdock0 -o eth0 -p udp",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("UDP lifecycle does not contain %q:\n%s", expected, joined)
