@@ -13,7 +13,11 @@ let package = Package(
         .macOS(.v15)
     ],
     products: [
-        .executable(name: "glassdock", targets: ["GlassDock"])
+        .library(name: "GlassDockControl", targets: ["GlassDockControl"]),
+        .library(name: "GlassDockMenuKit", targets: ["GlassDockMenuKit"]),
+        .executable(name: "glassdock", targets: ["GlassDock"]),
+        .executable(name: "glassdockctl", targets: ["glassdockctl"]),
+        .executable(name: "GlassDockMenu", targets: ["GlassDockMenu"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", exact: "1.2.1"),
@@ -25,6 +29,9 @@ let package = Package(
         .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
     ],
     targets: [
+        .target(
+            name: "GlassDockControl"
+        ),
         .executableTarget(
             name: "GlassDock",
             dependencies: [
@@ -48,6 +55,21 @@ let package = Package(
                 "BuildInfo",
             ]
         ),
+        .executableTarget(
+            name: "glassdockctl",
+            dependencies: [
+                "GlassDockControl",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
+        .executableTarget(
+            name: "GlassDockMenu",
+            dependencies: ["GlassDockMenuKit"]
+        ),
+        .target(
+            name: "GlassDockMenuKit",
+            dependencies: ["GlassDockControl"]
+        ),
         .testTarget(
             name: "GlassDockTests",
             dependencies: [
@@ -56,6 +78,14 @@ let package = Package(
                 .product(name: "VaporTesting", package: "vapor"),
                 .product(name: "libzstd", package: "zstd"),
             ],
+        ),
+        .testTarget(
+            name: "GlassDockControlTests",
+            dependencies: ["GlassDockControl"]
+        ),
+        .testTarget(
+            name: "GlassDockMenuKitTests",
+            dependencies: ["GlassDockMenuKit"]
         ),
         .target(
             name: "CFilteredStream",
@@ -78,5 +108,4 @@ let package = Package(
             ]
         ),
     ]
-
 )

@@ -23,6 +23,10 @@ make APPLE_APPLICATION_ID="Developer ID Application: Your Name" \
 - Xcode Command Line Tools installed
 - Developer certificates (for signed builds only)
 
+Notarization uses a `notarytool` Keychain profile. It does not accept plaintext
+password variables. The notarization target also requires the explicit final
+approval gates that `make help` describes.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -66,7 +70,7 @@ in-place upgrade by reinstalling the previous package or Homebrew version.
 ## Output
 
 Creates `out/glassdock-installer.pkg` that:
-- Installs the daemon, VMM helper, libkrun, and gvproxy to `/opt/glassdock/bin/`
+- Installs the daemon, `glassdockctl`, VMM helper, libkrun, and gvproxy to `/opt/glassdock/bin/`
 - Installs the guest kernel and read-only root disk to `/opt/glassdock/share/glassdock/`
 - Adds `/opt/glassdock/bin` to system PATH
 - Shows professional installer UI

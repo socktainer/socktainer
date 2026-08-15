@@ -323,6 +323,10 @@ We welcome contributions!
 
 ### Developer Notes 🧑‍💻
 
+See [Menu bar, Raycast, and control-plane development](docs/CONTROL_CLIENTS.md)
+for the native menu-bar app, the `glassdockctl` contract, and the Raycast
+extension.
+
 - Code organization under `Sources/GlassDock/`:
   - `Routes/` — Route handlers 🛣️
   - `Clients/` — Client integrations 🔌

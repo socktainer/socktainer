@@ -13,6 +13,8 @@
 # limitations under the License.
 
 BUILD_CONFIGURATION ?= debug
+APP_RELEASE_VERSION ?= 1.3.0
+APP_BUILD_NUMBER ?= 1
 TEST_PARALLELISM ?= $(shell sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.ncpu)
 TEST_SWIFT_FLAGS ?= --disable-index-store
 
@@ -66,6 +68,13 @@ help:
 	@echo "  all              - Build glassdock (default)"
 	@echo "  build            - Build in debug mode"
 	@echo "  release          - Build in release mode"
+	@echo "  control          - Build glassdockctl"
+	@echo "  menu-app         - Build a local GlassDock.app bundle"
+	@echo "  menu-popover-test - Verify the built menu-bar popover is visible"
+	@echo "  menu-release     - Prepare a Developer ID-signed app archive without submission"
+	@echo "  publishing-validate - Validate local Apple and Raycast publishing inputs"
+	@echo "  raycast-install  - Install Raycast extension dependencies"
+	@echo "  raycast-build    - Build and lint the Raycast extension"
 	@echo "  test             - Run tests"
 	@echo "  integration      - Run live Docker lifecycle integration tests"
 	@echo "  benchmark-preflight - Validate runtime benchmark configuration"
@@ -85,6 +94,45 @@ help:
 test: lint-pipes benchmark-test
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
 		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
+
+.PHONY: control
+control:
+	@$(SWIFT) build -c $(BUILD_CONFIGURATION) --product glassdockctl
+
+.PHONY: menu-app
+menu-app:
+	@bash scripts/build-menu-app.sh $(BUILD_CONFIGURATION) $(BUILD_VERSION)
+
+.PHONY: menu-popover-test
+menu-popover-test: menu-app
+	@bash scripts/test-menu-popover.sh .build/$(BUILD_CONFIGURATION)/GlassDock.app/Contents/MacOS/GlassDockMenu
+
+.PHONY: menu-release
+menu-release:
+	@bash scripts/prepare-menu-release.sh \
+		--version "$(APP_RELEASE_VERSION)" \
+		--build "$(APP_BUILD_NUMBER)"
+
+.PHONY: publishing-validate
+publishing-validate:
+	@plutil -lint \
+		Apps/GlassDockMenu/Info.plist \
+		Apps/GlassDockMenu/GlassDockMenu.entitlements \
+		Apps/GlassDockMenu/PrivacyInfo.xcprivacy >/dev/null
+	@jq -e . Apps/GlassDockMenu/Distribution.json raycast/package.json >/dev/null
+	@codesign --verify --deep --strict .build/release/GlassDock.app
+	@unzip -tq ".build/release-distribution/GlassDock-$(APP_RELEASE_VERSION)-macOS-arm64.zip" >/dev/null
+	@npm --prefix raycast run lint
+	@npm --prefix raycast run build
+
+.PHONY: raycast-install
+raycast-install:
+	@npm --prefix raycast install
+
+.PHONY: raycast-build
+raycast-build:
+	@npm --prefix raycast run lint
+	@npm --prefix raycast run build
 
 .PHONY: integration
 integration:
