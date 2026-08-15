@@ -12,6 +12,7 @@ actor GuestConnection {
     private let handle: FileHandle
     private let descriptor: Int32
     private let writer: GuestSocketWriter
+    private let readGate = GuestReadGate()
     private var nextID: UInt64 = 1
     private struct PendingRequest {
         let continuation: CheckedContinuation<GuestFrame, Error>
@@ -40,7 +41,7 @@ actor GuestConnection {
     deinit {
         _ = Darwin.shutdown(descriptor, SHUT_RDWR)
         writer.close()
-        try? handle.close()
+        readGate.close(handle)
     }
 
     func request(method: String, payload: JSONValue? = nil) async throws -> GuestFrame {
@@ -105,8 +106,10 @@ actor GuestConnection {
         reading = true
         let reads = AsyncStream<Data>.makeStream()
         readContinuation = reads.continuation
+        let readGate = readGate
         handle.readabilityHandler = { readable in
-            reads.continuation.yield(readable.availableData)
+            guard let data = readGate.read(readable) else { return }
+            reads.continuation.yield(data)
         }
         Task.detached { [weak self] in
             for await data in reads.stream {
@@ -161,12 +164,11 @@ actor GuestConnection {
         guard terminalError == nil else { return }
         terminalError = error
         reading = false
-        handle.readabilityHandler = nil
+        readGate.close(handle)
         readContinuation?.finish()
         readContinuation = nil
         _ = Darwin.shutdown(descriptor, SHUT_RDWR)
         writer.close()
-        try? handle.close()
         let continuations = pending.values
         pending.removeAll()
         for request in continuations {
@@ -204,6 +206,30 @@ actor GuestConnection {
 
     private func failRequest(id: UInt64, error: Error) {
         pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
+    }
+}
+
+final class GuestReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var closed = false
+
+    func read(_ handle: FileHandle) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return nil }
+        return handle.availableData
+    }
+
+    func close(_ handle: FileHandle) {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        closed = true
+        handle.readabilityHandler = nil
+        try? handle.close()
+        lock.unlock()
     }
 }
 

@@ -5,6 +5,17 @@ import Testing
 
 @Suite("Multiplexed guest connection")
 struct GuestConnectionTests {
+    @Test("readability callbacks stop before a closed descriptor is reused")
+    func readGateStopsAfterClose() throws {
+        let pair = try SocketPair.make()
+        defer { try? pair.peer.close() }
+
+        let gate = GuestReadGate()
+        gate.close(pair.client)
+
+        #expect(gate.read(pair.client) == nil)
+    }
+
     @Test("matches responses to request identifiers")
     func multiplexesResponses() async throws {
         let pair = try SocketPair.make()
