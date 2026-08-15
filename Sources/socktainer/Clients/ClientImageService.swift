@@ -307,6 +307,7 @@ struct ClientImageService: ClientImageProtocol {
                     )
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
                     continuation.yield(.message("Image digest: \(image.digest)"))
+                    continuation.yield(.message(ClientImageService.pulledStatusMessage(for: reference)))
                     continuation.finish()
                 } catch {
                     // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
@@ -328,6 +329,7 @@ struct ClientImageService: ClientImageProtocol {
                             try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
                             logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
                             continuation.yield(.message("Image digest: \(fallbackImage.digest)"))
+                            continuation.yield(.message(ClientImageService.pulledStatusMessage(for: reference)))
                             continuation.finish()
                         } catch let fallbackError {
                             logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
@@ -817,5 +819,15 @@ struct ClientImageService: ClientImageProtocol {
         } catch {
             return .malformed(reason: String(describing: error))
         }
+    }
+
+    /// docker-java's `PullImageResultCallback.checkDockerClientPullSuccessful` only accepts
+    /// a stream ending in one of a handful of exact terminal phrases; the real Docker daemon
+    /// always emits one, but `pull()`'s prior last line ("Image digest: …") matches none of
+    /// them, so every pull under Testcontainers/docker-java failed even though the image was
+    /// fetched correctly (issue #359). `pull()` doesn't distinguish a fresh fetch from an
+    /// already-cached image, so this is used unconditionally — docker-java accepts it either way.
+    static func pulledStatusMessage(for reference: String) -> String {
+        "Status: Downloaded newer image for \(reference)"
     }
 }
