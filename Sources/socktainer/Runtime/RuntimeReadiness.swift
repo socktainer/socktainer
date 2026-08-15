@@ -18,9 +18,6 @@ actor RuntimeReadiness: RuntimeReadying {
 
     init(start: @escaping @Sendable () async throws -> Void) {
         self.start = start
-        Task { [weak self] in
-            _ = try? await self?.waitUntilReady()
-        }
     }
 
     func waitUntilReady() async throws {
@@ -59,23 +56,10 @@ struct RuntimeReadinessMiddleware: AsyncMiddleware {
     let readiness: any RuntimeReadying
 
     func respond(to request: Request, chainingTo next: any AsyncResponder) async throws -> Response {
-        if Self.isDockerPing(request) {
+        if DockerPing.matches(method: request.method, path: request.url.path) {
             return try await next.respond(to: request)
         }
         try await readiness.waitUntilReady()
         return try await next.respond(to: request)
-    }
-
-    private static func isDockerPing(_ request: Request) -> Bool {
-        guard request.method == .GET || request.method == .HEAD else { return false }
-        let components = request.url.path.split(separator: "/")
-        guard components.last == "_ping" else { return false }
-        if components.count == 1 { return true }
-        guard components.count == 2, components[0].first == "v" else { return false }
-        let versionParts = components[0].dropFirst().split(separator: ".", omittingEmptySubsequences: false)
-        return versionParts.count == 2
-            && versionParts.allSatisfy {
-                !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber }
-            }
     }
 }

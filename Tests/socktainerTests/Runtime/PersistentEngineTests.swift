@@ -193,7 +193,8 @@ private actor FakeEngineMachineHost: EngineMachineHosting {
             processIdentifier: 62,
             guestIPv4: "192.168.72.2",
             hostGatewayIPv4: "192.168.72.1",
-            gvproxyAPI: URL(fileURLWithPath: "/tmp/gvproxy.sock")
+            gvproxyAPI: URL(fileURLWithPath: "/tmp/gvproxy.sock"),
+            tcpRelaySocket: URL(fileURLWithPath: "/tmp/tcp-relay.sock")
         )
     }
 

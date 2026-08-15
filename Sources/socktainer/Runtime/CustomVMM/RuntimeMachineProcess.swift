@@ -31,6 +31,9 @@ struct FoundationRuntimeMachineProcessLauncher: RuntimeMachineProcessLaunching {
         let controlSocket =
             runtimeDirectory
             .appendingPathComponent("vsock/1025.sock", isDirectory: false)
+        let tcpRelaySocket =
+            runtimeDirectory
+            .appendingPathComponent("vsock/1026.sock", isDirectory: false)
         let process = Process()
         process.executableURL = configuration.helperExecutable
         process.arguments = Self.arguments(
@@ -46,7 +49,7 @@ struct FoundationRuntimeMachineProcessLauncher: RuntimeMachineProcessLaunching {
         }
         return FoundationRuntimeMachineProcess(
             process: process,
-            readinessSockets: [controlSocket]
+            readinessSockets: [controlSocket, tcpRelaySocket]
         )
     }
 
@@ -63,6 +66,8 @@ struct FoundationRuntimeMachineProcessLauncher: RuntimeMachineProcessLaunching {
             "--excluded-bind-source", configuration.stateDirectory.path,
             "--control-socket",
             runtimeDirectory.appendingPathComponent("vsock/1025.sock").path,
+            "--tcp-relay-socket",
+            runtimeDirectory.appendingPathComponent("vsock/1026.sock").path,
             "--console-log",
             runtimeDirectory.appendingPathComponent("console.log").path,
             "--cpus", String(configuration.cpuCount),

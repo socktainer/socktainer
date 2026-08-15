@@ -42,7 +42,6 @@ struct VolumeDeleteForceTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
             try app.register(collection: VolumeDeleteRoute(client: mock))
 
@@ -65,7 +64,6 @@ struct VolumeDeleteForceTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
             try app.register(collection: VolumeDeleteRoute(client: mock))
 
@@ -89,7 +87,6 @@ struct VolumeDeleteForceTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
             try app.register(collection: VolumeDeleteRoute(client: mock))
 
@@ -114,7 +111,6 @@ struct VolumeDeleteForceTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
             try app.register(collection: VolumeDeleteRoute(client: mock))
 
@@ -139,7 +135,6 @@ struct VolumeDeleteForceTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.storage[EventBroadcasterKey.self] = EventBroadcaster()
             try app.register(collection: VolumeDeleteRoute(client: mock))
 

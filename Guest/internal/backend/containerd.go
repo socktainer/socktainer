@@ -63,6 +63,7 @@ type Backend struct {
 	logsDir       string
 	logCaptures   sync.Map
 	containers    sync.Map
+	networks      sync.Map // map[string]*networkPreparation
 	createMu      sync.Mutex
 	metadataMu    sync.Mutex
 	network       *NetworkManager
@@ -127,6 +128,15 @@ type orderedCleanupBarrier struct {
 }
 
 type cleanupResult struct {
+	done chan struct{}
+	err  error
+}
+
+// networkPreparation records private network setup started while a container
+// is being created. The namespace is not joined and no publication rules are
+// installed until Start; this only overlaps expensive netlink work with
+// container metadata and snapshot setup.
+type networkPreparation struct {
 	done chan struct{}
 	err  error
 }
@@ -268,6 +278,33 @@ func New(address, namespace, snapshotter, runtimeName, runtimeBinary string) (*B
 		logsDir: "/var/lib/containerd/io.socktainer.logs",
 		network: NewNetworkManager(commandRunner{}), taskCreates: make(chan struct{}, maxConcurrentTaskCreations),
 	}, nil
+}
+
+func (b *Backend) beginNetworkPreparation(id string) *networkPreparation {
+	preparation := &networkPreparation{done: make(chan struct{})}
+	actual, loaded := b.networks.LoadOrStore(id, preparation)
+	if loaded {
+		return actual.(*networkPreparation)
+	}
+	go func() {
+		_, preparation.err = b.network.Create(id)
+		close(preparation.done)
+	}()
+	return preparation
+}
+
+func (b *Backend) waitNetworkPreparation(ctx context.Context, id string) error {
+	value, ok := b.networks.Load(id)
+	if !ok {
+		return nil
+	}
+	preparation := value.(*networkPreparation)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-preparation.done:
+		return preparation.err
+	}
 }
 
 func (b *Backend) Close() error             { return b.client.Close() }
@@ -598,6 +635,21 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	default:
 		return api.Container{}, fmt.Errorf("unsupported network mode %q", request.Network.Mode)
 	}
+	var networkReady *networkPreparation
+	keepNetwork := false
+	if privateNetwork {
+		networkReady = b.beginNetworkPreparation(request.ID)
+		defer func() {
+			if keepNetwork || networkReady == nil {
+				return
+			}
+			<-networkReady.done
+			if networkReady.err == nil {
+				_ = b.network.Delete(request.ID)
+			}
+			b.networks.Delete(request.ID)
+		}()
+	}
 	ctx = b.ctx(ctx)
 	image, err := b.client.GetImage(ctx, request.Image)
 	if err != nil {
@@ -692,9 +744,8 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	}
 	metadata.AutoRemove = metadata.AutoRemove || request.AutoRemove
 	if privateNetwork {
-		// Docker create establishes durable container metadata. The network
-		// namespace is only required when runc creates the task, so prepare it
-		// after the create response instead of delaying this transaction.
+		// Docker create stores network intent. The network namespace is
+		// allocated when start realizes that intent.
 		metadata.PublishedPorts = append([]api.PublishedPort(nil), request.PublishedPorts...)
 	}
 	encodedMetadata, err := encodeRuntimeMetadata(metadata)
@@ -734,6 +785,7 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 	if err != nil {
 		return api.Container{}, err
 	}
+	keepNetwork = true
 	return api.Container{
 		ID: container.ID(), Image: info.Image, Status: "created", CreatedAt: info.CreatedAt, Metadata: metadata,
 	}, nil
@@ -914,6 +966,10 @@ func (b *Backend) AutoRemove(ctx context.Context, id string) bool {
 	return err == nil && labels["com.socktainer.auto-remove"] == "true"
 }
 
+func (b *Backend) PublishedTCPDestination(guestPort uint16) (string, bool) {
+	return b.network.PublishedTCPDestination(guestPort)
+}
+
 func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) (api.Container, error) {
 	ctx = b.ctx(ctx)
 	id := request.ID
@@ -931,6 +987,9 @@ func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) 
 		if err != nil {
 			return api.Container{}, err
 		}
+	}
+	if err := b.waitNetworkPreparation(ctx, id); err != nil {
+		return api.Container{}, err
 	}
 	published, err := b.prepareNetwork(id, request.PublishedPorts)
 	if err != nil {
@@ -1151,7 +1210,14 @@ func (b *Backend) Delete(ctx context.Context, request api.ContainerDeleteRequest
 		go b.removeSnapshot(record.snapshotter, record.snapshotKey)
 	}
 	b.removeLogs(request.ID)
-	b.cleanups.enqueue(func() error { return b.network.Delete(request.ID) })
+	b.cleanups.enqueue(func() error {
+		if err := b.waitNetworkPreparation(context.Background(), request.ID); err != nil {
+			return err
+		}
+		err := b.network.Delete(request.ID)
+		b.networks.Delete(request.ID)
+		return err
+	})
 	return nil
 }
 

@@ -40,7 +40,6 @@ private func withDistributionApp(_ provider: FakeDistributionProvider, run: (App
     try await withApp(configure: { _ in }) { app in
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
-        regexRouter.installMiddleware(on: app)
         app.middleware.use(ErrorMiddleware.default(environment: app.environment))
         try app.register(collection: DistributionJsonRoute(inspectProvider: provider))
         try await run(app)

@@ -295,7 +295,6 @@ func (s *Server) handle(ctx context.Context, request protocol.Envelope, w *proto
 			fail("containerd", err)
 			return
 		}
-		syscall.Sync()
 		state := s.registerWait(body.ID)
 		_ = writePayload(w, request.ID, api.ContainerResponse{Container: item})
 		s.monitor(context.Background(), body.ID, state, w)

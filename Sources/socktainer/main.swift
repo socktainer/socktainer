@@ -2,6 +2,7 @@ import ArgumentParser
 import BuildInfo
 import ContainerResource
 import Foundation
+import NIOPosix
 import Vapor
 
 // CLI options
@@ -34,6 +35,26 @@ struct CLIOptions: ParsableArguments {
     )
     var memoryMiB: UInt64 = Self.defaultMemoryMiB
 
+    @ArgumentParser.Flag(
+        name: .long,
+        inversion: .prefixedNo,
+        help: "Forward published TCP ports directly through the runtime VM"
+    )
+    var directTCPForwarding: Bool = true
+
+    @ArgumentParser.Flag(
+        name: .long,
+        inversion: .prefixedNo,
+        help: "Answer Docker ping before route lookup"
+    )
+    var fastPing: Bool = true
+
+    @ArgumentParser.Option(
+        name: .long,
+        help: "Number of host API event-loop threads (1 through 64)"
+    )
+    var eventLoopThreads: Int = System.coreCount
+
     func validate() throws {
         guard (1...RuntimeMachineConfiguration.maximumCPUCount).contains(cpus) else {
             throw ValidationError(
@@ -46,6 +67,9 @@ struct CLIOptions: ParsableArguments {
             throw ValidationError(
                 "--memory-mib must be between \(minimumMemoryMiB) and \(maximumMemoryMiB)"
             )
+        }
+        guard (1...64).contains(eventLoopThreads) else {
+            throw ValidationError("--event-loop-threads must be between 1 and 64")
         }
     }
 }
@@ -67,7 +91,9 @@ var env = try Environment.detect(arguments: vaporArgs)
 try LoggingSystem.bootstrap(from: &env)
 
 // Create and configure the Vapor application
-let app = try await Application.make(env)
+let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: options.eventLoopThreads)
+let app = try await Application.make(env, .shared(eventLoopGroup))
+configureDaemonMiddleware(app)
 let homeDirectory = SocktainerDirectories.hostHome.path
 let engineStateLock = try EngineStateLock.acquire(
     directory: SocktainerDirectories.engineStateDirectory
@@ -83,16 +109,31 @@ app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.
 try await configure(
     app,
     cpuCount: options.cpus,
-    memoryBytes: options.memoryMiB * 1024 * 1024
+    memoryBytes: options.memoryMiB * 1024 * 1024,
+    directTCPForwarding: options.directTCPForwarding,
+    fastPing: options.fastPing
 )
 
-// Start the app
-try await app.startup()
+// Bind Vapor's private socket before the public gateway becomes reachable.
+var gateway: DockerAPIGateway?
 do {
+    try await app.startup()
+    try restrictBackendSocketToOwner(homeDirectory: homeDirectory)
+    gateway = try DockerAPIGateway(
+        configuration: DockerAPIGatewayConfiguration(
+            publicSocketPath: containerSocketPath(homeDirectory: homeDirectory),
+            backendSocketPath: backendSocketPath(homeDirectory: homeDirectory),
+            apiVersion: DockerPing.apiVersion
+        )
+    )
     try openUnixSocketToAllUsers(homeDirectory: homeDirectory)
+    try await app.running?.onStop.get()
 } catch {
+    gateway?.stop()
     try? await app.asyncShutdown()
+    try? await eventLoopGroup.shutdownGracefully()
     throw error
 }
-try await app.running?.onStop.get()
+gateway?.stop()
 try await app.asyncShutdown()
+try await eventLoopGroup.shutdownGracefully()

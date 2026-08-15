@@ -216,7 +216,7 @@ enum DockerRuntimeRouteError: Error, Equatable {
 
 private struct DockerStopTimeout: Error {}
 
-private actor DockerRuntimeExecState {
+private final class DockerRuntimeExecState: @unchecked Sendable {
     struct Entry: Sendable {
         let request: DockerRuntimeExecCreate
         var running = false
@@ -224,27 +224,34 @@ private actor DockerRuntimeExecState {
     }
 
     private var entries: [String: Entry] = [:]
+    private let lock = NSLock()
 
     func insert(id: String, request: DockerRuntimeExecCreate) {
-        entries[id] = Entry(request: request)
+        lock.withLock { entries[id] = Entry(request: request) }
     }
 
-    func entry(id: String) -> Entry? { entries[id] }
+    func entry(id: String) -> Entry? { lock.withLock { entries[id] } }
 
     func markRunning(id: String) throws {
-        guard var entry = entries[id] else { throw DockerRuntimeRouteError.notFound("Exec instance (id)") }
-        guard !entry.running, entry.exitCode == nil else {
-            throw DockerRuntimeRouteError.conflict("Exec instance (id) has already been started")
+        try lock.withLock {
+            guard var entry = entries[id] else {
+                throw DockerRuntimeRouteError.notFound("Exec instance (id)")
+            }
+            guard !entry.running, entry.exitCode == nil else {
+                throw DockerRuntimeRouteError.conflict("Exec instance (id) has already been started")
+            }
+            entry.running = true
+            entries[id] = entry
         }
-        entry.running = true
-        entries[id] = entry
     }
 
     func finish(id: String, exitCode: Int32) {
-        guard var entry = entries[id] else { return }
-        entry.running = false
-        entry.exitCode = exitCode
-        entries[id] = entry
+        lock.withLock {
+            guard var entry = entries[id] else { return }
+            entry.running = false
+            entry.exitCode = exitCode
+            entries[id] = entry
+        }
     }
 }
 
@@ -269,18 +276,18 @@ struct DockerRuntimeRoutes: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/images/prune", use: pruneImages)
         try routes.registerVersionedRoute(.POST, pattern: "/images/{name:.*}/tag", use: tagImage)
         try routes.registerVersionedRoute(.POST, pattern: "/containers/create", use: createContainer)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/start", use: startContainer)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/stop", use: stopContainer)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/kill", use: killContainer)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/wait", use: waitContainer)
-        try routes.registerVersionedRoute(.DELETE, pattern: "/containers/{id}", use: deleteContainer)
-        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/json", use: inspectContainer)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/start", use: startContainer)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/stop", use: stopContainer)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/kill", use: killContainer)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/wait", use: waitContainer)
+        try routes.registerVersionedRoute(.DELETE, pattern: "/containers/{id:.*}", use: deleteContainer)
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id:.*}/json", use: inspectContainer)
         try routes.registerVersionedRoute(.GET, pattern: "/containers/json", use: listContainers)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/exec", use: createExec)
-        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/start", use: startExec)
-        try routes.registerVersionedRoute(.GET, pattern: "/exec/{id}/json", use: inspectExec)
-        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id}/logs", use: logs)
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/attach", use: attach)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/exec", use: createExec)
+        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id:.*}/start", use: startExec)
+        try routes.registerVersionedRoute(.GET, pattern: "/exec/{id:.*}/json", use: inspectExec)
+        try routes.registerVersionedRoute(.GET, pattern: "/containers/{id:.*}/logs", use: logs)
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id:.*}/attach", use: attach)
     }
 
     private func pullImage(_ req: Request) async throws -> Response {
@@ -532,29 +539,58 @@ struct DockerRuntimeRoutes: RouteCollection {
             attachStderr: body.AttachStderr ?? true
         )
         let id = try await call { try await backend.createExec(request) }
-        await execState.insert(id: id, request: request)
+        execState.insert(id: id, request: request)
         return try jsonResponse(.created, CreateExecResponse(Id: id))
     }
 
     private func startExec(_ req: Request) async throws -> Response {
         let id = try requiredParameter("id", request: req)
-        guard let entry = await execState.entry(id: id) else {
+        guard let entry = execState.entry(id: id) else {
             throw Abort(.notFound, reason: "Exec instance not found: \(id)")
         }
         let body = try req.content.decode(ExecStartRequest.self)
-        try await call { try await execState.markRunning(id: id) }
+        try execState.markRunning(id: id)
         let tty = body.Tty ?? entry.request.tty
         if body.Detach ?? false {
             do {
                 _ = try await call { try await backend.startExec(id: id, detach: true, tty: tty) }
-                await execState.finish(id: id, exitCode: 0)
+                execState.finish(id: id, exitCode: 0)
                 return Response(status: .ok)
             } catch {
-                await execState.finish(id: id, exitCode: -1)
+                execState.finish(id: id, exitCode: -1)
                 throw error
             }
         }
         let stream = try await call { try await backend.streamExec(id: id, tty: tty) }
+        if req.headers.first(name: "Upgrade")?.lowercased() == "tcp",
+            req.headers.first(name: "Connection")?.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).contains("upgrade") == true
+        {
+            let state = execState
+            return .dockerTCPUpgrade(execId: id, ttyEnabled: tty) { channel, _ in
+                do {
+                    var exitCode: Int32 = -1
+                    for try await frame in stream {
+                        if let code = frame.exitCode {
+                            exitCode = code
+                            continue
+                        }
+                        let data = frame.data
+                        let bytes =
+                            tty
+                            ? data
+                            : Self.frame(data, stream: frame.stream == .stderr ? 2 : 1)
+                        var buffer = channel.allocator.buffer(capacity: bytes.count)
+                        buffer.writeBytes(bytes)
+                        try await channel.writeAndFlush(buffer).get()
+                    }
+                    state.finish(id: id, exitCode: exitCode)
+                    try await channel.close().get()
+                } catch {
+                    state.finish(id: id, exitCode: -1)
+                    throw error
+                }
+            }
+        }
         var headers = HTTPHeaders()
         headers.contentType = HTTPMediaType(type: "application", subType: "vnd.docker.raw-stream")
         let state = execState
@@ -576,9 +612,9 @@ struct DockerRuntimeRoutes: RouteCollection {
                             )
                         }
                     }
-                    await state.finish(id: id, exitCode: exitCode)
+                    state.finish(id: id, exitCode: exitCode)
                 } catch {
-                    await state.finish(id: id, exitCode: -1)
+                    state.finish(id: id, exitCode: -1)
                     throw error
                 }
             })
@@ -593,7 +629,7 @@ struct DockerRuntimeRoutes: RouteCollection {
 
     private func inspectExec(_ req: Request) async throws -> Response {
         let id = try requiredParameter("id", request: req)
-        guard let entry = await execState.entry(id: id) else {
+        guard let entry = execState.entry(id: id) else {
             throw Abort(.notFound, reason: "Exec instance not found: \(id)")
         }
         return try jsonResponse(.ok, ExecInspectResponse(id: id, entry: entry))

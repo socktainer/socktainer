@@ -491,7 +491,7 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
             "autoRemove": .bool(request.autoRemove),
             "snapshotter": .string("overlayfs"),
             "runtime": .string("io.containerd.runc.v2"),
-            "runtimeBinary": .string("/usr/bin/runc"),
+            "runtimeBinary": .string("/usr/bin/crun"),
             "network": .object(["mode": .string("private")]),
             "publishedPorts": .array(requestedPorts),
             "mounts": .array(
@@ -583,7 +583,18 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
                 "hostSource": .string(hostSource),
             ])
         }
+        var reservedBindings: [DockerRuntimePortBinding]?
         do {
+            if let meta, !meta.ports.isEmpty {
+                let published = try await portPublisher.publish(
+                    containerID: resolved,
+                    bindings: meta.ports,
+                    guestPorts: meta.guestPorts
+                )
+                metadata[resolved]?.ports = published
+                pendingPublications.insert(resolved)
+                reservedBindings = published
+            }
             exitCodes.remove(id: resolved)
             metadata[resolved]?.state = .created
             metadata[resolved]?.exitCode = nil
@@ -591,19 +602,27 @@ actor GuestRuntime: DockerRuntimeRouteBackend {
                 "container.start",
                 ["id": .string(resolved), "publishedPorts": .array(confirmedPorts)]
             )
-            let started = try decode(response, as: GuestContainerPayload.self).container
+            _ = try decode(response, as: GuestContainerPayload.self).container
             if metadata[resolved]?.state != .exited {
                 metadata[resolved]?.state = .running
             }
-            if let meta, !meta.ports.isEmpty, metadata[resolved]?.state == .running {
-                pendingPublications.insert(resolved)
-                try await publishPorts(
-                    id: resolved,
-                    metadata: meta,
-                    guestPorts: started.publishedPorts?.map(\.guestPort) ?? meta.guestPorts
-                )
+            if let reservedBindings, metadata[resolved]?.state == .running {
+                do {
+                    try await persistPortBindings(
+                        containerID: resolved,
+                        bindings: reservedBindings
+                    )
+                    pendingPublications.remove(resolved)
+                } catch {
+                    try await portPublisher.remove(containerID: resolved)
+                    throw error
+                }
             }
         } catch {
+            if reservedBindings != nil {
+                try? await portPublisher.remove(containerID: resolved)
+                pendingPublications.remove(resolved)
+            }
             await starts.finish(id: resolved, result: .failure(error))
             throw error
         }

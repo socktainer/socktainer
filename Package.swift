@@ -42,6 +42,7 @@ let package = Package(
                 .product(name: "DataCompression", package: "DataCompression"),
                 .product(name: "libzstd", package: "zstd"),
                 "CFilteredStream",
+                "CPingGateway",
                 "BuildInfo",
             ]
         ),
@@ -61,6 +62,10 @@ let package = Package(
                 .linkedLibrary("archive"),
                 .linkedLibrary("lzma"),
             ]
+        ),
+        .target(
+            name: "CPingGateway",
+            publicHeadersPath: "include"
         ),
         .target(
             name: "BuildInfo",

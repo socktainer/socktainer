@@ -2,7 +2,7 @@ import Vapor
 
 struct NetworkConnectRoute: RouteCollection {
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/networks/{id}/connect", use: NetworkConnectRoute.handler)
+        try routes.registerVersionedRoute(.POST, pattern: "/networks/{id:.*}/connect", use: NetworkConnectRoute.handler)
     }
 
     // Apple Container uses a single global hostname namespace, so all containers

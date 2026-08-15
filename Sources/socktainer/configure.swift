@@ -1,10 +1,19 @@
 import ContainerResource
 import Vapor
 
+func configureDaemonMiddleware(_ app: Application) {
+    var middleware = Middlewares()
+    middleware.use(RouteLoggingMiddleware(logLevel: .debug))
+    middleware.use(ErrorMiddleware.default(environment: app.environment))
+    app.middleware = middleware
+}
+
 func configure(
     _ app: Application,
     cpuCount: Int = RuntimeMachineConfiguration.defaultCPUCount,
-    memoryBytes: UInt64 = RuntimeMachineConfiguration.defaultMemoryBytes
+    memoryBytes: UInt64 = RuntimeMachineConfiguration.defaultMemoryBytes,
+    directTCPForwarding: Bool = false,
+    fastPing: Bool = false
 ) async throws {
     guard #available(macOS 26.0, *) else {
         throw Abort(.internalServerError, reason: "Socktainer requires macOS 26 or newer")
@@ -40,10 +49,20 @@ func configure(
     )
     let engine = PersistentEngine(machine: machine)
     app.lifecycle.use(PersistentEngineLifecycle(engine: engine))
-    let portPublisher = GuestPortPublicationManager(
-        controller: GVProxyPublishedPortController {
-            try await machine.start()
+    let ready: @Sendable () async throws -> RuntimeMachineReady = {
+        try await machine.start()
+    }
+    let portController: any PublishedPortControlling =
+        if directTCPForwarding {
+            DirectTCPPublishedPortController(
+                eventLoopGroup: app.eventLoopGroup,
+                ready: ready
+            )
+        } else {
+            GVProxyPublishedPortController(ready: ready)
         }
+    let portPublisher = GuestPortPublicationManager(
+        controller: portController
     )
     app.lifecycle.use(GuestPortPublicationLifecycle(manager: portPublisher))
     let runtime = GuestRuntime(
@@ -64,10 +83,9 @@ func configure(
     // unfinished initialization before the runtime tears down its connections.
     app.lifecycle.use(RuntimeReadinessLifecycle(readiness: readiness))
 
-    // Create and install regex routing middleware with logging
+    // Greedy Docker paths install scoped fallback routes as they register.
     let regexRouter = app.regexRouter(with: app.logger)
     app.setRegexRouter(regexRouter)
-    regexRouter.installMiddleware(on: app)
 
     // /_ping
     try app.register(collection: HealthCheckPingRoute())
@@ -145,4 +163,11 @@ func configure(
     // --- miscellaneous ---
     try app.register(collection: VersionRoute())
 
+    // Docker ping is a daemon-liveness response. Keep Vapor's HTTP connection
+    // handling, but answer before route lookup, logging, and runtime readiness.
+    if fastPing {
+        app.responder.use { application in
+            DockerPingResponder(next: application.responder.default)
+        }
+    }
 }

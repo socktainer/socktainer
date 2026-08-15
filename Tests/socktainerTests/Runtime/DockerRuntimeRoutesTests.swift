@@ -247,7 +247,6 @@ struct DockerRuntimeRoutesTests {
         try await withApp(configure: { _ in }) { app in
             let router = app.regexRouter(with: app.logger)
             app.setRegexRouter(router)
-            router.installMiddleware(on: app)
             try app.register(collection: DockerRuntimeRoutes(backend: backend))
             try app.register(collection: ExplicitUnsupportedDockerRoutes())
             try await app.testing().test(.GET, "/v1.51/info") { response async in
@@ -331,7 +330,6 @@ private func withRuntimeRoutes(
     try await withApp(configure: { _ in }) { app in
         let router = app.regexRouter(with: app.logger)
         app.setRegexRouter(router)
-        router.installMiddleware(on: app)
         try app.register(collection: DockerRuntimeRoutes(backend: backend))
         try await test(app)
     }
