@@ -19,7 +19,7 @@ struct ControlTests {
     @Test("parses chunked HTTP responses")
     func parsesChunkedResponse() throws {
         let result = try UnixSocketHTTPClient.parse(
-            Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nSock\r\n6\r\ntainer\r\n0\r\n\r\n".utf8)
+            Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nGlass\r\n5\r\n Dock\r\n0\r\n\r\n".utf8)
         )
 
         #expect(String(decoding: result.body, as: UTF8.self) == "Glass Dock")
