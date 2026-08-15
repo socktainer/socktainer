@@ -36,5 +36,5 @@ while Date() < deadline {
     Thread.sleep(forTimeInterval: 0.1)
 }
 
-FileHandle.standardError.write(Data("No visible GlassDock status popover was found for process \(processIdentifier).\n".utf8))
+FileHandle.standardError.write(Data("No visible Glass Dock status popover was found for process \(processIdentifier).\n".utf8))
 exit(1)

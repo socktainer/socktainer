@@ -69,7 +69,7 @@ help:
 	@echo "  build            - Build in debug mode"
 	@echo "  release          - Build in release mode"
 	@echo "  control          - Build glassdockctl"
-	@echo "  menu-app         - Build a local GlassDock.app bundle"
+	@echo "  menu-app         - Build a local Glass Dock.app bundle"
 	@echo "  menu-popover-test - Verify the built menu-bar popover is visible"
 	@echo "  menu-release     - Prepare a Developer ID-signed app archive without submission"
 	@echo "  publishing-validate - Validate local Apple and Raycast publishing inputs"

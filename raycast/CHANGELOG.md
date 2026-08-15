@@ -1,8 +1,8 @@
-# GlassDock Changelog
+# Glass Dock Changelog
 
 ## [Initial Release] - {PR_MERGE_DATE}
 
-- Show GlassDock daemon health and version details.
+- Show Glass Dock daemon health and version details.
 - Start, stop, and restart a managed daemon when the operation is safe.
 - List containers and start or stop them.
 - Show bounded container and daemon log output.

@@ -46,12 +46,12 @@ export default function GlassDock() {
   return (
     <List
       isLoading={isLoading}
-      searchBarPlaceholder="Search GlassDock and containers"
+      searchBarPlaceholder="Search Glass Dock and containers"
     >
       {error ? (
         <List.EmptyView
           icon={Icon.ExclamationMark}
-          title="Cannot load GlassDock"
+          title="Cannot load Glass Dock"
           description={error.message}
           actions={
             <ActionPanel>
@@ -65,7 +65,7 @@ export default function GlassDock() {
         />
       ) : data ? (
         <>
-          <List.Section title="GlassDock">
+          <List.Section title="Glass Dock">
             <List.Item
               icon={{
                 source: data.daemon.healthy
@@ -171,8 +171,8 @@ function StatusDetail({
   ).length;
   return (
     <Detail
-      navigationTitle="GlassDock Status"
-      markdown={`# GlassDock ${snapshot.daemon.state}\n\n${snapshot.daemon.message ?? "The local Docker-compatible endpoint is available."}`}
+      navigationTitle="Glass Dock Status"
+      markdown={`# Glass Dock ${snapshot.daemon.state}\n\n${snapshot.daemon.message ?? "The local Docker-compatible endpoint is available."}`}
       metadata={
         <Detail.Metadata>
           <Detail.Metadata.Label
@@ -221,22 +221,22 @@ function StatusDetail({
           />
           {snapshot.daemon.state === "stopped" ? (
             <Action
-              title="Start GlassDock"
+              title="Start Glass Dock"
               icon={Icon.Play}
-              onAction={() => perform(["daemon", "start"], "GlassDock")}
+              onAction={() => perform(["daemon", "start"], "Glass Dock")}
             />
           ) : snapshot.daemon.managed ? (
             <>
               <Action
-                title="Restart GlassDock"
+                title="Restart Glass Dock"
                 icon={Icon.Repeat}
-                onAction={() => perform(["daemon", "restart"], "GlassDock")}
+                onAction={() => perform(["daemon", "restart"], "Glass Dock")}
               />
               <Action
-                title="Stop GlassDock"
+                title="Stop Glass Dock"
                 icon={Icon.Stop}
                 style={Action.Style.Destructive}
-                onAction={() => perform(["daemon", "stop"], "GlassDock")}
+                onAction={() => perform(["daemon", "stop"], "Glass Dock")}
               />
             </>
           ) : null}
@@ -260,7 +260,7 @@ function DiagnosticsDetail() {
   return (
     <Detail
       isLoading={isLoading}
-      navigationTitle="GlassDock Diagnostics"
+      navigationTitle="Glass Dock Diagnostics"
       markdown={`# Support Report\n\n\`\`\`text\n${reportText.replaceAll("```", "` ` `")}\n\`\`\``}
       metadata={
         snapshot ? (

@@ -74,7 +74,7 @@ private struct PopoverHeader: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("GlassDock \(model.statusLabel)")
+                Text("Glass Dock \(model.statusLabel)")
                     .font(.headline)
                 Text(subtitle)
                     .font(.caption)
@@ -88,7 +88,7 @@ private struct PopoverHeader: View {
             if model.isLoading {
                 ProgressView()
                     .controlSize(.small)
-                    .accessibilityLabel("Refreshing GlassDock")
+                    .accessibilityLabel("Refreshing Glass Dock")
             }
 
             Button {
@@ -106,7 +106,7 @@ private struct PopoverHeader: View {
             .buttonStyle(.borderless)
             .keyboardShortcut("r", modifiers: .command)
             .help("Refresh")
-            .accessibilityLabel("Refresh GlassDock")
+            .accessibilityLabel("Refresh Glass Dock")
         }
     }
 
@@ -154,7 +154,7 @@ private struct ContainersSurface: View {
                     ContentUnavailableView(
                         "Containers unavailable",
                         systemImage: "shippingbox",
-                        description: Text(model.snapshot?.daemon.message ?? "GlassDock is not available.")
+                        description: Text(model.snapshot?.daemon.message ?? "Glass Dock is not available.")
                     )
                 } else if filteredContainers.isEmpty {
                     ContentUnavailableView(
@@ -558,13 +558,13 @@ private struct PopoverFooter: View {
                     .help("This app will not stop or restart the current daemon.")
             case .managedLaunchAgent:
                 if snapshot.daemon.state == .stopped {
-                    Button("Start GlassDock") { Task { await model.perform(.startDaemon) } }
+                    Button("Start Glass Dock") { Task { await model.perform(.startDaemon) } }
                 } else {
                     Button("Restart") { Task { await model.perform(.restartDaemon) } }
                     Button("Stop", role: .destructive) { Task { await model.perform(.stopDaemon) } }
                 }
             case .none:
-                Button("Start GlassDock") { Task { await model.perform(.startDaemon) } }
+                Button("Start Glass Dock") { Task { await model.perform(.startDaemon) } }
             }
         } else {
             Text("Checking control…")

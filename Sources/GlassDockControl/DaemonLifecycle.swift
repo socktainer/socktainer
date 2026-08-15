@@ -262,18 +262,18 @@ enum DaemonSafety {
     ) throws -> DaemonSafetyDecision {
         switch intent {
         case .start:
-            return reachable ? .noChange("GlassDock is already running.") : .proceed
+            return reachable ? .noChange("Glass Dock is already running.") : .proceed
         case .stop:
             if !managed {
-                guard reachable else { return .noChange("GlassDock is already stopped.") }
+                guard reachable else { return .noChange("Glass Dock is already stopped.") }
                 throw ControlError.lifecycle(
-                    "The running daemon is not managed by GlassDock Control. Stop its foreground process instead."
+                    "The running daemon is not managed by Glass Dock Control. Stop its foreground process instead."
                 )
             }
         case .restart:
             if !managed, reachable {
                 throw ControlError.lifecycle(
-                    "The running daemon is not managed by GlassDock Control. Stop its foreground process before you start a managed daemon."
+                    "The running daemon is not managed by Glass Dock Control. Stop its foreground process before you start a managed daemon."
                 )
             }
         }

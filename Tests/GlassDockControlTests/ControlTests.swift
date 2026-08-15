@@ -3,7 +3,7 @@ import Testing
 
 @testable import GlassDockControl
 
-@Suite("GlassDock control contract")
+@Suite("Glass Dock control contract")
 struct ControlTests {
     @Test("parses content-length HTTP responses")
     func parsesContentLengthResponse() throws {
@@ -22,7 +22,7 @@ struct ControlTests {
             Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nSock\r\n6\r\ntainer\r\n0\r\n\r\n".utf8)
         )
 
-        #expect(String(decoding: result.body, as: UTF8.self) == "GlassDock")
+        #expect(String(decoding: result.body, as: UTF8.self) == "Glass Dock")
     }
 
     @Test("rejects a truncated HTTP body")
@@ -196,7 +196,7 @@ struct ControlTests {
             runningContainers: []
         )
 
-        #expect(decision == .noChange("GlassDock is already running."))
+        #expect(decision == .noChange("Glass Dock is already running."))
     }
 
     @Test("daemon discovery uses the sibling executable")

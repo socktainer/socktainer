@@ -266,7 +266,7 @@ public struct SupportReport: Codable, Sendable, Equatable {
         let diagnostics = snapshot.diagnostics
         let date = ISO8601DateFormatter().string(from: generatedAt)
         var lines = [
-            "GlassDock Support Report",
+            "Glass Dock Support Report",
             "Generated: \(date)",
             "Contract schema: \(snapshot.schemaVersion)",
             "",
@@ -331,17 +331,17 @@ public enum ControlError: LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .daemonExecutableNotFound:
-            return "The glassdock daemon executable was not found."
+            return "The Glass Dock daemon executable was not found."
         case .invalidSocketPath(let path):
             return "The Unix socket path is invalid: \(path)"
         case .socket(let message):
-            return "Cannot connect to the GlassDock socket: \(message)"
+            return "Cannot connect to the Glass Dock socket: \(message)"
         case .malformedResponse(let message):
-            return "GlassDock returned an invalid response: \(message)"
+            return "Glass Dock returned an invalid response: \(message)"
         case .requestFailed(let status, let message):
-            return "GlassDock request failed with status \(status): \(message)"
+            return "Glass Dock request failed with status \(status): \(message)"
         case .lifecycle(let message):
-            return "Cannot control the GlassDock daemon: \(message)"
+            return "Cannot control the Glass Dock daemon: \(message)"
         case .invalidContainerIdentifier:
             return "The container identifier is empty or invalid."
         }

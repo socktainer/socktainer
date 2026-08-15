@@ -1,12 +1,12 @@
-# GlassDock
+# Glass Dock
 
-Monitor the local GlassDock daemon and control container workloads from
+Monitor the local Glass Dock daemon and control container workloads from
 Raycast.
 
 ## Requirements
 
 - macOS on Apple Silicon
-- GlassDock and `glassdockctl` installed on the same user account
+- Glass Dock and `glassdockctl` installed on the same user account
 - Raycast 1.26 or later
 
 The extension checks these standard command locations:
@@ -20,13 +20,13 @@ preferences to its absolute path.
 
 ## Command
 
-**GlassDock** is one searchable view. It shows daemon status, containers, and
+**Glass Dock** is one searchable view. It shows daemon status, containers, and
 diagnostics. Open a status or diagnostics item for detail. Container items keep
 start, stop, log, and copy-ID actions in their action panels.
 
 The extension does not use a shell. It sends fixed arguments to
 `glassdockctl`. It does not send data to an external service. Stop and restart
-are available only for a daemon that GlassDock Control manages. Daemon stop
+are available only for a daemon that Glass Dock Control manages. Daemon stop
 and restart are blocked while a container is running.
 
 ## Local development

@@ -140,6 +140,6 @@ async function resolveControlExecutable(): Promise<string> {
   }
 
   throw new Error(
-    "glassdockctl was not found. Install GlassDock or set its absolute path in the extension preferences.",
+    "glassdockctl was not found. Install Glass Dock or set its absolute path in the extension preferences.",
   );
 }

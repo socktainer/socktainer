@@ -98,7 +98,7 @@ public struct ControlClient: Sendable {
                         return ActionResult(succeeded: true, message: message)
                     }
                     try self.lifecycle.start()
-                    return ActionResult(succeeded: true, message: "GlassDock is starting.")
+                    return ActionResult(succeeded: true, message: "Glass Dock is starting.")
                 case .stopDaemon:
                     let context = try Self.daemonSafetyContext(lifecycle: self.lifecycle)
                     let decision = try DaemonSafety.validate(
@@ -111,7 +111,7 @@ public struct ControlClient: Sendable {
                         return ActionResult(succeeded: true, message: message)
                     }
                     try self.lifecycle.stop()
-                    return ActionResult(succeeded: true, message: "GlassDock stopped.")
+                    return ActionResult(succeeded: true, message: "Glass Dock stopped.")
                 case .restartDaemon:
                     let context = try Self.daemonSafetyContext(lifecycle: self.lifecycle)
                     _ = try DaemonSafety.validate(
@@ -121,7 +121,7 @@ public struct ControlClient: Sendable {
                         runningContainers: context.runningContainers
                     )
                     try self.lifecycle.restart()
-                    return ActionResult(succeeded: true, message: "GlassDock is restarting.")
+                    return ActionResult(succeeded: true, message: "Glass Dock is restarting.")
                 case .startContainer(let identifier):
                     try Self.containerAction(
                         "start", identifier: identifier,

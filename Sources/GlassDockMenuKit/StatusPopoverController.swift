@@ -51,12 +51,12 @@ private final class AppKitStatusPopoverPresenter: NSObject, StatusPopoverPresent
         super.init()
 
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "shippingbox.fill", accessibilityDescription: "GlassDock")
+            let image = NSImage(systemSymbolName: "shippingbox.fill", accessibilityDescription: "Glass Dock")
             image?.isTemplate = true
             button.image = image
             button.imagePosition = .imageOnly
-            button.toolTip = "GlassDock"
-            button.setAccessibilityLabel("GlassDock menu")
+            button.toolTip = "Glass Dock"
+            button.setAccessibilityLabel("Glass Dock menu")
             button.target = self
             button.action = #selector(togglePopover)
             button.sendAction(on: [.leftMouseUp])

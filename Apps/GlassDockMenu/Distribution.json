@@ -3,7 +3,7 @@
   "category": "public.app-category.developer-tools",
   "distribution": "Developer ID",
   "minimumSystemVersion": "26.0",
-  "name": "GlassDock",
+  "name": "Glass Dock",
   "privacy": {
     "collectsData": false,
     "tracking": false

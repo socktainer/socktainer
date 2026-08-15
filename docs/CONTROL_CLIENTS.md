@@ -1,6 +1,6 @@
-# GlassDock control clients
+# Glass Dock control clients
 
-GlassDock has two local control clients:
+Glass Dock has two local control clients:
 
 - `GlassDockMenu` is a native SwiftUI menu-bar app.
 - `raycast/` is a TypeScript and React extension that uses Raycast UI.
@@ -10,7 +10,7 @@ the versioned JSON output of `glassdockctl`. The clients do not build shell
 commands. They do not call `launchctl` or the Docker socket directly.
 
 The native app has the same macOS 26 and Apple Silicon requirement as the
-GlassDock daemon.
+Glass Dock daemon.
 
 ## Architecture decision
 
@@ -123,7 +123,7 @@ reads existing fields.
 The menu app has no desktop window and no Dock item. Its transient status-item
 popover opens with a searchable container list. An in-place System destination
 contains status and diagnostics. Container logs also replace the popover body
-in place and return to the list. Raycast exposes one **GlassDock** command with
+in place and return to the list. Raycast exposes one **Glass Dock** command with
 status and diagnostics navigation plus searchable container items.
 
 The Docker server does not implement an atomic container restart route. The

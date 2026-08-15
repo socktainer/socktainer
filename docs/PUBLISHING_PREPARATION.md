@@ -5,7 +5,7 @@ submission, Store publication, or release.
 
 ## Distribution paths
 
-GlassDock Menu is a direct-distribution macOS app. It must use a `Developer ID
+The Glass Dock menu-bar app is a direct-distribution macOS app. It must use a `Developer ID
 Application` certificate. A signed installer package must use a separate
 `Developer ID Installer` certificate. Do not use an Apple Distribution or
 development certificate for this path. Apple describes these certificate types
@@ -30,7 +30,7 @@ runtime`; it must not use `sudo`. See [Apple's signing instructions](https://dev
 The current menu app needs no restricted entitlement. Keep its release
 entitlements minimal: do not add `get-task-allow` or a privacy-protected
 capability unless the app implementation requires it. Do not add App Sandbox
-until its effect on the user's GlassDock Unix socket is tested. App Sandbox is
+until its effect on the user's Glass Dock Unix socket is tested. App Sandbox is
 required for the Mac App Store and recommended, but not required, for Developer
 ID distribution. See [Distributing software on macOS](https://developer.apple.com/macos/distribution/).
 
@@ -92,7 +92,7 @@ and [Submitting software for notarization over the web](https://developer.apple.
 
 An App Store Connect privacy label, policy URL, and Store metadata are for an
 App Store Connect submission. They are not direct Developer ID notarization
-requirements. If GlassDock later uses App Store Connect, it must provide
+requirements. If Glass Dock later uses App Store Connect, it must provide
 accurate privacy details. See [App privacy details](https://developer.apple.com/app-store/app-privacy-details/).
 
 For a future App Store Connect build, add a valid `PrivacyInfo.xcprivacy` only
@@ -176,7 +176,7 @@ npm run dev
 ```
 
 For Store screenshots, create or use Raycast's **Capture Window** hotkey. Open
-each GlassDock command, capture the window, select **Save to Metadata**, and
+each Glass Dock command, capture the window, select **Save to Metadata**, and
 save at least three 2000 by 1250 PNG files in `raycast/metadata/`. Review each
 image for user names, paths, container names, log text, tokens, and unrelated
 apps before it is included.
