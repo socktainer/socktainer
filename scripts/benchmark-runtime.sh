@@ -1370,6 +1370,7 @@ RUNTIME_FILE=$(mktemp -t glassdock-benchmark-runtimes.XXXXXX)
 SUMMARY_FILE=$(mktemp -t glassdock-benchmark-summary.XXXXXX)
 SCHEDULE_FILE=$(mktemp -t glassdock-benchmark-schedule.XXXXXX)
 ENGINE_STATE_DIR=$(mktemp -d /tmp/glassdock-benchmark-engines.XXXXXX)
+export ENGINE_STATE_DIR
 BIND_STATE_DIR=$(mktemp -d "$HOME/.glassdock-benchmark-bind.XXXXXX")
 
 preflight
