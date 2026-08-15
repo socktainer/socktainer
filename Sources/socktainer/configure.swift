@@ -1,7 +1,11 @@
 import ContainerResource
 import Vapor
 
-func configure(_ app: Application) async throws {
+func configure(
+    _ app: Application,
+    cpuCount: Int = RuntimeMachineConfiguration.defaultCPUCount,
+    memoryBytes: UInt64 = RuntimeMachineConfiguration.defaultMemoryBytes
+) async throws {
     guard #available(macOS 26.0, *) else {
         throw Abort(.internalServerError, reason: "Socktainer requires macOS 26 or newer")
     }
@@ -30,8 +34,8 @@ func configure(_ app: Application) async throws {
             rootDisk: machineArtifacts.rootDisk,
             dataDisk: engineDataDisk,
             bindSource: SocktainerDirectories.hostHome,
-            cpuCount: 6,
-            memoryBytes: PersistentEngine.configuredMemoryBytes
+            cpuCount: cpuCount,
+            memoryBytes: memoryBytes
         )
     )
     let engine = PersistentEngine(machine: machine)

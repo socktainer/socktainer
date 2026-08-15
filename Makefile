@@ -69,6 +69,8 @@ help:
 	@echo "  test             - Run tests"
 	@echo "  integration      - Run live Docker lifecycle integration tests"
 	@echo "  benchmark-preflight - Validate runtime benchmark configuration"
+	@echo "  benchmark-discover - Report known runtime availability"
+	@echo "  benchmark-test   - Test benchmark scheduling, statistics, and parsers"
 	@echo "  benchmark        - Run the configured runtime benchmark matrix"
 	@echo "  fmt              - Format source code"
 	@echo "  clean            - Clean build artifacts"
@@ -80,7 +82,7 @@ help:
 	@echo "  help             - Show this help message"
 
 .PHONY: test
-test: lint-pipes
+test: lint-pipes benchmark-test
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
 		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
 
@@ -91,6 +93,10 @@ integration:
 .PHONY: benchmark-preflight
 benchmark-preflight:
 	@bash scripts/benchmark-runtime.sh --preflight
+
+.PHONY: benchmark-discover
+benchmark-discover:
+	@bash scripts/benchmark-runtime.sh --discover
 
 .PHONY: benchmark-test
 benchmark-test:

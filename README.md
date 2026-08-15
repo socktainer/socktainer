@@ -255,10 +255,12 @@ intentionally deletes them.
 
 ### Engine resources
 
-All containers share the persistent engine VM. The engine uses 6 virtual CPUs
-and a 1 GiB configured memory ceiling. The VMM reclaims guest pages through the
-virtio balloon device, so configured memory and physical footprint are separate
-measurements. Docker per-container CPU and memory limits are not implemented.
+All containers share the persistent engine VM. The defaults are 6 virtual CPUs
+and a 1 GiB configured memory ceiling. Use `--cpus <count>` and
+`--memory-mib <MiB>` to set the VM resources when you start Socktainer. The VMM
+reclaims guest pages through the virtio balloon device, so configured memory
+and physical footprint are separate measurements. Docker per-container CPU and
+memory limits are not implemented.
 
 ---
 
@@ -368,6 +370,23 @@ Ownership rules:
 - `StdioPipes.make()` closes any partial pipes on EMFILE and returns `nil` — always `guard let`.
 
 `make test` includes a `lint-pipes` check that fails if `= Pipe()` appears in application source.
+
+---
+
+## Runtime benchmarks
+
+Use the local benchmark harness to compare a changed Socktainer build with
+other Docker-compatible engines on the same Apple Silicon Mac:
+
+```bash
+make benchmark-discover
+make benchmark-preflight
+make benchmark
+```
+
+The [benchmark guide](benchmarks/README.md) specifies the warm-up, order,
+correctness, cleanup, raw-data, statistics, and external-product configuration
+rules. Do not compare result values from different machines.
 
 ---
 
