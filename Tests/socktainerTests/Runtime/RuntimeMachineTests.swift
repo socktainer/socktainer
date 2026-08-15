@@ -166,6 +166,29 @@ struct RuntimeMachineTests {
             memoryBytes: 1024 * 1024 * 1024
         )
     }
+
+    @Test(
+        "rejects resource values unsupported by the VMM helper",
+        arguments: [
+            (0, UInt64(1024 * 1024 * 1024)),
+            (65, UInt64(1024 * 1024 * 1024)),
+            (4, UInt64(95 * 1024 * 1024)),
+            (4, UInt64(65_537 * 1024 * 1024)),
+        ])
+    func rejectsUnsupportedResources(cpuCount: Int, memoryBytes: UInt64) {
+        #expect(throws: RuntimeMachineError.self) {
+            _ = try RuntimeMachineConfiguration(
+                helperExecutable: URL(fileURLWithPath: "/tmp/socktainer-vmm"),
+                stateDirectory: URL(fileURLWithPath: "/private/state", isDirectory: true),
+                kernel: URL(fileURLWithPath: "/tmp/kernel"),
+                rootDisk: URL(fileURLWithPath: "/tmp/root.ext4"),
+                dataDisk: URL(fileURLWithPath: "/private/state/data.ext4"),
+                bindSource: URL(fileURLWithPath: "/Users/test", isDirectory: true),
+                cpuCount: cpuCount,
+                memoryBytes: memoryBytes
+            )
+        }
+    }
 }
 
 private struct Fixture {

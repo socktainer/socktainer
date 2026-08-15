@@ -11,7 +11,6 @@ enum PersistentEngineError: Error, Equatable {
 /// provisioning or device details.
 actor PersistentEngine {
     static let guestPort: UInt32 = 1025
-    static let configuredMemoryBytes: UInt64 = 1_024 * 1024 * 1024
 
     private let machine: any EngineMachineHosting
     private let logger: Logger

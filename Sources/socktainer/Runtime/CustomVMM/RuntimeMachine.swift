@@ -10,7 +10,11 @@ enum RuntimeMachineError: Error, Equatable {
 }
 
 struct RuntimeMachineConfiguration: Sendable, Equatable {
+    static let defaultCPUCount = 6
+    static let maximumCPUCount = 64
+    static let defaultMemoryBytes: UInt64 = 1024 * 1024 * 1024
     static let minimumMemoryBytes: UInt64 = 96 * 1024 * 1024
+    static let maximumMemoryBytes: UInt64 = 65_536 * 1024 * 1024
 
     let helperExecutable: URL
     let stateDirectory: URL
@@ -47,12 +51,14 @@ struct RuntimeMachineConfiguration: Sendable, Equatable {
                 "engine state and host bind source must not overlap, and the data disk must be inside engine state"
             )
         }
-        guard cpuCount > 0 else {
-            throw RuntimeMachineError.invalidConfiguration("CPU count must be positive")
-        }
-        guard memoryBytes >= Self.minimumMemoryBytes else {
+        guard (1...Self.maximumCPUCount).contains(cpuCount) else {
             throw RuntimeMachineError.invalidConfiguration(
-                "memory must be at least \(Self.minimumMemoryBytes) bytes"
+                "CPU count must be between 1 and \(Self.maximumCPUCount)"
+            )
+        }
+        guard (Self.minimumMemoryBytes...Self.maximumMemoryBytes).contains(memoryBytes) else {
+            throw RuntimeMachineError.invalidConfiguration(
+                "memory must be between \(Self.minimumMemoryBytes) and \(Self.maximumMemoryBytes) bytes"
             )
         }
         guard memoryBytes.isMultiple(of: 1024 * 1024) else {
