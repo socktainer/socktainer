@@ -1,6 +1,6 @@
 {
   "$schema": "https://www.raycast.com/schemas/extension.json",
-  "name": "glassdock",
+  "name": "glass-dock",
   "type": "module",
   "title": "Glass Dock",
   "description": "Monitor Glass Dock and control local container workloads.",
@@ -33,7 +33,7 @@
   ],
   "commands": [
     {
-      "name": "glassdock",
+      "name": "glass-dock",
       "title": "Glass Dock",
       "description": "Show status, search containers, and collect diagnostics.",
       "keywords": [
