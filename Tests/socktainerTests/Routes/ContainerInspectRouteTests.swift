@@ -399,10 +399,10 @@ struct ContainerInspectRouteMissingContainerTests {
             regexRouter.installMiddleware(on: app)
             try app.register(collection: ContainerInspectRoute(client: EmptyContainerClient()))
 
-            try await app.testing().test(.GET, "/v1.51/containers/does-not-exist/json") { res async in
+            try await app.testing().test(.GET, "/v1.51/containers/does-not-exist/json") { res async throws in
                 #expect(res.status == .notFound)
-                #expect(res.body.string.lowercased().contains("no such container"))
-                #expect(res.body.string.contains("does-not-exist"))
+                let body = try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any]
+                #expect(body?["reason"] as? String == "No such container: does-not-exist")
             }
         }
     }
