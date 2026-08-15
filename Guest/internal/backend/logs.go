@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/cio"
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
 const maxLogBytes int64 = 4 << 20

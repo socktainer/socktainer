@@ -7,8 +7,8 @@ readonly DEFAULT_BASE_IMAGE='docker.io/library/alpine@sha256:2c9d26f410d032d5b15
 IMAGE=${INTEGRATION_IMAGE:-$DEFAULT_IMAGE}
 BASE_IMAGE=${INTEGRATION_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
 BIND_ROOT=${INTEGRATION_BIND_ROOT:-$HOME}
-RUN_ID="socktainer-integration-$$"
-LABEL="socktainer.integration.run=$RUN_ID"
+RUN_ID="glassdock-integration-$$"
+LABEL="glassdock.integration.run=$RUN_ID"
 
 usage() {
     cat <<'EOF'
@@ -36,7 +36,7 @@ cleanup() {
     local id
     while IFS= read -r id; do
         [[ -n $id ]] || continue
-        [[ $(docker_api inspect --format '{{ index .Config.Labels "socktainer.integration.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
+        [[ $(docker_api inspect --format '{{ index .Config.Labels "glassdock.integration.run" }}' "$id" 2>/dev/null) == "$RUN_ID" ]] || continue
         docker_api rm -f "$id" >/dev/null 2>&1 || true
     done < <(docker_api ps -aq --filter "label=$LABEL" 2>/dev/null || true)
 }
@@ -87,7 +87,7 @@ docker_api run -d --name "$runner" --label "$LABEL" "$IMAGE" \
 docker_api exec "$runner" /bin/true
 [[ $(docker_api exec "$runner" /bin/sh -c 'printf exec-ok') == exec-ok ]] \
     || die "docker exec output did not match"
-exec_failures=$(mktemp -t socktainer-integration-exec.XXXXXX)
+exec_failures=$(mktemp -t glassdock-integration-exec.XXXXXX)
 for index in $(seq 1 32); do
     (
         output=$(docker_api exec "$runner" /bin/sh -c "printf exec-$index")
@@ -152,7 +152,7 @@ if response != b"half-close-ok":
     raise SystemExit(f"TCP half-close response did not match: {response!r}")
 PY
 
-bind_dir=$(mktemp -d "$BIND_ROOT/.socktainer-integration-bind.XXXXXX")
+bind_dir=$(mktemp -d "$BIND_ROOT/.glassdock-integration-bind.XXXXXX")
 bind="$RUN_ID-bind"
 docker_api run -d --name "$bind" --label "$LABEL" -v "$bind_dir:/bind" \
     "$BASE_IMAGE" /bin/sh -c 'while :; do sleep 1; done' >/dev/null
@@ -186,7 +186,7 @@ docker_api run --rm --label "$LABEL" -v "$volume:/data" "$BASE_IMAGE" \
     /bin/sh -c 'test "$(cat /data/value)" = durable'
 docker_api volume rm "$volume" >/dev/null
 
-stress_failures=$(mktemp -t socktainer-integration-stress.XXXXXX)
+stress_failures=$(mktemp -t glassdock-integration-stress.XXXXXX)
 for batch in $(seq 1 7); do
     start=$(((batch - 1) * 16 + 1))
     end=$((batch * 16))

@@ -78,7 +78,7 @@ static void *watch_gvproxy(void *context) {
         }
     }
     if (!atomic_load_explicit(&stopping, memory_order_acquire)) {
-        fprintf(stderr, "socktainer-vmm: gvproxy exited; failing VM generation\n");
+        fprintf(stderr, "glassdock-vmm: gvproxy exited; failing VM generation\n");
         _exit(125);
     }
     return NULL;
@@ -111,7 +111,7 @@ static void *watch_parent(void *context) {
     return NULL;
 }
 
-int socktainer_gvproxy_watch_parent(pid_t parent_pid) {
+int glassdock_gvproxy_watch_parent(pid_t parent_pid) {
     if (parent_pid <= 1 || getppid() != parent_pid) {
         errno = ESRCH;
         return -1;
@@ -198,7 +198,7 @@ static int launch_gvproxy(const char *executable, const char *datapath_socket,
     return 0;
 }
 
-static int wait_until_ready(struct socktainer_gvproxy *gvproxy) {
+static int wait_until_ready(struct glassdock_gvproxy *gvproxy) {
     const struct timespec interval = {.tv_nsec = 1000000};
     for (unsigned int attempt = 0; attempt < 10000; attempt++) {
         int status = 0;
@@ -219,8 +219,8 @@ static int wait_until_ready(struct socktainer_gvproxy *gvproxy) {
     return -1;
 }
 
-int socktainer_gvproxy_start(const char *program, const char *console_log,
-    struct socktainer_gvproxy *gvproxy) {
+int glassdock_gvproxy_start(const char *program, const char *console_log,
+    struct glassdock_gvproxy *gvproxy) {
     char runtime_directory[PATH_MAX];
     char network_directory[PATH_MAX];
     char program_path[PATH_MAX];
@@ -251,11 +251,11 @@ int socktainer_gvproxy_start(const char *program, const char *console_log,
     atomic_store_explicit(&supervised_pid, gvproxy->pid, memory_order_release);
     atomic_store_explicit(&stopping, false, memory_order_release);
     if (atexit(stop_supervised_child) != 0) {
-        socktainer_gvproxy_stop(gvproxy);
+        glassdock_gvproxy_stop(gvproxy);
         return -1;
     }
     if (install_signal_handlers() != 0 || wait_until_ready(gvproxy) != 0) {
-        socktainer_gvproxy_stop(gvproxy);
+        glassdock_gvproxy_stop(gvproxy);
         return -1;
     }
     pthread_t watcher;
@@ -263,14 +263,14 @@ int socktainer_gvproxy_start(const char *program, const char *console_log,
         &watcher, NULL, watch_gvproxy, (void *)(intptr_t)gvproxy->pid);
     if (thread_result != 0) {
         errno = thread_result;
-        socktainer_gvproxy_stop(gvproxy);
+        glassdock_gvproxy_stop(gvproxy);
         return -1;
     }
     (void)pthread_detach(watcher);
     return 0;
 }
 
-void socktainer_gvproxy_stop(struct socktainer_gvproxy *gvproxy) {
+void glassdock_gvproxy_stop(struct glassdock_gvproxy *gvproxy) {
     if (gvproxy->pid <= 0) {
         return;
     }

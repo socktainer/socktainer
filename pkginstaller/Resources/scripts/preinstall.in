@@ -2,11 +2,11 @@
 
 set -e
 
-echo "Preparing to install socktainer..."
+echo "Preparing to install glassdock..."
 
-# Remove any existing socktainer installation to ensure clean installation
+# Remove any existing glassdock installation to ensure clean installation
 if [ -d "__INSTALL_PREFIX__" ]; then
-    echo "Removing existing socktainer installation..."
+    echo "Removing existing glassdock installation..."
     rm -rf "__INSTALL_PREFIX__"
 fi
 

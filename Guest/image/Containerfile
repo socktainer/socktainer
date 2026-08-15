@@ -7,16 +7,16 @@ RUN apk add --no-cache \
       iproute2=6.15.0-r0 \
       iptables=1.8.11-r1 \
       runc=1.3.4-r1 \
-    && mkdir -p /etc/containerd /var/lib/containerd /run/containerd /mnt/socktainer-host \
+    && mkdir -p /etc/containerd /var/lib/containerd /run/containerd /mnt/glassdock-host \
     && containerd config default > /etc/containerd/config.toml
 
-COPY socktainer-guest-agent /usr/local/libexec/socktainer-guest-agent
-COPY init /sbin/socktainer-init
+COPY glassdock-guest-agent /usr/local/libexec/glassdock-guest-agent
+COPY init /sbin/glassdock-init
 
-RUN chmod 0755 /usr/local/libexec/socktainer-guest-agent /sbin/socktainer-init \
-    && ln -sf /sbin/socktainer-init /sbin/init \
-    && test "$(readlink /sbin/init)" = /sbin/socktainer-init \
+RUN chmod 0755 /usr/local/libexec/glassdock-guest-agent /sbin/glassdock-init \
+    && ln -sf /sbin/glassdock-init /sbin/init \
+    && test "$(readlink /sbin/init)" = /sbin/glassdock-init \
     && test ! -e /usr/bin/crun \
     && /usr/bin/runc --version >/dev/null
 
-ENTRYPOINT ["/sbin/socktainer-init"]
+ENTRYPOINT ["/sbin/glassdock-init"]

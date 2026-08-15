@@ -1,9 +1,9 @@
-# Makefile for building the Socktainer macOS package installer
+# Makefile for building the Glass Dock macOS package installer
 SHELL := bash
 
 # Configuration variables
 BUILD_VERSION ?= 0.0.0-dev
-PKG_NAME ?= socktainer-installer.pkg
+PKG_NAME ?= glassdock-installer.pkg
 APPLE_APPLICATION_ID ?= -
 APPLE_PRODUCT_ID ?= mock
 NO_CODESIGN ?= 1
@@ -11,9 +11,9 @@ NO_NOTARIZE ?= 1
 NOTARIZE_USERNAME ?=
 NOTARIZE_PASSWORD ?=
 NOTARIZE_TEAM ?=
-INSTALL_PREFIX ?= /opt/socktainer
-PACKAGE_IDENTIFIER ?= io.github.socktainer
-PATHS_D_NAME ?= socktainer
+INSTALL_PREFIX ?= /opt/glassdock
+PACKAGE_IDENTIFIER ?= io.github.glassdock
+PATHS_D_NAME ?= glassdock
 INSTALL_PATHS_D ?= 1
 SIGNING_KEYCHAIN ?=
 
@@ -41,7 +41,7 @@ $(SCRIPTS_DIR): | $(BUILD_DIR)
 setup: validate-config $(BUILD_DIR) $(RESOURCES_DIR) $(SCRIPTS_DIR)
 	@echo "Setting up installer directory structure..."
 	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin
-	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer
+	@mkdir -p $(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock
 	@mkdir -p $(OUT_DIR)
 	@mkdir -p $(TMP_DIR)
 
@@ -102,35 +102,35 @@ $(SCRIPTS_DIR)/postinstall: Resources/scripts/postinstall.in FORCE | $(SCRIPTS_D
 prepare-root: setup
 	@rm -rf "$(PACKAGE_ROOT)"
 	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin"
-	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer"
+	@mkdir -p "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock"
 
 .PHONY: copy-binary
 copy-binary: prepare-root
-	@echo "Copying socktainer binary..."
-	@if [ ! -f "../.build/release/socktainer" ]; then \
-		echo "Error: socktainer binary not found. Run 'make release' in the parent directory first."; \
+	@echo "Copying glassdock binary..."
+	@if [ ! -f "../.build/release/glassdock" ]; then \
+		echo "Error: glassdock binary not found. Run 'make release' in the parent directory first."; \
 		exit 1; \
 	fi
-	@cp ../.build/release/socktainer "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
-	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"
+	@cp ../.build/release/glassdock "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
+	@chmod +x "$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock"
 	@for artifact in \
-		../VMM/out/socktainer-vmm \
+		../VMM/out/glassdock-vmm \
 		../VMM/out/libkrun.1.dylib \
 		../VMM/out/gvproxy \
-		../Guest/out/socktainer-vmlinux \
-		../Guest/out/socktainer-root.ext4; do \
+		../Guest/out/glassdock-vmlinux \
+		../Guest/out/glassdock-root.ext4; do \
 		if [ ! -f "$$artifact" ]; then \
 			echo "Error: runtime artifact not found: $$artifact"; \
 			exit 1; \
 		fi; \
 	done
-	@cp ../VMM/out/socktainer-vmm ../VMM/out/libkrun.1.dylib ../VMM/out/gvproxy \
+	@cp ../VMM/out/glassdock-vmm ../VMM/out/libkrun.1.dylib ../VMM/out/gvproxy \
 		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/"
 	@chmod +x \
-		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm" \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock-vmm" \
 		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"
-	@cp ../Guest/out/socktainer-vmlinux ../Guest/out/socktainer-root.ext4 \
-		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/socktainer/"
+	@cp ../Guest/out/glassdock-vmlinux ../Guest/out/glassdock-root.ext4 \
+		"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/share/glassdock/"
 	@xattr -cr "$(PACKAGE_ROOT)$(INSTALL_PREFIX)"
 
 .PHONY: sign-binary
@@ -143,10 +143,10 @@ sign-binary: copy-binary
 			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/gvproxy"; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
 			--entitlements ../VMM/helper/entitlements.plist \
-			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer-vmm"; \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock-vmm"; \
 		codesign --sign "$(APPLE_APPLICATION_ID)" --options runtime --timestamp --force \
-			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/socktainer"; \
-		for artifact in libkrun.1.dylib gvproxy socktainer-vmm socktainer; do \
+			"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/glassdock"; \
+		for artifact in libkrun.1.dylib gvproxy glassdock-vmm glassdock; do \
 			codesign --verify --strict --verbose=2 \
 				"$(PACKAGE_ROOT)$(INSTALL_PREFIX)/bin/$$artifact"; \
 		done; \
@@ -161,7 +161,7 @@ component-pkg: sign-binary scripts
 		--install-location / \
 		--scripts "$(SCRIPTS_DIR)" \
 		--ownership preserve \
-		$(OUT_DIR)/socktainer.pkg
+		$(OUT_DIR)/glassdock.pkg
 
 .PHONY: product-pkg
 product-pkg: component-pkg resources
@@ -169,22 +169,22 @@ product-pkg: component-pkg resources
 	@COPYFILE_DISABLE=1 productbuild --distribution $(BUILD_DIR)/Distribution \
 		--resources $(RESOURCES_DIR) \
 		--package-path $(OUT_DIR) \
-		$(OUT_DIR)/socktainer-unsigned.pkg
+		$(OUT_DIR)/glassdock-unsigned.pkg
 
 .PHONY: sign-pkg
 sign-pkg: product-pkg
 	@if [ "$(NO_CODESIGN)" = "1" ]; then \
-		mv $(OUT_DIR)/socktainer-unsigned.pkg $(OUT_DIR)/$(PKG_NAME); \
+		mv $(OUT_DIR)/glassdock-unsigned.pkg $(OUT_DIR)/$(PKG_NAME); \
 		echo "✅ Unsigned installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	else \
 		echo "Signing installer package..."; \
 		productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
-			$(OUT_DIR)/socktainer-unsigned.pkg \
+			$(OUT_DIR)/glassdock-unsigned.pkg \
 			$(OUT_DIR)/$(PKG_NAME); \
-		rm $(OUT_DIR)/socktainer-unsigned.pkg; \
+		rm $(OUT_DIR)/glassdock-unsigned.pkg; \
 		echo "✅ Signed installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	fi
-	@rm -f $(OUT_DIR)/socktainer.pkg
+	@rm -f $(OUT_DIR)/glassdock.pkg
 
 # Notarize the signed package
 .PHONY: notarize
@@ -216,7 +216,7 @@ installer-notarized: notarize
 
 .PHONY: help
 help:
-	@echo "Socktainer macOS Package Installer"
+	@echo "Glass Dock macOS Package Installer"
 	@echo ""
 	@echo "Targets:"
 	@echo "  pkginstaller       - Build unsigned .pkg installer (default)"

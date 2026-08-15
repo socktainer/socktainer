@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>Socktainer __VERSION__</title>
+    <title>Glass Dock __VERSION__</title>
     <welcome file="welcome.html"/>
     <conclusion file="conclusion.html"/>
     <pkg-ref id="__PACKAGE_IDENTIFIER__"/>
@@ -14,5 +14,5 @@
     <choice id="__PACKAGE_IDENTIFIER__" visible="false">
         <pkg-ref id="__PACKAGE_IDENTIFIER__"/>
     </choice>
-    <pkg-ref id="__PACKAGE_IDENTIFIER__" version="__VERSION__" onConclusion="none">socktainer.pkg</pkg-ref>
+    <pkg-ref id="__PACKAGE_IDENTIFIER__" version="__VERSION__" onConclusion="none">glassdock.pkg</pkg-ref>
 </installer-gui-script>

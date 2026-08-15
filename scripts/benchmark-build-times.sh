@@ -83,19 +83,19 @@ for sample in 1 2 3; do
 done
 
 for sample in 1 2 3; do
-    touch "$repo_root/Sources/socktainer/Routes/Volumes/VolumeListRoute.swift"
+    touch "$repo_root/Sources/GlassDock/Routes/Volumes/VolumeListRoute.swift"
     run_build "leaf-edit-$sample" debug
 done
 
 for sample in 1 2 3; do
-    touch "$repo_root/Sources/socktainer/configure.swift"
+    touch "$repo_root/Sources/GlassDock/configure.swift"
     run_build "central-edit-$sample" debug
 done
 
 run_test_build test-seed
 
 for sample in 1 2 3; do
-    touch "$repo_root/Tests/socktainerTests/Utilities/LabelUtilityTests.swift"
+    touch "$repo_root/Tests/GlassDockTests/Utilities/LabelUtilityTests.swift"
     run_test_build "test-only-edit-$sample"
 done
 

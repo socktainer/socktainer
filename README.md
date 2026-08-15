@@ -1,18 +1,18 @@
-# Socktainer 🚢
+# Glass Dock 🚢
 
 > [!IMPORTANT]
-> Both `socktainer` and [Apple container](https://github.com/apple/container) are still under heavy development!
+> Both `glassdock` and [Apple container](https://github.com/apple/container) are still under heavy development!
 
 > [!NOTE]
-> `socktainer` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
+> `glassdock` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
 >
 > Progress is tracked in [#14](https://github.com/socktainer/socktainer/issues/14) and [#90](https://github.com/socktainer/socktainer/issues/90).
 
 <!--toc:start-->
 
-- [Socktainer 🚢](#socktainer-🚢)
+- [Glass Dock 🚢](#glass-dock-🚢)
   - [Quick Start ⚡](#quick-start)
-    - [Launch socktainer 🏁](#launch-socktainer-🏁)
+    - [Launch Glass Dock 🏁](#launch-glass-dock-🏁)
     - [Using Docker CLI 🐳](#using-docker-cli-🐳)
   - [Key Features ✨](#key-features)
   - [Requirements 📋](#requirements-📋)
@@ -40,34 +40,34 @@
   - [Acknowledgements 🙏](#acknowledgements-🙏)
   <!--toc:end-->
 
-Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** through one persistent Linux VM on Apple Silicon 🍏📦.
+Glass Dock is a CLI/daemon that exposes a **Docker-compatible REST API** through one persistent Linux VM on Apple Silicon 🍏📦.
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
-[**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
+[**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses Glass Dock to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
 
 ---
 
 ## Quick Start ⚡
 
-Get started with socktainer CLI in just a few commands:
+Get started with the Glass Dock CLI in a few commands:
 
-### Launch socktainer 🏁
+### Launch Glass Dock 🏁
 
 ```bash
-./socktainer
+./glassdock
 FolderWatcher] Started watching $HOME/Library/Application Support/com.apple.container
-[ NOTICE ] Server started on http+unix: $HOME/.socktainer/container.sock
+[ NOTICE ] Server started on http+unix: $HOME/.glassdock/container.sock
 ...
 ```
 
 ### Using Docker CLI 🐳
 
-Socktainer automatically registers a `socktainer` Docker context on startup.
+Glass Dock automatically registers a `glassdock` Docker context on startup.
 Activate it once:
 
 ```bash
-docker context use socktainer
+docker context use glassdock
 ```
 
 Then use Docker normally — no `DOCKER_HOST` needed:
@@ -91,11 +91,11 @@ Pass `--no-docker-context` to skip writing the context file on startup — usefu
 in CI or when managing Docker contexts manually:
 
 ```bash
-socktainer --no-docker-context
+glassdock --no-docker-context
 ```
 
 Note: this flag skips **creating** the context but does not remove one that was
-already created. To remove it: `docker context rm socktainer`.
+already created. To remove it: `docker context rm glassdock`.
 
 </details>
 
@@ -103,7 +103,7 @@ already created. To remove it: `docker context rm socktainer`.
 <summary>Alternative: set DOCKER_HOST manually</summary>
 
 ```bash
-export DOCKER_HOST=unix://$HOME/.socktainer/container.sock
+export DOCKER_HOST=unix://$HOME/.glassdock/container.sock
 docker ps
 docker images
 ```
@@ -111,8 +111,8 @@ docker images
 Or inline without exporting:
 
 ```bash
-DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker ps
-DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
+DOCKER_HOST=unix://$HOME/.glassdock/container.sock docker ps
+DOCKER_HOST=unix://$HOME/.glassdock/container.sock docker images
 ```
 
 </details>
@@ -123,7 +123,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 - Runs one persistent Linux VM with a custom Hypervisor.framework VMM 🍏
 - Provides **Docker REST API compatibility** 🔄 (partial)
-- Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
+- Listens on a Unix domain socket `$HOME/.glassdock/container.sock` and auto-registers a `glassdock` Docker context
 - Uses containerd, overlayfs, runc, and Linux namespaces for containers
 - Supports create, start, stop, wait, remove, inspect, list, logs, and noninteractive exec
 - Supports containerd-backed image pull, list, inspect, tag, delete, and prune operations
@@ -142,28 +142,21 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 
 ### Homebrew
 
-`socktainer` is included in [Homebrew Formulae](https://formulae.brew.sh/formula/socktainer#default):
+After the `glassdock` formula is published to Homebrew, install it with:
 
 ```shell
-brew install socktainer
+brew install glassdock
 ```
 
-If you want to install the latest head version of socktainer:
+To install the latest source revision after the formula is published, use:
 
 ```shell
-brew install socktainer --HEAD
+brew install glassdock --HEAD
 ```
-
-> [!NOTE]
-> Formerly we have provided our own Homebrew tap. You may want to integrate it with the Homebrew official, and you can run the following command:
-> 
-> ```shell
-> brew untap socktainer/tap
-> ```
 
 ### GitHub Releases
 
-Download from socktainer [releases](https://github.com/socktainer/socktainer/releases) page the zip or binary. Ensure the binary has execute permissions (`+x`) before running it.
+Download Glass Dock from the current [releases page](https://github.com/socktainer/socktainer/releases). Ensure the binary has execute permissions (`+x`) before running it.
 
 ---
 
@@ -176,27 +169,27 @@ Refer to **Quick Start** above for immediate usage examples.
 Docker builds are not available in this alpha. The old build service started a
 second Apple VM, so the single-VM runtime does not register the Docker build
 endpoints. BuildKit integration must run inside the persistent engine VM before
-Socktainer can support Buildx.
+Glass Dock can support Buildx.
 
 ### Image names, IDs, and repeated builds
 
-containerd owns image content and tags. Socktainer normalizes familiar image names
+containerd owns image content and tags. Glass Dock normalizes familiar image names
 before it sends them to the guest. Image list, inspect, pull, tag, delete, and prune
 operations use this one content store.
 
 ### Runtime and published-port recovery
 
-Socktainer runs one persistent Linux VM through its custom VMM. The host Docker API maps
+Glass Dock runs one persistent Linux VM through its custom VMM. The host Docker API maps
 container operations through one multiplexed vsock connection to a guest agent.
 The guest uses containerd, overlayfs, runc, and Linux namespaces for all ordinary
-containers. Socktainer does not start one VM per container or use relay sidecar
+containers. Glass Dock does not start one VM per container or use relay sidecar
 VMs.
 
 Published TCP and UDP ports use one supervised gvproxy process for each VM
 generation. The VMM connects gvproxy to the guest virtio-net device. The guest
 applies DNAT from the engine ingress port to the container's private network
 namespace. The guest stores Docker names, labels, commands, and port mappings in
-containerd metadata. Socktainer restores this state and the gvproxy forwarding
+containerd metadata. Glass Dock restores this state and the gvproxy forwarding
 rules after a daemon restart.
 
 This alpha runtime does not import containers, images, networks, or transient
@@ -218,9 +211,9 @@ volumes.
 **Override globally** — apply the same mode to all named volumes (bind mounts and anonymous volumes are not affected):
 
 ```bash
-socktainer --volume-sync=fsync   # default: honor guest fsyncs (durable)
-socktainer --volume-sync=full    # fully synchronous writes (slowest)
-socktainer --volume-sync=nosync  # explicit unsafe performance mode
+glassdock --volume-sync=fsync   # default: honor guest fsyncs (durable)
+glassdock --volume-sync=full    # fully synchronous writes (slowest)
+glassdock --volume-sync=nosync  # explicit unsafe performance mode
 ```
 
 **Override per volume** — `docker volume create -o sync=<mode>` persists the
@@ -302,10 +295,10 @@ make fmt
 3. Run the debug binary:
 
 ```bash
-.build/arm64-apple-macosx/debug/socktainer
+.build/arm64-apple-macosx/debug/glassdock
 ```
 
-> The server will create the socket at `$HOME/.socktainer/container.sock`.
+> The server will create the socket at `$HOME/.glassdock/container.sock`.
 
 ### Testing ✅
 
@@ -325,12 +318,12 @@ We welcome contributions!
 
 1. Fork the repository and create a feature branch 🌿
 2. Open a PR against `main` with a clear description 📝
-3. Add or update tests for new behavior (see `Tests/socktainerTests`) ✔️
+3. Add or update tests for new behavior (see `Tests/GlassDockTests`) ✔️
 4. Keep changes small and focused. Document API or behavioral changes in the PR description 📚
 
 ### Developer Notes 🧑‍💻
 
-- Code organization under `Sources/socktainer/`:
+- Code organization under `Sources/GlassDock/`:
   - `Routes/` — Route handlers 🛣️
   - `Clients/` — Client integrations 🔌
   - `Utilities/` — Helper utilities 🧰
@@ -338,7 +331,7 @@ We welcome contributions!
 
 #### Piping I/O to container processes
 
-When passing I/O to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`, **do not use Foundation's `Pipe()`**. Use `StdioPipes` from `Sources/socktainer/Utilities/DockerConnectionUtility.swift` instead.
+When passing I/O to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`, **do not use Foundation's `Pipe()`**. Use `StdioPipes` from `Sources/GlassDock/Utilities/DockerConnectionUtility.swift` instead.
 
 **Background**: on Unix, every open file/socket/pipe is identified by a small integer called a *file descriptor* (fd). Apple's APIs dup the fds you pass into the container and then **immediately close your originals**. Foundation's `Pipe` doesn't know this happened — when it's eventually garbage-collected, it tries to `close()` the same fd number again. By then, that number may have been recycled for a NIO HTTP socket, so the double-close silently kills an active connection, corrupting the event loop and causing hard-to-reproduce crashes under concurrent load (issue [#107](https://github.com/socktainer/socktainer/issues/107)).
 
@@ -394,7 +387,7 @@ rules. Do not compare result values from different machines.
 
 - Intended for **local development and experimentation** 🏠
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
-- Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
+- Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/GlassDock/Routes/` for implemented routes
 - Pull authentication from Docker's `X-Registry-Auth` header is forwarded only
   to the registry named by the image reference.
 - Privileged containers are not yet implemented.
@@ -403,7 +396,7 @@ rules. Do not compare result values from different machines.
 - Bind-mounting the Docker socket into a container is not implemented.
 - The VMM exports the host home directory to the trusted guest so it can serve
   arbitrary Docker bind requests. Containers receive only their requested bind
-  paths. Socktainer rejects binds that overlap its engine state, and the
+  paths. Glass Dock rejects binds that overlap its engine state, and the
   virtio-fs server confines all file operations beneath the exported root.
 - Restart policies are not implemented.
 - `docker update` does not yet change container resources.
@@ -416,7 +409,7 @@ rules. Do not compare result values from different machines.
   export, stats, resize, rename, restart, and resource update.
 - Known unsupported Docker endpoints return an explicit `501 Not Implemented`
   Docker error instead of an accidental router `404`.
-- Socktainer replaces a readable data disk only when it identifies the previous
+- Glass Dock replaces a readable data disk only when it identifies the previous
   unjournaled alpha format. It preserves that disk as
   `data.ext4.incompatible-<UUID>`. An unreadable or corrupt disk stops startup
   and remains unchanged.
@@ -425,11 +418,11 @@ rules. Do not compare result values from different machines.
 
 ## Community 💬
 
-Join the Socktainer community to ask questions, share ideas, or get help:
+Join the Glass Dock community to ask questions, share ideas, or get help:
 
 - **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users
-- **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
-- **GitHub Issues**: [socktainer/issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
+- **GitHub Discussions**: [current repository discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
+- **GitHub Issues**: [current repository issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
 
 ## License 📄
 
@@ -439,5 +432,7 @@ See the `LICENSE` file in the repository root.
 
 ## Acknowledgements 🙏
 
+- Glass Dock is derived from Socktainer and retains its Apache License 2.0
+  license terms, copyright notices, and Git history.
 - Built with **Hypervisor.framework, libkrun, and gvproxy** 🍏
 - Enables Docker CLI and other Docker clients to interact with local macOS containers 🐳💻

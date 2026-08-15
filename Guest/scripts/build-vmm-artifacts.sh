@@ -5,9 +5,9 @@ guest_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=Guest/vmm-artifacts.lock
 . "${guest_root}/vmm-artifacts.lock"
 output_dir=${OUTPUT_DIR:-"${guest_root}/out"}
-tag=${IMAGE_TAG:-local/socktainer-guest:dev}
+tag=${IMAGE_TAG:-local/glassdock-guest:dev}
 kernel_source=${KERNEL_PATH:-"${HOME}/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"}
-artifact_container="socktainer-artifact-$$"
+artifact_container="glassdock-artifact-$$"
 temporary_directory=$(mktemp -d)
 
 cleanup() {
@@ -22,8 +22,8 @@ trap cleanup EXIT INT TERM
     exit 1
 }
 kernel_sha256=$(sha256sum "${kernel_source}" | awk '{print $1}')
-[ "${kernel_sha256}" = "${SOCKTAINER_KERNEL_SHA256}" ] || {
-    echo "guest kernel digest mismatch: got ${kernel_sha256}, want ${SOCKTAINER_KERNEL_SHA256}" >&2
+[ "${kernel_sha256}" = "${GLASSDOCK_KERNEL_SHA256}" ] || {
+    echo "guest kernel digest mismatch: got ${kernel_sha256}, want ${GLASSDOCK_KERNEL_SHA256}" >&2
     exit 1
 }
 
@@ -42,7 +42,7 @@ container run --remove --entrypoint /bin/sh \
         tar -xf /work/rootfs.tar -C /rootfs
         find /rootfs -exec touch -h -d @0 {} +
         truncate -s 256M /work/rootfs.ext4
-        E2FSPROGS_FAKE_TIME=0 mke2fs -q -t ext4 -L socktainer-root \
+        E2FSPROGS_FAKE_TIME=0 mke2fs -q -t ext4 -L glassdock-root \
             -U 8b64853e-3fca-4ad2-95a8-3232f2797988 -m 0 \
             -E lazy_itable_init=0,lazy_journal_init=0,hash_seed=8b64853e-3fca-4ad2-95a8-3232f2797988 \
             -d /rootfs /work/rootfs.ext4
@@ -50,6 +50,6 @@ container run --remove --entrypoint /bin/sh \
 
 cp "${kernel_source}" "${temporary_directory}/vmlinux"
 chmod 0644 "${temporary_directory}/rootfs.ext4" "${temporary_directory}/vmlinux"
-mv "${temporary_directory}/rootfs.ext4" "${output_dir}/socktainer-root.ext4"
-mv "${temporary_directory}/vmlinux" "${output_dir}/socktainer-vmlinux"
-sha256sum "${output_dir}/socktainer-root.ext4" "${output_dir}/socktainer-vmlinux"
+mv "${temporary_directory}/rootfs.ext4" "${output_dir}/glassdock-root.ext4"
+mv "${temporary_directory}/vmlinux" "${output_dir}/glassdock-vmlinux"
+sha256sum "${output_dir}/glassdock-root.ext4" "${output_dir}/glassdock-vmlinux"

@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in socktainer.
+description: Report a bug in Glass Dock.
 labels: ["bug"]
 body:
   - type: textarea
@@ -19,7 +19,7 @@ body:
       label: Reproduction Steps
       description: Minimal steps to reproduce the issue.
       placeholder: |
-        1. Run `socktainer`
+        1. Run `glassdock`
         2. Run `docker ...`
         3. ...
     validations:
@@ -29,10 +29,10 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: macOS version, socktainer version, Docker CLI version, and any other relevant details.
+      description: macOS version, Glass Dock version, Docker CLI version, and any other relevant details.
       placeholder: |
         - macOS: 26.0 (Tahoe)
-        - socktainer: v0.x.x
+        - Glass Dock: v0.x.x
         - Docker CLI: 28.x
         - Apple Container: x.x.x
     validations:

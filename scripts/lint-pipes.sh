@@ -6,13 +6,13 @@ set -euo pipefail
 PATTERN='(=[[:space:]]*|Foundation\.)Pipe\(\)'
 EXCLUDE='ClientRegistryService.swift'
 
-if grep -rEn "$PATTERN" Sources/socktainer/ \
+if grep -rEn "$PATTERN" Sources/GlassDock/ \
         --include="*.swift" \
         --exclude="$EXCLUDE" \
     | grep -q .; then
     echo "ERROR: Pipe() found in a ContainerClient code path."
     echo "       Use StdioPipes (DockerConnectionUtility.swift) instead — see AGENTS.md."
-    grep -rEn "$PATTERN" Sources/socktainer/ \
+    grep -rEn "$PATTERN" Sources/GlassDock/ \
         --include="*.swift" \
         --exclude="$EXCLUDE"
     exit 1

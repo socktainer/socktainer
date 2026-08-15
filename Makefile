@@ -36,21 +36,21 @@ SUDO ?= sudo
 .DEFAULT_GOAL := all
 
 .PHONY: all
-all: socktainer
+all: glassdock
 
 .PHONY: build
 build:
-	@echo Building socktainer binary...
+	@echo Building Glass Dock binary...
 	@$(SWIFT) build -c $(BUILD_CONFIGURATION)
 
-.PHONY: socktainer
-socktainer: build 
+.PHONY: glassdock
+glassdock: build
 
 .PHONY: release
 release: BUILD_CONFIGURATION = release
 release: BUILD_TIME = $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 release: all
-	@codesign --force --sign - --entitlements entitlements.plist .build/release/socktainer
+	@codesign --force --sign - --entitlements entitlements.plist .build/release/glassdock
 
 .PHONY: version
 version:
@@ -63,7 +63,7 @@ version:
 .PHONY: help
 help:
 	@echo "Available targets:"
-	@echo "  all              - Build socktainer (default)"
+	@echo "  all              - Build glassdock (default)"
 	@echo "  build            - Build in debug mode"
 	@echo "  release          - Build in release mode"
 	@echo "  test             - Run tests"

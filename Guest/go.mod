@@ -1,4 +1,4 @@
-module github.com/socktainer/socktainer/guest
+module github.com/glassdock/glassdock/guest
 
 go 1.23.0
 

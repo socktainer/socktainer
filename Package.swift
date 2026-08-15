@@ -8,9 +8,12 @@ let buildTime = ProcessInfo.processInfo.environment["BUILD_TIME"] ?? "unspecifie
 let dockerEngineApiMinVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MIN_VERSION"] ?? "v1.32"
 let dockerEngineApiMaxVersion = ProcessInfo.processInfo.environment["DOCKER_ENGINE_API_MAX_VERSION"] ?? "v1.51"
 let package = Package(
-    name: "socktainer",
+    name: "GlassDock",
     platforms: [
         .macOS(.v15)
+    ],
+    products: [
+        .executable(name: "glassdock", targets: ["GlassDock"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/container.git", exact: "1.2.1"),
@@ -23,7 +26,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "socktainer",
+            name: "GlassDock",
             dependencies: [
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "ContainerNetworkClient", package: "container"),
@@ -46,9 +49,9 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "socktainerTests",
+            name: "GlassDockTests",
             dependencies: [
-                .target(name: "socktainer"),
+                .target(name: "GlassDock"),
                 .product(name: "ContainerAPIClient", package: "container"),
                 .product(name: "VaporTesting", package: "vapor"),
                 .product(name: "libzstd", package: "zstd"),

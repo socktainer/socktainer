@@ -10,7 +10,7 @@ import (
 	"time"
 
 	containerrecords "github.com/containerd/containerd/v2/core/containers"
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
 func TestExecCleanupRetriesUntilSuccess(t *testing.T) {
@@ -279,7 +279,7 @@ func TestResolveBindSourceKeepsSharedPath(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          guestRoot,
-		excludedHostSource: "/Users/test/.socktainer/engine",
+		excludedHostSource: "/Users/test/.glassdock/engine",
 	}
 	got, err := resolveBindSource("/Users/test/project", configuration)
 	if err != nil {
@@ -298,7 +298,7 @@ func TestResolveBindSourceRejectsOutsideRoot(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          t.TempDir(),
-		excludedHostSource: "/Users/test/.socktainer/engine",
+		excludedHostSource: "/Users/test/.glassdock/engine",
 	}
 	if _, err := resolveBindSource("/private/tmp", configuration); err == nil {
 		t.Fatal("expected path escape rejection")
@@ -314,7 +314,7 @@ func TestResolveBindSourceRejectsSymlinkEscape(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          guestRoot,
-		excludedHostSource: "/Users/test/.socktainer/engine",
+		excludedHostSource: "/Users/test/.glassdock/engine",
 	}
 	if _, err := resolveBindSource("/Users/test/escape", configuration); err == nil {
 		t.Fatal("expected symlink escape rejection")
@@ -325,7 +325,7 @@ func TestResolveBindSourceRejectsHomeContainingEngineState(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          t.TempDir(),
-		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+		excludedHostSource: "/Users/test/Library/Application Support/Glass Dock/engine",
 	}
 	if _, err := resolveBindSource("/Users/test", configuration); err == nil {
 		t.Fatal("expected home bind rejection because it contains engine state")
@@ -336,7 +336,7 @@ func TestResolveBindSourceRejectsEngineStateAndDescendants(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          t.TempDir(),
-		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+		excludedHostSource: "/Users/test/Library/Application Support/Glass Dock/engine",
 	}
 	for _, source := range []string{
 		configuration.excludedHostSource,
@@ -350,7 +350,7 @@ func TestResolveBindSourceRejectsEngineStateAndDescendants(t *testing.T) {
 
 func TestResolveBindSourceRejectsSymlinkIntoEngineState(t *testing.T) {
 	guestRoot := t.TempDir()
-	engineState := filepath.Join(guestRoot, "Library/Application Support/Socktainer/engine")
+	engineState := filepath.Join(guestRoot, "Library/Application Support/Glass Dock/engine")
 	if err := os.MkdirAll(engineState, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestResolveBindSourceRejectsSymlinkIntoEngineState(t *testing.T) {
 	configuration := bindMountConfiguration{
 		hostSource:         "/Users/test",
 		guestRoot:          guestRoot,
-		excludedHostSource: "/Users/test/Library/Application Support/Socktainer/engine",
+		excludedHostSource: "/Users/test/Library/Application Support/Glass Dock/engine",
 	}
 	if _, err := resolveBindSource("/Users/test/engine-link", configuration); err == nil {
 		t.Fatal("expected symlink into engine state to be rejected")

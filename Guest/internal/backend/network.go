@@ -9,11 +9,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
 const (
-	bridgeName  = "socktainer0"
+	bridgeName  = "glassdock0"
 	bridgeCIDR  = "10.88.0.1/16"
 	networkCIDR = "10.88.0.0/16"
 )
@@ -273,7 +273,7 @@ func publicationRuleArguments(operation string, network *containerNetwork, port 
 	guestPort := strconv.Itoa(int(port.GuestPort))
 	containerPort := strconv.Itoa(int(port.ContainerPort))
 	target := network.address + ":" + containerPort
-	comment := "socktainer:" + network.name + ":" + port.Protocol + ":" + guestPort
+	comment := "glassdock:" + network.name + ":" + port.Protocol + ":" + guestPort
 	return [][]string{
 		{"-t", "nat", operation, "PREROUTING", "-i", "eth0", "-p", port.Protocol, "--dport", guestPort, "-m", "comment", "--comment", comment, "-j", "DNAT", "--to-destination", target},
 		{operation, "FORWARD", "-i", "eth0", "-o", bridgeName, "-p", port.Protocol, "-d", network.address, "--dport", containerPort, "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED", "-m", "comment", "--comment", comment, "-j", "ACCEPT"},

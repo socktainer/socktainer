@@ -1,10 +1,10 @@
 # Agent Instructions
 
-This file is the primary instruction surface for agents contributing to Socktainer. It is injected into your context on every interaction.
+This file is the primary instruction surface for agents contributing to Glass Dock. It is injected into your context on every interaction.
 
 ## Project Identity
 
-Socktainer is a Swift CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries. It allows Docker CLI clients to interact with local containers on macOS using the Docker API surface.
+Glass Dock is a Swift CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries. It allows Docker CLI clients to interact with local containers on macOS using the Docker API surface.
 
 - **Target platform**: macOS on Apple Silicon (arm64) only
 - **API compatibility**: [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml)
@@ -24,23 +24,23 @@ Agent skills live in `.agents/skills/`. Each skill has a `SKILL.md` file describ
 
 | Path | Component | Purpose |
 |---|---|---|
-| `Sources/socktainer/main.swift` | Entry point | CLI argument parsing, Vapor app setup, Unix socket binding |
-| `Sources/socktainer/configure.swift` | Configuration | Registers route collections and initializes services |
-| `Sources/socktainer/Routes/Containers/` | Container routes | Docker container lifecycle API endpoints |
-| `Sources/socktainer/Routes/Images/` | Image routes | Docker image management API endpoints |
-| `Sources/socktainer/Routes/Networks/` | Network routes | Docker network API endpoints |
-| `Sources/socktainer/Routes/Volumes/` | Volume routes | Docker volume API endpoints |
-| `Sources/socktainer/Routes/Server/` | Server routes | Health check, info, version, events, system endpoints |
-| `Sources/socktainer/Routes/Swarm/` | Swarm stubs | Stub responses for Docker Swarm API compatibility |
-| `Sources/socktainer/Routes/Plugins/` | Plugin stubs | Stub responses for Docker plugin API compatibility |
-| `Sources/socktainer/Routes/Registry/` | Registry routes | Auth and distribution endpoints |
-| `Sources/socktainer/Clients/` | Service layer | Business logic wrapping Apple Container/Containerization frameworks |
-| `Sources/socktainer/Models/` | REST models | Request/response DTOs matching Docker Engine API |
-| `Sources/socktainer/DNS/` | DNS service | Inter-container DNS resolution |
-| `Sources/socktainer/Events/` | Event system | Container event broadcasting for client liveness monitoring |
-| `Sources/socktainer/Utilities/` | Utilities | Shared helpers (ID generation, label normalization, etc.) |
+| `Sources/GlassDock/main.swift` | Entry point | CLI argument parsing, Vapor app setup, Unix socket binding |
+| `Sources/GlassDock/configure.swift` | Configuration | Registers route collections and initializes services |
+| `Sources/GlassDock/Routes/Containers/` | Container routes | Docker container lifecycle API endpoints |
+| `Sources/GlassDock/Routes/Images/` | Image routes | Docker image management API endpoints |
+| `Sources/GlassDock/Routes/Networks/` | Network routes | Docker network API endpoints |
+| `Sources/GlassDock/Routes/Volumes/` | Volume routes | Docker volume API endpoints |
+| `Sources/GlassDock/Routes/Server/` | Server routes | Health check, info, version, events, system endpoints |
+| `Sources/GlassDock/Routes/Swarm/` | Swarm stubs | Stub responses for Docker Swarm API compatibility |
+| `Sources/GlassDock/Routes/Plugins/` | Plugin stubs | Stub responses for Docker plugin API compatibility |
+| `Sources/GlassDock/Routes/Registry/` | Registry routes | Auth and distribution endpoints |
+| `Sources/GlassDock/Clients/` | Service layer | Business logic wrapping Apple Container/Containerization frameworks |
+| `Sources/GlassDock/Models/` | REST models | Request/response DTOs matching Docker Engine API |
+| `Sources/GlassDock/DNS/` | DNS service | Inter-container DNS resolution |
+| `Sources/GlassDock/Events/` | Event system | Container event broadcasting for client liveness monitoring |
+| `Sources/GlassDock/Utilities/` | Utilities | Shared helpers (ID generation, label normalization, etc.) |
 | `Sources/BuildInfo/` | Build metadata | C target exposing build version, git commit, API versions to Swift |
-| `Tests/socktainerTests/` | Test suite | Unit tests organized by feature area |
+| `Tests/GlassDockTests/` | Test suite | Unit tests organized by feature area |
 | `Package.swift` | SPM manifest | Dependencies: apple/container, apple/containerization, Vapor, swift-log, swift-argument-parser |
 
 ## Commits
@@ -66,13 +66,13 @@ Agent skills live in `.agents/skills/`. Each skill has a `SKILL.md` file describ
 | `make test` | Run the unit test suite |
 | `make release` | Build in release mode |
 
-Tests are in `Tests/socktainerTests/`. The PR CI (`pr-check.yaml`) runs: format check, unit tests, release build, installer build, and integration tests.
+Tests are in `Tests/GlassDockTests/`. The PR CI (`pr-check.yaml`) runs: format check, unit tests, release build, installer build, and integration tests.
 
 ### Unit Test Requirements
 
 - **Bug fixes must include a unit test** that reproduces the bug and verifies the fix. The test should fail without the fix and pass with it.
 - **New features must include unit tests** covering the main behavior and relevant edge cases.
-- Place tests in `Tests/socktainerTests/` following the existing directory structure (e.g., `Routes/`, `Utilities/`, `DNS/`, `Network/`).
+- Place tests in `Tests/GlassDockTests/` following the existing directory structure (e.g., `Routes/`, `Utilities/`, `DNS/`, `Network/`).
 - When modifying existing behavior, update the corresponding tests to reflect the change.
 - Run `make test` before committing to ensure all tests pass.
 
@@ -103,7 +103,7 @@ Tests are in `Tests/socktainerTests/`. The PR CI (`pr-check.yaml`) runs: format 
 
 These APIs dup the passed fds into the container and then **immediately close the parent copies**. `Pipe()` does not know about this external close — its `deinit` later calls `close()` again on the same fd, which may now be a recycled NIO socket. The double-close corrupts NIO's fd table, causing `writev`/`kevent` EBADF crashes under concurrent load (issue #107).
 
-**Use `StdioPipes`** (centralized allocation and cleanup, `Sources/socktainer/Utilities/DockerConnectionUtility.swift`):
+**Use `StdioPipes`** (centralized allocation and cleanup, `Sources/GlassDock/Utilities/DockerConnectionUtility.swift`):
 
 ```swift
 guard let pipes = StdioPipes.make([.stdin, .stdout, .stderr]) else {  // or make(.all)
@@ -138,4 +138,4 @@ Ownership contract:
 - Never commit secrets, API keys, or credentials. Do not stage files that look like they contain secrets (`.env`, `credentials.json`, etc.).
 - Do not run destructive operations (force push, hard reset) without explicit human confirmation.
 - Security vulnerabilities should be reported responsibly, not as public GitHub issues.
-- Socktainer listens on a Unix domain socket and is intended for local development use only.
+- Glass Dock listens on a Unix domain socket and is intended for local development use only.

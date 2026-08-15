@@ -28,10 +28,10 @@ import (
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/socktainer/socktainer/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/api"
 )
 
-const runtimeMetadataLabel = "io.socktainer.runtime-metadata"
+const runtimeMetadataLabel = "io.glassdock.runtime-metadata"
 const maxConcurrentTaskCreations = 1
 const execCleanupAttempts = 5
 const execCleanupAttemptTimeout = 2 * time.Second
@@ -265,7 +265,7 @@ func New(address, namespace, snapshotter, runtimeName, runtimeBinary string) (*B
 	return &Backend{
 		client: client, namespace: namespace, snapshotter: snapshotter,
 		runtime: runtimeName, runtimeBinary: runtimeBinary,
-		logsDir: "/var/lib/containerd/io.socktainer.logs",
+		logsDir: "/var/lib/containerd/io.glassdock.logs",
 		network: NewNetworkManager(commandRunner{}), taskCreates: make(chan struct{}, maxConcurrentTaskCreations),
 	}, nil
 }
@@ -678,7 +678,7 @@ func (b *Backend) Create(ctx context.Context, request api.ContainerCreateRequest
 		labels[key] = value
 	}
 	if request.AutoRemove {
-		labels["com.socktainer.auto-remove"] = "true"
+		labels["com.glassdock.auto-remove"] = "true"
 	}
 	metadata := request.Metadata
 	if metadata.Name == "" {
@@ -911,7 +911,7 @@ func (b *Backend) AutoRemove(ctx context.Context, id string) bool {
 		return false
 	}
 	labels, err := container.Labels(b.ctx(ctx))
-	return err == nil && labels["com.socktainer.auto-remove"] == "true"
+	return err == nil && labels["com.glassdock.auto-remove"] == "true"
 }
 
 func (b *Backend) Start(ctx context.Context, request api.ContainerStartRequest) (api.Container, error) {

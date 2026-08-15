@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/socktainer/socktainer/guest/internal/api"
-	"github.com/socktainer/socktainer/guest/internal/backend"
-	"github.com/socktainer/socktainer/guest/internal/protocol"
+	"github.com/glassdock/glassdock/guest/internal/api"
+	"github.com/glassdock/glassdock/guest/internal/backend"
+	"github.com/glassdock/glassdock/guest/internal/protocol"
 )
 
 type Server struct {

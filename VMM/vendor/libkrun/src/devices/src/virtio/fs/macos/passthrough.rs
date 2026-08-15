@@ -826,7 +826,7 @@ impl PassthroughFs {
         // Darwin has no bindat(2). Bind in a private host-owned directory,
         // then move the socket node into the descriptor-rooted destination.
         // Guest-controlled text is never part of an absolute host path.
-        let mut template = b"/tmp/socktainer-virtiofs.XXXXXX\0".to_vec();
+        let mut template = b"/tmp/glassdock-virtiofs.XXXXXX\0".to_vec();
         let temp_dir = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
         if temp_dir.is_null() {
             return Err(linux_error(io::Error::last_os_error()));

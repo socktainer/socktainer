@@ -38,13 +38,13 @@ jobs:
     if: github.event.repository.fork == false
     outputs:
       githubTag: ${{ steps.TAG_UTIL.outputs.githubTag}}
-      socktainerVersion: ${{ steps.TAG_UTIL.outputs.socktainerVersion}}
+      glassdockVersion: ${{ steps.TAG_UTIL.outputs.glassdockVersion}}
       releaseId: ${{ steps.create_release.outputs.id}}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-         token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+         token: ${{ secrets.GLASSDOCK_BOT_TOKEN }}
          fetch-depth: 0
       - name: Generate tag utilities
         id: TAG_UTIL
@@ -54,15 +54,15 @@ jobs:
             # grab the latest tags
             git fetch --tags
             # nearest tag on main
-            SOCKTAINER_VERSION=$(git describe --tags --abbrev=0 main)
-            STRIPPED_VERSION=${SOCKTAINER_VERSION#v}
+            GLASSDOCK_VERSION=$(git describe --tags --abbrev=0 main)
+            STRIPPED_VERSION=${GLASSDOCK_VERSION#v}
             echo "Current version is $STRIPPED_VERSION"
             tmp=${STRIPPED_VERSION%.*}
             minor=${tmp#*.}
             bumpedVersion=${STRIPPED_VERSION%%.*}.$((minor + 1)).0
             TAG_PATTERN=${STRIPPED_VERSION}-next.$(date +'%Y%m%d%H%M')-${SHORT_SHA1}
             echo "githubTag=v$TAG_PATTERN" >> ${GITHUB_OUTPUT}
-            echo "socktainerVersion=$TAG_PATTERN" >> ${GITHUB_OUTPUT}
+            echo "glassdockVersion=$TAG_PATTERN" >> ${GITHUB_OUTPUT}
       - name: tag
         run: |
           git config --local user.name ${{ github.actor }}
@@ -83,7 +83,7 @@ jobs:
           prerelease: true
           owner: socktainer
           repo: prereleases
-          token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          token: ${{ secrets.GLASSDOCK_BOT_TOKEN }}
 
   build:
     name: Build
@@ -142,16 +142,16 @@ jobs:
             --sign "${{ secrets.APPLE_APPLICATION_ID}}" \
             --options runtime \
             --entitlements entitlements.plist \
-            ./.build/arm64-apple-macosx/release/socktainer
+            ./.build/arm64-apple-macosx/release/glassdock
     
       - name: zip the binary
         run: |
           cd ./.build/arm64-apple-macosx/release/
-          zip -r socktainer.zip socktainer
+          zip -r glassdock.zip glassdock
 
       - name: Submit for notarization
         run: |
-          xcrun notarytool submit ./.build/arm64-apple-macosx/release/socktainer.zip \
+          xcrun notarytool submit ./.build/arm64-apple-macosx/release/glassdock.zip \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_ID_PASSWORD" \
@@ -165,20 +165,20 @@ jobs:
         run: |
           make installer-notarized
         env:
-          BUILD_VERSION: ${{ needs.tag.outputs.socktainerVersion}}
+          BUILD_VERSION: ${{ needs.tag.outputs.glassdockVersion}}
           APPLE_APPLICATION_ID: ${{ secrets.APPLE_APPLICATION_ID}}
           APPLE_PRODUCT_ID: ${{ secrets.APPLE_PRODUCT_ID}}  
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Upload socktainer binary
+      - name: Upload Glass Dock binary
         run: |
-         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
-         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
-         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/glassdock
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/glassdock.zip
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/glassdock-installer.pkg
         env:
-          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GLASSDOCK_BOT_TOKEN }}
 
   release:
     needs: [tag, build]
@@ -191,7 +191,7 @@ jobs:
       - name: Publish release
         uses: StuYarrow/publish-release@01f2a1365bacd77bad861873a7fdf274ab49eefd # v1.1.2
         env:
-          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GLASSDOCK_BOT_TOKEN }}
         with:
           id: ${{ needs.tag.outputs.releaseId}}
           repo: prereleases
@@ -205,12 +205,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: socktainer/homebrew-tap
-          token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          token: ${{ secrets.GLASSDOCK_BOT_TOKEN }}
           fetch-depth: 0
 
       - name: Trigger and wait for Homebrew formula update
         run: |
-          VERSION=${{ needs.tag.outputs.socktainerVersion}}
+          VERSION=${{ needs.tag.outputs.glassdockVersion}}
           echo "Triggering homebrew-tap workflow with version: $VERSION"
 
           # Trigger workflow run in homebrew-tap
@@ -232,4 +232,4 @@ jobs:
           # Watch until completion (streams logs & exits with same status)
           gh run watch "$run_id" --repo socktainer/homebrew-tap
         env:
-          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GLASSDOCK_BOT_TOKEN }}

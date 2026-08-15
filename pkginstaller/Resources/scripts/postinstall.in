@@ -2,14 +2,14 @@
 
 set -e
 
-echo "Socktainer __VERSION__ installation completed successfully!"
+echo "Glass Dock __VERSION__ installation completed successfully!"
 
 # Verify the installation
-if [ -f "__INSTALL_PREFIX__/bin/socktainer" ]; then
-    echo "✅ socktainer binary installed to __INSTALL_PREFIX__/bin/socktainer"
+if [ -f "__INSTALL_PREFIX__/bin/glassdock" ]; then
+    echo "✅ glassdock binary installed to __INSTALL_PREFIX__/bin/glassdock"
     
     # Make sure it's executable
-    chmod +x "__INSTALL_PREFIX__/bin/socktainer"
+    chmod +x "__INSTALL_PREFIX__/bin/glassdock"
     
     # Add to system PATH when requested. Isolated QA packages can disable this.
     if [ "__INSTALL_PATHS_D__" = "1" ]; then
@@ -23,14 +23,14 @@ if [ -f "__INSTALL_PREFIX__/bin/socktainer" ]; then
     echo ""
     echo "🚀 Quick start:"
     echo "   Open a new terminal, then run:"
-    echo "   socktainer --help      # Show available commands"
-    echo "   socktainer --version   # Display version information"
+    echo "   glassdock --help      # Show available commands"
+    echo "   glassdock --version   # Display version information"
     echo ""
     echo "   Or use the full path:"
-    echo "   __INSTALL_PREFIX__/bin/socktainer --help"
+    echo "   __INSTALL_PREFIX__/bin/glassdock --help"
     echo ""
     echo "Happy containerizing! 🍏📦🐳"
 else
-    echo "⚠️  Warning: socktainer binary not found at expected location"
+    echo "⚠️  Warning: glassdock binary not found at expected location"
     exit 1
 fi
