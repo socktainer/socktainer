@@ -13,9 +13,8 @@
     <p>Glass Dock is a lightweight, Docker-compatible container runtime that provides Docker Engine API compatibility</p>
     
     <h3>Installation Details</h3>
-    <p>The glassdock binary will be installed to <code>__INSTALL_PREFIX__/bin/glassdock</code></p>
-    <p>When PATH installation is enabled, the installation directory is added to the system PATH.</p>
-    <p>Otherwise, invoke Glass Dock using the full installation path shown above.</p>
+    <p>The complete runtime will be installed under <code>/opt/glassdock</code>.</p>
+    <p>The installer does not start background software. After installation, run <code>glassdock enable</code> as your user to enable launch-on-login.</p>
     
     <p><strong>Click Continue to proceed with the installation.</strong></p>
 </div>

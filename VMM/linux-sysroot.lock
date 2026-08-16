@@ -1,0 +1,5 @@
+# SHA-256 and repository path for the Debian bookworm arm64 libkrun sysroot.
+01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4 pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb
+8bc395bf2ee9939f1a6ae395f974cffdcf541d98f99adfe89ce7e4bef36d159e pool/main/g/glibc/libc6-dev_2.36-9+deb12u14_arm64.deb
+c83d28b7c3397c25f15ae17783fce78716a3d7cd415940940cc2af8dc4db8d6d pool/main/g/gcc-12/libgcc-12-dev_12.2.0-14+deb12u1_arm64.deb
+eeca5ec13bed7206f8171fab9a48e84119dcc20cc79557f104628447a524ad10 pool/main/l/linux/linux-libc-dev_6.1.176-1_arm64.deb

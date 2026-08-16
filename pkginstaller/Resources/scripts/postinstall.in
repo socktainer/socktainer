@@ -1,36 +1,35 @@
 #!/bin/bash
 
-set -e
+set -eu
 
-echo "Glass Dock __VERSION__ installation completed successfully!"
+prefix="__INSTALL_PREFIX__"
+version="__VERSION__"
+install_paths_d="__INSTALL_PATHS_D__"
+release="${prefix}/versions/${version}"
+current="${prefix}/current"
+previous="${prefix}/previous"
 
-# Verify the installation
-if [ -f "__INSTALL_PREFIX__/bin/glassdock" ]; then
-    echo "✅ glassdock binary installed to __INSTALL_PREFIX__/bin/glassdock"
-    
-    # Make sure it's executable
-    chmod +x "__INSTALL_PREFIX__/bin/glassdock"
-    
-    # Add to system PATH when requested. Isolated QA packages can disable this.
-    if [ "__INSTALL_PATHS_D__" = "1" ]; then
-        if [ ! -d "/etc/paths.d" ]; then
-            mkdir -p /etc/paths.d
-        fi
-        echo "__INSTALL_PREFIX__/bin" > "/etc/paths.d/__PATHS_D_NAME__"
-        echo "✅ Added __INSTALL_PREFIX__/bin to system PATH"
-    fi
-    
-    echo ""
-    echo "🚀 Quick start:"
-    echo "   Open a new terminal, then run:"
-    echo "   glassdock --help      # Show available commands"
-    echo "   glassdock --version   # Display version information"
-    echo ""
-    echo "   Or use the full path:"
-    echo "   __INSTALL_PREFIX__/bin/glassdock --help"
-    echo ""
-    echo "Happy containerizing! 🍏📦🐳"
-else
-    echo "⚠️  Warning: glassdock binary not found at expected location"
+[ -x "${release}/libexec/glassdock/glassdock" ] || {
+    echo "The installed Glass Dock daemon is missing." >&2
     exit 1
+}
+
+old_target=$(readlink "${current}" 2>/dev/null || true)
+new_target="versions/${version}"
+
+if [ -n "${old_target}" ] && [ "${old_target}" != "${new_target}" ] \
+    && [ -d "${prefix}/${old_target}" ]; then
+    ln -sfn "${old_target}" "${previous}"
 fi
+ln -sfn "${new_target}" "${current}"
+
+if [ "${install_paths_d}" = "1" ]; then
+    mkdir -p /etc/paths.d
+    printf '%s\n' "${prefix}/current/bin" > "/etc/paths.d/__PATHS_D_NAME__"
+else
+    rm -f "/etc/paths.d/__PATHS_D_NAME__"
+fi
+
+echo "Glass Dock ${version} is installed."
+echo "Run 'glassdock enable' as your user to enable launch-on-login."
+echo "Run 'glassdock restart' if a prior Glass Dock daemon is still running."

@@ -1,4 +1,4 @@
-.PHONY: test build image vmm-artifacts clean
+.PHONY: test build image vmm-artifacts reproducibility-test clean
 
 test:
 	go test ./...
@@ -11,6 +11,9 @@ image:
 
 vmm-artifacts:
 	./scripts/build-vmm-artifacts.sh
+
+reproducibility-test:
+	./scripts/test-reproducible-artifacts.sh
 
 clean:
 	rm -rf out

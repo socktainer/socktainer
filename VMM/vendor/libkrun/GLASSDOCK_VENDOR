@@ -5,3 +5,4 @@ License: Apache-2.0
 
 Glass Dock vendors this source to implement its single persistent macOS VMM.
 The examples/snp-example-data-disk.img fixture is omitted from this copy.
+The vendored Makefile requires Cargo.lock for deterministic dependency resolution.

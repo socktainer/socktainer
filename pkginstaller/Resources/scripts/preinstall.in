@@ -1,23 +1,18 @@
 #!/bin/bash
 
-set -e
+set -eu
 
-echo "Preparing to install glassdock..."
+case "$(uname -m)" in
+    arm64) ;;
+    *) echo "Glass Dock requires Apple Silicon." >&2; exit 1 ;;
+esac
 
-# Remove any existing glassdock installation to ensure clean installation
-if [ -d "__INSTALL_PREFIX__" ]; then
-    echo "Removing existing glassdock installation..."
-    rm -rf "__INSTALL_PREFIX__"
-fi
+install_prefix="__INSTALL_PREFIX__"
+case "${install_prefix}" in
+    /opt/*) ;;
+    *) echo "Refusing an unsafe installation prefix." >&2; exit 1 ;;
+esac
 
-# Remove this package's existing PATH entry. This also handles reinstalling with
-# PATH installation disabled after an earlier package enabled it.
-if [ -f "/etc/paths.d/__PATHS_D_NAME__" ]; then
-    echo "Removing existing PATH configuration..."
-    rm -f "/etc/paths.d/__PATHS_D_NAME__"
-fi
-
-# Ensure the target directory exists
-mkdir -p "__INSTALL_PREFIX__/bin"
-
-echo "Pre-installation checks completed successfully."
+# Do not stop the user daemon or delete the active release here. A running daemon
+# can finish on its versioned files. The user restarts it after the package changes
+# the current release link.

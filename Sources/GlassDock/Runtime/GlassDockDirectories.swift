@@ -10,12 +10,15 @@ enum GlassDockDirectories {
         engineStateDirectory(environment: ProcessInfo.processInfo.environment)
     }
 
-    static func engineStateDirectory(environment: [String: String]) -> URL {
+    static func engineStateDirectory(
+        environment: [String: String],
+        userID: uid_t = getuid()
+    ) -> URL {
         if let override = environment["GLASSDOCK_ENGINE_STATE_DIRECTORY"], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true).standardizedFileURL
         }
         return URL(
-            fileURLWithPath: "/private/var/tmp/glassdock-\(Darwin.getuid())/engine",
+            fileURLWithPath: "/Users/Shared/.glassdock-\(userID)",
             isDirectory: true
         )
     }

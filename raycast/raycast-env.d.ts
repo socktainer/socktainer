@@ -11,7 +11,6 @@ type ExtensionPreferences = {
   /** glassdockctl Executable - Optional absolute path to glassdockctl. Standard install locations are detected automatically. */
   "controlExecutable"?: string
 }
-
 /** Preferences accessible in all the extension's commands */
 declare type Preferences = ExtensionPreferences
 

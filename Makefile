@@ -18,18 +18,18 @@ APP_BUILD_NUMBER ?= 1
 TEST_PARALLELISM ?= $(shell sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.ncpu)
 TEST_SWIFT_FLAGS ?= --disable-index-store
 
-SWIFT := "swift"
-DESTDIR ?= /usr/local/
+SWIFT := swift
 ROOT_DIR := $(shell git rev-parse --show-toplevel)
+ACTIONLINT_VERSION ?= v1.7.12
 
 MACOS_VERSION := $(shell sw_vers -productVersion)
 MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
-# Build information - only shows real version if exactly on a tagged commit
-export BUILD_VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null || echo "0.0.0-dev")
-export BUILD_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-# Keep debug and test manifests stable so local rebuilds can reuse BuildInfo.
-# Release builds override this with the actual build timestamp below.
-export BUILD_TIME ?= development
+# Release metadata comes from an explicit value or an exact v-prefixed tag.
+BUILD_VERSION ?= $(or $(shell git describe --tags --exact-match HEAD 2>/dev/null | sed 's/^v//'),0.0.0-dev)
+BUILD_GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+BUILD_TIME ?= $(shell scripts/release/build-time.sh "$(SOURCE_DATE_EPOCH)" 2>/dev/null || echo development)
+export BUILD_VERSION BUILD_GIT_COMMIT BUILD_TIME SOURCE_DATE_EPOCH
 # Build information - docker engine API versions
 export DOCKER_ENGINE_API_MIN_VERSION := v1.32
 export DOCKER_ENGINE_API_MAX_VERSION := v1.51
@@ -50,9 +50,11 @@ glassdock: build
 
 .PHONY: release
 release: BUILD_CONFIGURATION = release
-release: BUILD_TIME = $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
-release: all
-	@codesign --force --sign - --entitlements entitlements.plist .build/release/glassdock
+release:
+	@scripts/release/validate-version.sh "$(BUILD_VERSION)"
+	@echo Building arm64 Glass Dock $(BUILD_VERSION)...
+	@$(SWIFT) build -c release --arch arm64 --disable-index-store --product glassdock
+	@file .build/release/glassdock | grep -q arm64
 
 .PHONY: version
 version:
@@ -65,9 +67,9 @@ version:
 .PHONY: help
 help:
 	@echo "Available targets:"
-	@echo "  all              - Build glassdock (default)"
+	@echo "  all              - Build Glass Dock (default)"
 	@echo "  build            - Build in debug mode"
-	@echo "  release          - Build in release mode"
+	@echo "  release          - Build the arm64 release daemon"
 	@echo "  control          - Build glassdockctl"
 	@echo "  menu-app         - Build a local Glass Dock.app bundle"
 	@echo "  menu-popover-test - Verify the built menu-bar popover is visible"
@@ -75,11 +77,11 @@ help:
 	@echo "  publishing-validate - Validate local Apple and Raycast publishing inputs"
 	@echo "  raycast-install  - Install Raycast extension dependencies"
 	@echo "  raycast-build    - Build and lint the Raycast extension"
+	@echo "  release-artifacts - Build signed and notarized distribution artifacts"
+	@echo "  release-artifacts-local - Build and verify unsigned local artifacts"
 	@echo "  test             - Run tests"
 	@echo "  integration      - Run live Docker lifecycle integration tests"
 	@echo "  benchmark-preflight - Validate runtime benchmark configuration"
-	@echo "  benchmark-discover - Report known runtime availability"
-	@echo "  benchmark-test   - Test benchmark scheduling, statistics, and parsers"
 	@echo "  benchmark        - Run the configured runtime benchmark matrix"
 	@echo "  fmt              - Format source code"
 	@echo "  clean            - Clean build artifacts"
@@ -87,11 +89,14 @@ help:
 	@echo "  installer        - Build unsigned macOS .pkg installer"
 	@echo "  installer-signed - Build signed macOS .pkg installer"
 	@echo "  installer-notarized - Build signed and notarized .pkg installer"
+	@echo "  installer-test   - Build and inspect a fixture installer"
+	@echo "  release-tools-test - Test release metadata scripts"
+	@echo "  actionlint       - Validate GitHub Actions workflows"
 	@echo "  installer-help   - Show detailed installer help"
 	@echo "  help             - Show this help message"
 
 .PHONY: test
-test: lint-pipes benchmark-test
+test: lint-pipes
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION) $(TEST_SWIFT_FLAGS) \
 		--experimental-maximum-parallelization-width $(TEST_PARALLELISM)
 
@@ -125,15 +130,6 @@ publishing-validate:
 	@npm --prefix raycast run lint
 	@npm --prefix raycast run build
 
-.PHONY: raycast-install
-raycast-install:
-	@npm --prefix raycast install
-
-.PHONY: raycast-build
-raycast-build:
-	@npm --prefix raycast run lint
-	@npm --prefix raycast run build
-
 .PHONY: integration
 integration:
 	@bash scripts/integration-runtime.sh
@@ -142,13 +138,22 @@ integration:
 benchmark-preflight:
 	@bash scripts/benchmark-runtime.sh --preflight
 
+.PHONY: benchmark-test
+benchmark-test:
+	@bash scripts/tests/benchmark-runtime-parser-test.sh
+
 .PHONY: benchmark-discover
 benchmark-discover:
 	@bash scripts/benchmark-runtime.sh --discover
 
-.PHONY: benchmark-test
-benchmark-test:
-	@bash scripts/tests/benchmark-runtime-parser-test.sh
+.PHONY: raycast-install
+raycast-install:
+	@npm --prefix raycast install
+
+.PHONY: raycast-build
+raycast-build:
+	@npm --prefix raycast run lint
+	@npm --prefix raycast run build
 
 .PHONY: benchmark
 benchmark:
@@ -174,7 +179,7 @@ swift-fmt:
 # Installer targets - delegated to pkginstaller subdirectory
 .PHONY: guest-image
 guest-image:
-	@$(MAKE) -C Guest image
+	@$(MAKE) -C Guest VERSION="$(BUILD_VERSION)" image
 
 .PHONY: vmm
 vmm:
@@ -192,6 +197,35 @@ installer-signed: release guest-image vmm
 installer-notarized: release guest-image vmm
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-notarized
 
+.PHONY: release-artifacts
+release-artifacts: release guest-image vmm
+	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" release-artifacts
+
+.PHONY: release-artifacts-local
+release-artifacts-local: release guest-image vmm
+	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" verify
+
+.PHONY: installer-test
+installer-test:
+	@$(MAKE) -C pkginstaller test
+
+.PHONY: release-tools-test
+release-tools-test:
+	@sh scripts/tests/release-tools-test.sh
+
+.PHONY: shellcheck
+shellcheck:
+	@shellcheck scripts/release/*.sh scripts/tests/release-tools-test.sh \
+		pkginstaller/tests/*.sh VMM/scripts/*.sh
+	@shellcheck -x Guest/scripts/*.sh
+	@shellcheck -s bash pkginstaller/Resources/glassdock.in \
+		pkginstaller/Resources/glassdock-uninstall.in
+	@shellcheck -s sh pkginstaller/Resources/scripts/*.in
+
+.PHONY: actionlint
+actionlint:
+	@go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+
 .PHONY: installer-help
 installer-help:
 	@$(MAKE) -C pkginstaller help
@@ -203,5 +237,4 @@ installer-clean:
 .PHONY: clean
 clean: installer-clean
 	@echo Cleaning the build files...
-	@rm -rf bin/ libexec/
 	@$(SWIFT) package clean

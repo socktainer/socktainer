@@ -1,84 +1,48 @@
-# Glass Dock macOS Package Installer
+# Glass Dock macOS release package
 
-Builds a macOS `.pkg` installer that installs Glass Dock, its custom VMM,
-and its persistent containerd guest artifacts under `/opt/glassdock/`. It also
-adds the binary directory to the system PATH.
+This directory builds a complete Apple Silicon runtime. The package installs
+versioned releases under `/opt/glassdock/versions` and selects the active release
+through `/opt/glassdock/current`.
 
-## Quick Start
-
-```bash
-# From project root
-make installer
-
-# For signed distribution
-make APPLE_APPLICATION_ID="Developer ID Application: Your Name" \
-     APPLE_PRODUCT_ID="Developer ID Installer: Your Name" \
-     NO_CODESIGN=0 installer-signed
-```
-
-## Prerequisites
-
-- Run `make release guest-image vmm` first only when you invoke the `pkginstaller`
-  subdirectory directly. The root `make installer` target does this automatically.
-- Xcode Command Line Tools installed
-- Developer certificates (for signed builds only)
-
-Notarization uses a `notarytool` Keychain profile. It does not accept plaintext
-password variables. The notarization target also requires the explicit final
-approval gates that `make help` describes.
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BUILD_VERSION` | `0.0.0-dev` | Version for installer |
-| `NO_CODESIGN` | `1` | Set to `0` to enable signing |
-| `INSTALL_PREFIX` | `/opt/glassdock` | Installation directory (must be a safe child of `/opt`) |
-| `PACKAGE_IDENTIFIER` | `io.github.glassdock` | Package receipt identifier |
-| `PATHS_D_NAME` | `glassdock` | Name of the `/etc/paths.d` entry |
-| `INSTALL_PATHS_D` | `1` | Set to `0` to leave the system PATH unchanged |
-
-For an isolated validation package, use a unique prefix and receipt and disable the
-PATH hook:
+From the repository root, build and verify all unsigned local artifacts:
 
 ```bash
-make INSTALL_PREFIX=/opt/glassdock-qa-123 \
-     PACKAGE_IDENTIFIER=io.github.glassdock.qa.123 \
-     INSTALL_PATHS_D=0 installer
+make release-artifacts-local BUILD_VERSION=0.0.0-dev
 ```
 
-Install and verify that isolated package with its full path:
+The package contains:
+
+- the public `glassdock` service controller;
+- the private `glassdock` daemon, VMM, `libkrun`, and `gvproxy`;
+- the guest kernel and root disk;
+- a per-user LaunchAgent definition;
+- an uninstaller that preserves workload data by default.
+
+The installer does not start background software or write to a user home. After
+installation, the user runs `glassdock enable` to install the LaunchAgent in that
+user's `~/Library/LaunchAgents` directory and enable launch-on-login.
+
+## Distribution build
+
+Use Developer ID Application and Developer ID Installer identities, plus a
+`notarytool` keychain profile or App Store Connect API key:
 
 ```bash
-sudo installer -pkg pkginstaller/out/glassdock-installer.pkg -target /
-/opt/glassdock-qa-123/bin/glassdock --version
-pkgutil --pkg-info io.github.glassdock.qa.123
+make release-artifacts BUILD_VERSION=1.3.0 \
+  CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
+  INSTALLER_SIGNING_IDENTITY='Developer ID Installer: Example (TEAMID)' \
+  NOTARYTOOL_PROFILE=glassdock-notary
 ```
 
-Because the isolated package has its own prefix and receipt and does not change
-`/etc/paths.d`, it leaves a Homebrew or existing default Glass Dock installation
-untouched. Roll it back with:
+The output directory contains:
 
-```bash
-sudo rm -rf /opt/glassdock-qa-123
-sudo pkgutil --forget io.github.glassdock.qa.123
-```
+- `glassdock-<version>-macos-arm64.pkg`;
+- `glassdock-<version>-macos-arm64.tar.gz`;
+- `SHA256SUMS`;
+- `BUILD-METADATA.txt`.
 
-An in-place installation at the default prefix replaces that prefix. Roll back an
-in-place upgrade by reinstalling the previous package or Homebrew version.
+The complete archive is for advanced use and future package-manager integration.
+The notarized package is the supported user installation.
 
-## Output
-
-Creates `out/glassdock-installer.pkg` that:
-- Installs the daemon, `glassdockctl`, VMM helper, libkrun, and gvproxy to `/opt/glassdock/bin/`
-- Installs the guest kernel and read-only root disk to `/opt/glassdock/share/glassdock/`
-- Adds `/opt/glassdock/bin` to system PATH
-- Shows professional installer UI
-
-## Uninstall
-
-```bash
-sudo rm -rf /opt/glassdock
-sudo rm -f /etc/paths.d/glassdock
-sudo pkgutil --forget io.github.glassdock
-```
+Run `make installer-test` from the repository root to build fixture artifacts and
+inspect their payload without installing them.

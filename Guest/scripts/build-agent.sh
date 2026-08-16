@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-guest_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+guest_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 output_dir=${OUTPUT_DIR:-"${guest_root}/out"}
 version=${VERSION:-dev}
 

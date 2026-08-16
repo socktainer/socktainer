@@ -12,9 +12,12 @@ struct RuntimeMachineArtifacts: Sendable, Equatable {
         repositoryRoot: URL? = nil
     ) throws -> Self {
         let executableDirectory = executable.deletingLastPathComponent()
-        let installedShare =
+        let installedPrefix =
             executableDirectory
             .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let installedShare =
+            installedPrefix
             .appendingPathComponent("share/glassdock", isDirectory: true)
         let roots = [
             repositoryRoot

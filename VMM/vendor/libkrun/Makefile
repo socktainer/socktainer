@@ -207,7 +207,7 @@ clean-sysroot:
 
 
 $(LIBRARY_RELEASE_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
-	cargo build --release -p libkrun $(FEATURE_FLAGS)
+	cargo build --locked --release -p libkrun $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
 endif
@@ -226,7 +226,7 @@ endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 
 $(LIBRARY_DEBUG_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
-	cargo build -p libkrun $(FEATURE_FLAGS)
+	cargo build --locked -p libkrun $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
 endif

@@ -1,0 +1,157 @@
+#!/bin/bash
+
+set -eu
+
+label="__SERVICE_LABEL__"
+uid=$(id -u)
+domain="gui/${uid}"
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+release_directory=$(dirname -- "${script_directory}")
+
+if [ "$(basename -- "$(dirname -- "${release_directory}")")" = "versions" ]; then
+    prefix=$(dirname -- "$(dirname -- "${release_directory}")")
+    current="${prefix}/current"
+    package_install=1
+else
+    prefix="${release_directory}"
+    current="${release_directory}"
+    package_install=0
+fi
+
+daemon="${current}/libexec/glassdock/glassdock"
+agent_source="${current}/share/glassdock/${label}.plist"
+agent_directory="${HOME}/Library/LaunchAgents"
+agent="${agent_directory}/${label}.plist"
+
+usage() {
+    cat <<EOF
+Usage: glassdock <command>
+
+Commands:
+  enable              Enable launch-on-login and start the daemon
+  disable             Stop the daemon and disable launch-on-login
+  start               Start an enabled daemon
+  stop                Stop the daemon for this login session
+  restart             Restart an enabled daemon
+  status              Show launchd service status
+  run [options]       Run the daemon in the foreground
+  version             Show the installed version
+  versions            List installed package versions
+  rollback <version>  Select an installed version; requires administrator access
+  uninstall [options] Remove Glass Dock; preserves data unless --purge-data is used
+EOF
+}
+
+enabled() {
+    [ -f "${agent}" ]
+}
+
+require_package_install() {
+    [ "${package_install}" -eq 1 ] || {
+        echo "This command requires the versioned macOS package installation." >&2
+        exit 1
+    }
+}
+
+start_service() {
+    enabled || {
+        echo "Glass Dock is not enabled. Run 'glassdock enable' first." >&2
+        exit 1
+    }
+    launchctl bootstrap "${domain}" "${agent}" 2>/dev/null \
+        || launchctl kickstart -k "${domain}/${label}"
+}
+
+command=${1:-help}
+[ "$#" -eq 0 ] || shift
+
+case "${command}" in
+    enable)
+        require_package_install
+        mkdir -p "${agent_directory}"
+        install -m 0644 "${agent_source}" "${agent}"
+        launchctl bootout "${domain}/${label}" >/dev/null 2>&1 || true
+        launchctl bootstrap "${domain}" "${agent}"
+        echo "Glass Dock is enabled and will start when you sign in."
+        ;;
+    disable)
+        require_package_install
+        launchctl bootout "${domain}/${label}" >/dev/null 2>&1 || true
+        rm -f "${agent}"
+        echo "Glass Dock launch-on-login is disabled."
+        ;;
+    start)
+        require_package_install
+        start_service
+        ;;
+    stop)
+        require_package_install
+        launchctl bootout "${domain}/${label}" >/dev/null 2>&1 || true
+        ;;
+    restart)
+        require_package_install
+        launchctl bootout "${domain}/${label}" >/dev/null 2>&1 || true
+        start_service
+        ;;
+    status)
+        require_package_install
+        launchctl print "${domain}/${label}"
+        ;;
+    run)
+        exec "${daemon}" "$@"
+        ;;
+    version | --version)
+        exec "${daemon}" --version
+        ;;
+    versions)
+        if [ -d "${prefix}/versions" ]; then
+            find "${prefix}/versions" -mindepth 1 -maxdepth 1 -type d -print \
+                | sed 's|.*/||' | LC_ALL=C sort
+        else
+            echo "This archive installation has one unversioned runtime."
+        fi
+        ;;
+    rollback)
+        require_package_install
+        version=${1:?rollback requires a version}
+        "${current}/bin/glassdock" version >/dev/null
+        printf '%s\n' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' \
+            || { echo "Invalid version: ${version}" >&2; exit 1; }
+        target="${prefix}/versions/${version}"
+        [ -x "${target}/libexec/glassdock/glassdock" ] || {
+            echo "Version ${version} is not installed." >&2
+            exit 1
+        }
+        if [ "$(id -u)" -ne 0 ]; then
+            exec sudo "$0" rollback "${version}"
+        fi
+        old_target=$(readlink "${prefix}/current" 2>/dev/null || true)
+        [ -z "${old_target}" ] || ln -sfn "${old_target}" "${prefix}/previous"
+        ln -sfn "versions/${version}" "${prefix}/current"
+        service_uid=${SUDO_UID:-}
+        if [ -n "${service_uid}" ]; then
+            service_user=${SUDO_USER:-$(id -un "${service_uid}")}
+            service_home=$(dscl . -read "/Users/${service_user}" NFSHomeDirectory \
+                | sed 's/^NFSHomeDirectory: //') || service_home=
+            service_agent="${service_home}/Library/LaunchAgents/${label}.plist"
+            launchctl bootout "gui/${service_uid}/${label}" >/dev/null 2>&1 || true
+            if [ -n "${service_home}" ] && [ -f "${service_agent}" ]; then
+                launchctl asuser "${service_uid}" launchctl bootstrap \
+                    "gui/${service_uid}" "${service_agent}"
+            fi
+        fi
+        echo "Glass Dock now uses version ${version}."
+        ;;
+    uninstall)
+        require_package_install
+        exec "${current}/bin/glassdock-uninstall" "$@"
+        ;;
+    help | --help | -h)
+        usage
+        ;;
+    *)
+        echo "Unknown command: ${command}" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

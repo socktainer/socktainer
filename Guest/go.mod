@@ -2,6 +2,8 @@ module github.com/glassdock/glassdock/guest
 
 go 1.23.0
 
+toolchain go1.26.5
+
 require (
 	github.com/containerd/containerd/api v1.9.0
 	github.com/containerd/containerd/v2 v2.1.5

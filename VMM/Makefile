@@ -1,8 +1,11 @@
 VENDOR_DIR := vendor/libkrun
 OUT_DIR := out
+BUILD_DIR := build
+LINUX_SYSROOT := $(abspath $(BUILD_DIR)/linux-sysroot)
 LIBKRUN := $(VENDOR_DIR)/target/release/libkrun.dylib
 LIBKRUN_SOURCES := $(shell find $(VENDOR_DIR)/src -type f) \
-	$(VENDOR_DIR)/Cargo.toml $(VENDOR_DIR)/Cargo.lock $(VENDOR_DIR)/Makefile
+	$(VENDOR_DIR)/Cargo.toml $(VENDOR_DIR)/Cargo.lock $(VENDOR_DIR)/Makefile \
+	linux-sysroot.lock scripts/prepare-linux-sysroot.sh ../rust-toolchain.toml
 HELPER := $(OUT_DIR)/glassdock-vmm
 GVPROXY := $(OUT_DIR)/gvproxy
 LIBKRUN_OUT := $(OUT_DIR)/libkrun.1.dylib
@@ -12,8 +15,11 @@ CLANG := /usr/bin/clang
 
 all: $(HELPER) $(GVPROXY)
 
-$(LIBKRUN): $(LIBKRUN_SOURCES)
-	$(MAKE) -C $(VENDOR_DIR) BLK=1 NET=1
+$(LINUX_SYSROOT)/.sysroot_ready: linux-sysroot.lock scripts/prepare-linux-sysroot.sh
+	OUTPUT_DIR="$(LINUX_SYSROOT)" sh scripts/prepare-linux-sysroot.sh
+
+$(LIBKRUN): $(LIBKRUN_SOURCES) $(LINUX_SYSROOT)/.sysroot_ready
+	CARGO_INCREMENTAL=0 $(MAKE) -C $(VENDOR_DIR) BLK=1 NET=1 SYSROOT_LINUX="$(LINUX_SYSROOT)"
 
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
@@ -43,4 +49,4 @@ test: $(HELPER) $(GVPROXY)
 
 clean:
 	$(MAKE) -C $(VENDOR_DIR) clean
-	rm -rf $(OUT_DIR)
+	rm -rf $(OUT_DIR) $(BUILD_DIR)

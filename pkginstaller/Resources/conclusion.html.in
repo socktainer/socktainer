@@ -14,20 +14,20 @@
     
     <h3>Getting Started</h3>
     <p style="color: #020202; font-size: 12px;">
-        You can now use the <code>glassdock</code> command from your terminal.
+        Open a new terminal and run <code>glassdock enable</code> to enable launch-on-login.
     </p>
     
     <p style="color: #020202; font-size: 12px;">
         <strong>Quick start commands:</strong>
     </p>
     <ul style="font-size: 12px; color: #020202;">
-        <li><code>glassdock --help</code> - Show help and available commands</li>
-        <li><code>glassdock --version</code> - Display version information</li>
+        <li><code>glassdock enable</code> - Enable and start the user daemon</li>
+        <li><code>glassdock status</code> - Display daemon status</li>
     </ul>
     
     <h3>Installation Location</h3>
     <p style="color: #555555; font-size: 11px;">
-        Binary installed to: <code>__INSTALL_PREFIX__/bin/glassdock</code>
+        Runtime installed to: <code>/opt/glassdock</code>
     </p>
     
     <p style="color: #020202; font-size: 12px;">

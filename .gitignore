@@ -5,6 +5,7 @@ __pycache__/
 RelaySidecar/target/
 RelaySidecar/artifacts/
 VMM/out/
+VMM/build/
 VMM/vendor/libkrun/linux-sysroot/
 VMM/vendor/libkrun/target/
 runtime-benchmark-*.json

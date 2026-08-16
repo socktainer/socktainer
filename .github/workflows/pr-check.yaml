@@ -32,8 +32,6 @@ jobs:
     name: build
     runs-on: macos-26
     timeout-minutes: 40
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -60,8 +58,10 @@ jobs:
         timeout-minutes: 40
         run: make release
 
-      - name: List Build
-        run: ls -la ./.build/arm64-apple-macosx/release/
+      - name: Inspect release daemon
+        run: |
+          file ./.build/arm64-apple-macosx/release/glassdock
+          ./.build/arm64-apple-macosx/release/glassdock --version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -88,6 +88,9 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: "26.6"
+
+      - name: Install build and validation dependencies
+        run: HOMEBREW_NO_REQUIRE_TAP_TRUST=1 brew install actionlint lld shellcheck xz
 
       - name: Display swift version
         run: |
@@ -119,3 +122,13 @@ jobs:
           cd Guest
           go test -race ./...
           go vet ./...
+
+      - name: Test VMM build and helper
+        run: make -C VMM test
+
+      - name: Test release tools and installer
+        run: |
+          make release-tools-test
+          make shellcheck
+          make actionlint
+          make installer-test

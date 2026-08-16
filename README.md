@@ -250,7 +250,7 @@ intentionally deletes them.
 
 All containers share the persistent engine VM. The defaults are 6 virtual CPUs
 and a 1 GiB configured memory ceiling. Use `--cpus <count>` and
-`--memory-mib <MiB>` to set the VM resources when you start Socktainer. The VMM
+`--memory-mib <MiB>` to set the VM resources when you start Glass Dock. The VMM
 reclaims guest pages through the virtio balloon device, so configured memory
 and physical footprint are separate measurements. Docker per-container CPU and
 memory limits are not implemented.
@@ -372,7 +372,7 @@ Ownership rules:
 
 ## Runtime benchmarks
 
-Use the local benchmark harness to compare a changed Socktainer build with
+Use the local benchmark harness to compare a changed Glass Dock build with
 other Docker-compatible engines on the same Apple Silicon Mac:
 
 ```bash

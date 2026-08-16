@@ -4,7 +4,12 @@
     <welcome file="welcome.html"/>
     <conclusion file="conclusion.html"/>
     <pkg-ref id="__PACKAGE_IDENTIFIER__"/>
-    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <options customize="never" require-scripts="false" rootVolumeOnly="true" hostArchitectures="arm64"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="26.0"/>
+        </allowed-os-versions>
+    </volume-check>
     <choices-outline>
         <line choice="default">
             <line choice="__PACKAGE_IDENTIFIER__"/>

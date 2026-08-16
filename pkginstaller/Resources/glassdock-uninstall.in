@@ -1,0 +1,76 @@
+#!/bin/bash
+
+set -eu
+
+prefix="__INSTALL_PREFIX__"
+receipt="__PACKAGE_IDENTIFIER__"
+paths_file="/etc/paths.d/__PATHS_D_NAME__"
+label="__SERVICE_LABEL__"
+purge=0
+dry_run=0
+
+for argument in "$@"; do
+    case "${argument}" in
+        --purge-data) purge=1 ;;
+        --dry-run) dry_run=1 ;;
+        *) echo "Unknown option: ${argument}" >&2; exit 2 ;;
+    esac
+done
+
+case "${prefix}" in
+    /opt/*) ;;
+    *) echo "Refusing an unsafe installation prefix: ${prefix}" >&2; exit 1 ;;
+esac
+
+target_uid=${SUDO_UID:-$(id -u)}
+target_user=$(id -nu "${target_uid}")
+target_home=$(dscl . -read "/Users/${target_user}" NFSHomeDirectory 2>/dev/null \
+    | sed 's/^NFSHomeDirectory: //') || target_home=
+[ -n "${target_home}" ] || target_home="/Users/${target_user}"
+agent="${target_home}/Library/LaunchAgents/${label}.plist"
+engine_state="/Users/Shared/.glassdock-${target_uid}"
+
+show_targets() {
+    printf '%s\n' "Program files: ${prefix}" "Shell path entry: ${paths_file}" \
+        "Launch agent: ${agent}" "Package receipt: ${receipt}"
+    if [ "${purge}" -eq 1 ]; then
+        printf '%s\n' "User runtime files: ${target_home}/.glassdock" \
+            "Workload data: ${target_home}/Library/Application Support/Glass Dock" \
+            "Engine state: ${engine_state}" \
+            "Logs: ${target_home}/Library/Logs/Glass Dock" \
+            "Caches: ${target_home}/Library/Caches/Glass Dock"
+    fi
+}
+
+if [ "${dry_run}" -eq 1 ]; then
+    show_targets
+    exit 0
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+
+launchctl bootout "gui/${target_uid}/${label}" >/dev/null 2>&1 || true
+rm -f "${agent}" "${paths_file}"
+
+docker_path=$(command -v docker || true)
+if [ -n "${docker_path}" ]; then
+    sudo -H -u "${target_user}" "${docker_path}" context rm -f glassdock >/dev/null 2>&1 || true
+fi
+
+if [ "${purge}" -eq 1 ]; then
+    rm -rf "${target_home}/.glassdock" \
+        "${target_home}/Library/Application Support/Glass Dock" \
+        "${target_home}/Library/Logs/Glass Dock" \
+        "${target_home}/Library/Caches/Glass Dock" \
+        "${engine_state}"
+fi
+
+rm -rf "${prefix}"
+pkgutil --forget "${receipt}" >/dev/null 2>&1 || true
+
+echo "Glass Dock was removed."
+if [ "${purge}" -eq 0 ]; then
+    echo "Workload data was preserved."
+fi
