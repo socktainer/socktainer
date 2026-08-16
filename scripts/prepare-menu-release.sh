@@ -63,7 +63,9 @@ if codesign --display --entitlements :- "$app_path" 2>/dev/null | plutil -extrac
     exit 1
 fi
 
-ditto -c -k --keepParent "$app_path" "$archive_path"
+# Do not include macOS resource-fork sidecars (._*) in the ZIP. They become
+# extra files in the extracted app bundle and invalidate its code signature.
+ditto -c -k --norsrc --keepParent "$app_path" "$archive_path"
 unzip -tq "$archive_path" >/dev/null
 
 if spctl --assess --type execute --verbose=2 "$app_path" >/dev/null 2>&1; then
