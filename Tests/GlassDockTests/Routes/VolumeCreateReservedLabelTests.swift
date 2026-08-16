@@ -14,7 +14,6 @@ struct VolumeCreateReservedLabelTests {
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             try app.register(collection: VolumeCreateRoute(client: UnusedVolumeClient()))
 
             try await app.testing().test(

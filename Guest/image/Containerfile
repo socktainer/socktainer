@@ -1,11 +1,13 @@
 FROM alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
 
 RUN apk add --no-cache \
+      --repository https://dl-cdn.alpinelinux.org/alpine/v3.22/community \
       ca-certificates=20260611-r0 \
       containerd=2.1.5-r2 \
       e2fsprogs=1.47.2-r2 \
       iproute2=6.15.0-r0 \
       iptables=1.8.11-r1 \
+      crun=1.23.1-r0 \
       runc=1.3.4-r1 \
     && mkdir -p /etc/containerd /var/lib/containerd /run/containerd /mnt/glassdock-host \
     && containerd config default > /etc/containerd/config.toml
@@ -16,7 +18,7 @@ COPY init /sbin/glassdock-init
 RUN chmod 0755 /usr/local/libexec/glassdock-guest-agent /sbin/glassdock-init \
     && ln -sf /sbin/glassdock-init /sbin/init \
     && test "$(readlink /sbin/init)" = /sbin/glassdock-init \
-    && test ! -e /usr/bin/crun \
+    && /usr/bin/crun --version >/dev/null \
     && /usr/bin/runc --version >/dev/null
 
 ENTRYPOINT ["/sbin/glassdock-init"]

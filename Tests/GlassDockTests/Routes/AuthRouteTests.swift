@@ -62,7 +62,6 @@ struct AuthRouteTests {
         let app = try await Application.make(.testing)
         let router = app.regexRouter(with: app.logger)
         app.setRegexRouter(router)
-        router.installMiddleware(on: app)
         try app.register(collection: AuthRoute(validator: validator))
         do {
             try await body(app)

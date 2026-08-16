@@ -83,6 +83,7 @@ struct RuntimeMachineReady: Sendable, Equatable {
     let guestIPv4: String
     let hostGatewayIPv4: String
     let gvproxyAPI: URL
+    let tcpRelaySocket: URL
 }
 
 private struct RuntimeMachineNetworkState: Decodable {
@@ -298,7 +299,8 @@ actor RuntimeMachine: EngineMachineHosting {
                     processIdentifier: process.processIdentifier,
                     guestIPv4: String(guestIPv4),
                     hostGatewayIPv4: networkState.gateway,
-                    gvproxyAPI: runtimeDirectory.appendingPathComponent("network/a.sock")
+                    gvproxyAPI: runtimeDirectory.appendingPathComponent("network/a.sock"),
+                    tcpRelaySocket: runtimeDirectory.appendingPathComponent("vsock/1026.sock")
                 ),
                 runtimeDirectory: runtimeDirectory,
                 process: process

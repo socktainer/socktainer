@@ -14,10 +14,9 @@ import VaporTesting
 
     // Helper to set up RegexRouter for testing
     private func setupRegexRouter(for app: Application) {
-        // Create and install regex routing middleware with logging
+        // Create the greedy-path fallback router.
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
-        regexRouter.installMiddleware(on: app)
     }
 
     // Create a fresh app instance for each test
@@ -46,11 +45,29 @@ import VaporTesting
     }
 
     @Test
-    func registerWithHandler() async throws {
+    func ordinaryRoutesBypassRegexFallback() async throws {
         try await withRegexRouter { app in
-            try app.registerVersionedRoute(.GET, pattern: "^/test/(.+)$") { req in
-                Response(status: .ok)
+            try app.registerVersionedRoute(.POST, pattern: "/containers/{id}/start") { request in
+                request.parameters.get("id") ?? ""
             }
+
+            #expect(app.regexRouter.fallbackRouteCount == 0)
+
+            try await app.testing().test(.POST, "/v1.51/containers/example/start") { response async throws in
+                #expect(response.status == .ok)
+                #expect(response.body.string == "example")
+            }
+        }
+    }
+
+    @Test
+    func greedyRoutesUseRegexFallback() async throws {
+        try await withRegexRouter { app in
+            try app.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json") { request in
+                request.parameters.get("name") ?? ""
+            }
+
+            #expect(app.regexRouter.fallbackRouteCount == 1)
         }
     }
 
@@ -82,25 +99,57 @@ import VaporTesting
     }
 
     @Test
-    func middlewareInstallation() async throws {
+    func fallbackRouteInstallation() async throws {
         let app = try await makeApp()
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
-        regexRouter.installMiddleware(on: app)
+        try app.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/json") { _ in "" }
 
-        // Test installing middleware multiple times doesn't cause issues
-        regexRouter.installMiddleware(on: app)
-        regexRouter.installMiddleware(on: app)
+        let routeCount = app.routes.all.count
+        try app.registerVersionedRoute(.GET, pattern: "/images/{name:.*}/history") { _ in "" }
+
+        // The second route adds only its native versioned and unversioned forms.
+        #expect(app.routes.all.count == routeCount + 2)
+        #expect(regexRouter.fallbackRoutePrefixes == ["images"])
 
         try await app.asyncShutdown()
     }
 
     @Test
-    func invalidRegexPatternThrowsError() async throws {
+    func invalidDockerPatternsThrowErrors() async throws {
         try await withRegexRouter { app in
-            #expect(throws: Error.self) {
-                try app.registerVersionedRoute(.GET, pattern: "[invalid(regex") { req in
-                    "test"
+            for pattern in ["containers/{id}", "/containers/{id", "/containers/{id:[0-9]+}"] {
+                #expect(throws: Error.self) {
+                    try app.registerVersionedRoute(.GET, pattern: pattern) { _ in "test" }
+                }
+            }
+        }
+    }
+
+    @Test
+    func greedyPluginNameSupportsSlashes() async throws {
+        try await withRegexRouter { app in
+            try app.registerVersionedRoute(.GET, pattern: "/plugins/{name:.*}/json") { request in
+                request.parameters.get("name") ?? ""
+            }
+
+            for path in ["/plugins/vendor/plugin/json", "/v1.51/plugins/vendor/plugin/json"] {
+                try await app.testing().test(.GET, path) { response async throws in
+                    #expect(response.status == .ok)
+                    #expect(response.body.string == "vendor/plugin")
+                }
+            }
+        }
+    }
+
+    @Test
+    func apiVersionUsesASCIIDigits() async throws {
+        try await withRegexRouter { app in
+            try app.registerVersionedRoute(.GET, pattern: "/_ping") { _ in "OK" }
+
+            for path in ["/v١.٥١/_ping", "/v1.51.0/_ping", "/v1./_ping"] {
+                try await app.testing().test(.GET, path) { response async throws in
+                    #expect(response.status == .notFound)
                 }
             }
         }

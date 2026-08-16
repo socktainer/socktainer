@@ -30,15 +30,18 @@ import Vapor
         let tempHome = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let socketDir = tempHome.appendingPathComponent(".glassdock")
         let socketPath = socketDir.appendingPathComponent("container.sock")
+        let backendPath = socketDir.appendingPathComponent("daemon.sock")
 
         try fileManager.createDirectory(at: socketDir, withIntermediateDirectories: true)
         fileManager.createFile(atPath: socketPath.path, contents: Data())
+        fileManager.createFile(atPath: backendPath.path, contents: Data())
 
         try prepareUnixSocket(for: app, homeDirectory: tempHome.path)
 
         #expect(fileManager.fileExists(atPath: socketDir.path))
         #expect(!fileManager.fileExists(atPath: socketPath.path))
-        #expect(app.http.server.configuration.address == .unixDomainSocket(path: socketPath.path))
+        #expect(!fileManager.fileExists(atPath: backendPath.path))
+        #expect(app.http.server.configuration.address == .unixDomainSocket(path: backendPath.path))
 
         try? fileManager.removeItem(at: tempHome)
 

@@ -12,8 +12,10 @@ struct RuntimeReadinessTests {
         let readiness = RuntimeReadiness {
             if await starts.begin() == 1 { throw TestFailure.notReady }
         }
-        while await starts.count() == 0 {
-            await Task.yield()
+        do {
+            try await readiness.waitUntilReady()
+            Issue.record("expected first initialization to fail")
+        } catch {
         }
         while true {
             do {
@@ -27,13 +29,24 @@ struct RuntimeReadinessTests {
         await readiness.cancel()
     }
 
+    @Test("Runtime initialization is lazy")
+    func initializationIsLazy() async throws {
+        let starts = StartAttempts()
+        let readiness = RuntimeReadiness { _ = await starts.begin() }
+
+        await Task.yield()
+        #expect(await starts.count() == 0)
+        try await readiness.waitUntilReady()
+        #expect(await starts.count() == 1)
+        await readiness.cancel()
+    }
+
     @Test("Docker ping is available while runtime initialization is incomplete")
     func pingDoesNotWaitForRuntime() async throws {
         let readiness = RecordingRuntimeReadiness(result: .failure(TestFailure.notReady))
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
             app.middleware.use(RuntimeReadinessMiddleware(readiness: readiness))
             try app.register(collection: HealthCheckPingRoute())
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/mdlayher/vsock"
 	"github.com/glassdock/glassdock/guest/internal/backend"
+	"github.com/glassdock/glassdock/guest/internal/forwarder"
 	"github.com/glassdock/glassdock/guest/internal/server"
 )
 
@@ -24,6 +25,8 @@ func main() {
 	runtimeBinary := flag.String("runtime-binary", "/usr/bin/runc", "OCI runtime binary used by the runc v2 shim")
 	unixAddress := flag.String("unix", "", "listen on a Unix socket instead of vsock (tests and diagnostics)")
 	port := flag.Uint("vsock-port", 1025, "guest vsock port")
+	forwardUnixAddress := flag.String("forward-unix", "", "listen for TCP relay connections on a Unix socket")
+	forwardPort := flag.Uint("forward-vsock-port", 1026, "guest TCP relay vsock port")
 	hostBindSource := flag.String("host-bind-source", "", "host source exported by virtiofs")
 	guestBindRoot := flag.String("guest-bind-root", "", "fixed guest mount point for the host source")
 	excludedHostBindSource := flag.String("excluded-host-bind-source", "", "host engine state excluded from bind mounts")
@@ -43,6 +46,7 @@ func main() {
 	}
 
 	var listener net.Listener
+	var forwardListener net.Listener
 	if *unixAddress != "" {
 		_ = os.Remove(*unixAddress)
 		listener, err = net.Listen("unix", *unixAddress)
@@ -53,11 +57,33 @@ func main() {
 		log.Fatal(err)
 	}
 	defer listener.Close()
+	if *forwardUnixAddress != "" {
+		_ = os.Remove(*forwardUnixAddress)
+		forwardListener, err = net.Listen("unix", *forwardUnixAddress)
+	} else {
+		forwardListener, err = vsock.Listen(uint32(*forwardPort), nil)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer forwardListener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("glassdock guest agent %s listening on %s", version, listener.Addr())
+	log.Printf(
+		"glassdock guest agent %s listening on %s; TCP relay on %s",
+		version,
+		listener.Addr(),
+		forwardListener.Addr(),
+	)
 	guestServer := server.New(b, version)
-	if err := guestServer.Serve(ctx, listener); err != nil {
+	tcpServer := forwarder.NewTCPServer(b.PublishedTCPDestination)
+	errors := make(chan error, 2)
+	go func() { errors <- guestServer.Serve(ctx, listener) }()
+	go func() { errors <- tcpServer.Serve(ctx, forwardListener) }()
+	if err := <-errors; err != nil {
+		stop()
+		_ = listener.Close()
+		_ = forwardListener.Close()
 		log.Fatal(err)
 	}
 }

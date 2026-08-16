@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -199,6 +200,22 @@ func (m *NetworkManager) Published(id string) []api.PublishedPort {
 		return append([]api.PublishedPort(nil), network.guestPorts...)
 	}
 	return nil
+}
+
+func (m *NetworkManager) PublishedTCPDestination(guestPort uint16) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, network := range m.containers {
+		for _, published := range network.guestPorts {
+			if published.Protocol == "tcp" && published.GuestPort == guestPort {
+				return net.JoinHostPort(
+					network.address,
+					strconv.Itoa(int(published.ContainerPort)),
+				), true
+			}
+		}
+	}
+	return "", false
 }
 
 func (m *NetworkManager) Delete(id string) error {

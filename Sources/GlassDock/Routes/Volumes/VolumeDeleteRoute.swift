@@ -4,7 +4,7 @@ struct VolumeDeleteRoute: RouteCollection {
     let client: ClientVolumeProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.DELETE, pattern: "/volumes/{name}", use: self.handler)
+        try routes.registerVersionedRoute(.DELETE, pattern: "/volumes/{name:.*}", use: self.handler)
     }
 
     func handler(_ req: Request) async throws -> Response {

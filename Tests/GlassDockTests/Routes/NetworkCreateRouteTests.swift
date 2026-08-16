@@ -230,7 +230,6 @@ private func withNetworkRouteApp(
     }) { app in
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
-        regexRouter.installMiddleware(on: app)
         try app.register(collection: NetworkCreateRoute(client: client))
         try await test(app)
     }

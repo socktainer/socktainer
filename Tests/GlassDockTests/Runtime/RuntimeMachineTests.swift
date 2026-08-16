@@ -147,6 +147,7 @@ struct RuntimeMachineTests {
                 "--bind-source", fixture.configuration.bindSource.path,
                 "--excluded-bind-source", fixture.configuration.stateDirectory.path,
                 "--control-socket", runtimeDirectory.appendingPathComponent("vsock/1025.sock").path,
+                "--tcp-relay-socket", runtimeDirectory.appendingPathComponent("vsock/1026.sock").path,
                 "--console-log", runtimeDirectory.appendingPathComponent("console.log").path,
                 "--cpus", "4",
                 "--memory-mib", "1024",
