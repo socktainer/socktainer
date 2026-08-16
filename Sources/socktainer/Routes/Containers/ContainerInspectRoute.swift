@@ -52,7 +52,14 @@ extension ContainerInspectRoute {
             }
 
             guard let container = try await client.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "Container not found")
+                // Docker phrasing ("No such container: <id>") is load-bearing, not
+                // cosmetic: the Supabase CLI's `legacyIsContainerNotFoundMessage`
+                // (and docker-py's ImageNotFound-style handling elsewhere in this
+                // codebase) pattern-matches on this exact text to distinguish a
+                // fresh-install "doesn't exist yet" from a real failure. A generic
+                // "Container not found" doesn't match, so callers propagate it as a
+                // hard error instead of proceeding to create the container.
+                throw Abort(.notFound, reason: "No such container: \(id)")
             }
 
             let exposedPorts = Dictionary(
