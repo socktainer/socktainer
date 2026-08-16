@@ -52,7 +52,9 @@ xcrun stapler staple "$app_path"
 xcrun stapler validate "$app_path"
 
 notarized_archive="${archive_path%.zip}-notarized.zip"
-ditto -c -k --keepParent "$app_path" "$notarized_archive"
+# Keep the notarized archive free of macOS resource-fork sidecars (._*), which
+# would be treated as unsigned files inside the extracted app bundle.
+ditto -c -k --norsrc --keepParent "$app_path" "$notarized_archive"
 echo "Prepared notarized archive:"
 echo "$notarized_archive"
 shasum -a 256 "$notarized_archive"
