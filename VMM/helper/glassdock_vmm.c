@@ -1,4 +1,4 @@
-// Copyright 2026 Socktainer contributors
+// Copyright 2026 Glass Dock contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "libkrun.h"

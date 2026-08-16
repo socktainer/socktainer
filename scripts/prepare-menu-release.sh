@@ -5,7 +5,7 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "$0")/.." && pwd)"
 version=""
 build_number=""
-signing_identity="${SOCKTAINER_SIGNING_IDENTITY:-}"
+signing_identity="${GLASSDOCK_SIGNING_IDENTITY:-}"
 
 usage() {
     echo "Usage: $0 --version VERSION --build BUILD [--identity SHA1_OR_NAME]" >&2

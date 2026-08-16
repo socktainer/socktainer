@@ -2,7 +2,7 @@ import ContainerResource
 import Foundation
 
 enum AppleContainerTimestampResolver {
-    static let legacyCreationTimestampLabel = "io.github.socktainer.creation-timestamp"
+    static let creationTimestampLabel = "io.github.glassdock.creation-timestamp"
 
     private static let appSupportURL = URL(
         fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container"
@@ -16,18 +16,18 @@ enum AppleContainerTimestampResolver {
             return bundleCreationDate
         }
 
-        return legacyLabelCreationDate(from: container.configuration.labels)
+        return labelCreationDate(from: container.configuration.labels)
     }
 
     static func networkCreationDate(_ networkResource: NetworkResource) -> Date? {
         if networkResource.configuration.creationDate > epoch {
             return networkResource.configuration.creationDate
         }
-        return legacyLabelCreationDate(from: networkResource.configuration.labels.dictionary)
+        return labelCreationDate(from: networkResource.configuration.labels.dictionary)
     }
 
-    static func legacyLabelCreationDate(from labels: [String: String]) -> Date? {
-        guard let timestampString = labels[legacyCreationTimestampLabel] else {
+    static func labelCreationDate(from labels: [String: String]) -> Date? {
+        guard let timestampString = labels[creationTimestampLabel] else {
             return nil
         }
 

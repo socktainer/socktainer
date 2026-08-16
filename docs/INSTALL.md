@@ -7,7 +7,7 @@ it does not contain the VMM, network helper, kernel, or guest root disk.
 ## Install
 
 1. Download `glassdock-<version>-macos-arm64.pkg` and `SHA256SUMS` from the same
-   [GitHub release](https://github.com/socktainer/socktainer/releases).
+   [GitHub release](https://github.com/naaiyy/glassdock/releases).
 2. Verify the download:
 
    ```bash

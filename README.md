@@ -6,7 +6,7 @@
 > [!NOTE]
 > `glassdock` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
 >
-> Progress is tracked in [#14](https://github.com/socktainer/socktainer/issues/14) and [#90](https://github.com/socktainer/socktainer/issues/90).
+> Progress is tracked in [#14](https://github.com/naaiyy/glassdock/issues/14) and [#90](https://github.com/naaiyy/glassdock/issues/90).
 
 <!--toc:start-->
 
@@ -156,7 +156,7 @@ brew install glassdock --HEAD
 
 ### GitHub Releases
 
-Download Glass Dock from the current [releases page](https://github.com/socktainer/socktainer/releases). Ensure the binary has execute permissions (`+x`) before running it.
+Download Glass Dock from the current [releases page](https://github.com/naaiyy/glassdock/releases). Ensure the binary has execute permissions (`+x`) before running it.
 
 ---
 
@@ -337,7 +337,7 @@ extension.
 
 When passing I/O to `ContainerClient.createProcess(stdio:)` or `ContainerClient.bootstrap(id:stdio:)`, **do not use Foundation's `Pipe()`**. Use `StdioPipes` from `Sources/GlassDock/Utilities/DockerConnectionUtility.swift` instead.
 
-**Background**: on Unix, every open file/socket/pipe is identified by a small integer called a *file descriptor* (fd). Apple's APIs dup the fds you pass into the container and then **immediately close your originals**. Foundation's `Pipe` doesn't know this happened — when it's eventually garbage-collected, it tries to `close()` the same fd number again. By then, that number may have been recycled for a NIO HTTP socket, so the double-close silently kills an active connection, corrupting the event loop and causing hard-to-reproduce crashes under concurrent load (issue [#107](https://github.com/socktainer/socktainer/issues/107)).
+**Background**: on Unix, every open file/socket/pipe is identified by a small integer called a *file descriptor* (fd). Apple's APIs dup the fds you pass into the container and then **immediately close your originals**. Foundation's `Pipe` doesn't know this happened — when it's eventually garbage-collected, it tries to `close()` the same fd number again. By then, that number may have been recycled for a NIO HTTP socket, so the double-close silently kills an active connection, corrupting the event loop and causing hard-to-reproduce crashes under concurrent load (issue [#107](https://github.com/naaiyy/glassdock/issues/107)).
 
 `StdioPipes` centralises allocation, EMFILE validation, and cleanup:
 
@@ -425,8 +425,8 @@ rules. Do not compare result values from different machines.
 Join the Glass Dock community to ask questions, share ideas, or get help:
 
 - **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users
-- **GitHub Discussions**: [current repository discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
-- **GitHub Issues**: [current repository issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
+- **GitHub Discussions**: [current repository discussions](https://github.com/naaiyy/glassdock/discussions) – ask questions or propose features
+- **GitHub Issues**: [current repository issues](https://github.com/naaiyy/glassdock/issues) – report bugs or request features
 
 ## License 📄
 

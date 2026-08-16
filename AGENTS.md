@@ -8,7 +8,7 @@ Glass Dock is a Swift CLI/daemon that exposes a **Docker-compatible REST API** o
 
 - **Target platform**: macOS on Apple Silicon (arm64) only
 - **API compatibility**: [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml)
-- **Repository**: <https://github.com/socktainer/socktainer>
+- **Repository**: <https://github.com/naaiyy/glassdock>
 - **License**: Apache 2.0
 
 ## Skills

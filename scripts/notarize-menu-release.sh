@@ -36,9 +36,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$approval" != "FINAL-APPROVAL" || "${SOCKTAINER_RELEASE_APPROVED:-}" != "YES" ]]; then
+if [[ "$approval" != "FINAL-APPROVAL" || "${GLASSDOCK_RELEASE_APPROVED:-}" != "YES" ]]; then
     echo "Error: notarization needs separate final approval." >&2
-    echo "After approval, set SOCKTAINER_RELEASE_APPROVED=YES and pass --approval FINAL-APPROVAL." >&2
+    echo "After approval, set GLASSDOCK_RELEASE_APPROVED=YES and pass --approval FINAL-APPROVAL." >&2
     exit 1
 fi
 if [[ ! -f "$archive_path" || ! -d "$app_path" || -z "$keychain_profile" ]]; then

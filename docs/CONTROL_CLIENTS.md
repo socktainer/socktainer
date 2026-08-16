@@ -56,9 +56,9 @@ The daemon is a foreground Swift and Vapor process. It:
 
 Its command options are `--version`, `--[no-]docker-context`, and
 `--volume-sync`. The volume sync values are `fsync`, `full`, and `nosync`.
-`SOCKTAINER_ENGINE_STATE_DIRECTORY` can replace the engine state location.
-`SOCKTAINER_HOST_HOME_DIRECTORY` can replace the exported host home.
-`SOCKTAINER_VOLUME_DIRECTORY` can replace the volume location. The managed
+`GLASSDOCK_ENGINE_STATE_DIRECTORY` can replace the engine state location.
+`GLASSDOCK_HOST_HOME_DIRECTORY` can replace the exported host home.
+`GLASSDOCK_VOLUME_DIRECTORY` can replace the volume location. The managed
 LaunchAgent uses the defaults and lets the daemon create the Docker context.
 
 The package installer puts the daemon and helpers in `/opt/glassdock`. Homebrew
@@ -170,7 +170,7 @@ make publishing-validate APP_RELEASE_VERSION=1.3.0
 
 The release target finds one Developer ID Application identity in the login
 keychain. If more than one identity exists, pass its SHA-1 value with
-`SOCKTAINER_SIGNING_IDENTITY`. The target enables Hardened Runtime, requests a
+`GLASSDOCK_SIGNING_IDENTITY`. The target enables Hardened Runtime, requests a
 secure timestamp, verifies the signature, creates a ZIP with `ditto`, and
 checks the archive. It does not contact Apple's notary service.
 
@@ -209,7 +209,7 @@ The repository has a production icon source, a privacy manifest, minimal menu
 app entitlements, a Developer ID release builder, a notarization script, and
 Raycast Store metadata. See [publishing preparation](PUBLISHING_PREPARATION.md).
 
-The notarization script requires both `SOCKTAINER_RELEASE_APPROVED=YES` and the
+The notarization script requires both `GLASSDOCK_RELEASE_APPROVED=YES` and the
 literal `--approval FINAL-APPROVAL` argument. Do not supply these values until
 the user gives separate final approval.
 

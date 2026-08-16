@@ -82,6 +82,7 @@ help:
 	@echo "  test             - Run tests"
 	@echo "  integration      - Run live Docker lifecycle integration tests"
 	@echo "  benchmark-preflight - Validate runtime benchmark configuration"
+	@echo "  benchmark-tools-test - Test benchmark tool install/uninstall plans"
 	@echo "  benchmark        - Run the configured runtime benchmark matrix"
 	@echo "  fmt              - Format source code"
 	@echo "  clean            - Clean build artifacts"
@@ -141,6 +142,10 @@ benchmark-preflight:
 .PHONY: benchmark-test
 benchmark-test:
 	@bash scripts/tests/benchmark-runtime-parser-test.sh
+
+.PHONY: benchmark-tools-test
+benchmark-tools-test:
+	@sh scripts/tests/benchmark-tools-test.sh
 
 .PHONY: benchmark-discover
 benchmark-discover:
@@ -215,7 +220,7 @@ release-tools-test:
 
 .PHONY: shellcheck
 shellcheck:
-	@shellcheck scripts/release/*.sh scripts/tests/release-tools-test.sh \
+	@shellcheck scripts/benchmark-tools.sh scripts/release/*.sh scripts/tests/benchmark-tools-test.sh scripts/tests/release-tools-test.sh \
 		pkginstaller/tests/*.sh VMM/scripts/*.sh
 	@shellcheck -x Guest/scripts/*.sh
 	@shellcheck -s bash pkginstaller/Resources/glassdock.in \

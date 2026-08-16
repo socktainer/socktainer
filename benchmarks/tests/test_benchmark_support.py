@@ -21,7 +21,7 @@ from benchmark_support import (  # noqa: E402
 
 class ScheduleTests(unittest.TestCase):
     def test_five_products_balance_position_and_carryover(self):
-        products = ["socktainer", "dory", "docker-stable", "docker-vmm", "orbstack"]
+        products = ["glassdock", "dory", "docker-stable", "docker-vmm", "orbstack"]
         sequences = balanced_sequences(products, seed=73)
 
         self.assertEqual(len(sequences), 10)

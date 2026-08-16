@@ -1,4 +1,4 @@
-#include "socktainer_ping_gateway.h"
+#include "glassdock_ping_gateway.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -49,7 +49,7 @@ typedef struct {
 } st_buffer_t;
 
 struct st_connection {
-    struct socktainer_ping_gateway *gateway;
+    struct glassdock_ping_gateway *gateway;
     st_connection_t *next;
     st_connection_t *reap_next;
     st_endpoint_t client_endpoint;
@@ -72,7 +72,7 @@ struct st_connection {
     st_buffer_t backend_to_client;
 };
 
-struct socktainer_ping_gateway {
+struct glassdock_ping_gateway {
     int listener_fd;
     int kqueue_fd;
     int control_read_fd;
@@ -146,7 +146,7 @@ static int st_make_nonblocking_socket(void) {
 }
 
 static bool st_set_event(
-    socktainer_ping_gateway_t *gateway,
+    glassdock_ping_gateway_t *gateway,
     int descriptor,
     int16_t filter,
     uint16_t flags,
@@ -353,7 +353,7 @@ static int st_classify_ping(const unsigned char *bytes, size_t length) {
 }
 
 static void st_unlink_connection(st_connection_t *connection) {
-    socktainer_ping_gateway_t *gateway = connection->gateway;
+    glassdock_ping_gateway_t *gateway = connection->gateway;
     st_connection_t **cursor = &gateway->connections;
     while (*cursor != NULL && *cursor != connection) {
         cursor = &(*cursor)->next;
@@ -393,7 +393,7 @@ static void st_close_connection(st_connection_t *connection) {
     connection->gateway->reap = connection;
 }
 
-static void st_reap_connections(socktainer_ping_gateway_t *gateway) {
+static void st_reap_connections(glassdock_ping_gateway_t *gateway) {
     st_connection_t *connection = gateway->reap;
     gateway->reap = NULL;
     while (connection != NULL) {
@@ -508,7 +508,7 @@ static void st_write_from_buffer(st_connection_t *connection, int descriptor, st
 }
 
 static bool st_start_backend(st_connection_t *connection) {
-    socktainer_ping_gateway_t *gateway = connection->gateway;
+    glassdock_ping_gateway_t *gateway = connection->gateway;
     int descriptor = st_make_nonblocking_socket();
     if (descriptor < 0) {
         return false;
@@ -690,7 +690,7 @@ static void st_handle_proxy_event(st_connection_t *connection, st_endpoint_side_
     st_update_proxy_events(connection);
 }
 
-static void st_accept_connections(socktainer_ping_gateway_t *gateway) {
+static void st_accept_connections(glassdock_ping_gateway_t *gateway) {
     while (gateway->connection_count < gateway->max_connections) {
         int descriptor = accept(gateway->listener_fd, NULL, NULL);
         if (descriptor < 0) {
@@ -733,7 +733,7 @@ static void st_accept_connections(socktainer_ping_gateway_t *gateway) {
     }
 }
 
-static void st_expire_headers(socktainer_ping_gateway_t *gateway) {
+static void st_expire_headers(glassdock_ping_gateway_t *gateway) {
     uint64_t now = st_now_milliseconds();
     st_connection_t *connection = gateway->connections;
     while (connection != NULL) {
@@ -751,7 +751,7 @@ static void st_expire_headers(socktainer_ping_gateway_t *gateway) {
     }
 }
 
-static void st_close_all_connections(socktainer_ping_gateway_t *gateway) {
+static void st_close_all_connections(glassdock_ping_gateway_t *gateway) {
     while (gateway->connections != NULL) {
         st_close_connection(gateway->connections);
     }
@@ -759,7 +759,7 @@ static void st_close_all_connections(socktainer_ping_gateway_t *gateway) {
 }
 
 static void *st_event_loop(void *context) {
-    socktainer_ping_gateway_t *gateway = context;
+    glassdock_ping_gateway_t *gateway = context;
     struct kevent events[ST_EVENT_BATCH];
     while (!atomic_load_explicit(&gateway->stopping, memory_order_acquire)) {
         int count = kevent(gateway->kqueue_fd, NULL, 0, events, ST_EVENT_BATCH, NULL);
@@ -869,7 +869,7 @@ static bool st_valid_header_value(const char *value) {
     return value != NULL && strchr(value, '\r') == NULL && strchr(value, '\n') == NULL;
 }
 
-static void st_cleanup_gateway(socktainer_ping_gateway_t *gateway) {
+static void st_cleanup_gateway(glassdock_ping_gateway_t *gateway) {
     if (gateway == NULL) {
         return;
     }
@@ -893,8 +893,8 @@ static void st_cleanup_gateway(socktainer_ping_gateway_t *gateway) {
     free(gateway);
 }
 
-socktainer_ping_gateway_t *socktainer_ping_gateway_start(
-    const socktainer_ping_gateway_config_t *config,
+glassdock_ping_gateway_t *glassdock_ping_gateway_start(
+    const glassdock_ping_gateway_config_t *config,
     char *error_buffer,
     size_t error_buffer_size
 ) {
@@ -904,7 +904,7 @@ socktainer_ping_gateway_t *socktainer_ping_gateway_start(
         st_set_error(error_buffer, error_buffer_size, "Invalid gateway configuration");
         return NULL;
     }
-    socktainer_ping_gateway_t *gateway = calloc(1, sizeof(*gateway));
+    glassdock_ping_gateway_t *gateway = calloc(1, sizeof(*gateway));
     if (gateway == NULL) {
         st_set_errno_error(error_buffer, error_buffer_size, "Allocate gateway");
         return NULL;
@@ -1016,7 +1016,7 @@ socktainer_ping_gateway_t *socktainer_ping_gateway_start(
     return gateway;
 }
 
-void socktainer_ping_gateway_stop(socktainer_ping_gateway_t *gateway) {
+void glassdock_ping_gateway_stop(glassdock_ping_gateway_t *gateway) {
     if (gateway == NULL) {
         return;
     }

@@ -164,7 +164,7 @@ struct NetworkCreationDateTests {
     func fallsBackToLegacyLabel() throws {
         let labelTimestamp = 1_600_000_000.0
         let resource = try makeNetworkResourceWithDate(
-            labels: [AppleContainerTimestampResolver.legacyCreationTimestampLabel: "\(labelTimestamp)"],
+            labels: [AppleContainerTimestampResolver.creationTimestampLabel: "\(labelTimestamp)"],
             creationDate: Date(timeIntervalSince1970: 0)
         )
         let result = AppleContainerTimestampResolver.networkCreationDate(resource)
@@ -182,7 +182,7 @@ struct NetworkCreationDateTests {
     func doesNotUseLabelWhenDateIsValid() throws {
         let configDate = Date(timeIntervalSince1970: 1_700_000_000)
         let resource = try makeNetworkResourceWithDate(
-            labels: [AppleContainerTimestampResolver.legacyCreationTimestampLabel: "1600000000"],
+            labels: [AppleContainerTimestampResolver.creationTimestampLabel: "1600000000"],
             creationDate: configDate
         )
         let result = AppleContainerTimestampResolver.networkCreationDate(resource)

@@ -179,7 +179,7 @@ struct RuntimeMachineTests {
     func rejectsUnsupportedResources(cpuCount: Int, memoryBytes: UInt64) {
         #expect(throws: RuntimeMachineError.self) {
             _ = try RuntimeMachineConfiguration(
-                helperExecutable: URL(fileURLWithPath: "/tmp/socktainer-vmm"),
+                helperExecutable: URL(fileURLWithPath: "/tmp/glassdock-vmm"),
                 stateDirectory: URL(fileURLWithPath: "/private/state", isDirectory: true),
                 kernel: URL(fileURLWithPath: "/tmp/kernel"),
                 rootDisk: URL(fileURLWithPath: "/tmp/root.ext4"),

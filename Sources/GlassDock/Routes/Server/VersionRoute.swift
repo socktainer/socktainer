@@ -10,7 +10,7 @@ struct VersionRoute: RouteCollection {
             let version = VersionInfo(
                 Platform: ServerPlatform(Name: "glassdock"),
                 // NOTE: For the time being, we will report glassdock's version as a component
-                //       https://github.com/socktainer/socktainer/pull/28#issuecomment-3318209340
+                //       https://github.com/naaiyy/glassdock/pull/28#issuecomment-3318209340
                 Components: [Component(Name: "glassdock", Version: getBuildVersion())],
                 // NOTE: Some libraries may require a higher SemVer version compared to Glass Dock's actual version
                 //       https://github.com/testcontainers/testcontainers-java/blob/51219646dca72ad267e575bf25d0b60208c60b42/core/src/main/java/org/testcontainers/DockerClientFactory.java#L272

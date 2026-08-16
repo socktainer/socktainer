@@ -32,11 +32,11 @@ code or require a general benchmark framework.
 
 CPU hashing and cached bind read remain as diagnostic measurements from the
 existing suite. Their result rows have `optimizationGoal: false`. Do not use
-them to select Socktainer optimization work.
+them to select Glass Dock optimization work.
 
 ## Commands
 
-Build Socktainer and its guest artifacts first. Then inspect availability:
+Build Glass Dock and its guest artifacts first. Then inspect availability:
 
 ```sh
 make release guest-image vmm
@@ -66,7 +66,7 @@ Run a dry run, and then explicitly permit the reviewed resets:
 ```sh
 scripts/benchmark-runtime.sh \
   --config /path/to/products.local.sh \
-  --products socktainer,dory,orbstack \
+  --products glassdock,dory,orbstack \
   --samples 6 \
   --seed 73 \
   --allow-unmatched-resources \
@@ -74,7 +74,7 @@ scripts/benchmark-runtime.sh \
 
 scripts/benchmark-runtime.sh \
   --config /path/to/products.local.sh \
-  --products socktainer,dory,orbstack \
+  --products glassdock,dory,orbstack \
   --samples 6 \
   --seed 73 \
   --allow-external-reset \
@@ -94,6 +94,26 @@ Docker Desktop **Settings > General**, run a complete campaign with the matching
 declared product, select the other mode, and repeat the same seed and settings.
 Treat the two campaigns as separate cohorts. Do not describe them as one
 position-balanced five-product run.
+
+## External tool lifecycle
+
+The harness stops benchmark processes and removes only containers labeled with
+the current run ID. It does not uninstall Docker Desktop, Dory, or OrbStack
+during a run. This keeps benchmark cleanup separate from application and user
+data cleanup.
+
+Use the lifecycle helper when you want to install or remove external benchmark
+applications between campaigns. It prints a dry-run plan by default:
+
+```sh
+scripts/benchmark-tools.sh --action install --products dory,orbstack
+scripts/benchmark-tools.sh --action uninstall --products dory,orbstack --apply
+```
+
+The helper uses Homebrew casks and does not remove application data. It refuses
+to remove Docker Desktop when it finds an EasyLink container in any Docker
+context. Keep Docker Desktop installed while EasyLink uses it. Do not pass
+`--apply` until you have reviewed the printed commands.
 
 ## Suites
 

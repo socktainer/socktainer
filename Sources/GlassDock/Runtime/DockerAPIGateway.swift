@@ -32,7 +32,7 @@ final class DockerAPIGateway: @unchecked Sendable {
             configuration.backendSocketPath.withCString { backendPath in
                 configuration.apiVersion.withCString { apiVersion in
                     configuration.builderVersion.withCString { builderVersion in
-                        var cConfiguration = socktainer_ping_gateway_config_t(
+                        var cConfiguration = glassdock_ping_gateway_config_t(
                             public_socket_path: publicPath,
                             backend_socket_path: backendPath,
                             api_version: apiVersion,
@@ -41,7 +41,7 @@ final class DockerAPIGateway: @unchecked Sendable {
                             max_connections: configuration.maxConnections,
                             header_timeout_milliseconds: configuration.headerTimeoutMilliseconds
                         )
-                        return socktainer_ping_gateway_start(
+                        return glassdock_ping_gateway_start(
                             &cConfiguration,
                             &error,
                             error.count
@@ -66,7 +66,7 @@ final class DockerAPIGateway: @unchecked Sendable {
             defer { handle = nil }
             return handle
         }
-        socktainer_ping_gateway_stop(current)
+        glassdock_ping_gateway_stop(current)
     }
 
     deinit {
