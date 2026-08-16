@@ -400,6 +400,61 @@ struct CapabilityValidationTests {
     }
 }
 
+/// Regression tests for issue #361: `HostConfig.Privileged` was decoded but never
+/// consulted, so `docker run --privileged` (and buildx's docker-container driver,
+/// which creates its buildkit container with `Privileged: true` rather than
+/// `CapAdd`) silently ran without the capabilities buildkitd needs to rbind-mount
+/// its build context.
+@Suite("ContainerCreateRoute.requestedCapAdd")
+struct PrivilegedCapAddTests {
+
+    private func decodeHostConfig(_ json: String) -> HostConfig {
+        try! JSONDecoder().decode(HostConfig.self, from: Data(json.utf8))
+    }
+
+    @Test("Privileged with no CapAdd grants ALL, matching ClientBuilderService's own builder container")
+    func privilegedGrantsAll() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["ALL"])
+    }
+
+    @Test("Privileged alongside an explicit CapAdd list still grants ALL")
+    func privilegedWithExplicitCapAddStillGrantsAll() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true,"CapAdd":["NET_ADMIN"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["NET_ADMIN", "ALL"])
+    }
+
+    @Test("Privileged with CapAdd already containing ALL does not duplicate it")
+    func privilegedWithAllAlreadyPresentIsNotDuplicated() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true,"CapAdd":["ALL"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["ALL"])
+    }
+
+    @Test("Privileged false leaves CapAdd untouched")
+    func nonPrivilegedLeavesCapAddUntouched() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":false,"CapAdd":["NET_ADMIN"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["NET_ADMIN"])
+    }
+
+    @Test("No HostConfig yields no capabilities")
+    func nilHostConfigYieldsEmpty() {
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: nil) == [])
+    }
+
+    @Test("A privileged create request reaches the image stage instead of being rejected")
+    func privilegedCreateRequestReachesImageStage() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=privileged",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Privileged":true}}"#)
+            ) { res async in
+                expectReachedImageStage(res)
+            }
+        }
+    }
+}
+
 @Suite("ContainerCreateRoute.vCpus")
 struct VCpusConversionTests {
 
