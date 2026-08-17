@@ -424,7 +424,9 @@ extension ContainerAttachRoute {
         let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
         guard let currentContainer = try await client.getContainer(id: container.id) else {
-            throw Abort(.notFound, reason: "Container not found")
+            // Docker phrasing ("No such container: <id>") is load-bearing — see the
+            // matching comment in ContainerInspectRoute.
+            throw Abort(.notFound, reason: "No such container: \(container.id)")
         }
 
         // NOTE: For true docker run -it behavior, we need to control the main process stdio,

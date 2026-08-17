@@ -99,7 +99,7 @@ extension ContainerCreateRoute {
             let normalizedCapabilities: (capAdd: [String], capDrop: [String])
             do {
                 normalizedCapabilities = try Parser.capabilities(
-                    capAdd: body.HostConfig?.CapAdd ?? [],
+                    capAdd: ContainerCreateRoute.requestedCapAdd(hostConfig: body.HostConfig),
                     capDrop: body.HostConfig?.CapDrop ?? [])
             } catch {
                 throw Abort(.badRequest, reason: "invalid capability: \(error)")
@@ -794,6 +794,19 @@ extension ContainerCreateRoute {
             name: container.id,
             labels: LabelNormalization.restore(container.configuration.labels)
         )
+    }
+
+    /// Docker's `--privileged` has no direct Apple Containerization equivalent; granting
+    /// every capability (the same "ALL" grant `ClientBuilderService` already uses for its
+    /// own builder container) is what actually unblocks the rbind mounts buildx's
+    /// docker-container driver needs (issue #361) — `Privileged` was previously decoded
+    /// but never consulted anywhere, so it was silently dropped.
+    static func requestedCapAdd(hostConfig: HostConfig?) -> [String] {
+        var capAdd = hostConfig?.CapAdd ?? []
+        if hostConfig?.Privileged == true, !capAdd.contains(where: { $0.uppercased() == "ALL" }) {
+            capAdd.append("ALL")
+        }
+        return capAdd
     }
 
     /// Mirrors moby's daemon_unix.go cpu subsystem checks (v28.5.2): NanoCpus and the CFS
