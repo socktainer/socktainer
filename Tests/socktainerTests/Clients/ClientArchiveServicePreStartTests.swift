@@ -186,6 +186,44 @@ struct ClientArchiveServicePreStartTests {
         #expect(try String(contentsOf: hostname, encoding: .utf8) == "web\n")
     }
 
+    @Test("a file archive is exactly one basename entry, like moby — no ./ directory entry")
+    func singleEntryTarForFile() async throws {
+        let fixture = PreStartFixture()
+        defer { fixture.cleanUp() }
+
+        try fixture.writeSnapshot(digest: "abc123", files: ["/etc/passwd": "root:x:0:0:root\n"])
+        try fixture.writeRuntimeConfig(containerId: "web", snapshotDigest: "abc123")
+        let container = try fixture.makeContainer(id: "web")
+
+        let (tarData, _) = try await fixture.service.getArchive(container: container, path: "/etc/passwd")
+
+        // Regression guard for the OpenShell first-entry bug: the tar must
+        // contain exactly one entry named after the basename — the previous
+        // directory-wrapped form ("./" entry first) made first-entry
+        // consumers extract an empty directory instead of the file.
+        let entries = try fixture.tarEntries(tarData)
+        #expect(entries.count == 1)
+        #expect(entries[0].path == "passwd")
+        #expect(entries[0].type == .regular)
+    }
+
+    @Test("a symlink archive is exactly one symlink entry, like moby")
+    func singleEntryTarForSymlink() async throws {
+        let fixture = PreStartFixture()
+        defer { fixture.cleanUp() }
+
+        try fixture.writeSnapshot(digest: "abc123", files: ["/etc/passwd": "root:x:0:0:root\n"], links: ["/etc/passwd-link": "/etc/passwd"])
+        try fixture.writeRuntimeConfig(containerId: "web", snapshotDigest: "abc123")
+        let container = try fixture.makeContainer(id: "web")
+
+        let (tarData, _) = try await fixture.service.getArchive(container: container, path: "/etc/passwd-link")
+
+        let entries = try fixture.tarEntries(tarData)
+        #expect(entries.count == 1)
+        #expect(entries[0].path == "passwd-link")
+        #expect(entries[0].type == .symbolicLink)
+    }
+
     @Test("a symlink in the snapshot is served as a symlink, dangling included")
     func symlinkFromSnapshot() async throws {
         let fixture = PreStartFixture()
@@ -350,6 +388,19 @@ private struct PreStartFixture {
             stream.close()
         }
         try formatter.close()
+    }
+
+    /// Parse a tar's entries (path + file type) via ArchiveReader — unlike
+    /// filesystem extraction this sees the raw entry list, so it can assert
+    /// there is no leading "./" directory entry.
+    func tarEntries(_ data: Data) throws -> [(path: String, type: URLFileResourceType)] {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("entries-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tarPath = dir.appendingPathComponent("archive.tar")
+        try data.write(to: tarPath)
+        let reader = try ArchiveReader(file: tarPath)
+        return reader.makeStreamingIterator().map { entry, _ in (entry.path ?? "", entry.fileType) }
     }
 
     func extractTar(_ data: Data) throws -> URL {
