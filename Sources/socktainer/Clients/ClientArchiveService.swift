@@ -223,13 +223,43 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try? FileManager.default.removeItem(at: tarPath)
         }
 
-        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        let baseName = (normalizedPath as NSString).lastPathComponent
 
-        // Extract the requested path to the staging directory
-        try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+        if inode.isDirectory {
+            // Directories: stage the subtree, then archive it. Entries are
+            // `./`-prefixed — accepted by docker cp.
+            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-        // Create tar archive from the staging directory
-        try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+            // Extract the requested path to the staging directory
+            try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+
+            // Create tar archive from the staging directory
+            try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+        } else {
+            // Single file or symlink: emit exactly one tar entry named after
+            // the basename, matching moby's archivePath output (no `./`
+            // directory entry). The directory-wrapped form breaks consumers
+            // that take the first tar entry as the payload
+            let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: tarPath)
+            let entry = WriteEntry(writer)
+            entry.path = baseName
+            entry.fileType = inode.isRegularFile ? .regular : .symbolicLink
+            entry.permissions = inode.permissions
+            entry.owner = inode.fullUid
+            entry.group = inode.fullGid
+            entry.modificationDate = Date(timeIntervalSince1970: TimeInterval(inode.mtime))
+            if inode.isSymlink {
+                entry.symlinkTarget = readSymlinkTarget(reader: reader, path: normalizedPath)
+            }
+            let data = inode.isRegularFile ? try reader.readFile(at: FilePath(normalizedPath)) : nil
+            if let data {
+                entry.size = Int64(data.count)
+                try writer.writeEntry(entry: entry, data: data)
+            } else {
+                try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
+            }
+            try writer.finishEncoding()
+        }
 
         // Read the tar data
         let tarData = try Data(contentsOf: tarPath)
