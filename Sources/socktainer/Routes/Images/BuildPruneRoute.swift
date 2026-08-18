@@ -53,6 +53,15 @@ struct BuildPruneRoute: RouteCollection {
                 logger: logger
             )
 
+            // moby's BuildPrune emits a single aggregate `builder prune` event (no
+            // per-cache-entry events), mirroring the volume/network prune events above.
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(
+                    DockerEvent.make(
+                        type: "builder", action: "prune", actorID: "",
+                        attributes: ["reclaimed": String(result.spaceReclaimed)]))
+            }
+
             return RESTBuildPruneResponse(
                 CachesDeleted: result.deletedCaches.isEmpty ? nil : result.deletedCaches,
                 SpaceReclaimed: result.spaceReclaimed
