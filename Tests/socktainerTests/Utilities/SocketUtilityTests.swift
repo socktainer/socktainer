@@ -98,7 +98,9 @@ struct SocketUtilityPermissionsTests {
 
     private func boundUnixSocket(at path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        try #require(fd >= 0)
+        guard fd >= 0 else {
+            throw POSIXError(.EIO)
+        }
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
