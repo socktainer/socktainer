@@ -201,9 +201,10 @@ extension ContainerWaitRoute {
 
         for await event in events {
             guard event.Type == "container", event.Action == "die" else { continue }
-            guard event.Actor.ID == containerId
-                || event.Actor.ID.hasPrefix(containerId)
-                || event.Actor.Attributes["name"] == containerId
+            guard
+                event.Actor.ID == containerId
+                    || event.Actor.ID.hasPrefix(containerId)
+                    || event.Actor.Attributes["name"] == containerId
             else { continue }
 
             if let exitCode = event.Actor.Attributes["exitCode"], let code = Int64(exitCode) {
