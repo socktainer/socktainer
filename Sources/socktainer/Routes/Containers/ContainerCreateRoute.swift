@@ -654,12 +654,24 @@ extension ContainerCreateRoute {
 
             containerConfiguration.mounts = resolvedMounts
 
-            if let memoryBytes = resolveMemoryInBytes(body.HostConfig?.Memory) {
+            // Fall back to Apple Container's own `[container]` configuration when the
+            // request carries no explicit limits, so `container system property set
+            // container.cpus` / `container.memory` applies to containers created through
+            // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
+            let configuredDefaults = await ContainerResourceDefaults.shared.current(logger: req.logger)
+
+            if let memoryBytes = ContainerResourceResolution.memoryInBytes(
+                requested: body.HostConfig?.Memory,
+                configured: configuredDefaults
+            ) {
                 containerConfiguration.resources.memoryInBytes = memoryBytes
             }
 
-            if let nanoCpus = body.HostConfig?.NanoCpus, nanoCpus > 0 {
-                containerConfiguration.resources.cpus = ContainerCreateRoute.vCpus(fromNanoCpus: nanoCpus)
+            if let cpus = ContainerResourceResolution.cpus(
+                requestedNanoCpus: body.HostConfig?.NanoCpus,
+                configured: configuredDefaults
+            ) {
+                containerConfiguration.resources.cpus = cpus
             }
 
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
