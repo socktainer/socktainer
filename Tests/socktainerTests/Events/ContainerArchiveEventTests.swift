@@ -145,7 +145,7 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
         URL(fileURLWithPath: "/nonexistent/rootfs.ext4")
     }
 
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
         if case .failure(let error) = getResult { throw error }
         return (
             Data("fake-tar".utf8),

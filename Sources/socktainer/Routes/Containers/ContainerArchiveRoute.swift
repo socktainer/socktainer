@@ -58,7 +58,7 @@ struct ContainerArchiveRoute: RouteCollection {
             }
 
             do {
-                let (tarData, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
+                let (tarData, stat) = try await archiveClient.getArchive(container: container, path: query.path)
 
                 // Create the path stat header (base64 encoded JSON)
                 let statJson = try JSONEncoder().encode(stat)
@@ -198,7 +198,7 @@ struct ContainerArchiveRoute: RouteCollection {
             }
 
             do {
-                let (_, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
+                let (_, stat) = try await archiveClient.getArchive(container: container, path: query.path)
 
                 // Create the path stat header (base64 encoded JSON)
                 let statJson = try JSONEncoder().encode(stat)
