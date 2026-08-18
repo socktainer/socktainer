@@ -159,7 +159,7 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
         URL(fileURLWithPath: "/nonexistent/rootfs.ext4")
     }
 
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
         if case .failure(let error) = getResult { throw error }
         return (
             Data("fake-tar".utf8),
@@ -167,7 +167,7 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
         )
     }
 
-    func statPath(containerId: String, path: String) async throws -> PathStat {
+    func statPath(container: ContainerSnapshot, path: String) async throws -> PathStat {
         if case .failure(let error) = statResult { throw error }
         return PathStat(name: "hosts", size: 8, mode: 0o644, mtime: "2026-01-01T00:00:00Z", linkTarget: "")
     }

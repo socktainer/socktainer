@@ -1,4 +1,7 @@
+import ContainerAPIClient
+import ContainerResource
 import ContainerizationEXT4
+import ContainerizationOCI
 import Foundation
 import SystemPackage
 import Testing
@@ -14,7 +17,7 @@ struct ClientArchiveServicePathStatTests {
         defer { fixture.cleanUp() }
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/etc/hostname": "web\n"])
 
-        let (_, stat) = try await fixture.service.getArchive(containerId: "web", path: "/etc")
+        let (_, stat) = try await fixture.service.getArchive(container: fixture.makeContainer(id: "web"), path: "/etc")
 
         #expect(stat.mode & (1 << 31) != 0)
         #expect(stat.mode & 0o777 == 0o755)
@@ -26,7 +29,7 @@ struct ClientArchiveServicePathStatTests {
         defer { fixture.cleanUp() }
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/hello.txt": "hi\n"])
 
-        let (_, stat) = try await fixture.service.getArchive(containerId: "web", path: "/hello.txt")
+        let (_, stat) = try await fixture.service.getArchive(container: fixture.makeContainer(id: "web"), path: "/hello.txt")
 
         #expect(stat.mode == 0o644)
     }
@@ -55,7 +58,7 @@ struct ClientArchiveServicePathStatTests {
         defer { fixture.cleanUp() }
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/hello.txt": "hi\n"])
 
-        let (_, stat) = try await fixture.service.getArchive(containerId: "web", path: "/hello.txt")
+        let (_, stat) = try await fixture.service.getArchive(container: fixture.makeContainer(id: "web"), path: "/hello.txt")
 
         #expect(stat.linkTarget == "")
         let encoded = try #require(String(data: try JSONEncoder().encode(stat), encoding: .utf8))
@@ -88,6 +91,22 @@ private struct PathStatFixture {
         appSupport = FileManager.default.temporaryDirectory.appendingPathComponent(
             "path-stat-test-\(UUID().uuidString)")
         service = ClientArchiveService(appSupportPath: appSupport)
+    }
+
+    /// A stopped container whose rootfs lives at the legacy per-container path.
+    func makeContainer(id: String) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [],
+            workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "busybox:latest",
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+        )
+        return ContainerSnapshot(
+            configuration: ContainerConfiguration(id: id, image: img, process: proc),
+            status: .stopped, networks: [], startedDate: nil
+        )
     }
 
     func cleanUp() {

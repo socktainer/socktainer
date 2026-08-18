@@ -1,4 +1,7 @@
+import ContainerAPIClient
+import ContainerResource
 import ContainerizationEXT4
+import ContainerizationOCI
 import Foundation
 import SystemPackage
 import Testing
@@ -14,8 +17,8 @@ struct ClientArchiveServiceStatPathTests {
         defer { fixture.cleanUp() }
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/hello.txt": "exported\n"])
 
-        let stat = try await fixture.service.statPath(containerId: "web", path: "/hello.txt")
-        let (_, viaArchive) = try await fixture.service.getArchive(containerId: "web", path: "/hello.txt")
+        let stat = try await fixture.service.statPath(container: fixture.makeContainer(id: "web"), path: "/hello.txt")
+        let (_, viaArchive) = try await fixture.service.getArchive(container: fixture.makeContainer(id: "web"), path: "/hello.txt")
 
         #expect(stat.name == viaArchive.name)
         #expect(stat.size == viaArchive.size)
@@ -29,8 +32,8 @@ struct ClientArchiveServiceStatPathTests {
         defer { fixture.cleanUp() }
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/etc/hostname": "web\n"])
 
-        let stat = try await fixture.service.statPath(containerId: "web", path: "/etc")
-        let (_, viaArchive) = try await fixture.service.getArchive(containerId: "web", path: "/etc")
+        let stat = try await fixture.service.statPath(container: fixture.makeContainer(id: "web"), path: "/etc")
+        let (_, viaArchive) = try await fixture.service.getArchive(container: fixture.makeContainer(id: "web"), path: "/etc")
 
         #expect(stat.name == viaArchive.name)
         #expect(stat.mode == viaArchive.mode)
@@ -43,7 +46,7 @@ struct ClientArchiveServiceStatPathTests {
         try fixture.writeExt4Rootfs(containerId: "web", files: ["/hello.txt": "hi\n"])
 
         do {
-            _ = try await fixture.service.statPath(containerId: "web", path: "/absent")
+            _ = try await fixture.service.statPath(container: fixture.makeContainer(id: "web"), path: "/absent")
             Issue.record("statting a path that is not there must throw")
         } catch let error as ClientArchiveError {
             guard case .pathNotFound = error else {
@@ -59,7 +62,7 @@ struct ClientArchiveServiceStatPathTests {
         defer { fixture.cleanUp() }
 
         do {
-            _ = try await fixture.service.statPath(containerId: "ghost", path: "/")
+            _ = try await fixture.service.statPath(container: fixture.makeContainer(id: "ghost"), path: "/")
             Issue.record("statting a container with no rootfs must throw")
         } catch let error as ClientArchiveError {
             guard case .rootfsNotFound = error else {
@@ -78,6 +81,22 @@ private struct StatPathFixture {
         appSupport = FileManager.default.temporaryDirectory.appendingPathComponent(
             "stat-path-test-\(UUID().uuidString)")
         service = ClientArchiveService(appSupportPath: appSupport)
+    }
+
+    /// A stopped container whose rootfs lives at the legacy per-container path.
+    func makeContainer(id: String) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [],
+            workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "busybox:latest",
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+        )
+        return ContainerSnapshot(
+            configuration: ContainerConfiguration(id: id, image: img, process: proc),
+            status: .stopped, networks: [], startedDate: nil
+        )
     }
 
     func cleanUp() {
