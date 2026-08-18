@@ -78,6 +78,7 @@ struct ContainerResourceResolutionTests {
         #expect(ContainerResourceResolution.memoryInBytes(requested: 0, configured: config) == fourGiB)
         #expect(ContainerResourceResolution.memoryInBytes(requested: -1, configured: config) == fourGiB)
         #expect(ContainerResourceResolution.cpus(requestedNanoCpus: 0, configured: config) == 6)
+        #expect(ContainerResourceResolution.cpus(requestedNanoCpus: -1, configured: config) == 6)
     }
 
     @Test("configuration left untouched when the defaults cannot be read")
