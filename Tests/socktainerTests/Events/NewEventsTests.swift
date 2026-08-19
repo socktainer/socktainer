@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerBuild
 import ContainerResource
 import ContainerizationOCI
 import Foundation
@@ -122,6 +123,41 @@ struct NewEventsTests {
         #expect(event?.Actor.Attributes["reclaimed"] == "1024")
         #expect(event?.Actor.Attributes["name"] == nil, "prune events carry no 'name' attribute")
         #expect(event?.Actor.Attributes["image"] == nil, "prune events carry no 'image' attribute")
+    }
+
+    // MARK: - builder.prune
+
+    // moby's daemon/builder/backend.PruneCache logs exactly this: Type=builder,
+    // Action=prune, empty Actor.ID, a single "reclaimed" attribute. Verified against
+    // moby master (daemon/builder/backend/backend.go).
+    @Test("build cache prune route broadcasts Type=builder Action=prune event")
+    func builderPruneEventBroadcast() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "prune" && event.Type == "builder" { return event }
+            return nil
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: BuildPruneRoute(builderClient: StubBuilderClient()))
+
+            try await app.testing().test(.POST, "/v1.51/build/prune") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let event = await withTimeout(captureTask)
+        captureTask.cancel()
+
+        #expect(event?.Type == "builder")
+        #expect(event?.Action == "prune")
+        #expect(event?.Actor.ID == "")
+        #expect(event?.Actor.Attributes["reclaimed"] == "2048")
     }
 
     @Test("container prune emits a per-container 'destroy' before the aggregate prune")
@@ -476,4 +512,15 @@ private struct StubNetworkClient: ClientNetworkProtocol {
         RESTNetworkCreate(Id: "net-abc123", Warning: "")
     }
     func delete(id: String, logger: Logger) async throws {}
+}
+
+private struct StubBuilderClient: ClientBuilderProtocol {
+    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {}
+    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+        fatalError("not exercised by this test")
+    }
+    func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
+        BuilderPruneResult(deletedCaches: ["cache-1"], spaceReclaimed: 2048)
+    }
+    func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord] { [] }
 }
