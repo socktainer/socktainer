@@ -56,6 +56,108 @@ struct ContainerRestartPolicyPostStartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
+    @Test("Every restart-policy restart reports its own exit, not just the first")
+    func consecutiveAutomaticRestartsEachEmitDie() async throws {
+        // A `die` event is claimed per run and the claim is never handed back, so a restarted
+        // container has to open a new run — otherwise the second exit finds the first run's
+        // claim still held and reports nothing, leaving `docker wait` and Compose blocked.
+        let nativeId = "restart-consecutive-die-ctr"
+        let ip = "192.168.65.70"
+        let network = "myapp_default"
+
+        let mock = RestartMock(snapshot: try makeSnapshot(nativeId: nativeId, ip: ip, network: network, restartPolicyName: "always"))
+        let broadcaster = EventBroadcaster()
+        let collector = EventCollector()
+        let stream = await broadcaster.stream()
+        let captureTask = Task {
+            for await event in stream where event.Action == "die" {
+                await collector.add(event)
+            }
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+
+            // First crash: the observer armed by /start reports it and the always-policy
+            // restarts the container, arming a fresh observer.
+            await ContainerExitCodeStore.shared.set(id: nativeId, code: 1)
+            let firstDie = try await pollUntil(timeoutSeconds: 3) { await collector.events.count >= 1 }
+            #expect(firstDie, "the first exit must be reported")
+            let restarted = try await pollUntil(timeoutSeconds: 3) { await mock.startCallCount() >= 2 }
+            #expect(restarted, "the always-policy must restart the container")
+
+            // Second crash of the restarted container.
+            await ContainerExitCodeStore.shared.remove(id: nativeId)
+            await ContainerExitCodeStore.shared.set(id: nativeId, code: 2)
+            let secondDie = try await pollUntil(timeoutSeconds: 6) { await collector.events.count >= 2 }
+            #expect(secondDie, "the restarted container's exit must be reported too")
+        }
+
+        captureTask.cancel()
+        #expect(await collector.events.compactMap { $0.Actor.Attributes["exitCode"] }.prefix(2) == ["1", "2"])
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
+    @Test("POST /restart reports the restarted container's own exit")
+    func manualRestartEmitsDieForTheNewRun() async throws {
+        // `/restart` starts a new run without going through `/start`, so it has to open its own
+        // `die` claim: the previous run's claim is never handed back, and inheriting it would
+        // leave `docker restart` followed by an exit completely silent.
+        let nativeId = "restart-route-die-ctr"
+        let ip = "192.168.65.80"
+        let network = "myapp_default"
+
+        let mock = RestartMock(snapshot: try makeSnapshot(nativeId: nativeId, ip: ip, network: network, restartPolicyName: "no"))
+        let broadcaster = EventBroadcaster()
+        let collector = EventCollector()
+        let stream = await broadcaster.stream()
+        let captureTask = Task {
+            for await event in stream where event.Action == "die" {
+                await collector.add(event)
+            }
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerStartRoute(client: mock))
+            try app.register(collection: ContainerRestartRoute(client: mock))
+
+            // First run and its exit, which claims that run's die event.
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+            await ContainerExitCodeStore.shared.set(id: nativeId, code: 1)
+            #expect(try await pollUntil(timeoutSeconds: 3) { await collector.events.count >= 1 })
+
+            // Restart, then let the restarted container exit.
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/restart") { res async in
+                #expect(res.status == .noContent)
+            }
+            await ContainerExitCodeStore.shared.set(id: nativeId, code: 5)
+            let secondDie = try await pollUntil(timeoutSeconds: 3) { await collector.events.count >= 2 }
+            #expect(secondDie, "the restarted run's exit must be reported")
+        }
+
+        captureTask.cancel()
+        #expect(await collector.events.compactMap { $0.Actor.Attributes["exitCode"] }.prefix(2) == ["1", "5"])
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
     @Test("A manual /start during the backoff window supersedes the pending automatic restart")
     func manualStartDuringBackoffSupersedesPendingRestart() async throws {
         let nativeId = "restart-race-ctr"

@@ -110,6 +110,9 @@ extension ContainerAttachWSRoute {
             }
         }
 
+        // Executing now: open a run so this exit's `die` is claimable exactly once.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
@@ -140,7 +143,8 @@ extension ContainerAttachWSRoute {
                     fallbackImage: container.configuration.image.reference,
                     fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                    broadcaster: broadcaster
+                    broadcaster: broadcaster,
+                    runEpoch: runEpoch
                 )
 
                 try? await ws.close()

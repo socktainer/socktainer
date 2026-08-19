@@ -36,5 +36,9 @@ enum ContainerAutoRemoveCleanup {
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
+        // `--rm` containers are reaped here instead of through DELETE, so this is where their
+        // die-event bookkeeping is released. It also refuses later claims: a second observer
+        // still resolving the same exit would otherwise find no record and emit another `die`.
+        await DieEventOwnership.shared.forget(id: cached?.nativeId ?? nativeId)
     }
 }

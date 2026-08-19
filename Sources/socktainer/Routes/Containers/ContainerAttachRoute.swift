@@ -331,6 +331,10 @@ extension ContainerAttachRoute {
             }
         }
 
+        // The container is executing now: open a run so this exit's `die` is claimable.
+        // `docker compose up` starts a service entirely through this path, never `POST /start`.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
         await broadcastAttach(
@@ -366,7 +370,8 @@ extension ContainerAttachRoute {
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            runEpoch: runEpoch
                         )
                     }
 
@@ -495,6 +500,9 @@ extension ContainerAttachRoute {
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
 
+        // Executing now: open a run so this exit's `die` is claimable exactly once.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
@@ -529,7 +537,8 @@ extension ContainerAttachRoute {
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            runEpoch: runEpoch
                         )
                     }
 
@@ -778,7 +787,8 @@ extension ContainerAttachRoute {
                         fallbackImage: container.configuration.image.reference,
                         fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                        broadcaster: req.application.storage[EventBroadcasterKey.self]
+                        broadcaster: req.application.storage[EventBroadcasterKey.self],
+                        runEpoch: runEpoch
                     )
 
                     // DockerTCPHandler owns pipes.stdin!.write after setStdinWriter(); it closes
