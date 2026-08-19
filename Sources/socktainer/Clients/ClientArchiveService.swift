@@ -415,7 +415,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
         let exitCode: Int32
         do {
-            exitCode = try await process.wait()
+            exitCode = try await GuestProcess.waitBounded(
+                wait: { try await process.wait() },
+                terminate: { try? await process.kill(SIGKILL) }
+            )
+        } catch is GuestProcessTimedOut {
+            throw ClientArchiveError.operationFailed(message: "Timed out waiting for validation in running container \(container.id)")
         } catch {
             // Concurrent close(2) + read(2) on the same fd is unsafe (NSException risk).
             // Rethrow immediately; stderrTask exits naturally when the process terminates
