@@ -71,6 +71,16 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
+/// Subset of Apple Container's `runtime-configuration.json` (written at
+/// container create time) containing the rootfs source reference.
+private struct RuntimeConfiguration: Decodable {
+    struct Filesystem: Decodable {
+        let source: String
+    }
+
+    let containerRootFilesystem: Filesystem
+}
+
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
@@ -94,7 +104,7 @@ protocol ClientArchiveProtocol: Sendable {
     func getRootfsPath(containerId: String) -> URL
 
     /// Read a file or directory from a container's filesystem and return as tar data
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
@@ -120,13 +130,59 @@ struct ClientArchiveService: ClientArchiveProtocol {
             .appendingPathComponent("rootfs.ext4")
     }
 
+    /// Resolve the ext4 file backing a container's rootfs.
+    ///
+    /// Apple Container provisions `containers/{id}/rootfs.ext4` only at first
+    /// start, so a created-but-never-started container has no rootfs file
+    /// (its `containers/{id}` directory holds runtime config only). Until the
+    /// container boots, its filesystem is the image's shared snapshot
+    /// referenced by `runtime-configuration.json` — read-only by construction
+    /// (every container of an image points at the same file), so reads can
+    /// safely serve from it.
+    ///
+    /// A container that has ever booted always has a private rootfs.ext4
+    /// (provisioned at start, persists after stop), so absence of the file
+    /// means "never started" — unless the rootfs was removed out-of-band, in
+    /// which case falling back to the image snapshot would silently serve
+    /// stale image content. `startedDate` is the runtime's ground truth for
+    /// "has booted" and gates the fallback.
+    private func resolveRootfsPath(container: ContainerSnapshot) throws -> URL {
+        let rootfsPath = getRootfsPath(containerId: container.id)
+        guard !FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            return rootfsPath
+        }
+
+        guard container.startedDate == nil else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let configURL =
+            appSupportPath
+            .appendingPathComponent("containers")
+            .appendingPathComponent(container.id)
+            .appendingPathComponent("runtime-configuration.json")
+        guard
+            let data = try? Data(contentsOf: configURL),
+            let config = try? JSONDecoder().decode(RuntimeConfiguration.self, from: data),
+            !config.containerRootFilesystem.source.isEmpty
+        else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+
+        let snapshotURL = URL(fileURLWithPath: config.containerRootFilesystem.source)
+        guard FileManager.default.fileExists(atPath: snapshotURL.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
+        }
+        return snapshotURL
+    }
+
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        let rootfsPath = try resolveRootfsPath(container: container)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
+            throw ClientArchiveError.rootfsNotFound(id: container.id)
         }
 
         // Normalize the path
@@ -135,12 +191,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
 
-        // Check if path exists and get stat
-        guard reader.exists(FilePath(normalizedPath)) else {
+        // Check if path exists and get stat. Like moby's lstat-based path
+        // resolution, a final-component symlink is reported as the symlink
+        // itself (linkTarget + symlink tar entry, dangling included), while
+        // intermediate symlink components are followed.
+        guard reader.exists(FilePath(normalizedPath)) || reader.exists(FilePath(normalizedPath), followSymlinks: false) else {
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
 
-        let (_, inode) = try reader.stat(FilePath(normalizedPath))
+        let (_, inode) =
+            try (try? reader.stat(FilePath(normalizedPath), followSymlinks: false))
+            ?? reader.stat(FilePath(normalizedPath))
 
         // Create PathStat for the response header
         let pathStat = PathStat(
@@ -162,13 +223,43 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try? FileManager.default.removeItem(at: tarPath)
         }
 
-        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        let baseName = (normalizedPath as NSString).lastPathComponent
 
-        // Extract the requested path to the staging directory
-        try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+        if inode.isDirectory {
+            // Directories: stage the subtree, then archive it. Entries are
+            // `./`-prefixed — accepted by docker cp.
+            try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
-        // Create tar archive from the staging directory
-        try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+            // Extract the requested path to the staging directory
+            try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
+
+            // Create tar archive from the staging directory
+            try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
+        } else {
+            // Single file or symlink: emit exactly one tar entry named after
+            // the basename, matching moby's archivePath output (no `./`
+            // directory entry). The directory-wrapped form breaks consumers
+            // that take the first tar entry as the payload
+            let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: tarPath)
+            let entry = WriteEntry(writer)
+            entry.path = baseName
+            entry.fileType = inode.isRegularFile ? .regular : .symbolicLink
+            entry.permissions = inode.permissions
+            entry.owner = inode.fullUid
+            entry.group = inode.fullGid
+            entry.modificationDate = Date(timeIntervalSince1970: TimeInterval(inode.mtime))
+            if inode.isSymlink {
+                entry.symlinkTarget = readSymlinkTarget(reader: reader, path: normalizedPath)
+            }
+            let data = inode.isRegularFile ? try reader.readFile(at: FilePath(normalizedPath)) : nil
+            if let data {
+                entry.size = Int64(data.count)
+                try writer.writeEntry(entry: entry, data: data)
+            } else {
+                try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
+            }
+            try writer.finishEncoding()
+        }
 
         // Read the tar data
         let tarData = try Data(contentsOf: tarPath)
@@ -581,12 +672,27 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Read symlink target using the reader's public API
+    /// Read a symlink's target.
+    ///
+    /// EXT4.EXT4Reader has no public symlink API — `readFile(followSymlinks:
+    /// false)` rejects symlink inodes with `notAFile`, and `followSymlinks:
+    /// true` returns the *target file's* content. Fast symlinks (target < 60
+    /// bytes, the overwhelming majority in practice) store the target inline
+    /// in the inode block field, which is public; slow symlinks (>= 60 bytes)
+    /// are not readable through the public API and report nil.
     private func readSymlinkTarget(reader: EXT4.EXT4Reader, path: String) -> String? {
-        guard let data = try? reader.readFile(at: FilePath(path), followSymlinks: false) else {
+        guard
+            let inode = try? reader.stat(FilePath(path), followSymlinks: false).inode,
+            inode.isSymlink
+        else {
             return nil
         }
-        return String(data: data, encoding: .utf8)
+        let targetLength = inode.size
+        guard targetLength > 0, targetLength < 60 else {
+            return nil
+        }
+        let blockBytes = Mirror(reflecting: inode.block).children.map { $0.value as! UInt8 }
+        return String(bytes: blockBytes.prefix(Int(targetLength)), encoding: .utf8)
     }
 
     private func validateArchiveEntries(
@@ -622,9 +728,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Extract a path from the ext4 filesystem to a local directory
+    /// Extract a path from the ext4 filesystem to a local directory.
+    /// Symlinks are reported as symlinks (non-following stat, matching moby's
+    /// lstat semantics) — recursive children are only listed for real
+    /// directories, never followed through symlinks.
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
-        let (_, inode) = try reader.stat(FilePath(sourcePath))
+        let (_, inode) =
+            try (try? reader.stat(FilePath(sourcePath), followSymlinks: false))
+            ?? reader.stat(FilePath(sourcePath))
         let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
