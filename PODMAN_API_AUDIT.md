@@ -95,21 +95,18 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman events` | GET `/libpod/events` | ✅ |
 | `podman login` (auth check) | POST `/libpod/auth` | ✅ |
 
-## Manifest lists (multi-arch) — now implemented
+## Manifest lists (multi-arch)
 
-**Correction (verified against a real podman issue this fork's author filed
-upstream, [containers/podman#27211](https://github.com/containers/podman/issues/27211)):**
-an earlier version of this doc claimed bare `podman build --platform a,b,c -t
-foo .` "already works end-to-end" against socktainer. That was an overstated
-inference from a CI test that calls the Docker-compat `/build` endpoint
-*directly via curl* — proving socktainer's own Docker-compat build endpoint
-can assemble a multi-platform manifest list when given `platform=a,b,c`, but
-that is not the same thing as the real podman CLI's actual behavior. Per
-#27211: real podman, invoked bare (no `--manifest` flag), only builds a
-**single** architecture regardless of how many comma-separated `--platform`
-values you pass — the client itself never asks the server for a multi-arch
-result unless you pass `--manifest <name>`. The only real multi-arch path in
-podman is `--platform a,b --manifest name`.
+Real podman's actual multi-arch workflow (confirmed against
+[containers/podman#27211](https://github.com/containers/podman/issues/27211)):
+invoked bare (no `--manifest` flag), `podman build --platform a,b,c -t foo .`
+only builds a **single** architecture regardless of how many comma-separated
+`--platform` values are passed — the client never asks the server for a
+multi-arch result unless `--manifest <name>` is given. The only real
+multi-arch path in podman is `--platform a,b --manifest name`. A Docker-compat
+client hitting `/build?platform=a,b,c` directly is a separate case: that
+endpoint does assemble a multi-platform manifest list from a comma-separated
+`platform` value, matching Docker's own API contract rather than podman's.
 
 Implemented as a `ClientManifestService` modeling a manifest list as an
 ordinary tagged reference whose descriptor points at an OCI image index blob
@@ -120,21 +117,21 @@ existing Apple Containerization framework primitives this codebase's own
 over the daemon's own Application Support directory, and `ContentStore.ingest`
 to write new index blobs (via `ContentWriter.write`, which computes the
 correct SHA256 filename — `completeIngestSession` trusts the filename
-verbatim with no hashing of its own, so getting this right mattered).
-Reviewed by an independent second opinion before implementation, which caught
-two real issues: `resolvedPushPlatform`'s single-available-platform narrowing
-would silently defeat an explicit "push the whole list" request (fixed with a
-dedicated `pushManifestList` that always pushes `platform: nil`), and pushing
-to a different destination reference needs a re-tag first since the
-framework's push always pushes to the same reference it resolves from (added
-`retagForPush`).
+verbatim with no hashing of its own, so getting this right matters).
 
-Known limitation, not closed: `ImageStore`'s reference table (`state.json`) is
-a plain load-entire-map → overwrite-entire-map with no file lock, shared with
-the separate `container-apiserver` process — the real contention is
-cross-process, which no in-process lock added here would fix. This is the
-same risk profile the existing `load`/`import` code already accepts; ingest
-and create are kept back-to-back to narrow, not close, the window.
+`resolvedPushPlatform`'s single-available-platform narrowing (used by
+ordinary image push) would silently defeat an explicit "push the whole list"
+request, so manifest-list push goes through a dedicated `pushManifestList`
+that always pushes `platform: nil` instead. Pushing to a different
+destination reference needs a re-tag first, since the framework's push always
+pushes to the same reference it resolves from (`retagForPush`).
+
+Known limitation: `ImageStore`'s reference table (`state.json`) is a plain
+load-entire-map → overwrite-entire-map with no file lock, shared with the
+separate `container-apiserver` process — the real contention is cross-process,
+which no in-process lock added here would fix. This is the same risk profile
+the existing `load`/`import` code already accepts; ingest and create are kept
+back-to-back to narrow, not close, the window.
 
 | Command | Method + Path | Implemented |
 |---|---|---|
@@ -163,9 +160,9 @@ and create are kept back-to-back to narrow, not close, the window.
   secrets/Swarm story, and no evidence it's used against a non-Swarm-mode
   daemon.
 
-## Minor / low-priority gaps not yet mentioned above
+## Minor / low-priority gaps
 
-- ~~`{resource}/exists` endpoints~~ — now implemented: `/libpod/containers/{name}/exists`,
+- `{resource}/exists` endpoints: `/libpod/containers/{name}/exists`,
   `/libpod/images/{name}/exists`, `/libpod/volumes/{name}/exists`,
   `/libpod/networks/{name}/exists` all return 204 (exists) or 404 (not found).
 - `podman untag` — likely handled by the same `/libpod/images/{name}/tag`
@@ -186,10 +183,7 @@ and create are kept back-to-back to narrow, not close, the window.
 
 ## Top gaps worth implementing next (priority order)
 
-Most previously listed gaps are now implemented (see the per-row ✅ entries above).
-Remaining:
-
-1. **`podman healthcheck run`** — the one genuine blocker hit so far. Unlike
+1. **`podman healthcheck run`** — the one genuine blocker. Unlike
    every other gap in this doc, there is no existing Docker-side route to
    delegate to: real `podman healthcheck run <container>` executes the
    container's configured healthcheck test command right now and reports
