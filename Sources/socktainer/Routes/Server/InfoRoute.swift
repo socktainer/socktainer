@@ -49,7 +49,7 @@ struct InfoRoute: RouteCollection {
         }
     }
 
-    private static func handle(
+    static func handle(
         _ req: Request,
         containerClient: ClientContainerProtocol,
         imageClient: ClientImageProtocol,
