@@ -286,6 +286,34 @@ struct ArchiveExtractionSafetyTests {
         #expect(stat(linkedPath, &linkedInfo) == 0)
         #expect(originalInfo.st_ino == linkedInfo.st_ino)
     }
+
+    @Test("A hard-link entry resolving to the extraction root itself is rejected, not linked over the destination directory")
+    func hardLinkEntryAtDestinationRootIsRejected() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let tar = tmp.appendingPathComponent("malicious.tar")
+        try writeRawTar(
+            at: tar,
+            entries: [
+                RawTarEntry(path: "sentinel.txt", fileType: .regular, data: Data("sentinel".utf8)),
+                // A "."/root-path hard-link entry would otherwise `removeItem` the destination
+                // directory itself before re-linking it — reject it instead of processing it.
+                RawTarEntry(path: ".", fileType: .regular, hardlinkTarget: "sentinel.txt"),
+            ])
+
+        let dest = tmp.appendingPathComponent("out")
+        do {
+            try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the root hard-link entry")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("."))
+        }
+        // The destination directory itself must have survived, still able to hold the
+        // sentinel entry that was extracted before the malicious root entry was rejected.
+        #expect(FileManager.default.fileExists(atPath: dest.appendingPathComponent("sentinel.txt").path))
+    }
 }
 
 private struct RawTarEntry {

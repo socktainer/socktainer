@@ -144,11 +144,13 @@ struct ImagePushSaveLoadEventTests {
 
     @Test("libpod's multi-image export endpoint decodes repeated 'references', matching real podman's ImageExportLibpod")
     func libpodExportDecodesReferences() async throws {
-        try await withImageApp(client: FakeImageClient(), broadcaster: EventBroadcaster()) { app in
+        let capturedReferences = Box<[String]>([])
+        try await withImageApp(client: FakeImageClient(saveReferencesCapture: capturedReferences), broadcaster: EventBroadcaster()) { app in
             try await app.testing().test(.GET, "/v1.51/libpod/images/export?references=alpine&references=busybox") { res async in
                 #expect(res.status == .ok)
             }
         }
+        #expect(await capturedReferences.get() == ["alpine", "busybox"])
     }
 
     @Test("libpod's multi-image export endpoint is a 400 with no 'references' given")
@@ -210,6 +212,7 @@ private struct FakeImageClient: ClientImageProtocol {
     var images: [ClientImage] = []
     var loadedImages: [String] = []
     var failPushStream = false
+    var saveReferencesCapture: Box<[String]>? = nil
 
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { images }
 
@@ -253,6 +256,9 @@ private struct FakeImageClient: ClientImageProtocol {
     }
 
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+        if let saveReferencesCapture {
+            await saveReferencesCapture.set(references)
+        }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tarball = tempDir.appendingPathComponent("images.tar")

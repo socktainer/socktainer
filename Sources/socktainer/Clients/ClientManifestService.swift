@@ -220,13 +220,16 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// digest — removes every requested digest via a SINGLE read-modify-write instead of one
     /// `removeDigest` call per digest, which would re-`inspect`/re-tag `name` once per digest
     /// and leave a window between each pair of removals where a concurrent request could see
-    /// (or race against) a partially-modified list. The caller has already validated every
-    /// digest is a current member before calling this — that's still a separate concern from
-    /// the atomicity this collapses.
+    /// (or race against) a partially-modified list.
     @discardableResult
     func removeDigests(name: String, digests: [String]) async throws -> String {
         var manifests = try await inspect(name: name).manifests
+        let currentDigests = Set(manifests.map(\.digest))
         let digestSet = Set(digests)
+        guard digestSet.isSubset(of: currentDigests) else {
+            let missing = digestSet.subtracting(currentDigests)
+            throw ContainerizationError(.invalidArgument, message: "\(missing.sorted().joined(separator: ", ")) not a member of \(name)")
+        }
         manifests.removeAll { digestSet.contains($0.digest) }
         return try await writeIndexAndTag(name: name, manifests: manifests)
     }
