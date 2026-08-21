@@ -100,6 +100,18 @@ struct ArchiveUtility {
                 continue
             }
 
+            // The extraction root itself (fullPath == destination, from a "."/"./" entry per
+            // `safeDestination`) may only ever be an ordinary directory entry — its own
+            // pendingDirectoryPermissions handling further down applies just to that case.
+            // Any OTHER entry type resolving directly to the destination (a regular file, a
+            // symlink, or — the case this guards against — a hard link, which would `removeItem`
+            // and then re-link the extraction root itself) is rejected outright rather than
+            // processed, matching how every other unsafe entry shape here is handled.
+            if fullPath.standardizedFileURL.path == destinationPath, entry.hardlink != nil || entry.fileType != .directory {
+                rejectedPaths.append(rawPath)
+                continue
+            }
+
             // A hard-link entry carries a populated `hardlink` (the linked-to path,
             // archive-root-relative like the entry's own `path`, not entry-directory-relative
             // like a symlink target) regardless of what `fileType` itself reports for it
