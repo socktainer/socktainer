@@ -97,13 +97,15 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 
 ## Manifest lists (multi-arch)
 
-Real podman's actual multi-arch workflow (confirmed against
+Real podman's actual multi-arch **build** workflow (confirmed against
 [containers/podman#27211](https://github.com/containers/podman/issues/27211)):
 invoked bare (no `--manifest` flag), `podman build --platform a,b,c -t foo .`
 only builds a **single** architecture regardless of how many comma-separated
 `--platform` values are passed — the client never asks the server for a
 multi-arch result unless `--manifest <name>` is given. The only real
-multi-arch path in podman is `--platform a,b --manifest name`. A Docker-compat
+multi-arch path for the `build` command specifically is `--platform a,b
+--manifest name`; `podman manifest create`/`add` are a separate, always-multi-
+arch-capable path that doesn't go through `build` at all. A Docker-compat
 client hitting `/build?platform=a,b,c` directly is a separate case: that
 endpoint does assemble a multi-platform manifest list from a comma-separated
 `platform` value, matching Docker's own API contract rather than podman's.
