@@ -147,6 +147,10 @@ private actor FakeArchiveClient: ClientArchiveProtocol {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
 
+    func statPath(containerId: String, path: String) async throws -> PathStat {
+        throw ClientArchiveError.operationFailed(message: "not under test")
+    }
+
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
