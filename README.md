@@ -14,6 +14,8 @@
   - [Quick Start ⚡](#quick-start)
     - [Launch socktainer 🏁](#launch-socktainer-🏁)
     - [Using Docker CLI 🐳](#using-docker-cli-🐳)
+    - [Using Podman CLI 🦭](#using-podman-cli-🦭)
+    - [Socket Symlinks 🔗](#socket-symlinks-🔗)
   - [Key Features ✨](#key-features)
   - [Requirements 📋](#requirements-📋)
   - [Installation 🛠️](#installation-🛠️)
@@ -114,6 +116,128 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ```
 
 </details>
+
+### Using Podman CLI 🦭
+
+Podman connects to socktainer via `CONTAINER_HOST` or socket symlink:
+
+```bash
+export CONTAINER_HOST=unix://$HOME/.socktainer/container.sock
+podman version   # Check connection
+podman ps        # List running containers
+podman images    # List available images
+```
+
+> [!NOTE]
+> Podman uses its own API endpoints (`/libpod/*`), not Docker-compatible ones.
+> Socktainer implements a subset of the libpod API — see [#201](https://github.com/socktainer/socktainer/issues/201) for progress.
+
+> [!TIP]
+> Already have Podman Desktop (or `podman machine`) set up, with
+> `/var/run/docker.sock` symlinked to its own Docker-compat socket? `CONTAINER_HOST`
+> above talks to socktainer **without touching that link at all** — nothing else
+> that depends on it (Podman Desktop itself, other tools) is affected. This is
+> the reason to prefer the env var over the symlink approach below whenever an
+> existing setup like that is already in place.
+
+### Socket Symlinks 🔗
+
+Instead of setting environment variables, you can symlink socktainer's socket to the default locations that Docker and Podman expect.
+
+> [!WARNING]
+> `/var/run/docker.sock` is often already a symlink to something else — most
+> commonly Podman Desktop's own Docker-compat socket (`podman machine`'s
+> `podman.sock`), which is what makes plain `docker` commands work against
+> Podman in the first place. Overwriting it with `ln -sf` **replaces that link
+> silently**, so back up the existing target first if you want to switch back
+> later without reinstalling anything.
+
+**Docker** (requires `sudo`):
+
+```bash
+if [ -e /var/run/docker.sock ] && [ ! -L /var/run/docker.sock ]; then
+  echo "warning: /var/run/docker.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  # Back up whatever /var/run/docker.sock currently points to (if it's a symlink, and not
+  # already socktainer's own link — e.g. re-running setup without an intervening undo) —
+  # e.g. Podman Desktop's own Docker-compat link — so it can be restored later.
+  if [ -L /var/run/docker.sock ] && [ ! -f "$HOME/.socktainer-docker-sock-backup" ] \
+     && [ "$(readlink /var/run/docker.sock)" != "$HOME/.socktainer/container.sock" ]; then
+    readlink /var/run/docker.sock > "$HOME/.socktainer-docker-sock-backup"
+  fi
+  sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+fi
+```
+
+**Podman** (no `sudo` needed):
+
+```bash
+# Podman looks for its socket at $TMPDIR/storage-run-$UID/podman/podman.sock
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+if [ -e "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -L "$PODMAN_SOCK_DIR/podman.sock" ]; then
+  echo "warning: $PODMAN_SOCK_DIR/podman.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -f "$HOME/.socktainer-podman-sock-backup" ] \
+     && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" != "$HOME/.socktainer/container.sock" ]; then
+    readlink "$PODMAN_SOCK_DIR/podman.sock" > "$HOME/.socktainer-podman-sock-backup"
+  fi
+  ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+fi
+```
+
+**Both at once:**
+
+```bash
+# Docker
+if [ -e /var/run/docker.sock ] && [ ! -L /var/run/docker.sock ]; then
+  echo "warning: /var/run/docker.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L /var/run/docker.sock ] && [ ! -f "$HOME/.socktainer-docker-sock-backup" ] \
+     && [ "$(readlink /var/run/docker.sock)" != "$HOME/.socktainer/container.sock" ]; then
+    readlink /var/run/docker.sock > "$HOME/.socktainer-docker-sock-backup"
+  fi
+  sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+fi
+
+# Podman
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+if [ -e "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -L "$PODMAN_SOCK_DIR/podman.sock" ]; then
+  echo "warning: $PODMAN_SOCK_DIR/podman.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -f "$HOME/.socktainer-podman-sock-backup" ] \
+     && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" != "$HOME/.socktainer/container.sock" ]; then
+    readlink "$PODMAN_SOCK_DIR/podman.sock" > "$HOME/.socktainer-podman-sock-backup"
+  fi
+  ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+fi
+```
+
+To undo — restores whatever was linked before (e.g. Podman Desktop's socket), or just removes the link if there was nothing to restore:
+
+```bash
+# Docker
+if [ -f "$HOME/.socktainer-docker-sock-backup" ]; then
+  sudo ln -sf "$(cat "$HOME/.socktainer-docker-sock-backup")" /var/run/docker.sock
+  rm -f "$HOME/.socktainer-docker-sock-backup"
+else
+  [ -L /var/run/docker.sock ] && sudo rm -f /var/run/docker.sock
+fi
+
+# Podman
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+if [ -f "$HOME/.socktainer-podman-sock-backup" ]; then
+  mkdir -p "$PODMAN_SOCK_DIR"
+  ln -sf "$(cat "$HOME/.socktainer-podman-sock-backup")" "$PODMAN_SOCK_DIR/podman.sock"
+  rm -f "$HOME/.socktainer-podman-sock-backup"
+else
+  [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && rm -f "$PODMAN_SOCK_DIR/podman.sock"
+fi
+```
 
 ---
 

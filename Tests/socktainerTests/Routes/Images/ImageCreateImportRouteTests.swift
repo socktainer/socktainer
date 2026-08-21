@@ -65,7 +65,7 @@ struct ImageCreateImportRouteTests {
     }
 }
 
-private actor SpyImageClient: ClientImageProtocol {
+actor SpyImageClient: ClientImageProtocol {
     private(set) var importImageWasCalled = false
 
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { [] }
@@ -76,6 +76,9 @@ private actor SpyImageClient: ClientImageProtocol {
         AsyncThrowingStream { $0.finish() }
     }
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {

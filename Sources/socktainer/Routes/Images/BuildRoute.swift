@@ -13,19 +13,26 @@ import TerminalProgress
 import Vapor
 
 struct BuildRoute: RouteCollection {
+    /// Prefix for the mixed-platform split build's scratch tags (see `performBuild`) — also
+    /// used by `ClientImageService.list()` to hide one that survives a crash mid-build,
+    /// before the normal cleanup runs.
+    static let scratchTagPrefix = "socktainer-buildsplit-"
 
     let client: ClientContainerProtocol
     let builderClient: ClientBuilderProtocol
     let systemConfig: ContainerSystemConfig
+    let manifestClient: ClientManifestServiceProtocol
 
-    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) {
+    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig, manifestClient: ClientManifestServiceProtocol) {
         self.client = client
         self.builderClient = builderClient
         self.systemConfig = systemConfig
+        self.manifestClient = manifestClient
     }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient, systemConfig: systemConfig))
+        try routes.registerVersionedRoute(
+            .POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
 
     }
 
@@ -57,6 +64,7 @@ struct RESTBuildQuery: Vapor.Content {
     var target: String?  // target stage to build
     var outputs: String?  // output destination
     var version: String?  // API version
+    var manifest: String?  // podman: add the built image(s) to this named manifest list, creating it if needed
 
     init() {
         self.dockerfile = "Dockerfile"
@@ -72,6 +80,68 @@ struct RESTBuildQuery: Vapor.Content {
 }
 
 extension BuildRoute {
+    /// Recovers every value of the repeated `platform` query parameter from the raw
+    /// query string.
+    ///
+    /// Real podman sends `--platform a,b` as the SAME query key repeated once per
+    /// platform (`pkg/bindings/images/build.go`: `params.Del("platform")` then
+    /// `params.Add("platform", ...)` per platform) — i.e. `?platform=linux/arm64&platform=linux/amd64`,
+    /// not one comma-joined value. `Vapor.Content` decoding a repeated key into a
+    /// scalar `String?` field silently keeps only the last occurrence, dropping every
+    /// platform but one.
+    static func parseAllPlatformQueryValues(from queryString: String?) -> [String] {
+        allQueryValues(named: "platform", from: queryString)
+    }
+
+    /// Resolves the `t` (tag) query parameter to a concrete target image name.
+    ///
+    /// Real podman sends `t=` (present, but empty) when no explicit tag is given — treating
+    /// that the same as "absent" (falling back, e.g. to a generated name) requires checking
+    /// emptiness, not just nil, or the build ends up tagged as the literal empty string.
+    static func resolvedTargetImageName(_ tag: String?, fallback: String) -> String {
+        tag?.isEmpty == false ? tag! : fallback
+    }
+
+    /// Parses the `dockerfile` query parameter.
+    ///
+    /// Docker-compat clients send a plain path (e.g. `Dockerfile`). Real podman
+    /// clients send it JSON-array-encoded (e.g. `["Dockerfile"]`, since buildah
+    /// supports multiple Containerfiles). Only the first element is used —
+    /// multi-Containerfile builds aren't supported here yet.
+    static func parseDockerfileQueryParam(_ value: String, logger: Logger? = nil) throws -> String {
+        // An empty top-level value means "no dockerfile was specified" — the same as the
+        // param being omitted entirely (falls back to "Dockerfile" upstream) or JSON-decoding
+        // to an empty array (below). `sanitizedDockerfilePath`'s own empty-value rejection is
+        // for when a caller explicitly names a specific-but-degenerate path (e.g. an empty
+        // string as an array's first element) — a materially different situation from simply
+        // not asking for anything in particular.
+        guard !value.isEmpty else { return "Dockerfile" }
+        guard value.hasPrefix("[") else { return try sanitizedDockerfilePath(value) }
+        guard let data = value.data(using: .utf8),
+            let array = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            throw Abort(.badRequest, reason: "dockerfile query param '\(value)' looks JSON-array-encoded but failed to decode")
+        }
+        guard let first = array.first else {
+            logger?.warning("dockerfile query param decoded to an empty array; falling back to 'Dockerfile'")
+            return "Dockerfile"
+        }
+        return try sanitizedDockerfilePath(first)
+    }
+
+    /// Rejects a dockerfile path that would escape the build context (absolute paths, or
+    /// `..` components) with a client error instead of silently substituting a different
+    /// file — the caller asked for a SPECIFIC dockerfile, so a fallback that builds
+    /// something else entirely without telling them is worse than just failing the request.
+    static func sanitizedDockerfilePath(_ value: String) throws -> String {
+        let isAbsolute = value.hasPrefix("/")
+        let hasTraversal = value.split(separator: "/").contains(where: { $0 == ".." })
+        guard !value.isEmpty, !isAbsolute, !hasTraversal else {
+            throw Abort(.badRequest, reason: "dockerfile path '\(value)' escapes the build context")
+        }
+        return value
+    }
+
     /// Parses a Docker API build query parameter (`buildargs` or `labels`).
     ///
     /// The Docker Engine API sends these as a JSON-encoded `{"KEY":"VALUE"}` map.
@@ -106,7 +176,8 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
-    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
+    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig, manifestClient: ClientManifestServiceProtocol)
+        -> @Sendable (Request) async throws -> Response
     {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
@@ -123,21 +194,55 @@ extension BuildRoute {
             if query.version == nil { query.version = "1" }
 
             // Extract values with Docker-compliant defaults
-            let dockerfile = query.dockerfile!
-            let targetImageName = query.t ?? UUID().uuidString.lowercased()
+            let dockerfile = try BuildRoute.parseDockerfileQueryParam(query.dockerfile!, logger: req.logger)
+            let targetImageName = BuildRoute.resolvedTargetImageName(query.t, fallback: UUID().uuidString.lowercased())
             let quiet = query.q!
             let noCache = query.nocache!
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
-            let platform = query.platform!
+            let platformQueryValues = BuildRoute.parseAllPlatformQueryValues(from: req.url.query)
+            let platformString = platformQueryValues.isEmpty ? query.platform! : platformQueryValues.joined(separator: ",")
             let memory = query.memory ?? 2_048_000_000  // 2GB default
+            let manifestName = query.manifest?.isEmpty == false ? query.manifest : nil
+
+            // Parse the platform parameter early so we can select the right builder mode
+            // before calling ensureReachable.  Supports comma-separated values, e.g.
+            //   --platform linux/arm64,linux/s390x
+            let parsedPlatforms: [Platform]
+            do {
+                if platformString.isEmpty {
+                    parsedPlatforms = [try Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
+                } else {
+                    parsedPlatforms = try parseMultiPlatformString(platformString)
+                }
+            } catch {
+                throw Abort(
+                    .badRequest,
+                    reason:
+                        "Invalid platform specification '\(platformString)': expected os/architecture or comma-separated list (e.g. linux/arm64,linux/amd64): \(error.localizedDescription)"
+                )
+            }
+
+            // Platforms that are neither arm64 nor amd64 require the QEMU-enabled builder
+            // (a separate container named "buildkit-qemu") so the builder VM can emulate
+            // foreign instruction sets via Linux binfmt_misc registration. The two builder
+            // VMs are provisioned with mutually-exclusive emulation backends (Rosetta 2 vs.
+            // generic QEMU binfmt), so a request mixing e.g. arm64/amd64 with s390x is split
+            // and built against each backend independently, then merged — see performBuild.
+            let rosettaPlatforms = parsedPlatforms.filter { !platformRequiresQEMU($0) }
+            let qemuPlatforms = parsedPlatforms.filter { platformRequiresQEMU($0) }
+            let needsQEMU = !qemuPlatforms.isEmpty
+            let needsRosettaBuilder = !rosettaPlatforms.isEmpty
 
             do {
-                try await builderClient.ensureReachable(
-                    timeout: .seconds(3),
-                    retryInterval: .milliseconds(250),
-                    logger: req.logger
-                )
+                if needsRosettaBuilder {
+                    try await builderClient.ensureReachable(
+                        timeout: .seconds(3), retryInterval: .milliseconds(250), qemu: false, logger: req.logger)
+                }
+                if needsQEMU {
+                    try await builderClient.ensureReachable(
+                        timeout: .seconds(3), retryInterval: .milliseconds(250), qemu: true, logger: req.logger)
+                }
             } catch {
                 throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
             }
@@ -223,7 +328,7 @@ extension BuildRoute {
                         try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
 
                         do {
-                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
+                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir, logger: req.logger)
                         } catch {
                             req.logger.error("Tar extraction failed: \(error)")
 
@@ -261,11 +366,13 @@ extension BuildRoute {
                             noCache: noCache,
                             pull: pull,
                             target: target,
-                            platform: platform,
+                            platforms: parsedPlatforms,
                             memory: memory,
                             quiet: quiet,
                             builderClient: builderClient,
                             systemConfig: systemConfig,
+                            manifestClient: manifestClient,
+                            manifestName: manifestName,
                             writer: writer,
                             logger: req.logger
                         )
@@ -337,11 +444,13 @@ extension BuildRoute {
         noCache: Bool,
         pull: Bool,
         target: String,
-        platform: String,
+        platforms: [Platform],
         memory: Int,
         quiet: Bool,
         builderClient: ClientBuilderProtocol,
         systemConfig: ContainerSystemConfig,
+        manifestClient: ClientManifestServiceProtocol,
+        manifestName: String?,
         writer: BodyStreamWriter,
         logger: Logger
     ) async throws {
@@ -384,17 +493,6 @@ extension BuildRoute {
         // Send initial build started message
         sendStreamMessage("Step 1/1 : Starting build for \(targetImageName)")
 
-        let timeout: Duration = .seconds(300)
-
-        sendStreamMessage(" ---> Connecting to build daemon")
-
-        let builder = try await builderClient.connect(
-            timeout: timeout,
-            retryInterval: .seconds(1),
-            logger: logger
-        )
-        sendStreamMessage(" ---> Successfully connected to builder")
-
         // resolve the full path to the Dockerfile
         sendStreamMessage(" ---> Reading Dockerfile")
         let dockerfilePath = URL(fileURLWithPath: contextDir).appendingPathComponent(dockerfile).path
@@ -405,13 +503,8 @@ extension BuildRoute {
         }
 
         sendStreamMessage(" ---> Setting up build environment")
-
-        // Setup temp directory - must use the builder export path that's mounted in buildkit container
         let builderExportPath = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
             .appendingPathComponent("com.apple.container/builder")
-        let buildID = UUID().uuidString
-        let tempURL = builderExportPath.appendingPathComponent(buildID)
-        try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
 
         // Validate and normalize image name
         let imageName: String = try {
@@ -420,7 +513,176 @@ extension BuildRoute {
             return parsedReference.description
         }()
 
-        // Setup exports - use BuildCommand approach
+        // The two builder VMs are provisioned with mutually-exclusive emulation backends
+        // (Rosetta 2 vs. generic QEMU binfmt) — a request mixing e.g. arm64/amd64 with
+        // s390x can't be satisfied by either builder alone without emulating everything
+        // through the slower one. Split into a build per backend, run them concurrently,
+        // and merge the results, rather than routing the whole request to whichever
+        // builder the least-native platform requires.
+        let rosettaPlatforms = platforms.filter { !platformRequiresQEMU($0) }
+        let qemuPlatforms = platforms.filter { platformRequiresQEMU($0) }
+
+        let builtReference: String
+        let builtDigest: String
+
+        if rosettaPlatforms.isEmpty || qemuPlatforms.isEmpty {
+            // Not a mixed request — single build, exactly as before.
+            let result = try await runSingleBuild(
+                dockerfile: dockerfile, dockerfileData: dockerfileData, contextDir: contextDir,
+                buildArgs: buildArgs, labels: labels, noCache: noCache, pull: pull, target: target,
+                platforms: platforms, qemu: !qemuPlatforms.isEmpty, tags: [imageName], quiet: quiet,
+                builderExportPath: builderExportPath, buildIDSuffix: "single",
+                builderClient: builderClient, systemConfig: systemConfig,
+                sendStreamMessage: sendStreamMessage, logger: logger
+            )
+            builtReference = result.reference
+            builtDigest = result.digest
+        } else {
+            sendStreamMessage(
+                " ---> Splitting build: \(rosettaPlatforms.map(\.description).joined(separator: ",")) via Rosetta, "
+                    + "\(qemuPlatforms.map(\.description).joined(separator: ",")) via QEMU"
+            )
+
+            // Scratch tags, unrelated to targetImageName's own reference syntax so there's
+            // no need to parse/rewrite it — cleaned up below once merged. Filtered out of
+            // `ClientImageService.list()` too (see `scratchTagPrefix`) so one that survives a
+            // crash mid-build (before cleanup runs) doesn't linger forever in image listings.
+            // Lowercased: Docker/OCI reference syntax requires a lowercase repository name,
+            // and UUID().uuidString is uppercase.
+            let requestID = UUID().uuidString.lowercased()
+            let rosettaTag = "\(Self.scratchTagPrefix)\(requestID)-rosetta"
+            let qemuTag = "\(Self.scratchTagPrefix)\(requestID)-qemu"
+
+            async let rosettaResult = runSingleBuild(
+                dockerfile: dockerfile, dockerfileData: dockerfileData, contextDir: contextDir,
+                buildArgs: buildArgs, labels: labels, noCache: noCache, pull: pull, target: target,
+                platforms: rosettaPlatforms, qemu: false, tags: [rosettaTag], quiet: quiet,
+                builderExportPath: builderExportPath, buildIDSuffix: "rosetta",
+                builderClient: builderClient, systemConfig: systemConfig,
+                sendStreamMessage: sendStreamMessage, logger: logger
+            )
+            async let qemuResult = runSingleBuild(
+                dockerfile: dockerfile, dockerfileData: dockerfileData, contextDir: contextDir,
+                buildArgs: buildArgs, labels: labels, noCache: noCache, pull: pull, target: target,
+                platforms: qemuPlatforms, qemu: true, tags: [qemuTag], quiet: quiet,
+                builderExportPath: builderExportPath, buildIDSuffix: "qemu",
+                builderClient: builderClient, systemConfig: systemConfig,
+                sendStreamMessage: sendStreamMessage, logger: logger
+            )
+
+            // Awaited as two separate statements (not `try await (rosettaResult, qemuResult)`)
+            // so BOTH are always fully settled before any cleanup runs — a tuple await short-
+            // circuits on the first throw, without waiting for the other side, which could
+            // still be mid-build (and mid-tagging `qemuTag`/`rosettaTag`) by the time cleanup
+            // below runs, racing a delete against a still-in-progress create.
+            let rosettaOutcome: Result<(reference: String, digest: String), Error>
+            do { rosettaOutcome = .success(try await rosettaResult) } catch { rosettaOutcome = .failure(error) }
+            let qemuOutcome: Result<(reference: String, digest: String), Error>
+            do { qemuOutcome = .success(try await qemuResult) } catch { qemuOutcome = .failure(error) }
+
+            switch (rosettaOutcome, qemuOutcome) {
+            case (.success(let rosetta), .success(let qemu)):
+                sendStreamMessage(" ---> Merging split builds into \(imageName)")
+                do {
+                    builtDigest = try await manifestClient.mergeAndTag(name: imageName, images: [rosetta.reference, qemu.reference], logger: logger)
+                } catch {
+                    // Both halves succeeded and are still tagged — clean up regardless of
+                    // whether the merge itself succeeded, or these scratch tags leak forever.
+                    try? await manifestClient.delete(name: rosettaTag)
+                    try? await manifestClient.delete(name: qemuTag)
+                    throw error
+                }
+                try? await manifestClient.delete(name: rosettaTag)
+                try? await manifestClient.delete(name: qemuTag)
+                builtReference = imageName
+            case (.failure(let rosettaError), .failure(let qemuError)):
+                // Both halves failed — the thrown error only ever carries one of them
+                // (matching the single-failure case below), so log the other rather than
+                // silently dropping a second, independently useful failure reason.
+                logger.error("QEMU build also failed (Rosetta error is being thrown): \(qemuError)")
+                try? await manifestClient.delete(name: rosettaTag)
+                try? await manifestClient.delete(name: qemuTag)
+                throw rosettaError
+            case (.failure(let error), _), (_, .failure(let error)):
+                // Best-effort clean up whichever scratch tag DID get written (a delete of one
+                // that was never created is a harmless no-op) before propagating — safe now
+                // that both outcomes are guaranteed settled.
+                try? await manifestClient.delete(name: rosettaTag)
+                try? await manifestClient.delete(name: qemuTag)
+                throw error
+            }
+        }
+
+        // `--manifest <name>`: fold the just-built image's platform(s) into a named manifest
+        // list, creating it if it doesn't exist yet — this is podman's real multi-arch
+        // workflow (see containers/podman#27211): a bare multi-platform build alone never
+        // produces one on the real client. Runs before the success message/stream close
+        // (not as a best-effort afterthought) so a registration failure is reported as a
+        // build failure instead of silently succeeding with an unregistered manifest.
+        if let manifestName {
+            sendStreamMessage(" ---> Adding to manifest list \(manifestName)")
+            try await manifestClient.addBuiltImage(name: manifestName, builtReference: builtReference, logger: logger)
+        }
+
+        // Real podman clients (pkg/bindings/images/build.go) only treat a clean
+        // stream EOF as success if they've already seen a "stream" line whose
+        // content starts with 12+ raw hex chars (`iidRegex`) — otherwise EOF is
+        // reported as `Error: decoding stream: EOF` even though the build (and
+        // this response) genuinely succeeded. Real buildah/podman builds emit
+        // the bare image ID as its own stream line for exactly this reason;
+        // mirror that here so the client recognizes success.
+        let bareID = builtDigest.hasPrefix("sha256:") ? String(builtDigest.dropFirst("sha256:".count)) : builtDigest
+        sendStreamMessage(bareID)
+
+        // Send success message in Docker API format
+        sendStreamMessage("Successfully built \(imageName)")
+
+        _ = writer.write(.end)
+    }
+
+    /// Runs a single BuildKit solve against one builder backend and loads/unpacks its
+    /// output, returning the resulting image's reference and digest. Factored out of
+    /// `performBuild` so a mixed-platform request can call this twice (once per backend)
+    /// instead of duplicating the whole connect/build/load/unpack sequence inline.
+    private static func runSingleBuild(
+        dockerfile: String,
+        dockerfileData: Data,
+        contextDir: String,
+        buildArgs: [String],
+        labels: [String],
+        noCache: Bool,
+        pull: Bool,
+        target: String,
+        platforms: [Platform],
+        qemu: Bool,
+        tags: [String],
+        quiet: Bool,
+        builderExportPath: URL,
+        buildIDSuffix: String,
+        builderClient: ClientBuilderProtocol,
+        systemConfig: ContainerSystemConfig,
+        sendStreamMessage: @escaping @Sendable (String) -> Void,
+        logger: Logger
+    ) async throws -> (reference: String, digest: String) {
+        let timeout: Duration = .seconds(300)
+
+        sendStreamMessage(" ---> Connecting to build daemon (\(qemu ? "QEMU" : "Rosetta") builder)")
+        let builder = try await builderClient.connect(
+            timeout: timeout,
+            retryInterval: .seconds(1),
+            qemu: qemu,
+            logger: logger
+        )
+        sendStreamMessage(" ---> Successfully connected to builder")
+
+        let buildID = "\(UUID().uuidString)-\(buildIDSuffix)"
+        let tempURL = builderExportPath.appendingPathComponent(buildID)
+        try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
+        // The exported OCI tarball is only needed for the ClientImage.load below — clean up
+        // this per-build export directory on every exit path (success or failure) rather than
+        // leaking it under Application Support forever.
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
         let exports: [Builder.BuildExport] = try ["type=oci"].map { output in
             var exp = try Builder.BuildExport(from: output)
             if exp.destination == nil {
@@ -429,15 +691,6 @@ extension BuildRoute {
             return exp
         }
 
-        // Parse platforms
-        let platforms: Set<Platform> = {
-            guard platform.isEmpty else {
-                return [try! Platform(from: platform)]
-            }
-            return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
-        }()
-
-        // Build configuration
         let config = ContainerBuild.Builder.BuildConfig(
             buildID: buildID,
             contentStore: RemoteContentStoreClient(),
@@ -449,9 +702,9 @@ extension BuildRoute {
             dockerignore: nil,
             labels: labels,
             noCache: noCache,
-            platforms: [Platform](platforms),
+            platforms: platforms,
             terminal: nil,  // No terminal for API
-            tags: [imageName],
+            tags: tags,
             target: target,
             quiet: quiet,
             exports: exports,
@@ -493,9 +746,12 @@ extension BuildRoute {
             try await image.unpack(platform: nil, progressUpdate: { _ in })
         }
 
-        // Send success message in Docker API format
-        sendStreamMessage("Successfully built \(imageName)")
-
-        _ = writer.write(.end)
+        // The loader tags images verbatim (e.g. `<uuid>:latest`, no `docker.io/library/`
+        // prefix) — the as-stored reference is what later lookups (retag, manifest merge)
+        // must use, not a re-derivation of the requested tag through normalization.
+        guard let firstImage = loaded.images.first else {
+            throw ContainerizationError(.internalError, message: "Build produced no image")
+        }
+        return (reference: firstImage.reference, digest: firstImage.digest)
     }
 }

@@ -227,4 +227,44 @@ import VaporTesting
         }
     }
 
+    /// A greedy `{name:.*}` route (like `manifest create`'s `POST /manifests/{name}`)
+    /// registered BEFORE a more specific sibling sharing the same method and a longer path
+    /// (like `manifest push`'s `POST /manifests/{name}/registry/{destination}`) used to win
+    /// unconditionally — first-match-in-registration-order — silently swallowing the whole
+    /// remainder of the specific route's path (including "/registry/...") as part of "name".
+    /// Routes are now matched in descending specificity order regardless of registration
+    /// order, so the more specific route wins even when registered second.
+    @Test
+    func moreSpecificRouteWinsOverGreedySiblingRegisteredFirst() async throws {
+        try await withRegexRouter { app in
+            // Register the greedy, less-specific route FIRST.
+            try app.registerVersionedRoute(.POST, pattern: "/manifests/{name:.*}") { req in
+                let name = req.parameters.get("name") ?? ""
+                return ["matched": "generic", "name": name]
+            }
+            // Register the more specific sibling SECOND.
+            try app.registerVersionedRoute(.POST, pattern: "/manifests/{name:.*}/registry/{destination:.*}") { req in
+                let name = req.parameters.get("name") ?? ""
+                let destination = req.parameters.get("destination") ?? ""
+                return ["matched": "specific", "name": name, "destination": destination]
+            }
+
+            try await app.testing().test(.POST, "/manifests/mylist/registry/192.168.1.1:5000/repo:tag") { res async throws in
+                #expect(res.status == .ok)
+                let response = try res.content.decode([String: String].self)
+                #expect(response["matched"] == "specific")
+                #expect(response["name"] == "mylist")
+                #expect(response["destination"] == "192.168.1.1:5000/repo:tag")
+            }
+
+            // The generic route should still handle requests that don't match the specific one.
+            try await app.testing().test(.POST, "/manifests/mylist") { res async throws in
+                #expect(res.status == .ok)
+                let response = try res.content.decode([String: String].self)
+                #expect(response["matched"] == "generic")
+                #expect(response["name"] == "mylist")
+            }
+        }
+    }
+
 }

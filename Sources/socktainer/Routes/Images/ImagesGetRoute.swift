@@ -35,7 +35,7 @@ struct ImagesGetRoute: RouteCollection {
         }
     }
 
-    private static func saveImages(references: [String], req: Request, client: ClientImageProtocol) async throws -> Response {
+    static func saveImages(references: [String], req: Request, client: ClientImageProtocol) async throws -> Response {
         let platformString = try? req.query.get(String.self, at: "platform")
         let platform = try platformString.map(platformOrThrow)
 

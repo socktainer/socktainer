@@ -21,6 +21,13 @@ enum DockerProgressFrame {
         let stream: String
     }
 
+    private struct IdFrame: Encodable {
+        let id: String
+        enum CodingKeys: String, CodingKey {
+            case id = "Id"
+        }
+    }
+
     private struct ProgressBarFrame: Encodable {
         struct Detail: Encodable {
             let current: Int64
@@ -37,6 +44,13 @@ enum DockerProgressFrame {
 
     static func stream(_ message: String) -> String {
         encode(StreamFrame(stream: message))
+    }
+
+    /// A completion frame carrying only an `Id` — real podman's `manifest push` client
+    /// (`pkg/bindings/manifests`'s `Push`) requires seeing one of these before it accepts
+    /// a clean stream close as success; a plain EOF is otherwise reported as a decode error.
+    static func manifestPushId(_ id: String) -> String {
+        encode(IdFrame(id: id))
     }
 
     static func progress(status: String, id: String, current: Int64, total: Int64) -> String {
@@ -60,16 +74,43 @@ enum DockerProgressFrame {
 
     /// Streams progress messages as status frames, converts a thrown error
     /// into a final error frame, and always ends the body cleanly.
+    ///
+    /// - Parameters:
+    ///   - useStreamKey: real podman clients (`pkg/bindings/images`'s `Push`,
+    ///     `pkg/bindings/manifests`'s `Push`) decode into a struct with a `stream`
+    ///     field, not `status` — a `{"status": ...}` frame silently decodes to an
+    ///     all-empty report and is rejected as unparseable. Docker-compat clients
+    ///     expect `status`. Pass `true` for a request reaching this over `/libpod/*`.
+    ///   - finalFrame: an already-JSON-encoded frame (see `manifestPushId`) written
+    ///     immediately before the stream ends, only on the success path — used by
+    ///     manifest push to satisfy its stricter "must see an `Id` before EOF" check.
     static func pipe(
         _ progress: AsyncThrowingStream<String, Error>,
         to writer: any BodyStreamWriter,
-        onSuccess: (() async -> Void)? = nil
+        useStreamKey: Bool = false,
+        onSuccess: (() async -> Void)? = nil,
+        finalFrame: (() async -> String?)? = nil
     ) async {
         do {
             for try await message in progress {
-                write(status(message), to: writer)
+                write(useStreamKey ? stream(message) : status(message), to: writer)
             }
             await onSuccess?()
+            if let finalFrame {
+                if let frame = await finalFrame() {
+                    write(frame, to: writer)
+                } else {
+                    // The operation itself succeeded (we reached here past the `for try
+                    // await` loop with no thrown error), but the caller's finalFrame
+                    // closure couldn't produce its required completion frame (e.g. a
+                    // post-success digest lookup failed). Ending the stream silently here
+                    // would leave the client waiting on a frame that's never coming — real
+                    // podman's manifest push client reports a bare EOF with no `Id` frame as
+                    // a decode error anyway, so surface an explicit error frame instead of
+                    // the more opaque failure that a silent EOF produces.
+                    write(Self.error("push succeeded but the completion frame could not be produced"), to: writer)
+                }
+            }
         } catch {
             write(Self.error(String(describing: error)), to: writer)
         }
