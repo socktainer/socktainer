@@ -96,6 +96,9 @@ protocol ClientArchiveProtocol: Sendable {
     /// Read a file or directory from a container's filesystem and return as tar data
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
 
+    /// Stat a path without reading it, for callers that only need the header
+    func statPath(containerId: String, path: String) async throws -> PathStat
+
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 
@@ -122,6 +125,34 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
+
+    /// Stat a single path, reading the inode and nothing else.
+    ///
+    /// `getArchive` builds a tar of everything under the path before its caller
+    /// discards it. For `/` that is the whole filesystem, which is why a HEAD
+    /// against a large image took as long as reading it.
+    func statPath(containerId: String, path: String) async throws -> PathStat {
+        let rootfsPath = getRootfsPath(containerId: containerId)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: containerId)
+        }
+
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        guard reader.exists(FilePath(normalizedPath)) else {
+            throw ClientArchiveError.pathNotFound(path: normalizedPath)
+        }
+
+        let (_, inode) = try reader.stat(FilePath(normalizedPath))
+        return PathStat(
+            name: (normalizedPath as NSString).lastPathComponent,
+            size: inode.size,
+            mode: UInt32(inode.mode),
+            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
+        )
+    }
+
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
         let rootfsPath = getRootfsPath(containerId: containerId)
 
