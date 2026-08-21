@@ -1,4 +1,5 @@
 import Testing
+import Vapor
 
 @testable import socktainer
 
@@ -84,30 +85,42 @@ struct BuildDockerfileQueryParamTests {
     }
 
     @Test("Malformed JSON starting with '[' is rejected rather than used verbatim as a literal path")
-    func malformedJson() {
-        #expect(throws: (any Error).self) {
-            try BuildRoute.parseDockerfileQueryParam("[not valid json")
+    func malformedJson() throws {
+        do {
+            _ = try BuildRoute.parseDockerfileQueryParam("[not valid json")
+            Issue.record("expected parseDockerfileQueryParam to throw")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
         }
     }
 
     @Test("An absolute dockerfile path is rejected with a client error, not silently substituted")
-    func absolutePathIsRejected() {
-        #expect(throws: (any Error).self) {
-            try BuildRoute.parseDockerfileQueryParam("/etc/passwd")
+    func absolutePathIsRejected() throws {
+        do {
+            _ = try BuildRoute.parseDockerfileQueryParam("/etc/passwd")
+            Issue.record("expected parseDockerfileQueryParam to throw")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
         }
     }
 
     @Test("A dockerfile path containing '..' traversal is rejected with a client error")
-    func traversalPathIsRejected() {
-        #expect(throws: (any Error).self) {
-            try BuildRoute.parseDockerfileQueryParam("../../etc/passwd")
+    func traversalPathIsRejected() throws {
+        do {
+            _ = try BuildRoute.parseDockerfileQueryParam("../../etc/passwd")
+            Issue.record("expected parseDockerfileQueryParam to throw")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
         }
     }
 
     @Test("A JSON-array-encoded escaping path is also rejected")
-    func jsonArrayEscapingPathIsRejected() {
-        #expect(throws: (any Error).self) {
-            try BuildRoute.parseDockerfileQueryParam(#"["/etc/passwd"]"#)
+    func jsonArrayEscapingPathIsRejected() throws {
+        do {
+            _ = try BuildRoute.parseDockerfileQueryParam(#"["/etc/passwd"]"#)
+            Issue.record("expected parseDockerfileQueryParam to throw")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
         }
     }
 
@@ -117,9 +130,12 @@ struct BuildDockerfileQueryParamTests {
     }
 
     @Test("A JSON array whose first element is empty is also rejected")
-    func jsonArrayEmptyFirstElementIsRejected() {
-        #expect(throws: (any Error).self) {
-            try BuildRoute.parseDockerfileQueryParam(#"[""]"#)
+    func jsonArrayEmptyFirstElementIsRejected() throws {
+        do {
+            _ = try BuildRoute.parseDockerfileQueryParam(#"[""]"#)
+            Issue.record("expected parseDockerfileQueryParam to throw")
+        } catch let abort as Abort {
+            #expect(abort.status == .badRequest)
         }
     }
 }
@@ -177,5 +193,20 @@ struct RepeatedQueryParamTests {
     @Test("A query with no matching key returns no values")
     func noMatchingKey() {
         #expect(allQueryValues(named: "platform", from: "dockerfile=Dockerfile") == [])
+    }
+
+    @Test("A '+' in a value decodes to a space, matching Vapor's own form-encoded query decoding")
+    func plusDecodesToSpace() {
+        #expect(allQueryValues(named: "message", from: "message=hello+world") == ["hello world"])
+    }
+
+    @Test("A malformed percent escape is used as-is instead of trapping")
+    func malformedPercentEscapeIsUsedAsIs() {
+        #expect(allQueryValues(named: "platform", from: "platform=%ZZ") == ["%ZZ"])
+    }
+
+    @Test("A matching key with no '=' returns an empty string, not nil or dropped")
+    func keyWithNoEqualsReturnsEmptyString() {
+        #expect(allQueryValues(named: "amend", from: "amend") == [""])
     }
 }
