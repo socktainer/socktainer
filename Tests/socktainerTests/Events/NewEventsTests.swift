@@ -481,6 +481,11 @@ private struct StubImageClient: ClientImageProtocol {
     {
         AsyncThrowingStream { $0.finish() }
     }
+    func pushManifestList(reference: String, logger: Logger) async throws
+        -> AsyncThrowingStream<String, Error>
+    {
+        AsyncThrowingStream { $0.finish() }
+    }
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         (
             [ImageDeletionResult(untagged: "docker.io/library/alpine:latest", digest: "sha256:abc123", deletedDigest: "sha256:abc123")],
@@ -515,8 +520,8 @@ private struct StubNetworkClient: ClientNetworkProtocol {
 }
 
 private struct StubBuilderClient: ClientBuilderProtocol {
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {}
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws {}
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder {
         fatalError("not exercised by this test")
     }
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
