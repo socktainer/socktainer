@@ -180,6 +180,17 @@ jobs:
           fi
           sudo container system status
 
+      # `container system start --enable-kernel-install` kicks off the kernel
+      # download asynchronously — `system status` above only confirms the API
+      # server itself is up, not that the kernel download finished. Without
+      # waiting for it here, the BuildKit builder container (used by `podman
+      # build`/`docker build`, see BuildRoute) can start against an
+      # unconfigured kernel and fail intermittently. `kernel set --recommended`
+      # blocks until the kernel is actually installed; `--force` because
+      # `system start` may already have set one (see 18c9955).
+      - name: Install default Linux kernel for container builds
+        run: sudo container system kernel set --recommended --force
+
       - name: run socktainer
         run: |
           nohup sudo -i $PWD/socktainer > service.log 2>&1 &
@@ -315,3 +326,286 @@ jobs:
           # prune all images end ensure no volumes are left
           sudo docker volume prune --all --force
           [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+
+      # --- Podman CLI integration tests ---
+      - name: install podman cli
+        run: |
+          brew install podman
+
+      - name: setup podman socket
+        run: |
+          # /run is read-only on macOS, so use CONTAINER_HOST env var
+          echo "CONTAINER_HOST=unix:///var/root/.socktainer/container.sock" >> "$GITHUB_ENV"
+
+      - name: check podman version with socktainer
+        run: |
+          sudo -E podman version
+          # Verify socktainer is responding with expected API version
+          sudo -E podman version | grep 'v1.51'
+
+      - name: check podman images with socktainer
+        run: |
+          sudo -E podman image ls
+          sudo -E podman pull alpine:latest
+          sudo -E podman image ls | grep alpine
+
+      - name: check podman containers with socktainer
+        run: |
+          sudo -E podman ps
+          sudo -E podman ps -a
+
+      # `podman manifest add/create/inspect/exists` don't need a running container or a
+      # build (no BuildKit VM involved) — just already-pulled images and real query-param
+      # decoding, so unlike `podman build` these are testable on this runner. Regression
+      # coverage for: `PUT /libpod/manifests/{name}` needing to be decoded from query
+      # params (real podman sends operation/images there, not a JSON body with a
+      # Content-Type header — see LibpodManifestModifyRoute), and the greedy
+      # `{name:.*}` route (manifest create) no longer swallowing the more specific
+      # `{name}/registry/{destination}` sibling (manifest push) registered after it
+      # (see RegexRouter's specificity-ordered matching).
+      - name: check podman manifest with socktainer
+        run: |
+          sudo -E podman manifest create ci-test-manifest
+          sudo -E podman manifest add ci-test-manifest alpine:latest
+          sudo -E podman manifest inspect ci-test-manifest | grep 'image.index.v1+json'
+          sudo -E podman manifest exists ci-test-manifest
+
+      # Push destinations aren't reachable via a local registry container here (running any
+      # container needs the same unavailable nested-virtualization capability as
+      # `podman build`'s BuildKit VM — see the NOTE below), so this pushes to ttl.sh, a
+      # public ephemeral registry (tag suffix sets image lifetime, no auth needed). This is
+      # real regression coverage for two fixes: `podman push <image> <destination>` used to
+      # silently ignore `destination` entirely (real podman sends it as a `destination`
+      # query param, not folded into the path reference) and always tried — and, for
+      # anything without its own domain, failed — to push the source reference back to
+      # wherever it resolved to; `podman manifest push` used to fail on every push (success
+      # included) because the progress stream was framed with a `status` key real podman's
+      # client doesn't recognize (`stream`/`error`/`Id`, see DockerProgressFrame).
+      #
+      # The manifest pushed here is a fresh, empty one (not `ci-test-manifest` from the
+      # step above) — `manifest add`'s real podman semantics expand a multi-platform
+      # reference like `alpine:latest` into every platform's leaf manifest, but a normal
+      # pull only fetches this runner's own (arm64) platform content, so pushing that one
+      # would fail on missing blobs for the platforms never pulled — a real content-
+      # completeness constraint, not the bug being tested here.
+      #
+      # NOTE: this does NOT cover the bare-tag lookup fix (ClientImageService.push /
+      # ClientManifestService.retagForPush resolving a locally BUILT image, tagged
+      # verbatim with no registry/library prefix) or the private-IP-with-port scheme
+      # workaround (ClientImageService.resolvedScheme) — both need a real `podman build`
+      # output to reproduce, which this runner can't do for the same reason `podman build`
+      # itself is disabled below.
+      - name: check podman push with socktainer
+        run: |
+          retry() {
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "attempt ${attempt} failed, retrying..." >&2
+                sleep 5
+              fi
+            done
+            return 1
+          }
+          TAG="ci-$(date +%s)"
+          retry sudo -E podman push alpine:latest "ttl.sh/socktainer-ci-push-${TAG}:5m"
+          sudo -E podman manifest create ci-push-manifest
+          retry sudo -E podman manifest push ci-push-manifest "ttl.sh/socktainer-ci-manifest-${TAG}:5m"
+
+      # NOTE: podman/docker build requires a BuildKit builder VM. Confirmed on a real
+      #       run here (see below) that GitHub-hosted macOS runners genuinely can't
+      #       boot it: "Error Domain=VZErrorDomain Code=2 Virtualization is not
+      #       available on this hardware." The kernel-install-completion step above
+      #       (needed regardless, for image/manifest ops) doesn't change this — it's
+      #       a hardware capability gap, not a race.
+      #       See: https://github.com/actions/runner-images/issues/12933
+      #            https://github.com/orgs/community/discussions/69211
+      # - name: check podman build with socktainer
+      #   run: |
+      #     echo 'FROM alpine:latest' > /tmp/Dockerfile.test
+      #     echo 'RUN echo hello' >> /tmp/Dockerfile.test
+      #     sudo -E podman build -t test-build -f /tmp/Dockerfile.test /tmp
+      #     sudo -E podman image ls | grep test-build
+
+  multi-arch-build:
+    name: multi-arch build test (amd64 + arm64 + s390x)
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 75
+    # Disabled: confirmed by a real run that every build here fails with
+    # "Error Domain=VZErrorDomain Code=2 Virtualization is not available on
+    # this hardware" — GitHub-hosted macOS runners can't boot the BuildKit
+    # builder VM this job's docker-build-API steps depend on (same root
+    # cause as podman build being disabled above). Re-enable once
+    # https://github.com/actions/runner-images/issues/12933 is resolved.
+    if: false
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # fetch the artifact from the build job
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: socktainer
+
+      - name: Prepare socktainer binary
+        run: |
+          ls -la
+          chmod 755 socktainer
+
+      - name: Fetch Apple Container installer
+        run: |
+          APPLE_CONTAINER_VERSION=$(python3 -c "import json; d=json.load(open('Package.resolved')); print([p['state']['version'] for p in d['pins'] if p['identity']=='container'][0])")
+          wget "https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-installer-unsigned.pkg" \
+            -O container-installer-signed.pkg
+
+      - name: Install Apple Container
+        run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
+
+      - name: Setup tmate
+        run: brew install tmate
+
+      - name: Start Apple Container system
+        run: |
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          # skip welcome screen
+          tmate -F -S /tmp/tmate.sock send-keys "q" C-m
+
+          tmate -S /tmp/tmate.sock send-keys "sudo container system start --enable-kernel-install | tee /tmp/container.log" C-m
+
+          START=$SECONDS
+          TIMEOUT=60
+          READY=false
+          while [ $((SECONDS - START)) -lt $TIMEOUT ]; do
+            tmate -S /tmp/tmate.sock capture-pane -p > /tmp/container.log
+            cat /tmp/container.log
+            if sudo container system status >/dev/null 2>&1; then
+              echo "Container system is ready."
+              READY=true
+              break
+            else
+              echo "Container not ready yet..."
+            fi
+            sleep 2
+          done
+          tmate -S /tmp/tmate.sock kill-session
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: container system did not become ready within ${TIMEOUT}s"
+            exit 1
+          fi
+
+      # container system start --enable-kernel-install runs the kernel download
+      # inside the tmate session. The loop above exits as soon as the API server
+      # responds (container system status = OK), which happens *before* the
+      # kernel download finishes.  Killing the tmate session at that point
+      # interrupts the download, leaving the kernel unconfigured.
+      # Running `container system kernel set --recommended` here (synchronously,
+      # not inside tmate) ensures the kernel is fully installed before we try to
+      # start the buildkit builder container. `--force` because the tmate-driven
+      # `system start` may have already installed one before being killed off,
+      # and a bare re-install then fails with "already exists" (NSCocoaErrorDomain
+      # Code=516) rather than being a no-op.
+      - name: Install default Linux kernel for container builds
+        run: sudo container system kernel set --recommended --force
+
+      - name: Start socktainer
+        run: |
+          SOCKTAINER_BIN="$(pwd)/socktainer"
+          nohup sudo -i "$SOCKTAINER_BIN" > service.log 2>&1 &
+          echo $! > service.pid
+          sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
+          sleep 5
+          cat service.log
+
+      - name: Install docker, docker-buildx, and podman CLIs
+        run: |
+          brew install docker docker-buildx podman
+          # docker-buildx is installed as a CLI plugin by Homebrew under
+          # /opt/homebrew/lib/docker/cli-plugins/docker-buildx.
+          # Make it visible to sudo (which may search a different prefix).
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo ln -sf "$(brew --prefix)/lib/docker/cli-plugins/docker-buildx" \
+            /usr/local/lib/docker/cli-plugins/docker-buildx
+
+      - name: Create test Dockerfile
+        run: |
+          mkdir -p /tmp/testbuild
+          cat > /tmp/testbuild/Dockerfile <<'EOF'
+          FROM alpine:3
+          RUN echo "Built for $(uname -m)" > /arch.txt
+          CMD ["sh", "-c", "cat /arch.txt"]
+          EOF
+
+      # ── Rosetta path: arm64 + amd64 ──────────────────────────────────────────
+      # docker buildx build with the default docker-container driver would start
+      # a moby/buildkit container inside socktainer, which is not supported.
+      # We call the Docker build API directly via curl instead; socktainer routes
+      # multi-platform requests to its Rosetta / QEMU builder containers.
+      - name: docker build – arm64+amd64 (Rosetta builder)
+        run: |
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -sS --fail-with-body --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3Arosetta&platform=linux%2Farm64%2Clinux%2Famd64"
+          sudo docker image ls | grep 'test-multiarch:rosetta'
+
+      # ── QEMU path: s390x ─────────────────────────────────────────────────────
+      - name: docker build – s390x (QEMU builder)
+        run: |
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -sS --fail-with-body --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3As390x&platform=linux%2Fs390x"
+          sudo docker image ls | grep 'test-multiarch:s390x'
+
+      # ── Combined manifest list: arm64 + amd64 + s390x ────────────────────────
+      - name: docker build – combined amd64+arm64+s390x manifest list
+        run: |
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -sS --fail-with-body --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3Alatest&platform=linux%2Farm64%2Clinux%2Famd64%2Clinux%2Fs390x"
+          sudo docker image ls | grep 'test-multiarch:latest'
+
+      - name: Verify manifest list contains amd64, arm64, and s390x
+        run: |
+          MANIFESTS=$(sudo curl -sS --fail-with-body --unix-socket /var/run/docker.sock \
+            "http://localhost/images/test-multiarch:latest/json?manifests=true" \
+            | jq -r '[.Manifests[]? | select(.Kind == "image") | .ImageData.Platform.architecture // empty] | unique | sort | join(",")')
+          echo "Platforms in manifest list: $MANIFESTS"
+          [[ "$MANIFESTS" == *"amd64"* ]] || { echo "ERROR: amd64 missing from manifest list"; exit 1; }
+          [[ "$MANIFESTS" == *"arm64"* ]] || { echo "ERROR: arm64 missing from manifest list"; exit 1; }
+          [[ "$MANIFESTS" == *"s390x"* ]] || { echo "ERROR: s390x missing from manifest list"; exit 1; }
+          echo "✓ Manifest list verified: amd64, arm64, and s390x all present"
+
+      # ── Docker multi-arch build API: manifest list amd64+ppc64le+arm64+s390x ──
+      # This is NOT equivalent to `podman build --platform ... --manifest name`.
+      # Real podman CLI, invoked bare (no --manifest), only builds a single
+      # platform anyway (see containers/podman#27211) — comma-separated
+      # --platform alone does not produce a multi-arch image on the real
+      # podman client. Podman's own --manifest flow (BuildRoute now reads the
+      # `manifest` query param and registers the built image via
+      # `manifestClient.addBuiltImage` — see socktainer#201) isn't exercised by
+      # this step either, since it never sends that param. This step only
+      # proves the Docker-compat build endpoint itself can assemble a
+      # multi-platform manifest list when asked directly via curl; it is not
+      # a stand-in for testing the podman CLI's multi-arch workflow.
+      - name: docker build API – manifest list amd64+ppc64le+arm64+s390x
+        run: |
+          platarch=linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
+          encoded=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$platarch")
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -sS --fail-with-body --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=shazam&platform=${encoded}"
+          sudo docker image ls | grep 'shazam'
