@@ -53,8 +53,8 @@ struct LibpodManifestModifyRouteTests {
         }
     }
 
-    @Test("operation=remove removes each listed digest in order")
-    func removeDigests() async throws {
+    @Test("operation=remove removes every listed digest in a single batch call")
+    func removeDigestsInOneBatch() async throws {
         let removedDigests = Box<[String]>([])
         let client = MockManifestClient(
             inspectHandler: { _ in
@@ -63,8 +63,8 @@ struct LibpodManifestModifyRouteTests {
                     Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:bbb", size: 100),
                 ])
             },
-            removeDigestHandler: { _, digest in
-                await removedDigests.set(await removedDigests.get() + [digest])
+            removeDigestsHandler: { _, digests in
+                await removedDigests.set(digests)
                 return "sha256:afterremoval"
             })
 
@@ -89,6 +89,21 @@ struct LibpodManifestModifyRouteTests {
         }
     }
 
+    @Test("a non-sha256 digest is rejected as unsupported, not silently mangled into a malformed sha256 value")
+    func removeWithNonSha256DigestIs400() async throws {
+        let client = MockManifestClient(
+            inspectHandler: { _ in
+                Index(manifests: [Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:aaa", size: 100)])
+            })
+
+        try await withModifyApp(client: client) { app in
+            try await app.testing().test(.PUT, "/v1.51/libpod/manifests/mylist?operation=remove&images=sha512:abc") { res async throws in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("not a supported digest"))
+            }
+        }
+    }
+
     @Test("a later invalid digest in a multi-digest remove is rejected before any digest is actually removed")
     func removeRejectsBeforeMutatingWhenADigestIsInvalid() async throws {
         let removedDigests = Box<[String]>([])
@@ -97,8 +112,8 @@ struct LibpodManifestModifyRouteTests {
                 // Only "sha256:aaa" is an actual member — "sha256:bbb" is not.
                 Index(manifests: [Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:aaa", size: 100)])
             },
-            removeDigestHandler: { _, digest in
-                await removedDigests.set(await removedDigests.get() + [digest])
+            removeDigestsHandler: { _, digests in
+                await removedDigests.set(await removedDigests.get() + digests)
                 return "sha256:afterremoval"
             })
 
@@ -119,8 +134,8 @@ struct LibpodManifestModifyRouteTests {
             inspectHandler: { _ in
                 Index(manifests: [Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:aaa", size: 100)])
             },
-            removeDigestHandler: { _, digest in
-                await removedDigests.set(await removedDigests.get() + [digest])
+            removeDigestsHandler: { _, digests in
+                await removedDigests.set(await removedDigests.get() + digests)
                 return "sha256:afterremoval"
             })
 
@@ -174,7 +189,7 @@ struct LibpodManifestModifyRouteTests {
     func removeFromNonexistentManifestIs404() async throws {
         let client = MockManifestClient(
             inspectHandler: { name in throw ClientManifestError.notFound(name: name) },
-            removeDigestHandler: { name, _ in
+            removeDigestsHandler: { name, _ in
                 throw ClientManifestError.notFound(name: name)
             })
 

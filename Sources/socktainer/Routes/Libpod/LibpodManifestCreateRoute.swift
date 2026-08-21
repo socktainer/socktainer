@@ -1,4 +1,5 @@
 import ContainerPersistence
+import ContainerizationError
 import Vapor
 
 struct RESTManifestCreateQuery: Content {
@@ -30,7 +31,7 @@ struct LibpodManifestCreateRoute: RouteCollection {
 
     static func handler(client: ClientManifestServiceProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            guard let name = req.parameters.get("name") else {
+            guard let name = req.parameters.get("name"), !name.isEmpty else {
                 throw Abort(.badRequest, reason: "Missing manifest list name")
             }
 
@@ -83,6 +84,8 @@ struct LibpodManifestCreateRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "No such image: \(id)")
             } catch ClientManifestError.alreadyExists {
                 throw Abort(.conflict, reason: "manifest list \(name) already exists (use --amend to update it)")
+            } catch let error as ContainerizationError where error.code == .invalidArgument {
+                throw Abort(.badRequest, reason: error.message)
             }
         }
     }

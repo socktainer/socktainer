@@ -1,3 +1,4 @@
+import ContainerizationError
 import Vapor
 
 /// `PUT /libpod/manifests/{name}` — real podman's unified add/remove/annotate endpoint
@@ -24,7 +25,7 @@ struct LibpodManifestModifyRoute: RouteCollection {
 
     static func handler(client: ClientManifestServiceProtocol) -> @Sendable (Request) async throws -> RESTManifestIDResponse {
         { req in
-            guard let name = req.parameters.get("name") else {
+            guard let name = req.parameters.get("name"), !name.isEmpty else {
                 throw Abort(.badRequest, reason: "Missing manifest list name")
             }
             let query: RESTManifestModifyQuery
@@ -50,7 +51,14 @@ struct LibpodManifestModifyRoute: RouteCollection {
                     var normalizedDigests: [String] = []
                     var seenDigests = Set<String>()
                     for digest in images {
-                        let normalized = digest.hasPrefix("sha256:") ? digest : "sha256:\(digest)"
+                        let normalized: String
+                        if digest.hasPrefix("sha256:") {
+                            normalized = digest
+                        } else if digest.contains(":") {
+                            throw Abort(.badRequest, reason: "\(digest) is not a supported digest (only sha256 is)")
+                        } else {
+                            normalized = "sha256:\(digest)"
+                        }
                         guard currentDigests.contains(normalized) else {
                             throw Abort(.badRequest, reason: "\(normalized) is not a member of \(name)")
                         }
@@ -64,10 +72,7 @@ struct LibpodManifestModifyRoute: RouteCollection {
                         }
                         normalizedDigests.append(normalized)
                     }
-                    var result = name
-                    for digest in normalizedDigests {
-                        result = try await client.removeDigest(name: name, digest: digest)
-                    }
+                    let result = try await client.removeDigests(name: name, digests: normalizedDigests)
                     return RESTManifestIDResponse(ID: result)
                 case "annotate":
                     throw Abort(.notImplemented, reason: "manifest annotate is not implemented")
@@ -84,6 +89,8 @@ struct LibpodManifestModifyRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "No such image: \(id)")
             } catch is ClientManifestError {
                 throw Abort(.notFound, reason: "No such manifest list: \(name)")
+            } catch let error as ContainerizationError where error.code == .invalidArgument {
+                throw Abort(.badRequest, reason: error.message)
             }
         }
     }

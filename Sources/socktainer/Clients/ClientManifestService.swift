@@ -34,6 +34,8 @@ protocol ClientManifestServiceProtocol: Sendable {
     @discardableResult
     func removeDigest(name: String, digest: String) async throws -> String
     @discardableResult
+    func removeDigests(name: String, digests: [String]) async throws -> String
+    @discardableResult
     func addBuiltImage(name: String, builtReference: String, logger: Logger) async throws -> String
     func delete(name: String) async throws
     func retagForPush(name: String, destination: String) async throws -> (reference: String, priorState: RetagState?)
@@ -193,12 +195,39 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     @discardableResult
     func removeDigest(name: String, digest: String) async throws -> String {
         var manifests = try await inspect(name: name).manifests
-        let normalizedDigest = digest.hasPrefix("sha256:") ? digest : "sha256:\(digest)"
+        // A bare hex digest (no algorithm prefix) is assumed sha256, matching real podman's
+        // own convention — but a digest already carrying a DIFFERENT algorithm's prefix
+        // (e.g. `sha512:...`) must not be blindly re-prefixed into `sha256:sha512:...`, a
+        // malformed digest that could never match a real member and would silently succeed as
+        // "not found" instead of surfacing the actual problem (an unsupported algorithm).
+        let normalizedDigest: String
+        if digest.hasPrefix("sha256:") {
+            normalizedDigest = digest
+        } else if digest.contains(":") {
+            throw ContainerizationError(.invalidArgument, message: "\(digest) is not a supported digest (only sha256 is)")
+        } else {
+            normalizedDigest = "sha256:\(digest)"
+        }
         let countBefore = manifests.count
         manifests.removeAll { $0.digest == normalizedDigest }
         guard manifests.count < countBefore else {
             throw ContainerizationError(.invalidArgument, message: "\(normalizedDigest) is not a member of \(name)")
         }
+        return try await writeIndexAndTag(name: name, manifests: manifests)
+    }
+
+    /// The "remove" operation of `PUT /libpod/manifests/{name}` when it carries more than one
+    /// digest — removes every requested digest via a SINGLE read-modify-write instead of one
+    /// `removeDigest` call per digest, which would re-`inspect`/re-tag `name` once per digest
+    /// and leave a window between each pair of removals where a concurrent request could see
+    /// (or race against) a partially-modified list. The caller has already validated every
+    /// digest is a current member before calling this — that's still a separate concern from
+    /// the atomicity this collapses.
+    @discardableResult
+    func removeDigests(name: String, digests: [String]) async throws -> String {
+        var manifests = try await inspect(name: name).manifests
+        let digestSet = Set(digests)
+        manifests.removeAll { digestSet.contains($0.digest) }
         return try await writeIndexAndTag(name: name, manifests: manifests)
     }
 

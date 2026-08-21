@@ -46,7 +46,7 @@ struct LibpodManifestPushRoute: RouteCollection {
     private static func push(
         _ req: Request, manifestClient: ClientManifestServiceProtocol, imageClient: ClientImageProtocol, destination: String
     ) async throws -> Response {
-        guard let name = req.parameters.get("name") else {
+        guard let name = req.parameters.get("name"), !name.isEmpty else {
             throw Abort(.badRequest, reason: "Missing manifest list name")
         }
 
