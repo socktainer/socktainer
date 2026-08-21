@@ -1,3 +1,4 @@
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import Testing
@@ -114,6 +115,19 @@ struct LibpodManifestCreateRouteTests {
             }
         }
         #expect(await receivedAmend.get() == true)
+    }
+
+    @Test("a ContainerizationError.invalidArgument from create surfaces as 400, not a raw 500")
+    func invalidArgumentFromCreateIs400() async throws {
+        let client = MockManifestClient(createHandler: { name, _, _ in
+            throw ContainerizationError(.invalidArgument, message: "\(name) exists but is not a manifest list")
+        })
+
+        try await withManifestApp(client: client) { app in
+            try await app.testing().test(.POST, "/v1.51/libpod/manifests/mylist?image=alpine:latest&amend=true") { res async throws in
+                #expect(res.status == .badRequest)
+            }
+        }
     }
 }
 

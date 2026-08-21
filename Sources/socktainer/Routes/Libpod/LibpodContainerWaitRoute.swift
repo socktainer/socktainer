@@ -36,8 +36,10 @@ struct LibpodContainerWaitRoute: RouteCollection {
 
     /// Real podman's libpod `wait` endpoint (`condition=`, repeatable) uses the container's
     /// own lowercase status names ("configured", "created", "running", "paused", "exited",
-    /// "stopped", ...), not Docker compat's `wait`-specific vocabulary
-    /// (`ContainerWaitCondition`: "not-running", "next-exit", "removed", "healthy"). Only
+    /// "stopped", "removing", ...), not Docker compat's `wait`-specific vocabulary
+    /// (`ContainerWaitCondition`: "not-running", "next-exit", "removed", "healthy"). "removing"
+    /// (in-progress removal) maps to the same `.removed` condition as Docker-compat's "removed"
+    /// since this daemon has no distinct in-progress-removal state to block on. Only
     /// the first `condition` value is honored — real podman lets multiple be OR-matched,
     /// which would need genuine target-state polling this daemon's `client.wait` doesn't
     /// implement (it only supports "block until the container stops and report its exit
@@ -47,7 +49,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
         switch first {
         case "stopped", "exited":
             return .notRunning
-        case "removed":
+        case "removed", "removing":
             return .removed
         case "healthy":
             return .healthy

@@ -32,6 +32,23 @@ struct LibpodContainerWaitRouteTests {
         #expect(await client.receivedCondition == .notRunning)
     }
 
+    @Test("condition=removing (real podman's in-progress-removal status) maps to removed, not a 400")
+    func removingConditionMapsToRemoved() async throws {
+        let client = RecordingWaitClient()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: LibpodContainerWaitRoute(client: client))
+
+            try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=removing") { res async throws in
+                #expect(res.status == .ok)
+            }
+        }
+        #expect(await client.receivedCondition == .removed)
+    }
+
     @Test("condition=running (not implemented) is 501, not a misleading 400 'invalid condition'")
     func runningConditionIsNotImplemented() async throws {
         let client = RecordingWaitClient()

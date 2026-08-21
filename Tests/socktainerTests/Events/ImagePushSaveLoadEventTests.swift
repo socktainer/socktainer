@@ -141,6 +141,24 @@ struct ImagePushSaveLoadEventTests {
         #expect(events.first?.Actor.ID == alpineDigest)
         #expect(events.last?.Actor.ID == "docker.io/library/busybox:latest")
     }
+
+    @Test("libpod's multi-image export endpoint decodes repeated 'references', matching real podman's ImageExportLibpod")
+    func libpodExportDecodesReferences() async throws {
+        try await withImageApp(client: FakeImageClient(), broadcaster: EventBroadcaster()) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/images/export?references=alpine&references=busybox") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+    }
+
+    @Test("libpod's multi-image export endpoint is a 400 with no 'references' given")
+    func libpodExportWithNoReferencesIs400() async throws {
+        try await withImageApp(client: FakeImageClient(), broadcaster: EventBroadcaster()) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/images/export") { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -159,6 +177,7 @@ private func withImageApp(
         let manifestClient = ClientManifestService(appSupportURL: FileManager.default.temporaryDirectory, containerSystemConfig: ContainerSystemConfig())
         try app.register(collection: ImagePushRoute(client: client, manifestClient: manifestClient))
         try app.register(collection: ImagesGetRoute(client: client))
+        try app.register(collection: LibpodImagesGetRoute(client: client))
         try app.register(collection: ImagesLoadRoute(client: client))
         try await test(app)
     }

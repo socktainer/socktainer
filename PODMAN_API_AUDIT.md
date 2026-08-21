@@ -61,7 +61,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman search` | GET `/libpod/images/search` | ✅ |
 | `podman history` | GET `/libpod/images/{name}/history` | ✅ |
 | `podman image prune` | POST `/libpod/images/prune` (confirmed in podman source) | ✅ |
-| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/get?names=...` (multi) | ✅ |
+| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
 | `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
