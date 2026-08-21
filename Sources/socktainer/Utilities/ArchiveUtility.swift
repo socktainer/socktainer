@@ -100,6 +100,38 @@ struct ArchiveUtility {
                 continue
             }
 
+            // A hard-link entry carries a populated `hardlink` (the linked-to path,
+            // archive-root-relative like the entry's own `path`, not entry-directory-relative
+            // like a symlink target) regardless of what `fileType` itself reports for it
+            // (confirmed empirically: this framework's reader surfaces a hard-link entry's
+            // `fileType` as `.unknown`, landing it in the `default:` case below — NOT
+            // `.regular`, despite that being this project's own EXT4 exporter's convention for
+            // entries it constructs itself). Its data stream is empty — falling through to
+            // `default:`'s "unsupported, skip" handling would silently produce no file at all
+            // instead of linking to the earlier entry's real content.
+            if let hardlinkTarget = entry.hardlink {
+                guard let linkSource = safeDestination(for: hardlinkTarget, under: destination, destinationPath: destinationPath),
+                    hasSafeAncestors(of: linkSource, under: destination)
+                else {
+                    rejectedPaths.append(rawPath)
+                    continue
+                }
+                try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+                // "Last entry wins", matching `.regular`/`.directory`/`.symbolicLink`.
+                try? fileManager.removeItem(at: fullPath)
+                guard link(linkSource.path, fullPath.path) == 0 else {
+                    // ENOENT (the archive references a hard-link target that hasn't been
+                    // extracted, e.g. malformed ordering) is an unsupported/malformed entry,
+                    // not a host-side failure — anything else still deserves a hard failure.
+                    guard errno == ENOENT else {
+                        throw ArchiveUtilityError.archiveWriteFailed("\(rawPath): link failed (errno \(errno))")
+                    }
+                    rejectedPaths.append(rawPath)
+                    continue
+                }
+                continue
+            }
+
             switch entry.fileType {
             case .directory:
                 // "Last entry wins", matching the `.regular` case below: a prior entry may
@@ -117,7 +149,14 @@ struct ArchiveUtility {
                     try? fileManager.removeItem(at: fullPath)
                 }
                 try fileManager.createDirectory(at: fullPath, withIntermediateDirectories: true)
-                pendingDirectoryPermissions.append((fullPath.path, mode_t(entry.permissions & 0o777)))
+                // Skip the extraction root itself (a `.`/`./` entry, per `safeDestination`,
+                // resolves to `destination` verbatim) — the caller created `destination` with
+                // its own intended permissions before extraction ever started, and a tar
+                // entry's recorded mode for the archive's own top-level directory (which can be
+                // arbitrarily restrictive) has no business overriding that.
+                if fullPath.standardizedFileURL.path != destinationPath {
+                    pendingDirectoryPermissions.append((fullPath.path, mode_t(entry.permissions & 0o777)))
+                }
             case .regular:
                 try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 // "Last entry wins", matching the framework's own extraction semantics.
@@ -211,9 +250,10 @@ struct ArchiveUtility {
                 let linkDestination = isAbsoluteTarget ? relativePath(from: fullPath.deletingLastPathComponent(), to: resolvedTarget) : target
                 try fileManager.createSymbolicLink(atPath: fullPath.path, withDestinationPath: linkDestination)
             default:
-                // Hard-link entries (and anything else libarchive might surface) land
-                // here — the framework's own `extractEntry` has no support for them
-                // either (its `default: return false`). Unlike a path-traversal/symlink
+                // Hard links are handled above (regardless of `fileType`) before this switch
+                // is ever reached. Anything else libarchive might surface (FIFOs, device
+                // nodes, ...) lands here — the framework's own `extractEntry` has no support
+                // for them either (its `default: return false`). Unlike a path-traversal/symlink
                 // violation above, this is just an unsupported (not hostile) tar feature a
                 // real build context can legitimately contain — logged for visibility, but
                 // not fatal to the rest of the extraction.
