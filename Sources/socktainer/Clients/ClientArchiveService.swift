@@ -71,13 +71,44 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
+/// POSIX `st_mode` in Go's `os.FileMode` encoding, which is what the Docker API
+/// carries: permission bits are shared, but Go keeps the file type in the high
+/// bits rather than in `S_IFMT`.
+func goFileMode(posixMode: UInt32) -> UInt32 {
+    var mode = posixMode & 0o777
+    switch posixMode & 0o170000 {
+    case 0o040000: mode |= 1 << 31  // ModeDir
+    case 0o120000: mode |= 1 << 27  // ModeSymlink
+    case 0o020000: mode |= (1 << 26) | (1 << 21)  // ModeDevice | ModeCharDevice
+    case 0o060000: mode |= 1 << 26  // ModeDevice
+    case 0o010000: mode |= 1 << 25  // ModeNamedPipe
+    case 0o140000: mode |= 1 << 24  // ModeSocket
+    default: break  // regular files carry no type bit
+    }
+    if posixMode & 0o4000 != 0 { mode |= 1 << 23 }  // ModeSetuid
+    if posixMode & 0o2000 != 0 { mode |= 1 << 22 }  // ModeSetgid
+    if posixMode & 0o1000 != 0 { mode |= 1 << 20 }  // ModeSticky
+    return mode
+}
+
+/// Go's RFC3339Nano in the daemon's own timezone, as Docker reports it. An ext4
+/// inode holds whole seconds and Go omits a zero fraction, so only the offset
+/// differs from RFC3339.
+func dockerPathStatTimestamp(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+    return formatter.string(from: date)
+}
+
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
     let size: Int64
     let mode: UInt32
     let mtime: String
-    let linkTarget: String?
+    let linkTarget: String
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -146,9 +177,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let pathStat = PathStat(
             name: (normalizedPath as NSString).lastPathComponent,
             size: inode.size,
-            mode: UInt32(inode.mode),
-            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
-            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
+            mode: goFileMode(posixMode: UInt32(inode.mode)),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: (inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil) ?? ""
         )
 
         // Create temporary directory for tar creation
