@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerResource
 import ContainerizationOCI
 import Foundation
@@ -155,7 +156,8 @@ private func withImageApp(
         regexRouter.installMiddleware(on: app)
         app.storage[EventBroadcasterKey.self] = broadcaster
         app.storage[AppleContainerAppSupportUrlKey.self] = FileManager.default.temporaryDirectory
-        try app.register(collection: ImagePushRoute(client: client))
+        let manifestClient = ClientManifestService(appSupportURL: FileManager.default.temporaryDirectory, containerSystemConfig: ContainerSystemConfig())
+        try app.register(collection: ImagePushRoute(client: client, manifestClient: manifestClient))
         try app.register(collection: ImagesGetRoute(client: client))
         try app.register(collection: ImagesLoadRoute(client: client))
         try await test(app)
@@ -210,6 +212,10 @@ private struct FakeImageClient: ClientImageProtocol {
                 continuation.finish()
             }
         }
+    }
+
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
     }
 
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
