@@ -84,8 +84,11 @@ struct ArchiveExtractionSafetyTests {
             entries: [RawTarEntry(path: "../escape", fileType: .regular, data: Data("pwned".utf8))])
 
         let dest = tmp.appendingPathComponent("out")
-        #expect(throws: ArchiveUtilityError.self) {
+        do {
             try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the traversal entry")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("../escape"))
         }
         #expect(!FileManager.default.fileExists(atPath: tmp.appendingPathComponent("escape").path))
     }
@@ -111,8 +114,11 @@ struct ArchiveExtractionSafetyTests {
             ])
 
         let dest = tmp.appendingPathComponent("out")
-        #expect(throws: ArchiveUtilityError.self) {
+        do {
             try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the symlink-ancestor traversal entry")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("evil/pwned"))
         }
         #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("pwned").path))
     }
@@ -139,8 +145,11 @@ struct ArchiveExtractionSafetyTests {
             ])
 
         let dest = tmp.appendingPathComponent("out")
-        #expect(throws: ArchiveUtilityError.self) {
+        do {
             try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the chained-symlink traversal entry")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("b/x"))
         }
         #expect(!FileManager.default.fileExists(atPath: dest.appendingPathComponent("b/x").path))
     }

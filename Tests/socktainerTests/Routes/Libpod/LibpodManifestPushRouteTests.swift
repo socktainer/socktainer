@@ -78,6 +78,30 @@ struct LibpodManifestPushRouteTests {
         }
     }
 
+    @Test("a destination that already had its own prior tag forwards that exact descriptor to untagPushDestination unchanged")
+    func differingDestinationWithPriorTagForwardsPriorDescriptor() async throws {
+        let priorDescriptor = Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:priorexisting", size: 123)
+        let untaggedState = Box<RetagState?>(nil)
+        let manifestClient = MockManifestClient(
+            digestHandler: { _ in "sha256:finaldigest" },
+            retagForPushHandler: { _, destination in
+                (destination, RetagState(reference: destination, priorDescriptor: priorDescriptor))
+            },
+            untagPushDestinationHandler: { state in await untaggedState.set(state) }
+        )
+        let imageClient = StubImageClient(pushManifestListHandler: { _ in AsyncThrowingStream { $0.finish() } })
+
+        try await withPushApp(manifestClient: manifestClient, imageClient: imageClient) { app in
+            try await app.testing().test(.POST, "/v1.51/libpod/manifests/mylist/registry/registry.example.com/repo:tag") { res async throws in
+                #expect(res.status == .ok)
+            }
+        }
+
+        let state = await untaggedState.get()
+        #expect(state?.reference == "registry.example.com/repo:tag")
+        #expect(state?.priorDescriptor?.digest == "sha256:priorexisting")
+    }
+
     @Test("the legacy ?destination= query form behaves the same as the path form")
     func legacyQueryDestinationForm() async throws {
         let pushedReference = Box<String?>(nil)
