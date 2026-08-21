@@ -245,12 +245,45 @@ struct ArchiveExtractionSafetyTests {
         #expect(lstat(evilPath, &info) == 0)
         #expect((info.st_mode & S_IFMT) == S_IFDIR)
     }
+
+    @Test("A hard-link entry links to its target's real content, not an empty file")
+    func hardLinkEntryLinksToTargetContent() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let tar = tmp.appendingPathComponent("context.tar")
+        try writeRawTar(
+            at: tar,
+            entries: [
+                RawTarEntry(path: "original.txt", fileType: .regular, data: Data("hello, hardlink".utf8)),
+                // A hard-link entry surfaces with `fileType == .regular` (see `archive_entry_hardlink`
+                // convention) and no data of its own — the entry itself only carries the linked-to
+                // path.
+                RawTarEntry(path: "linked.txt", fileType: .regular, hardlinkTarget: "original.txt"),
+            ])
+
+        let dest = tmp.appendingPathComponent("out")
+        try ArchiveUtility.extract(tarPath: tar, to: dest)
+
+        let originalPath = dest.appendingPathComponent("original.txt").path
+        let linkedPath = dest.appendingPathComponent("linked.txt").path
+        let linkedContent = try String(contentsOfFile: linkedPath, encoding: .utf8)
+        #expect(linkedContent == "hello, hardlink")
+
+        var originalInfo = stat()
+        var linkedInfo = stat()
+        #expect(stat(originalPath, &originalInfo) == 0)
+        #expect(stat(linkedPath, &linkedInfo) == 0)
+        #expect(originalInfo.st_ino == linkedInfo.st_ino)
+    }
 }
 
 private struct RawTarEntry {
     let path: String
     let fileType: URLFileResourceType
     var symlinkTarget: String? = nil
+    var hardlinkTarget: String? = nil
     var data: Data? = nil
     var modificationDate: Date? = nil
 }
@@ -267,6 +300,9 @@ private func writeRawTar(at tarPath: URL, entries: [RawTarEntry]) throws {
         entry.permissions = raw.fileType == .directory ? 0o755 : 0o644
         if let target = raw.symlinkTarget {
             entry.symlinkTarget = target
+        }
+        if let target = raw.hardlinkTarget {
+            entry.hardlink = target
         }
         if let modificationDate = raw.modificationDate {
             entry.modificationDate = modificationDate
