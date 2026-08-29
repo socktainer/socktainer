@@ -106,6 +106,25 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
+    /// `Error.localizedDescription` only produces a useful message for types that
+    /// bridge to `NSError` or explicitly conform to `LocalizedError` — most
+    /// Swift-native errors this route can throw don't. Notably, a failed BuildKit
+    /// step surfaces as `GRPCCore.RPCError`, which carries the real failure reason in
+    /// `.message`/`.code` and has its own `description`, but `.localizedDescription`
+    /// on it ignores that and falls back to a generic, useless
+    /// "The operation couldn't be completed. (GRPCCore.RPCError error 1.)" — so a
+    /// real `RUN` step failure reached the client as that instead of the actual
+    /// command and exit code (issue #386).
+    ///
+    /// String interpolation calls the error's own `description` when it has one —
+    /// which both `ContainerizationError` and `RPCError` do — falling back to a
+    /// generic-but-still-more-useful Swift-derived description otherwise. Used for
+    /// every error this route reports, not just a `ContainerizationError` special
+    /// case, since the same gap applies to any error type without `LocalizedError`.
+    static func errorMessage(for error: Error) -> String {
+        "\(error)"
+    }
+
     static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
     {
         { req in
@@ -277,14 +296,7 @@ extension BuildRoute {
                     } catch {
                         req.logger.error("Build failed: \(error)")
 
-                        // Extract error message - prioritize ContainerizationError message
-                        let errorMessage: String
-                        if error is ContainerizationError {
-                            // Use string interpolation to get ContainerizationError's description
-                            errorMessage = "\(error)"
-                        } else {
-                            errorMessage = error.localizedDescription
-                        }
+                        let errorMessage = BuildRoute.errorMessage(for: error)
 
                         // Docker API compliant error response
                         let errorDetail: [String: Any] = [
