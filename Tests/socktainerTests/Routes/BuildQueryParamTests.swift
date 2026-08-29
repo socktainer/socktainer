@@ -1,4 +1,5 @@
 import ContainerizationError
+import Foundation
 import Testing
 
 @testable import socktainer
@@ -63,9 +64,18 @@ struct BuildQueryParamTests {
 /// instead of the real failure — because `.localizedDescription` on a plain
 /// Swift-native error (BuildKit's own `RPCError` isn't `LocalizedError`/`NSError`)
 /// falls back to that templated string, discarding whatever the error's own
-/// `description` actually says.
+/// `description` actually says. Also covers the follow-up gap in the first fix: a
+/// type that conforms *only* to `LocalizedError` (not `CustomStringConvertible`)
+/// interpolates to a bare, useless default instead of its `errorDescription`.
 @Suite("BuildRoute.errorMessage")
 struct BuildRouteErrorMessageTests {
+
+    /// A type conforming only to `LocalizedError` — no `CustomStringConvertible` —
+    /// mirroring any error that carries its message solely through `errorDescription`.
+    private struct FakeLocalizedOnlyError: Error, LocalizedError {
+        let reason: String
+        var errorDescription: String? { reason }
+    }
 
     /// Mirrors the exact shape of the real bug: a custom, non-`LocalizedError`
     /// Swift error (like `GRPCCore.RPCError`) whose own `description` carries the
@@ -99,5 +109,22 @@ struct BuildRouteErrorMessageTests {
         let error = ContainerizationError(.invalidArgument, message: "Dockerfile does not exist at path: /tmp/missing/Dockerfile")
         let result = BuildRoute.errorMessage(for: error)
         #expect(result.contains("Dockerfile does not exist at path"))
+        // ContainerizationError conforms to both CustomStringConvertible and
+        // LocalizedError; its .description includes the error code, its
+        // .errorDescription does not. Must still prefer .description (interpolation),
+        // not silently lose the code by checking LocalizedError first.
+        #expect(result.contains("invalidArgument"))
+    }
+
+    @Test("falls back to errorDescription for a type that is LocalizedError but not CustomStringConvertible")
+    func fallsBackToErrorDescriptionWhenNotCustomStringConvertible() {
+        let error = FakeLocalizedOnlyError(reason: "real message")
+        let result = BuildRoute.errorMessage(for: error)
+        // Plain interpolation on this type would produce its bare Mirror-based
+        // default (e.g. "FakeLocalizedOnlyError(reason: \"real message\")" only by
+        // accident of having a single stored property named the same as the message —
+        // the point is it must be exactly the errorDescription, not whatever Swift's
+        // default description happens to contain).
+        #expect(result == "real message")
     }
 }
