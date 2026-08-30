@@ -28,6 +28,8 @@ public enum AppleContainerBootstrap {
         /// exit code 0 doesn't surface.
         case startedButUnresponsive
 
+        /// User-facing status line for this outcome, or an empty string when there's
+        /// nothing worth printing (the common case: the service was already running).
         var message: String {
             switch self {
             case .alreadyRunning:
@@ -43,6 +45,8 @@ public enum AppleContainerBootstrap {
         }
     }
 
+    /// Pings Apple Container's service and, if it isn't reachable, starts it and reports
+    /// the outcome. A no-op (silently) when the service already answers.
     public static func ensureRunning() async {
         guard !(await isReachable()) else {
             return
@@ -58,6 +62,7 @@ public enum AppleContainerBootstrap {
         print(outcome.message)
     }
 
+    /// Whether Apple Container's apiserver answers a health-check ping within 2 seconds.
     private static func isReachable() async -> Bool {
         (try? await ClientHealthCheck.ping(timeout: .seconds(2))) != nil
     }
@@ -68,10 +73,11 @@ public enum AppleContainerBootstrap {
     /// (this runs before the Vapor app comes up, so there'd be no server to fall back on).
     private static let startTimeout: Duration = .seconds(120)
 
-    /// `--enable-kernel-install` (rather than leaving Apple's default behavior, which
-    /// prompts the user) is required here, not just a convenience: socktainer usually runs
-    /// as a background service with no attached TTY, so an interactive prompt would hang
-    /// forever waiting for input that can never arrive — defeating the point of an
+    /// Launches `container system start` and waits (bounded by `startTimeout`) for it to
+    /// finish. `--enable-kernel-install` (rather than leaving Apple's default behavior,
+    /// which prompts the user) is required here, not just a convenience: socktainer usually
+    /// runs as a background service with no attached TTY, so an interactive prompt would
+    /// hang forever waiting for input that can never arrive — defeating the point of an
     /// automatic bootstrap entirely.
     private static func runContainerSystemStart() async -> Bool {
         // Launching via an unqualified `env container ...` depends on PATH already
