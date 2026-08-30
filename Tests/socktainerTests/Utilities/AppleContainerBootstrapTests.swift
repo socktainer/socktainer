@@ -97,4 +97,27 @@ struct AppleContainerBootstrapWaitForExitTests {
         #expect(elapsed < .seconds(10))
         #expect(!process.isRunning)
     }
+
+    @Test("a process that ignores SIGTERM is force-killed instead of blocking past the deadline")
+    func forceKillsAProcessThatIgnoresSIGTERM() async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Traps and discards SIGTERM, so only SIGKILL can end this — reproduces the gap
+        // CodeRabbit's follow-up review found: terminate() alone doesn't bound the wait.
+        process.arguments = ["-c", "trap '' TERM; sleep 30"]
+        try! process.run()
+
+        let start = ContinuousClock.now
+        let result = await AppleContainerBootstrap.waitForExit(
+            of: process,
+            timeout: .milliseconds(200),
+            killGracePeriod: .milliseconds(200)
+        )
+        let elapsed = start.duration(to: .now)
+
+        #expect(result == false)
+        // Bounded by timeout + killGracePeriod, not the process's own 30-second sleep.
+        #expect(elapsed < .seconds(10))
+        #expect(!process.isRunning)
+    }
 }

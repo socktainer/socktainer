@@ -100,11 +100,14 @@ public enum AppleContainerBootstrap {
         return await Self.waitForExit(of: process, timeout: startTimeout)
     }
 
-    /// Races a launched process's exit against `timeout`, killing it if the deadline
-    /// passes first. Separated from `runContainerSystemStart()` so the race itself —
-    /// the part a stalled subprocess would actually expose — is testable against any
-    /// process, not just a live `container system start`.
-    static func waitForExit(of process: Process, timeout: Duration) async -> Bool {
+    /// Races a launched process's exit against `timeout`. If the deadline passes first,
+    /// sends SIGTERM and gives it `killGracePeriod` to exit cleanly; a process that ignores
+    /// SIGTERM (which it's free to do) is then force-killed with SIGKILL, which it isn't
+    /// free to ignore — so this always returns within `timeout + killGracePeriod`, not just
+    /// on cooperative subprocesses. Separated from `runContainerSystemStart()` so the race
+    /// itself — the part a stalled subprocess would actually expose — is testable against
+    /// any process, not just a live `container system start`.
+    static func waitForExit(of process: Process, timeout: Duration, killGracePeriod: Duration = .seconds(5)) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 process.waitUntilExit()
@@ -112,8 +115,12 @@ public enum AppleContainerBootstrap {
             }
             group.addTask {
                 try? await Task.sleep(for: timeout)
+                guard process.isRunning else { return false }
+
+                process.terminate()
+                try? await Task.sleep(for: killGracePeriod)
                 if process.isRunning {
-                    process.terminate()
+                    kill(process.processIdentifier, SIGKILL)
                 }
                 return false
             }
