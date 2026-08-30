@@ -71,13 +71,44 @@ enum ClientArchiveError: Error, LocalizedError {
     }
 }
 
+/// POSIX `st_mode` in Go's `os.FileMode` encoding, which is what the Docker API
+/// carries: permission bits are shared, but Go keeps the file type in the high
+/// bits rather than in `S_IFMT`.
+func goFileMode(posixMode: UInt32) -> UInt32 {
+    var mode = posixMode & 0o777
+    switch posixMode & 0o170000 {
+    case 0o040000: mode |= 1 << 31  // ModeDir
+    case 0o120000: mode |= 1 << 27  // ModeSymlink
+    case 0o020000: mode |= (1 << 26) | (1 << 21)  // ModeDevice | ModeCharDevice
+    case 0o060000: mode |= 1 << 26  // ModeDevice
+    case 0o010000: mode |= 1 << 25  // ModeNamedPipe
+    case 0o140000: mode |= 1 << 24  // ModeSocket
+    default: break  // regular files carry no type bit
+    }
+    if posixMode & 0o4000 != 0 { mode |= 1 << 23 }  // ModeSetuid
+    if posixMode & 0o2000 != 0 { mode |= 1 << 22 }  // ModeSetgid
+    if posixMode & 0o1000 != 0 { mode |= 1 << 20 }  // ModeSticky
+    return mode
+}
+
+/// Go's RFC3339Nano in the daemon's own timezone, as Docker reports it. An ext4
+/// inode holds whole seconds and Go omits a zero fraction, so only the offset
+/// differs from RFC3339.
+func dockerPathStatTimestamp(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+    return formatter.string(from: date)
+}
+
 /// File stat information for the X-Docker-Container-Path-Stat header
 struct PathStat: Codable {
     let name: String
     let size: Int64
     let mode: UInt32
     let mtime: String
-    let linkTarget: String?
+    let linkTarget: String
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -95,6 +126,9 @@ protocol ClientArchiveProtocol: Sendable {
 
     /// Read a file or directory from a container's filesystem and return as tar data
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
+
+    /// Stat a path without reading it, for callers that only need the header
+    func statPath(containerId: String, path: String) async throws -> PathStat
 
     /// Extract a tar archive into a container's filesystem at the specified path
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
@@ -122,6 +156,34 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
+
+    /// Stat a single path, reading the inode and nothing else.
+    ///
+    /// `getArchive` builds a tar of everything under the path before its caller
+    /// discards it. For `/` that is the whole filesystem, which is why a HEAD
+    /// against a large image took as long as reading it.
+    func statPath(containerId: String, path: String) async throws -> PathStat {
+        let rootfsPath = getRootfsPath(containerId: containerId)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            throw ClientArchiveError.rootfsNotFound(id: containerId)
+        }
+
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        guard reader.exists(FilePath(normalizedPath)) else {
+            throw ClientArchiveError.pathNotFound(path: normalizedPath)
+        }
+
+        let (_, inode) = try reader.stat(FilePath(normalizedPath))
+        return PathStat(
+            name: (normalizedPath as NSString).lastPathComponent,
+            size: inode.size,
+            mode: goFileMode(posixMode: UInt32(inode.mode)),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: (inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil) ?? ""
+        )
+    }
+
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
         let rootfsPath = getRootfsPath(containerId: containerId)
 
@@ -146,9 +208,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let pathStat = PathStat(
             name: (normalizedPath as NSString).lastPathComponent,
             size: inode.size,
-            mode: UInt32(inode.mode),
-            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
-            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
+            mode: goFileMode(posixMode: UInt32(inode.mode)),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: (inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil) ?? ""
         )
 
         // Create temporary directory for tar creation
@@ -222,6 +284,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let rootfsPath = getRootfsPath(containerId: container.id)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            // Never booted: hold the files until the runtime builds the
+            // filesystem, rather than refuse a copy Docker would accept.
+            if container.startedDate == nil {
+                try await stagePreStartInjection(
+                    container: container, destinationPath: normalizedPath, tarPath: tarPath)
+                return
+            }
+            // Booted before and the rootfs is gone: staging would quietly
+            // resurrect the container carrying only these files.
             throw ClientArchiveError.rootfsNotFound(id: container.id)
         }
 
@@ -238,6 +309,46 @@ struct ClientArchiveService: ClientArchiveProtocol {
             destinationPath: normalizedPath,
             inputTarPath: tarPath
         )
+    }
+
+    /// Hold an archive uploaded before the container was ever started.
+    ///
+    /// Only regular files: a directory would need a whole-directory mount,
+    /// which hides what the image put there, and a symlink has no mount that
+    /// reproduces it. Both are refused while the copy can still be retried
+    /// after start.
+    private func stagePreStartInjection(
+        container: ContainerSnapshot, destinationPath: String, tarPath: URL
+    ) async throws {
+        let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
+        for entry in plan {
+            if case .symlink = entry.kind {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot copy a symlink into \(container.id) before it starts")
+            }
+            if case .directory = entry.kind {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot copy a directory into \(container.id) before it starts")
+            }
+        }
+
+        let stagingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prestart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
+
+        for entry in plan {
+            guard case .file = entry.kind else { continue }
+            let extracted = stagingDir.appendingPathComponent(entry.relativePath)
+            guard FileManager.default.fileExists(atPath: extracted.path) else {
+                throw ClientArchiveError.operationFailed(
+                    message: "archive entry missing after extraction: \(entry.relativePath)")
+            }
+            try await PreStartInjectionStore.shared.stage(
+                containerId: container.id, guestPath: entry.guestPath,
+                source: extracted, mode: entry.mode)
+        }
     }
 
     /// One parsed entry of the uploaded archive.

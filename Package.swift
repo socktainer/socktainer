@@ -26,7 +26,7 @@ let package = Package(
         .macOS(.v15)
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/container.git", exact: "1.2.0"),
+        .package(url: "https://github.com/apple/container.git", exact: "1.2.2"),
         .package(url: "https://github.com/apple/containerization.git", exact: "0.40.1"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.121.3"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
@@ -40,6 +40,7 @@ let package = Package(
             dependencies: [
                 .product(name: "ContainerBuild", package: "container"),
                 .product(name: "ContainerAPIClient", package: "container"),
+                .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerNetworkClient", package: "container"),
                 .product(name: "ContainerPersistence", package: "container"),
                 .product(name: "ContainerResource", package: "container"),

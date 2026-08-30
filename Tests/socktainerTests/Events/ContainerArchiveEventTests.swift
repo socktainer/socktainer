@@ -104,6 +104,19 @@ struct ContainerArchiveEventTests {
         captureTask.cancel()
         #expect(event == nil)
     }
+
+    @Test("HEAD /archive answers from the stat alone, without reading the path")
+    func headDoesNotReadThePath() async throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+        let archive = FakeArchiveClient(getResult: .failure(.operationFailed(message: "must not be called")))
+
+        try await withArchiveApp(snapshot: snapshot, archive: archive, broadcaster: EventBroadcaster()) { app in
+            try await app.testing().test(.HEAD, "/v1.51/containers/web/archive?path=/etc/hosts") { res async in
+                #expect(res.status == .ok)
+                #expect(res.headers.first(name: "X-Docker-Container-Path-Stat") != nil)
+            }
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -140,6 +153,7 @@ private func withTimeout<T>(_ task: Task<T, Never>) async -> T {
 
 private struct FakeArchiveClient: ClientArchiveProtocol {
     var getResult: Result<Void, ClientArchiveError> = .success(())
+    var statResult: Result<Void, ClientArchiveError> = .success(())
 
     func getRootfsPath(containerId: String) -> URL {
         URL(fileURLWithPath: "/nonexistent/rootfs.ext4")
@@ -149,8 +163,13 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
         if case .failure(let error) = getResult { throw error }
         return (
             Data("fake-tar".utf8),
-            PathStat(name: "hosts", size: 8, mode: 0o644, mtime: "2026-01-01T00:00:00Z", linkTarget: nil)
+            PathStat(name: "hosts", size: 8, mode: 0o644, mtime: "2026-01-01T00:00:00Z", linkTarget: "")
         )
+    }
+
+    func statPath(containerId: String, path: String) async throws -> PathStat {
+        if case .failure(let error) = statResult { throw error }
+        return PathStat(name: "hosts", size: 8, mode: 0o644, mtime: "2026-01-01T00:00:00Z", linkTarget: "")
     }
 
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {}

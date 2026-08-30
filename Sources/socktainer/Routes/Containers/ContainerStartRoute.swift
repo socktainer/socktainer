@@ -37,6 +37,7 @@ extension ContainerStartRoute {
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
             }
 
+            let runEpoch: Int
             do {
                 guard let container = preStartSnapshot else {
                     throw Abort(.notFound, reason: "No such container: \(id)")
@@ -49,9 +50,16 @@ extension ContainerStartRoute {
                 // If container is already running, return success (Docker CLI behavior)
                 if container.status == .running {
                     req.logger.debug("Container \(id) is already running")
+                    // Joins the run the attach route opened rather than starting a new one:
+                    // `docker run` bootstraps through attach and then starts, and both observers
+                    // must land on the same run for one of them to lose.
+                    runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
                 } else {
                     // Try to start the container
                     try await client.start(id: id, detachKeys: detachKeys)
+                    // Executing now, and this request caused it: open a run so the exit is
+                    // claimable.
+                    runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
                     req.logger.debug("Started container \(id)")
                 }
 
@@ -67,6 +75,8 @@ extension ContainerStartRoute {
                     throw Abort(.internalServerError, reason: "Failed to start container: \(error)")
                 }
                 req.logger.debug("Container \(id) was already running or bootstrapped")
+                // Started by whoever won the race — the attach path — so join its run.
+                runEpoch = await DieEventOwnership.shared.beginRun(id: preStartSnapshot?.id ?? id)
             }
 
             let startedSnapshot = await ContainerStartRoute.performPostStartSetup(
@@ -136,6 +146,7 @@ extension ContainerStartRoute {
                     refreshCache: false,
                     restartPolicy: restartPolicy,
                     generation: generation,
+                    runEpoch: runEpoch,
                     broadcaster: broadcaster,
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
                     healthManager: req.application.storage[HealthCheckManagerKey.self],
@@ -163,7 +174,10 @@ extension ContainerStartRoute {
         restartPolicy: RestartPolicy?,
         client: ClientContainerProtocol,
         logger: Logger,
-        generation: Int
+        generation: Int,
+        /// Run this observer watches, from `DieEventOwnership`. A `die` is claimed per run, so a
+        /// restart's observer must carry the new run's epoch to be able to report its exit.
+        runEpoch: Int
     ) {
         Task.detached {
             let startedAt = Date()
@@ -176,7 +190,11 @@ extension ContainerStartRoute {
 
             // A redundant /start also arms a second observer on this nativeId; bail before a
             // stale one broadcasts its own "die" for an exit the current observer already owns.
-            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else { return }
+            // The newer /start superseded this observer's reservation, so the claim below would
+            // fail anyway — but returning here also skips its unmount and restart-policy work.
+            guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                return
+            }
 
             let executionDuration = Date().timeIntervalSince(startedAt)
 
@@ -189,21 +207,29 @@ extension ContainerStartRoute {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
 
-            var attrs = labels
-            attrs["exitCode"] = String(code)
-            // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
-            attrs["execDuration"] = String(Int(executionDuration))
-            let dieEvent = DockerEvent.simpleEvent(
-                id: eventId, type: "container", status: "die",
-                image: image, name: name, labels: attrs
-            )
-            await broadcaster.broadcast(dieEvent)
+            // Take the run only now, after the generation check: the reservation belongs to
+            // whichever observer is current, and a container that exited before this one armed
+            // was already reported by the attach path's exit monitor — that is how
+            // `docker compose up` runs a service. Claiming twice would double every exit.
+            let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
+            if ownsExit {
+                var attrs = labels
+                attrs["exitCode"] = String(code)
+                // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
+                attrs["execDuration"] = String(Int(executionDuration))
+                let dieEvent = DockerEvent.simpleEvent(
+                    id: eventId, type: "container", status: "die",
+                    image: image, name: name, labels: attrs
+                )
+                await broadcaster.broadcast(dieEvent)
+            }
 
             // moby fires `destroy` right after `die` for `--rm` containers. Apple Container
-            // reaps them itself (no DELETE arrives), so emit it here. consumeAutoRemove both
-            // gates on the --rm flag and dedups against the foreground attach path, so a
-            // container attached in the foreground does not get a second destroy.
-            if await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
+            // reaps them itself (no DELETE arrives), so emit it here. Only the observer that
+            // reported the exit does it: the other one reaches this point while the owner is
+            // still inside its output-flush grace, and would publish `destroy` before the `die`
+            // it belongs to — clients that treat `destroy` as terminal would miss the exit.
+            if ownsExit, await ContainerInfoCache.shared.consumeAutoRemove(id: nativeId) {
                 await ContainerAutoRemoveCleanup.perform(
                     hexId: eventId,
                     nativeId: nativeId,
@@ -273,8 +299,13 @@ extension ContainerStartRoute {
             // /start or /restart landing during the backoff sleep above must not inflate
             // RestartCount for a restart that the generation check just aborted.
             let attempt = await ContainerRestartState.shared.nextAttempt(id: nativeId)
+            let restartedEpoch: Int
             do {
                 try await client.start(id: nativeId, detachKeys: nil)
+                // A restart is a new run: it needs its own claim. The exit that triggered it
+                // ended the previous run, whose observer keeps the claim it broadcast under, so
+                // this must not join it — every restart after the first would go unreported.
+                restartedEpoch = await DieEventOwnership.shared.beginRestartedRun(id: nativeId)
             } catch {
                 await ContainerRestartState.shared.clearPendingRestart(id: nativeId)
                 logger.warning("restart-policy: failed to restart \(nativeId) (attempt \(attempt)): \(error)")
@@ -298,6 +329,7 @@ extension ContainerStartRoute {
                 refreshCache: restartedSnapshot != nil,
                 restartPolicy: restartPolicy,
                 generation: generation,
+                runEpoch: restartedEpoch,
                 broadcaster: broadcaster,
                 dnsServer: dnsServer,
                 healthManager: healthManager,
@@ -326,6 +358,7 @@ extension ContainerStartRoute {
         refreshCache: Bool,
         restartPolicy: RestartPolicy?,
         generation: Int,
+        runEpoch: Int,
         broadcaster: EventBroadcaster,
         dnsServer: SocktainerDNSServer?,
         healthManager: HealthCheckManager?,
@@ -341,10 +374,17 @@ extension ContainerStartRoute {
         // restart for a stop that should suppress restart-policy enforcement on the next exit.
         _ = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
 
+        // Reserve the `die` event before the process can exit: the attach route's exit monitor
+        // emits it for containers nothing else observes, and it must defer to this observer,
+        // whose event carries execDuration and the post-start labels. A newer /start replaces
+        // this reservation, keeping the obligation on the observer that stays current.
+        await DieEventOwnership.shared.reserveForStart(id: nativeId, epoch: runEpoch, generation: generation)
+
         ContainerStartRoute.observeExit(
             nativeId: nativeId, eventId: eventId, image: image, name: name, labels: labels,
             broadcaster: broadcaster, dnsServer: dnsServer, healthManager: healthManager,
-            restartPolicy: restartPolicy, client: client, logger: logger, generation: generation
+            restartPolicy: restartPolicy, client: client, logger: logger, generation: generation,
+            runEpoch: runEpoch
         )
     }
 
