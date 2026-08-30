@@ -17,6 +17,11 @@ extension HealthCheckPingRoute {
         response.headers.add(name: "Api-Version", value: "1.51")
         response.headers.add(name: "Builder-Version", value: "")
         response.headers.add(name: "Docker-Experimental", value: "false")
+        // Podman's own client checks this on GET /_ping during connection setup
+        // (pkg/bindings/connection.go's pingNewConnection) — without it, podman
+        // just warns and assumes version 0.0.0, but setting a real, current
+        // value avoids that warning and any future MinimalAPI version gate.
+        response.headers.add(name: "Libpod-API-Version", value: "5.0.0")
         response.headers.add(name: "Cache-Control", value: "no-cache, no-store, must-revalidate")
         response.headers.add(name: "Pragma", value: "no-cache")
         return response

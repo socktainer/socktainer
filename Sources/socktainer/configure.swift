@@ -87,12 +87,13 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerWaitRoute(client: containerClient))
 
     // /images
+    let manifestClient = ClientManifestService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
     try app.register(collection: ImageDeleteRoute(client: imageClient))
     try app.register(collection: ImageHistoryRoute(systemConfig: systemConfig))
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
     try app.register(collection: ImageCreateRoute(client: imageClient))
-    try app.register(collection: ImagePushRoute(client: imageClient))
+    try app.register(collection: ImagePushRoute(client: imageClient, manifestClient: manifestClient))
     try app.register(collection: ImageSearchRoute())
     try app.register(collection: ImageInspectRoute(systemConfig: systemConfig))
     try app.register(collection: ImageTagRoute(systemConfig: systemConfig))
@@ -126,7 +127,7 @@ func configure(_ app: Application) async throws {
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
-    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig))
+    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
     try app.register(collection: DistributionJsonRoute(systemConfig: systemConfig))
 
     // --- plugin routes ---
@@ -177,13 +178,85 @@ func configure(_ app: Application) async throws {
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
     try app.register(collection: CommitRoute())
-    try app.register(
-        collection: SystemDFRoute(
-            imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient,
-            diskUsageProvider: ContainerClientDiskUsageProvider(),
-            imageLayerDiskUsageProvider: ClientImageLayerDiskUsageProvider()
-        ))
+    let systemDFRoute = SystemDFRoute(
+        imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient,
+        diskUsageProvider: ContainerClientDiskUsageProvider(),
+        imageLayerDiskUsageProvider: ClientImageLayerDiskUsageProvider()
+    )
+    try app.register(collection: systemDFRoute)
     try app.register(collection: VersionRoute())
+
+    // --- Podman libpod routes ---
+    try app.register(collection: LibpodPingRoute(client: healthCheckClient))
+    try app.register(collection: LibpodVersionRoute())
+    try app.register(collection: LibpodInfoRoute(containerClient: containerClient, imageClient: imageClient))
+    try app.register(collection: LibpodContainerListRoute(client: containerClient))
+    try app.register(collection: LibpodContainerCreateRoute(client: containerClient, systemConfig: systemConfig))
+    try app.register(collection: LibpodContainerStartRoute(client: containerClient))
+    try app.register(collection: LibpodContainerStopRoute(client: containerClient))
+    try app.register(collection: LibpodContainerKillRoute(client: containerClient))
+    try app.register(collection: LibpodContainerAttachRoute(client: containerClient))
+    try app.register(collection: LibpodContainerWaitRoute(client: containerClient))
+    try app.register(collection: LibpodContainerInspectRoute(client: containerClient))
+    try app.register(collection: LibpodContainerDeleteRoute(client: containerClient))
+    try app.register(collection: LibpodImageListRoute(client: imageClient))
+    try app.register(collection: LibpodImagePullRoute(client: imageClient))
+    try app.register(collection: LibpodImageDeleteRoute(client: imageClient))
+    try app.register(collection: LibpodImageInspectRoute(systemConfig: systemConfig))
+    try app.register(collection: LibpodImageTagRoute(systemConfig: systemConfig))
+    try app.register(collection: LibpodBuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
+    try app.register(collection: LibpodContainerLogsRoute(client: containerClient))
+    try app.register(collection: LibpodContainerTopRoute())
+    try app.register(collection: LibpodContainerRenameRoute())
+    try app.register(collection: LibpodContainerRestartRoute(client: containerClient))
+    try app.register(collection: LibpodExecCreateRoute(client: containerClient))
+    try app.register(collection: LibpodExecStartRoute(client: containerClient))
+    try app.register(collection: LibpodExecInspectRoute(client: containerClient))
+    try app.register(collection: LibpodVolumeListRoute(dockerRoute: VolumeListRoute(client: volumeClient)))
+    try app.register(collection: LibpodVolumeCreateRoute(dockerRoute: VolumeCreateRoute(client: volumeClient)))
+    try app.register(collection: LibpodVolumeDeleteRoute(dockerRoute: VolumeDeleteRoute(client: volumeClient)))
+    try app.register(collection: LibpodVolumeInspectRoute(dockerRoute: VolumeInspectRoute(client: volumeClient)))
+    try app.register(collection: LibpodNetworkListRoute())
+    try app.register(collection: LibpodNetworkCreateRoute(dockerRoute: NetworkCreateRoute(client: networkClient)))
+    try app.register(collection: LibpodNetworkDeleteRoute(dockerRoute: NetworkDeleteRoute(client: networkClient)))
+    try app.register(collection: LibpodNetworkInspectRoute(client: networkClient))
+    try app.register(
+        collection: LibpodSystemDFRoute(dockerRoute: systemDFRoute))
+    try app.register(collection: LibpodAuthRoute(client: registryClient))
+
+    // --- Podman libpod routes: stats/pause/prune/cp/push/save/load/events gaps ---
+    try app.register(collection: LibpodContainerStatsRoute())
+    try app.register(collection: LibpodContainerPauseRoute())
+    try app.register(collection: LibpodContainerUnpauseRoute())
+    try app.register(collection: LibpodContainerChangesRoute())
+    try app.register(collection: LibpodContainerPruneRoute(dockerRoute: ContainerPruneRoute(client: containerClient)))
+    try app.register(collection: LibpodContainerUpdateRoute(client: containerClient))
+    try app.register(collection: LibpodContainerExportRoute(containerClient: containerClient, archiveClient: archiveClient))
+    try app.register(collection: LibpodContainerArchiveRoute(containerClient: containerClient, archiveClient: archiveClient))
+    try app.register(collection: LibpodImagePushRoute(client: imageClient, manifestClient: manifestClient))
+    try app.register(collection: LibpodImagePruneRoute(dockerRoute: ImagePruneRoute(client: imageClient)))
+    try app.register(collection: LibpodImagesGetRoute(client: imageClient))
+    try app.register(collection: LibpodImagesLoadRoute(client: imageClient))
+    try app.register(collection: LibpodVolumePruneRoute(dockerRoute: VolumePruneRoute(client: volumeClient)))
+    try app.register(collection: LibpodNetworkPruneRoute(client: networkClient))
+    try app.register(collection: LibpodNetworkConnectRoute())
+    try app.register(collection: LibpodNetworkDisconnectRoute())
+    try app.register(collection: LibpodEventsRoute(client: healthCheckClient))
+    try app.register(collection: LibpodImageImportRoute(client: imageClient))
+    try app.register(collection: LibpodImageSearchRoute(dockerRoute: ImageSearchRoute()))
+    try app.register(collection: LibpodImageHistoryRoute(systemConfig: systemConfig))
+    try app.register(collection: LibpodCommitRoute())
+    try app.register(collection: LibpodContainerExistsRoute(client: containerClient))
+    try app.register(collection: LibpodImageExistsRoute(systemConfig: systemConfig))
+    try app.register(collection: LibpodVolumeExistsRoute(client: volumeClient))
+    try app.register(collection: LibpodNetworkExistsRoute(client: networkClient))
+
+    try app.register(collection: LibpodManifestCreateRoute(client: manifestClient))
+    try app.register(collection: LibpodManifestInspectRoute(client: manifestClient))
+    try app.register(collection: LibpodManifestExistsRoute(client: manifestClient))
+    try app.register(collection: LibpodManifestModifyRoute(client: manifestClient))
+    try app.register(collection: LibpodManifestDeleteRoute(client: manifestClient))
+    try app.register(collection: LibpodManifestPushRoute(manifestClient: manifestClient, imageClient: imageClient))
 
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()

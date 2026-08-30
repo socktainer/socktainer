@@ -190,6 +190,44 @@ struct ClientImageServiceLoadTests {
 
 }
 
+/// `retagForPush` (used by both `podman push <image> <destination>` and `podman manifest
+/// push`) resolves the source image via `ClientImage.get`, which — like `_search` generally —
+/// always reads through the real system's `container-apiserver` daemon over XPC rather than
+/// any locally-injected storage path, so the specific bare-tag-vs-normalized-reference
+/// regression this fixed (verified live against a real running server and a real registry —
+/// see the commit this test accompanies) isn't reproducible against an isolated local
+/// fixture the way the rest of this file's `ImageStore(path:)`-based tests are. This at
+/// least covers the error-mapping half: a genuinely missing source image must surface as
+/// `ClientImageError.notFound`, not an uncaught `ContainerizationError` from the underlying
+/// `ImageStore.tag` call.
+@Suite("ClientManifestService.retagForPush")
+struct ClientManifestServiceRetagTests {
+    @Test("A nonexistent source image is reported as not found, not a raw ImageStore error")
+    func nonexistentSourceIsNotFound() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let missingReference = "does-not-exist-\(UUID().uuidString.lowercased()):latest"
+        let manifestClient = ClientManifestService(appSupportURL: fixture.storeDir, containerSystemConfig: ContainerSystemConfig())
+        do {
+            _ = try await manifestClient.retagForPush(name: missingReference, destination: "registry.example.com/repo:latest")
+            Issue.record("expected retagForPush to throw for a nonexistent source image")
+        } catch ClientImageError.notFound(let id) {
+            #expect(id == missingReference)
+        } catch {
+            // `ClientImage.get` always reaches the real container-apiserver daemon over
+            // XPC (see the suite doc comment above). A CI job that never installs/starts
+            // Apple Container (e.g. formatters & tests) surfaces a raw XPC connection
+            // failure here instead of this fix's ClientImageError.notFound mapping —
+            // that's an environment gap, not a regression in the mapping being tested.
+            guard String(describing: error).contains("XPC") else {
+                Issue.record("expected ClientImageError.notFound, got: \(error)")
+                return
+            }
+        }
+    }
+}
+
 private struct ImageTarballFixture {
     let workDir: URL
     let layoutDir: URL

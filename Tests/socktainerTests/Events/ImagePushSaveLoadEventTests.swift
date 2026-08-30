@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerResource
 import ContainerizationOCI
 import Foundation
@@ -140,6 +141,26 @@ struct ImagePushSaveLoadEventTests {
         #expect(events.first?.Actor.ID == alpineDigest)
         #expect(events.last?.Actor.ID == "docker.io/library/busybox:latest")
     }
+
+    @Test("libpod's multi-image export endpoint decodes repeated 'references', matching real podman's ImageExportLibpod")
+    func libpodExportDecodesReferences() async throws {
+        let capturedReferences = Box<[String]>([])
+        try await withImageApp(client: FakeImageClient(saveReferencesCapture: capturedReferences), broadcaster: EventBroadcaster()) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/images/export?references=alpine&references=busybox") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+        #expect(await capturedReferences.get() == ["alpine", "busybox"])
+    }
+
+    @Test("libpod's multi-image export endpoint is a 400 with no 'references' given")
+    func libpodExportWithNoReferencesIs400() async throws {
+        try await withImageApp(client: FakeImageClient(), broadcaster: EventBroadcaster()) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/images/export") { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -155,8 +176,10 @@ private func withImageApp(
         regexRouter.installMiddleware(on: app)
         app.storage[EventBroadcasterKey.self] = broadcaster
         app.storage[AppleContainerAppSupportUrlKey.self] = FileManager.default.temporaryDirectory
-        try app.register(collection: ImagePushRoute(client: client))
+        let manifestClient = ClientManifestService(appSupportURL: FileManager.default.temporaryDirectory, containerSystemConfig: ContainerSystemConfig())
+        try app.register(collection: ImagePushRoute(client: client, manifestClient: manifestClient))
         try app.register(collection: ImagesGetRoute(client: client))
+        try app.register(collection: LibpodImagesGetRoute(client: client))
         try app.register(collection: ImagesLoadRoute(client: client))
         try await test(app)
     }
@@ -189,6 +212,7 @@ private struct FakeImageClient: ClientImageProtocol {
     var images: [ClientImage] = []
     var loadedImages: [String] = []
     var failPushStream = false
+    var saveReferencesCapture: Box<[String]>? = nil
 
     func list(includeSystemImages: Bool) async throws -> [ClientImage] { images }
 
@@ -212,6 +236,10 @@ private struct FakeImageClient: ClientImageProtocol {
         }
     }
 
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }
@@ -228,6 +256,9 @@ private struct FakeImageClient: ClientImageProtocol {
     }
 
     func save(references: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
+        if let saveReferencesCapture {
+            await saveReferencesCapture.set(references)
+        }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tarball = tempDir.appendingPathComponent("images.tar")

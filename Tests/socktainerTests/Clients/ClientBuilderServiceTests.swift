@@ -22,6 +22,7 @@ struct ClientBuilderServiceConfigurationTests {
             imageDescription: makeImageDescription(),
             imageEnv: nil,
             useRosetta: false,
+            qemu: false,
             builderCPUs: 2,
             builderMemory: "2048MB",
             exportsMountPath: "/tmp/exports",
@@ -38,6 +39,7 @@ struct ClientBuilderServiceConfigurationTests {
             imageDescription: makeImageDescription(),
             imageEnv: ["PATH=/usr/bin"],
             useRosetta: true,
+            qemu: false,
             builderCPUs: 4,
             builderMemory: "4096MB",
             exportsMountPath: "/tmp/exports",
@@ -49,5 +51,41 @@ struct ClientBuilderServiceConfigurationTests {
         #expect(config.rosetta == true)
         #expect(config.networks.first?.network == "mynet")
         #expect(config.dns?.nameservers == ["192.168.65.1"])
+    }
+
+    @Test("--enable-qemu is derived solely from qemu, independent of useRosetta")
+    func enableQemuIndependentOfRosetta() throws {
+        // The Rosetta builder with the user's own rosetta support disabled (useRosetta:
+        // false) must NOT also register QEMU binfmt handlers — these are mutually
+        // exclusive in the shim, and this combination previously did exactly that by
+        // deriving --enable-qemu from `!useRosetta` instead of the actual qemu flag.
+        let rosettaBuilderConfig = try ClientBuilderService.builderContainerConfiguration(
+            builderContainerId: "buildkit",
+            imageDescription: makeImageDescription(),
+            imageEnv: nil,
+            useRosetta: false,
+            qemu: false,
+            builderCPUs: 2,
+            builderMemory: "2048MB",
+            exportsMountPath: "/tmp/exports",
+            networkId: "default",
+            nameserver: "192.168.65.1"
+        )
+        #expect(!rosettaBuilderConfig.initProcess.arguments.contains("--enable-qemu"))
+        #expect(rosettaBuilderConfig.rosetta == false)
+
+        let qemuBuilderConfig = try ClientBuilderService.builderContainerConfiguration(
+            builderContainerId: "buildkit-qemu",
+            imageDescription: makeImageDescription(),
+            imageEnv: nil,
+            useRosetta: false,
+            qemu: true,
+            builderCPUs: 2,
+            builderMemory: "2048MB",
+            exportsMountPath: "/tmp/exports",
+            networkId: "default",
+            nameserver: "192.168.65.1"
+        )
+        #expect(qemuBuilderConfig.initProcess.arguments.contains("--enable-qemu"))
     }
 }

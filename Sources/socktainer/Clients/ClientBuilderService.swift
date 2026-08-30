@@ -38,10 +38,25 @@ struct BuilderCacheRecord: Sendable {
 }
 
 protocol ClientBuilderProtocol: Sendable {
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder
+    /// Verify the builder is reachable (starting it if necessary).
+    /// Pass `qemu: true` when the build requires platforms other than arm64/amd64
+    /// (e.g. s390x, ppc64le) so that a QEMU-enabled builder container is used.
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws
+    /// Connect to the builder, starting it if necessary.
+    /// Pass `qemu: true` when the build requires platforms other than arm64/amd64.
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult
     func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord]
+}
+
+extension ClientBuilderProtocol {
+    // Backward-compatible overloads that default to Rosetta mode (qemu: false).
+    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
+        try await ensureReachable(timeout: timeout, retryInterval: retryInterval, qemu: false, logger: logger)
+    }
+    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+        try await connect(timeout: timeout, retryInterval: retryInterval, qemu: false, logger: logger)
+    }
 }
 
 struct ClientBuilderService: ClientBuilderProtocol {
@@ -71,27 +86,95 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
-        let container = try await runningBuilderContainer(logger: logger)
-
         let command = try BuildctlUtility.pruneCommand(from: request)
-        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl prune", logger: logger)
+        var deletedIds: [String] = []
+        var reclaimed: Int64 = 0
+        var attempted = false
+        var succeeded = false
+        var lastError: Error?
 
-        let entries = BuildctlUtility.parsePruneOutput(stdoutText, logger: logger)
-        let deletedIds = entries.compactMap(\.id)
-        let reclaimed = entries.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+        // Neither builder is provisioned just to report/reclaim nothing — a fresh install
+        // that's never built anything shouldn't have `docker builder prune` spin up a VM only
+        // to say "0 bytes freed".
+        for qemu in [false, true] {
+            let container: ContainerSnapshot?
+            do {
+                container = try await existingRunningBuilderContainer(qemu: qemu)
+            } catch {
+                // A lookup failure is itself a real, attempted-but-failed outcome — unlike
+                // the container genuinely not running (the ordinary, benign `nil` case
+                // below), this must count toward `attempted` or a lookup-only failure on
+                // both builders would silently return an empty success.
+                attempted = true
+                logger.error("buildctl prune\(qemu ? " (qemu)" : "") lookup failed: \(error)")
+                lastError = error
+                continue
+            }
+            guard let container else { continue }
+            attempted = true
+            do {
+                let stdoutText = try await execute(command: command, in: container, actionName: "buildctl prune\(qemu ? " (qemu)" : "")", logger: logger)
+                let entries = BuildctlUtility.parsePruneOutput(stdoutText, logger: logger)
+                deletedIds.append(contentsOf: entries.compactMap(\.id))
+                reclaimed += entries.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+                succeeded = true
+            } catch {
+                // One builder's transient failure shouldn't hide a successful prune of the
+                // other — log and keep going instead of propagating and losing everything
+                // already accumulated. Only rethrown below if EVERY attempted builder failed.
+                logger.error("buildctl prune\(qemu ? " (qemu)" : "") failed: \(error)")
+                lastError = error
+            }
+        }
+
+        // Every builder that was actually running failed — an empty success result here
+        // would silently read as "nothing to prune" instead of "the operation failed".
+        if attempted, !succeeded, let lastError {
+            throw lastError
+        }
 
         return BuilderPruneResult(deletedCaches: deletedIds, spaceReclaimed: reclaimed)
     }
 
     func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord] {
-        let container = try await runningBuilderContainer(logger: logger)
         let command = BuildctlUtility.duCommand()
-        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl du", logger: logger)
+        var records: [BuilderCacheRecord] = []
+        var attempted = false
+        var succeeded = false
+        var lastError: Error?
 
-        return BuildctlUtility.parseDuOutput(stdoutText, logger: logger).compactMap { record in
-            guard let id = record.id else {
-                return nil
+        for qemu in [false, true] {
+            let container: ContainerSnapshot?
+            do {
+                container = try await existingRunningBuilderContainer(qemu: qemu)
+            } catch {
+                attempted = true
+                logger.error("buildctl du\(qemu ? " (qemu)" : "") lookup failed: \(error)")
+                lastError = error
+                continue
             }
+            guard let container else { continue }
+            attempted = true
+            do {
+                let stdoutText = try await execute(command: command, in: container, actionName: "buildctl du\(qemu ? " (qemu)" : "")", logger: logger)
+                records.append(contentsOf: Self.parseDuRecords(from: stdoutText, logger: logger))
+                succeeded = true
+            } catch {
+                logger.error("buildctl du\(qemu ? " (qemu)" : "") failed: \(error)")
+                lastError = error
+            }
+        }
+
+        if attempted, !succeeded, let lastError {
+            throw lastError
+        }
+
+        return records
+    }
+
+    private static func parseDuRecords(from stdoutText: String, logger: Logger) -> [BuilderCacheRecord] {
+        BuildctlUtility.parseDuOutput(stdoutText, logger: logger).compactMap { record in
+            guard let id = record.id else { return nil }
             return BuilderCacheRecord(
                 id: id,
                 parents: record.parents ?? [],
@@ -107,8 +190,23 @@ struct ClientBuilderService: ClientBuilderProtocol {
         }
     }
 
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
-        _ = try await runningBuilderContainer(logger: logger)
+    /// Returns the QEMU (or Rosetta) builder container only if it's already running — never
+    /// creates/starts it, unlike `runningBuilderContainer`. Used by reporting/cleanup
+    /// operations (`prune`/`diskUsage`) that shouldn't provision a builder VM just to say
+    /// there's nothing to report for it.
+    private func existingRunningBuilderContainer(qemu: Bool) async throws -> ContainerSnapshot? {
+        let containerID = resolvedContainerId(qemu: qemu)
+        let container: ContainerSnapshot
+        do {
+            container = try await containerClient.withClient { try await $0.get(id: containerID) }
+        } catch let error as ContainerizationError where error.code == .notFound {
+            return nil
+        }
+        return container.status == .running ? container : nil
+    }
+
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws {
+        _ = try await runningBuilderContainer(qemu: qemu, logger: logger)
 
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
@@ -116,7 +214,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         while clock.now < deadline {
             do {
-                let socket = try await dialBuilderSocket()
+                let socket = try await dialBuilderSocket(qemu: qemu)
                 try? socket.close()
                 return
             } catch {
@@ -133,8 +231,8 @@ struct ClientBuilderService: ClientBuilderProtocol {
         throw ContainerizationError(.timeout, message: "Timeout waiting for builder reachability")
     }
 
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
-        _ = try await runningBuilderContainer(logger: logger)
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder {
+        _ = try await runningBuilderContainer(qemu: qemu, logger: logger)
 
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
@@ -142,7 +240,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         while clock.now < deadline {
             do {
-                let socket = try await dialBuilderSocket()
+                let socket = try await dialBuilderSocket(qemu: qemu)
                 let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
                 let builder = try await Builder(socket: socket, group: group, logger: logger)
                 do {
@@ -166,20 +264,41 @@ struct ClientBuilderService: ClientBuilderProtocol {
         throw ContainerizationError(.timeout, message: "Timeout waiting for connection to builder")
     }
 
-    private func dialBuilderSocket() async throws -> FileHandle {
-        let container = try await runningBuilderContainer(logger: nil)
+    private func dialBuilderSocket(qemu: Bool) async throws -> FileHandle {
+        let container = try await runningBuilderContainer(qemu: qemu, logger: nil)
         return try await containerClient.withClient { try await $0.dial(id: container.id, port: builderPort) }
     }
 
-    private func runningBuilderContainer(logger: Logger?) async throws -> ContainerSnapshot {
+    private func runningBuilderContainer(qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
+        let containerID = resolvedContainerId(qemu: qemu)
         let container: ContainerSnapshot
         do {
-            container = try await containerClient.withClient { try await $0.get(id: builderContainerId) }
+            container = try await containerClient.withClient { try await $0.get(id: containerID) }
         } catch let error as ContainerizationError where error.code == .notFound {
             logger?.info("Builder container not found, creating a new builder instance")
-            return try await createAndStartBuilder(logger: logger)
+            do {
+                return try await createAndStartBuilder(qemu: qemu, logger: logger)
+            } catch {
+                // A concurrent caller may have created it between our own `get` miss and this
+                // `create` call — this codebase's own split-build (see BuildRoute) can now
+                // issue genuinely concurrent build requests, some of which may need the same
+                // cold-started builder. If someone else won the race, use what they created
+                // instead of failing this request; if `get` also fails, this wasn't a race —
+                // propagate the original creation error. Routed through the same status
+                // handling below (not returned directly) — the race winner's container could
+                // still be `.stopped`/`.stopping` at the exact moment we observe it.
+                guard let existing = try? await containerClient.withClient({ try await $0.get(id: containerID) }) else {
+                    throw error
+                }
+                return try await ensureRunning(existing, qemu: qemu, logger: logger)
+            }
         }
 
+        return try await ensureRunning(container, qemu: qemu, logger: logger)
+    }
+
+    private func ensureRunning(_ container: ContainerSnapshot, qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
+        let containerID = resolvedContainerId(qemu: qemu)
         guard container.status == .running else {
             switch container.status {
             case .running:
@@ -189,20 +308,28 @@ struct ClientBuilderService: ClientBuilderProtocol {
                 try await startBuildKit(containerId: container.id)
                 return try await containerClient.withClient { try await $0.get(id: container.id) }
             case .stopping:
-                throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is stopping")
+                throw ContainerizationError(.invalidState, message: "BuildKit container '\(containerID)' is stopping")
             case .unknown:
                 logger?.warning("Builder container has unknown state, recreating it")
                 try? await containerClient.withClient { try await $0.delete(id: container.id) }
-                return try await createAndStartBuilder(logger: logger)
+                return try await createAndStartBuilder(qemu: qemu, logger: logger)
             @unknown default:
-                throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is in an unsupported state")
+                throw ContainerizationError(.invalidState, message: "BuildKit container '\(containerID)' is in an unsupported state")
             }
         }
 
         return container
     }
 
-    private func createAndStartBuilder(logger: Logger?) async throws -> ContainerSnapshot {
+    /// Returns the container ID for a given mode.
+    /// QEMU-mode builder uses a distinct ID (base ID + "-qemu") so both builders can
+    /// coexist and be looked up independently.
+    private func resolvedContainerId(qemu: Bool) -> String {
+        qemu ? "\(builderContainerId)-qemu" : builderContainerId
+    }
+
+    private func createAndStartBuilder(qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
+        let containerID = resolvedContainerId(qemu: qemu)
         let exportsMount = appSupportURL.appendingPathComponent("builder")
         if !FileManager.default.fileExists(atPath: exportsMount.path) {
             try FileManager.default.createDirectory(at: exportsMount, withIntermediateDirectories: true)
@@ -210,24 +337,27 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         let builderImage = containerSystemConfig.build.image
         let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
-        let useRosetta = containerSystemConfig.build.rosetta
+        // QEMU mode: register binfmt handlers inside the VM kernel for all foreign
+        // architectures (s390x, ppc64le, riscv64, etc.).  Rosetta is disabled because
+        // it and QEMU binfmt registration are mutually exclusive in the builder shim.
+        let useRosetta = qemu ? false : containerSystemConfig.build.rosetta
 
         let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform, containerSystemConfig: containerSystemConfig)
         _ = try await image.getCreateSnapshot(platform: builderPlatform)
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
         let imageConfig = try await image.config(for: builderPlatform).config
-
         guard let defaultNetwork = try await networkClient.withClient({ try await $0.builtin }) else {
             throw ContainerizationError(.invalidState, message: "default network is not present")
         }
         let nameserver = IPv4Address(defaultNetwork.status.ipv4Subnet.lower.value + 1).description
 
         let config = try Self.builderContainerConfiguration(
-            builderContainerId: builderContainerId,
+            builderContainerId: containerID,
             imageDescription: imageDesc,
             imageEnv: imageConfig?.env,
             useRosetta: useRosetta,
+            qemu: qemu,
             builderCPUs: builderCPUs,
             builderMemory: builderMemory,
             exportsMountPath: exportsMount.path,
@@ -237,8 +367,8 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await containerClient.withClient { try await $0.create(configuration: config, options: .default, kernel: kernel) }
-        try await startBuildKit(containerId: builderContainerId)
-        return try await containerClient.withClient { try await $0.get(id: builderContainerId) }
+        try await startBuildKit(containerId: containerID)
+        return try await containerClient.withClient { try await $0.get(id: containerID) }
     }
 
     /// Pure construction of the BuildKit guest's ContainerConfiguration — no real service
@@ -249,6 +379,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
         imageDescription: ImageDescription,
         imageEnv: [String]?,
         useRosetta: Bool,
+        qemu: Bool,
         builderCPUs: Int64,
         builderMemory: String,
         exportsMountPath: String,
@@ -257,7 +388,13 @@ struct ClientBuilderService: ClientBuilderProtocol {
     ) throws -> ContainerConfiguration {
         let processConfig = ProcessConfiguration(
             executable: "/usr/local/bin/container-builder-shim",
-            arguments: ["--debug", "--vsock", useRosetta ? nil : "--enable-qemu"].compactMap { $0 },
+            // `--enable-qemu` depends solely on which builder instance this is — NOT on
+            // `useRosetta`, which independently reflects the user's own rosetta config and
+            // can be false even for the non-qemu builder (e.g. `build.rosetta` disabled).
+            // Deriving it from `!useRosetta` would register QEMU binfmt handlers on the
+            // Rosetta builder too in that case, which this type's own doc comment says are
+            // mutually exclusive in the shim.
+            arguments: ["--debug", "--vsock", qemu ? "--enable-qemu" : nil].compactMap { $0 },
             environment: imageEnv ?? [],
             workingDirectory: "/",
             terminal: false,
