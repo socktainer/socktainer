@@ -64,7 +64,7 @@ If Apple Container's own service isn't already running, socktainer starts it
 automatically first (like colima does for Docker) — no separate `container
 system start` step needed — then continues with the rest of startup above:
 
-```
+```text
 Launching container-apiserver...
 [ INFO ] Apple Container service not running — attempting to start it...
 [ INFO ] Apple Container service started

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import socktainer
@@ -46,5 +47,54 @@ struct AppleContainerBootstrapOutcomeTests {
             AppleContainerBootstrap.Outcome.startedButUnresponsive.message,
         ]
         #expect(Set(messages).count == messages.count)
+    }
+}
+
+/// Regression tests for a CodeRabbit review finding on PR #374: `runContainerSystemStart()`
+/// used to call `Process.waitUntilExit()` with no deadline, so a stalled `container system
+/// start` would block `ensureRunning()` — and therefore socktainer's entire startup, since
+/// this runs before the Vapor app comes up — forever. `waitForExit(of:timeout:)` is the
+/// extracted race that fixes this; tested here against real short-lived subprocesses rather
+/// than a live `container system start`, mirroring how `Outcome` above is tested against
+/// its inputs directly instead of a live service.
+@Suite("AppleContainerBootstrap.waitForExit")
+struct AppleContainerBootstrapWaitForExitTests {
+
+    @Test("a process that exits cleanly within the deadline reports success")
+    func exitsCleanlyWithinDeadline() async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try! process.run()
+
+        let result = await AppleContainerBootstrap.waitForExit(of: process, timeout: .seconds(5))
+        #expect(result == true)
+    }
+
+    @Test("a process that exits non-zero within the deadline reports failure")
+    func exitsNonZeroWithinDeadline() async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/false")
+        try! process.run()
+
+        let result = await AppleContainerBootstrap.waitForExit(of: process, timeout: .seconds(5))
+        #expect(result == false)
+    }
+
+    @Test("a process that outlives the deadline is killed and reported as failed, not hung")
+    func killsAndReportsFailureWhenDeadlineExpires() async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try! process.run()
+
+        let start = ContinuousClock.now
+        let result = await AppleContainerBootstrap.waitForExit(of: process, timeout: .milliseconds(200))
+        let elapsed = start.duration(to: .now)
+
+        #expect(result == false)
+        // The whole point of the fix: this returns near the (short) timeout, not after the
+        // process's own 30-second runtime — proving the caller isn't blocked indefinitely.
+        #expect(elapsed < .seconds(10))
+        #expect(!process.isRunning)
     }
 }
