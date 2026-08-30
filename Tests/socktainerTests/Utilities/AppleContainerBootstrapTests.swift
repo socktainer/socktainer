@@ -104,7 +104,7 @@ struct AppleContainerBootstrapWaitForExitTests {
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         // Traps and discards SIGTERM, so only SIGKILL can end this — reproduces the gap
         // CodeRabbit's follow-up review found: terminate() alone doesn't bound the wait.
-        process.arguments = ["-c", "trap '' TERM; sleep 30"]
+        process.arguments = ["-c", "trap '' TERM; exec sleep 30"]
         try! process.run()
 
         let start = ContinuousClock.now

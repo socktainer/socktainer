@@ -107,11 +107,22 @@ public enum AppleContainerBootstrap {
     /// on cooperative subprocesses. Separated from `runContainerSystemStart()` so the race
     /// itself — the part a stalled subprocess would actually expose — is testable against
     /// any process, not just a live `container system start`.
+    ///
+    /// Watches exit via `terminationHandler` rather than the blocking `waitUntilExit()`:
+    /// the latter parks a Swift Concurrency worker thread for as long as the child runs,
+    /// and Swift's cooperative pool is small and shared with the rest of the process — under
+    /// enough concurrent subprocess-waiting tests (as CI has, with fewer cores than a dev
+    /// machine), that starves the pool and stalls unrelated async work process-wide, not
+    /// just this function. `terminationHandler` fires from Foundation's own process-exit
+    /// monitoring, so waiting for it is a true suspension with no thread held captive.
     static func waitForExit(of process: Process, timeout: Duration, killGracePeriod: Duration = .seconds(5)) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
-                process.waitUntilExit()
-                return process.terminationStatus == 0
+                await withCheckedContinuation { continuation in
+                    process.terminationHandler = { process in
+                        continuation.resume(returning: process.terminationStatus == 0)
+                    }
+                }
             }
             group.addTask {
                 try? await Task.sleep(for: timeout)
