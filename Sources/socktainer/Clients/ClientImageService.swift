@@ -269,6 +269,8 @@ struct ClientImageService: ClientImageProtocol {
 
         logger.info("Pulling image reference: \(reference)")
 
+        let scheme = RegistryScheme.scheme(forReference: reference, internalDnsDomain: containerSystemConfig.dns.domain)
+
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield(.message("Trying to pull \(reference)"))
@@ -278,6 +280,7 @@ struct ClientImageService: ClientImageProtocol {
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
+                        scheme: scheme,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
@@ -323,6 +326,7 @@ struct ClientImageService: ClientImageProtocol {
                             let fallbackImage = try await ClientImage.pull(
                                 reference: reference,
                                 platform: amd64,
+                                scheme: scheme,
                                 containerSystemConfig: containerSystemConfig,
                                 progressUpdate: nil
                             )
@@ -372,7 +376,7 @@ struct ClientImageService: ClientImageProtocol {
                 do {
                     try await image.push(
                         platform: effectivePlatform,
-                        scheme: .auto,
+                        scheme: RegistryScheme.scheme(forReference: normalizedReference, internalDnsDomain: containerSystemConfig.dns.domain),
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {

@@ -165,6 +165,7 @@ extension ContainerCreateRoute {
                 img = try await ClientImage.fetch(
                     reference: body.Image,
                     platform: requestedPlatform,
+                    scheme: RegistryScheme.scheme(forReference: body.Image, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
                 // Case 2: image exists locally but may have been pulled as amd64
@@ -185,6 +186,7 @@ extension ContainerCreateRoute {
                 img = try await ClientImage.fetch(
                     reference: body.Image,
                     platform: amd64,
+                    scheme: RegistryScheme.scheme(forReference: body.Image, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
                 requestedPlatform = amd64
@@ -199,6 +201,7 @@ extension ContainerCreateRoute {
 
             let initImage = try await ClientImage.fetch(
                 reference: systemConfig.vminit.image, platform: .current,
+                scheme: RegistryScheme.scheme(forReference: systemConfig.vminit.image, internalDnsDomain: systemConfig.dns.domain),
                 containerSystemConfig: systemConfig
             )
 

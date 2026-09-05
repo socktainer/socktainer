@@ -54,7 +54,7 @@ struct RegistryDistributionProvider: DistributionInspectProviding {
     }
 
     private func registryClient(server: String, authentication: Authentication?) throws -> RegistryClient {
-        let scheme = try RequestScheme.auto.schemeFor(host: server, internalDnsDomain: containerSystemConfig.dns.domain)
+        let scheme = RegistryScheme.scheme(forHost: server, internalDnsDomain: containerSystemConfig.dns.domain)
         guard let url = URL(string: "\(scheme.rawValue)://\(server)"), let host = url.host else {
             throw Abort(.badRequest, reason: "invalid registry host: \(server)")
         }
