@@ -491,9 +491,17 @@ extension ContainerCreateRoute {
                     req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
                 }
             }
-            containerConfiguration.labels = containerLabels
+            var labelsWithTimestamp = containerLabels
+            // Stamp the creation time so the Docker-facing id stays the same if
+            // the container is later rebuilt to carry pre-start files.
+            labelsWithTimestamp[AppleContainerTimestampResolver.legacyCreationTimestampLabel] =
+                String(Date().timeIntervalSince1970)
+            containerConfiguration.labels = labelsWithTimestamp
 
             var resolvedMounts: [Filesystem] = []
+            // Named volumes worth a copy-up, collected here and populated once the
+            // container exists: the image's contents are only reachable from it.
+            var copyUpCandidates: [(source: String, destination: String)] = []
 
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
@@ -619,9 +627,12 @@ extension ContainerCreateRoute {
                     // Strip /lost+found when PGDATA is set (any value) — that
                     // reliably signals a Postgres container, and named volumes are
                     // always mounted at their root so /lost+found is always reachable.
+                    // An empty volume is rebuilt by the copy-up below, which drops
+                    // /lost+found as part of it; reformatting here would be undone.
                     if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
                         volume.format == "ext4",
-                        VolumeImageCleaner.isEnabled(labels: volume.labels)
+                        VolumeImageCleaner.isEnabled(labels: volume.labels),
+                        !VolumeCopyUp.isEmpty(volumeImagePath: volume.source)
                     {
                         VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
                     }
@@ -640,6 +651,9 @@ extension ContainerCreateRoute {
                         options: parsed.options,
                         sync: syncMode
                     )
+                    if volume.format == "ext4" {
+                        copyUpCandidates.append((source: volume.source, destination: parsed.destination))
+                    }
                     resolvedMounts.append(volumeMount)
                 }
             }
@@ -654,21 +668,54 @@ extension ContainerCreateRoute {
 
             containerConfiguration.mounts = resolvedMounts
 
-            if let memoryBytes = resolveMemoryInBytes(body.HostConfig?.Memory) {
+            // Fall back to Apple Container's own `[container]` configuration when the
+            // request carries no explicit limits, so `container system property set
+            // container.cpus` / `container.memory` applies to containers created through
+            // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
+            //
+            // Only loaded when at least one limit is missing: the first load pings the
+            // daemon with a 10s timeout, and a create that specifies both limits would
+            // otherwise wait on a configuration read whose result it never uses.
+            let requestedMemory = body.HostConfig?.Memory
+            let requestedNanoCpus = body.HostConfig?.NanoCpus
+            let needsConfiguredDefaults = !((requestedMemory ?? 0) > 0 && (requestedNanoCpus ?? 0) > 0)
+            let configuredDefaults =
+                needsConfiguredDefaults
+                ? await ContainerResourceDefaults.shared.current(logger: req.logger)
+                : nil
+
+            if let memoryBytes = ContainerResourceResolution.memoryInBytes(
+                requested: requestedMemory,
+                configured: configuredDefaults
+            ) {
                 containerConfiguration.resources.memoryInBytes = memoryBytes
             }
 
-            if let nanoCpus = body.HostConfig?.NanoCpus, nanoCpus > 0 {
-                containerConfiguration.resources.cpus = ContainerCreateRoute.vCpus(fromNanoCpus: nanoCpus)
+            if let cpus = ContainerResourceResolution.cpus(
+                requestedNanoCpus: requestedNanoCpus,
+                configured: configuredDefaults
+            ) {
+                containerConfiguration.resources.cpus = cpus
             }
 
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
             do {
                 let containerClient = ContainerClient()
-                try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                // Recorded before the container exists: recording afterwards turns a
+                // creation that happened into a reported failure, and the retry then
+                // collides with the name.
+                try await PreStartInjectionStore.shared.rememberCreateOptions(
+                    containerId: containerConfiguration.id, autoRemove: options.autoRemove)
+                do {
+                    try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                } catch {
+                    try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                    throw error
+                }
                 container = try await containerClient.get(id: containerConfiguration.id)
                 req.logger.debug("Container created successfully with ID: \(container.id)")
+                ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
             } catch {
                 req.logger.error("Failed to create container: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
@@ -782,6 +829,37 @@ extension ContainerCreateRoute {
                 )
             }
             return result
+        }
+    }
+
+    /// Docker's copy-up: an empty named volume mounted over a path the image
+    /// populates takes that path's contents, ownership and permissions. Runs once
+    /// the container exists, which is when the image's filesystem can be read, and
+    /// always before it starts. Best-effort: a volume that cannot be prepared is
+    /// left as it was rather than failing the creation.
+    static func populateEmptyVolumes(
+        _ candidates: [(source: String, destination: String)],
+        for container: ContainerSnapshot,
+        logger: Logger
+    ) {
+        guard !candidates.isEmpty else { return }
+        let appSupport = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container")
+        guard
+            let rootfs = VolumeCopyUp.imageFilesystem(
+                containerId: container.id, appSupportPath: appSupport)
+        else { return }
+
+        for candidate in candidates where VolumeCopyUp.isEmpty(volumeImagePath: candidate.source) {
+            do {
+                try VolumeCopyUp.populate(
+                    volumeImagePath: candidate.source,
+                    fromRootfs: rootfs.path,
+                    sourcePath: candidate.destination,
+                    logger: logger
+                )
+            } catch {
+                logger.warning("[volume-copyup] \(candidate.destination) left empty: \(error)")
+            }
         }
     }
 

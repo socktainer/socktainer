@@ -28,6 +28,7 @@ struct ContainerProcessExitMonitorTests {
             fallbackLabels: [:],
             dnsServer: nil,
             broadcaster: nil,
+            runEpoch: 0,
             outputFlushGraceNs: 0,
             exitCodeRetryDelayNs: 0
         )
@@ -54,6 +55,7 @@ struct ContainerProcessExitMonitorTests {
             fallbackLabels: [:],
             dnsServer: nil,
             broadcaster: nil,
+            runEpoch: 0,
             outputFlushGraceNs: 0,
             exitCodeRetryDelayNs: 0
         )
@@ -81,6 +83,7 @@ struct ContainerProcessExitMonitorTests {
             fallbackLabels: [:],
             dnsServer: nil,
             broadcaster: nil,
+            runEpoch: 0,
             outputFlushGraceNs: 0,
             exitCodeRetryDelayNs: 0
         )

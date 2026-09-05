@@ -106,6 +106,45 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
+    /// `Error.localizedDescription` only produces a useful message for types that
+    /// bridge to `NSError` or explicitly conform to `LocalizedError` — most
+    /// Swift-native errors this route can throw don't. Notably, a failed BuildKit
+    /// step surfaces as `GRPCCore.RPCError`, which carries the real failure reason in
+    /// `.message`/`.code` and has its own `description`, but `.localizedDescription`
+    /// on it ignores that and falls back to a generic, useless
+    /// "The operation couldn't be completed. (GRPCCore.RPCError error 1.)" — so a
+    /// real `RUN` step failure reached the client as that instead of the actual
+    /// command and exit code (issue #386).
+    ///
+    /// Note `error is CustomStringConvertible` is **not** a usable way to detect
+    /// "this type has a real custom description" here: on Darwin, any concrete
+    /// `Error` bridges to `NSError`, which satisfies that check regardless of the
+    /// concrete type — the compiler will flag it as an always-true test. So the
+    /// three known shapes are handled explicitly instead of by a generic runtime
+    /// probe:
+    ///
+    /// - `ContainerizationError` conforms to both `CustomStringConvertible` and
+    ///   `LocalizedError`, and its two descriptions differ: `.description` includes
+    ///   its `.code`, `.errorDescription` doesn't. Special-cased first so its
+    ///   existing (richer) message format doesn't regress.
+    /// - A plain `LocalizedError` — `RPCError` isn't one, but nothing guarantees
+    ///   every error this route can throw won't be — is checked next, since
+    ///   `errorDescription` is the type's own explicit, semantic "here is my
+    ///   message" API and should win over an accidental Mirror-based default.
+    /// - Everything else, including `RPCError`, falls through to plain string
+    ///   interpolation, which calls a type's own `description` when it explicitly
+    ///   conforms to `CustomStringConvertible` (`RPCError` does) — fixing the
+    ///   original #386 gap without depending on the unreliable runtime check above.
+    static func errorMessage(for error: Error) -> String {
+        if error is ContainerizationError {
+            return "\(error)"
+        }
+        if let localizedError = error as? LocalizedError, let description = localizedError.errorDescription {
+            return description
+        }
+        return "\(error)"
+    }
+
     static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
     {
         { req in
@@ -277,14 +316,7 @@ extension BuildRoute {
                     } catch {
                         req.logger.error("Build failed: \(error)")
 
-                        // Extract error message - prioritize ContainerizationError message
-                        let errorMessage: String
-                        if error is ContainerizationError {
-                            // Use string interpolation to get ContainerizationError's description
-                            errorMessage = "\(error)"
-                        } else {
-                            errorMessage = error.localizedDescription
-                        }
+                        let errorMessage = BuildRoute.errorMessage(for: error)
 
                         // Docker API compliant error response
                         let errorDetail: [String: Any] = [

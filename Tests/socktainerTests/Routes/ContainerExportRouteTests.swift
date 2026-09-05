@@ -143,11 +143,11 @@ private actor FakeArchiveClient: ClientArchiveProtocol {
         URL(fileURLWithPath: "/nonexistent/rootfs.ext4")
     }
 
-    func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
+    func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
 
-    func statPath(containerId: String, path: String) async throws -> PathStat {
+    func statPath(container: ContainerSnapshot, path: String) async throws -> PathStat {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
 

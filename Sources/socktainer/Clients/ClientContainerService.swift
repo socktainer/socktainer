@@ -278,12 +278,47 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
+    /// Rebuild a container so it carries the files copied into it before it was
+    /// ever started.
+    ///
+    /// There is no API to add a mount to a container that already exists, so the
+    /// only way to put the files where the guest will see them is to create it
+    /// again with the mounts included. The name is kept, and the creation
+    /// timestamp travels in a label, so the id the client holds does not change.
+    private func applyPreStartInjections(container: ContainerSnapshot) async throws {
+        let staged = try await PreStartInjectionStore.shared.mounts(containerId: container.id)
+        guard !staged.isEmpty else { return }
+
+        var configuration = container.configuration
+        let existing = Set(configuration.mounts.map(\.destination))
+        let additions = staged.filter { !existing.contains($0.destination) }
+        guard !additions.isEmpty else { return }
+        configuration.mounts.append(contentsOf: additions)
+        let rebuilt = configuration
+
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        let options = await PreStartInjectionStore.shared.createOptions(containerId: container.id)
+
+        try await containerClient.withClient { try await $0.delete(id: container.id, force: true) }
+        do {
+            try await containerClient.withClient {
+                try await $0.create(configuration: rebuilt, options: options, kernel: kernel)
+            }
+        } catch {
+            // The container is gone and could not be put back. Say so plainly:
+            // a client told only that start failed would look everywhere else.
+            throw ClientContainerError.notFound(id: container.id)
+        }
+    }
+
     private func startInternal(container: ContainerSnapshot) async throws {
         let stdin: FileHandle? = nil
         let stdout: FileHandle? = nil
         let stderr: FileHandle? = nil
 
         let stdio = [stdin, stdout, stderr]
+
+        try await applyPreStartInjections(container: container)
 
         do {
             let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
@@ -374,6 +409,10 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.withClient { try await $0.delete(id: container.id) }
+        // After the delete, and by the native id: the reference a client holds may
+        // be a derived Docker id, and a delete that failed leaves a container that
+        // still needs its uploads.
+        try await PreStartInjectionStore.shared.clear(containerId: container.id)
     }
 
     // Poll until the container is no longer running, then return the real exit
@@ -505,6 +544,10 @@ struct ClientContainerService: ClientContainerProtocol {
         for container in containersToDelete {
             do {
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
+                // Pruning reclaims a container, so it reclaims what was staged for
+                // it too: those files are whatever a client uploaded, secrets
+                // included.
+                try await PreStartInjectionStore.shared.clear(containerId: container.id)
                 deletedIds.append(container.id)
             } catch {
                 continue

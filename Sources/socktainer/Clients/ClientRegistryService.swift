@@ -29,23 +29,6 @@ struct ClientRegistryService: ClientRegistryProtocol {
         return serverAddress
     }
 
-    private func discoverContainerCLIPath() -> String? {
-        let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
-            .split(separator: ":")
-            .map(String.init)
-
-        for directory in pathDirectories {
-            let candidatePath = URL(fileURLWithPath: directory).appendingPathComponent("container").path
-            guard FileManager.default.isExecutableFile(atPath: candidatePath) else {
-                continue
-            }
-
-            return URL(fileURLWithPath: candidatePath).resolvingSymlinksInPath().path
-        }
-
-        return nil
-    }
-
     func validateCredentials(serverAddress: String, username: String, password: String) async throws -> Bool {
         guard !serverAddress.isEmpty else {
             throw ClientRegistryError.invalidServerAddress

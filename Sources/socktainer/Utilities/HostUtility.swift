@@ -80,6 +80,30 @@ func findAvailablePort() throws -> Int {
     return Int(CFSwapInt16BigToHost(actualAddr.sin_port))
 }
 
+/// Locates the `container` CLI executable. Searches `PATH` first, then falls back to
+/// the two locations Apple Container actually installs to — Homebrew's Cellar symlink
+/// (`/opt/homebrew/bin`) and the official installer's location (`/usr/local/bin`) — since
+/// background launch contexts (e.g. launchd) often inherit a minimal `PATH` that omits
+/// both, which would otherwise make the executable unreachable even though it's present.
+public func discoverContainerCLIPath() -> String? {
+    let searchDirectories =
+        (ProcessInfo.processInfo.environment["PATH"] ?? "")
+        .split(separator: ":")
+        .map(String.init)
+        + ["/opt/homebrew/bin", "/usr/local/bin"]
+
+    for directory in searchDirectories {
+        let candidatePath = URL(fileURLWithPath: directory).appendingPathComponent("container").path
+        guard FileManager.default.isExecutableFile(atPath: candidatePath) else {
+            continue
+        }
+
+        return URL(fileURLWithPath: candidatePath).resolvingSymlinksInPath().path
+    }
+
+    return nil
+}
+
 public func parseSignal(_ signal: String) throws -> Int32 {
     let signalUpper = signal.uppercased()
     switch signalUpper {
