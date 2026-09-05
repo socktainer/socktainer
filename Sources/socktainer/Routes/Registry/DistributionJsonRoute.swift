@@ -149,6 +149,12 @@ struct DistributionJsonRoute: RouteCollection {
             default:
                 return Abort(.internalServerError, reason: String(describing: error))
             }
+        case .insecureCredentialExchange(let message):
+            // Not the registry rejecting us — containerization 0.42 refuses to hand credentials
+            // to a party that isn't the registry itself (CVE fix). A 401 would be misleading:
+            // it invites the client to re-authenticate, which cannot help. Surface it as a
+            // daemon-side failure with the real reason.
+            return Abort(.internalServerError, reason: "\(message) (\(reference))")
         }
     }
 }
