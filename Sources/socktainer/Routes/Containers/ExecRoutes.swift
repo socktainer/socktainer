@@ -363,7 +363,7 @@ struct ExecRoute: RouteCollection {
                     // The exec was marked started; if creating/starting the
                     // process fails we must record an exit code, otherwise the
                     // exec is stuck reporting Running forever.
-                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    await ExecManager.shared.setExitCode(id: execId, code: ExecRoute.execStartFailureExitCode(error))
                     throw error
                 }
                 await broadcastExecEvent(execStartAction)
@@ -454,7 +454,7 @@ struct ExecRoute: RouteCollection {
                         try await process.start()
                     } catch {
                         pipes.closeAfterHandoff()
-                        await ExecManager.shared.setExitCode(id: execId, code: -1)
+                        await ExecManager.shared.setExitCode(id: execId, code: ExecRoute.execStartFailureExitCode(error))
                         throw error
                     }
                     await broadcastExecEvent(execStartAction)
@@ -635,7 +635,7 @@ struct ExecRoute: RouteCollection {
                     try await process.start()
                 } catch {
                     pipes.closeAfterHandoff()
-                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                    await ExecManager.shared.setExitCode(id: execId, code: ExecRoute.execStartFailureExitCode(error))
                     throw error
                 }
                 await broadcastExecEvent(execStartAction)
@@ -837,6 +837,19 @@ struct ExecRoute: RouteCollection {
     static func broadcastExecDetach(execRunning: Bool, execId: String, container: ContainerSnapshot, broadcaster: EventBroadcaster?) async {
         guard execRunning, let broadcaster else { return }
         await broadcaster.broadcast(DockerEvent.containerEvent("exec_detach", container: container, extraAttributes: ["execID": execId]))
+    }
+
+    /// Docker/runc report a missing executable as exit code 127 (the POSIX
+    /// "command not found" convention) rather than a generic failure.
+    /// Containerization's vmexec throws the same generic .internalError for
+    /// every startup failure — see vmexec.swift's Errno/Failure constructors —
+    /// so the message text is the only signal available to distinguish this
+    /// specific case (matches the exact string vmexec.swift uses).
+    static func execStartFailureExitCode(_ error: Error) -> Int32 {
+        if String(describing: error).contains("failed to find target executable") {
+            return 127
+        }
+        return -1
     }
 
     /// Maps Docker's exec-start `ConsoleSize` to an initial terminal size.
