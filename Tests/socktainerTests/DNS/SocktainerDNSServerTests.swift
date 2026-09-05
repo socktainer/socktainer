@@ -216,6 +216,56 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
     return nil
 }
 
+/// Sends an A query for `name`, optionally carrying an EDNS0 OPT record in the
+/// ADDITIONAL section (as Go's `net` resolver always does), and returns the raw
+/// response bytes. Same retry strategy as `dnsRcode`.
+private func dnsRawResponse(name: String, port: Int, withEDNS0: Bool) -> [UInt8]? {
+    var qname = [UInt8]()
+    for label in name.split(separator: ".") {
+        let bytes = Array(label.utf8)
+        qname.append(UInt8(bytes.count))
+        qname.append(contentsOf: bytes)
+    }
+    qname.append(0)
+
+    var packet = [UInt8]()
+    packet += [0x12, 0x34, 0x01, 0x00]  // ID + RD=1 query
+    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, withEDNS0 ? 0x01 : 0x00]  // QDCOUNT=1, ARCOUNT=0/1
+    packet += qname
+    packet += [0x00, 0x01, 0x00, 0x01]  // QTYPE=A, QCLASS=IN
+    if withEDNS0 {
+        // OPT pseudo-RR: root name, TYPE=41, UDP payload 4096, no flags/options.
+        packet += [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+
+    var dst = sockaddr_in()
+    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst.sin_family = sa_family_t(AF_INET)
+    dst.sin_port = in_port_t(port).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr)
+
+    for attempt in 0..<5 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.05) }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { continue }
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let sent = packet.withUnsafeBytes { ptr in
+            withUnsafePointer(to: &dst) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, ptr.baseAddress!, packet.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent > 0 else { continue }
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = recv(fd, &buf, buf.count, 0)
+        if n >= 12 { return Array(buf[0..<n]) }
+    }
+    return nil
+}
+
 @Suite("SocktainerDNSServer — query behaviour")
 struct SocktainerDNSQueryTests {
 
@@ -229,6 +279,34 @@ struct SocktainerDNSQueryTests {
         server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
         let rcode = dnsRcode(type: 1, name: "supabase_db_supabase", port: port)
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
+    }
+
+    // Regression for issue #329: an A response built by copying the whole request
+    // (header+question+the client's EDNS0 OPT record) and only zeroing ARCOUNT in
+    // the header still physically carries that OPT record right after the
+    // question — a parser reads the declared ANCOUNT=1 answer from that position,
+    // so it gets the leftover OPT record instead of the appended A record. Go's
+    // `net` resolver always sends EDNS0, so this broke every Go-based container.
+    @Test("A query with an EDNS0 OPT record still returns the A record as the answer, not the OPT")
+    func ednS0QueryReturnsARecordNotOPT() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "peer-host", ip: "192.168.65.8")
+
+        let response = try #require(dnsRawResponse(name: "peer-host", port: port, withEDNS0: true))
+
+        let ancount = (UInt16(response[6]) << 8) | UInt16(response[7])
+        let arcount = (UInt16(response[10]) << 8) | UInt16(response[11])
+        #expect(ancount == 1, "must declare exactly one answer")
+        #expect(arcount == 0, "the client's OPT record must not be echoed back as an additional record")
+
+        // Answer starts right after the question: root header (12) + "peer-host" (1+9) + "." terminator (1) + QTYPE/QCLASS (4).
+        let questionEnd = 12 + 1 + "peer-host".utf8.count + 1 + 4
+        let answerType = (UInt16(response[questionEnd + 2]) << 8) | UInt16(response[questionEnd + 3])
+        #expect(answerType == 1, "the first (and only) answer record must be an A record (type 1), not the leftover OPT (type 41)")
     }
 
     @Test("A query for unknown single-label name returns local NXDOMAIN (RCODE 3)")

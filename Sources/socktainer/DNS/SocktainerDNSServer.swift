@@ -174,7 +174,14 @@ final class SocktainerDNSServer: @unchecked Sendable {
         guard packet.count >= 12 else { return nil }
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
-        guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else { return nil }
+        guard let (qname, qtype, qEnd) = parseQuestion(packet, offset: 12) else { return nil }
+        // Base every response on header+question only. A copy of the full
+        // request would still carry the client's EDNS0 OPT record (or any
+        // other data past the question) even after ARCOUNT is zeroed below —
+        // a parser reads records by position, not by trusting the header, so
+        // that leftover OPT record is mistaken for the answer that gets
+        // appended after it. See issue #329.
+        let base = Array(packet[0..<qEnd])
         let normalized = Self.normalize(qname)
         let isSingleLabel = !normalized.contains(".")
         if qtype == 1 {
@@ -183,24 +190,24 @@ final class SocktainerDNSServer: @unchecked Sendable {
             lock.unlock()
             if let ip {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
-                return buildAResponse(packet: packet, ip: ip)
+                return buildAResponse(packet: base, ip: ip)
             }
             if isSingleLabel {
                 log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
-                return buildNxdomainResponse(packet: packet)
+                return buildNxdomainResponse(packet: base)
             }
         } else if qtype == 28 {
-            if isSingleLabel { return buildNodataResponse(packet: packet) }
+            if isSingleLabel { return buildNodataResponse(packet: base) }
             lock.lock()
             let known = entries[normalized] != nil
             lock.unlock()
-            if known { return buildNodataResponse(packet: packet) }
+            if known { return buildNodataResponse(packet: base) }
         }
         // Any other single-label query type (HTTPS/SVCB/SRV/TXT/…) is answered NODATA
         // locally rather than forwarded: a single-label name has no public meaning, so
         // forwarding it upstream only invites an authoritative NXDOMAIN that poisons the
         // resolver's parallel A+AAAA lookups.
-        if isSingleLabel { return buildNodataResponse(packet: packet) }
+        if isSingleLabel { return buildNodataResponse(packet: base) }
         return nil
     }
 
@@ -211,9 +218,12 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
 
-        guard let (qname, qtype, _) = parseQuestion(packet, offset: 12) else {
+        guard let (qname, qtype, qEnd) = parseQuestion(packet, offset: 12) else {
             return forwardToUpstream(packet)
         }
+        // Base every response on header+question only — see the matching
+        // comment in handleLocalQuery (issue #329).
+        let base = Array(packet[0..<qEnd])
 
         let normalized = Self.normalize(qname)
 
@@ -227,20 +237,20 @@ final class SocktainerDNSServer: @unchecked Sendable {
             lock.unlock()
             if let ip {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
-                return buildAResponse(packet: packet, ip: ip)
+                return buildAResponse(packet: base, ip: ip)
             }
             if isSingleLabel {
                 log.info("[dns] \(normalized) not in table (local NXDOMAIN)")
-                return buildNxdomainResponse(packet: packet)
+                return buildNxdomainResponse(packet: base)
             }
         } else if qtype == 28 {  // AAAA — container names are IPv4-only
             // For single-label names return NODATA unconditionally; forwarding to 1.1.1.1
             // would yield an authoritative NXDOMAIN that poisons concurrent A+AAAA resolvers.
-            if isSingleLabel { return buildNodataResponse(packet: packet) }
+            if isSingleLabel { return buildNodataResponse(packet: base) }
             lock.lock()
             let known = entries[normalized] != nil
             lock.unlock()
-            if known { return buildNodataResponse(packet: packet) }
+            if known { return buildNodataResponse(packet: base) }
         }
 
         return forwardToUpstream(packet)
