@@ -298,9 +298,13 @@ final class SocktainerDNSServer: @unchecked Sendable {
     }
 
     /// Query skeleton forwarded upstream: header + question with any additional records
-    /// (e.g. an EDNS0 OPT) dropped and ARCOUNT zeroed, so the packet stays well-formed.
+    /// (e.g. an EDNS0 OPT) dropped and other counts zeroed, so the packet stays well-formed.
     private func makeQueryPacket(_ packet: [UInt8], questionEnd: Int) -> [UInt8] {
         var query = Array(packet.prefix(12))
+        query[6] = 0  // ANCOUNT=0
+        query[7] = 0
+        query[8] = 0  // NSCOUNT=0
+        query[9] = 0
         query[10] = 0  // ARCOUNT=0
         query[11] = 0
         query += Array(packet[12..<questionEnd])
