@@ -247,10 +247,11 @@ private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
     return nil
 }
 
-/// Sends an EDNS0-OPT query and returns the response's ARCOUNT and the bytes remaining
-/// after the question and answer sections. Both are 0 for a well-formed response — an
-/// echoed OPT record or trailing bytes would make them nonzero.
-private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcount: Int, remaining: Int)? {
+/// Sends an EDNS0-OPT query and returns the response's ARCOUNT, the first A answer's IP,
+/// and the bytes remaining after the question and answer sections. ARCOUNT and remaining
+/// are 0 for a well-formed response — an echoed OPT record or trailing bytes would make
+/// them nonzero.
+private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcount: Int, ip: String, remaining: Int)? {
     guard
         let response = sendDnsQuery(makeDnsQuery(names: names, type: type, edns0: true), port: port),
         response.count >= 12
@@ -259,6 +260,7 @@ private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcou
     let an = Int((UInt16(response[6]) << 8) | UInt16(response[7]))
     let arcount = Int((UInt16(response[10]) << 8) | UInt16(response[11]))
     var pos = 12
+    var ip = ""
     func skipName() {
         while pos < response.count {
             let len = Int(response[pos])
@@ -278,10 +280,17 @@ private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcou
     for _ in 0..<an {
         skipName()
         guard pos + 10 <= response.count else { break }
+        let answerType = Int((UInt16(response[pos]) << 8) | UInt16(response[pos + 1]))
         let rdlen = Int((UInt16(response[pos + 8]) << 8) | UInt16(response[pos + 9]))
-        pos += 10 + rdlen
+        pos += 10
+        // Capture the first A record's rdata; skip AAAA and other types.
+        if answerType == 1 && rdlen == 4 && ip.count == 0 {
+            guard pos + 4 <= response.count else { break }
+            ip = response[pos..<pos + rdlen].map(String.init).joined(separator: ".")
+        }
+        pos += rdlen
     }
-    return (arcount, response.count - pos)
+    return (arcount, ip, response.count - pos)
 }
 
 @Suite("SocktainerDNSServer — query behaviour")
@@ -365,6 +374,7 @@ struct SocktainerDNSQueryTests {
             return
         }
         #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.ip == "192.168.1.10", "response must return the correct ip in the answer section")
         #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
     }
 
