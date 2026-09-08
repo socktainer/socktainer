@@ -441,6 +441,10 @@ services:
 
 If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
 
+### Internal networks
+
+Use `docker network create --internal <name>` or Compose's `internal: true` to create a network without external connectivity, backed by Apple Container's host-only mode. Network inspect reports `Internal: true`; the driver remains `nat`.
+
 ### Network subnets (IPAM)
 
 Socktainer pins a stable subnet on each network it creates so that inter-container DNS keeps working across a `container system` restart (an unpinned network's subnet is reassigned by `vmnet` on restart, which would leave containers' DNS nameservers pointing at a dead address). An explicit `--subnet` / Compose `ipam.config.subnet` is honored; otherwise a free `192.168.x.0/24` is chosen automatically.

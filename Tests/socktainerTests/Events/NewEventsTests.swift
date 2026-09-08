@@ -19,8 +19,8 @@ struct NewEventsTests {
 
     // MARK: - network.create
 
-    @Test("network create route broadcasts Type=network Action=create event")
-    func networkCreateEventBroadcast() async throws {
+    @Test("network create route broadcasts Type=network Action=create event", arguments: [false, true])
+    func networkCreateEventBroadcast(internalNetwork: Bool) async throws {
         let broadcaster = EventBroadcaster()
         let stream = await broadcaster.stream()
         let captureTask = Task<DockerEvent?, Never> {
@@ -38,7 +38,7 @@ struct NewEventsTests {
             try await app.testing().test(
                 .POST, "/v1.51/networks/create",
                 headers: ["Content-Type": "application/json"],
-                body: ByteBuffer(string: #"{"Name":"my-net"}"#)
+                body: ByteBuffer(string: #"{"Name":"my-net","Internal":\#(internalNetwork)}"#)
             ) { res async in
                 #expect(res.status == .created)
             }
@@ -51,7 +51,7 @@ struct NewEventsTests {
         #expect(event?.Action == "create")
         #expect(event?.Actor.ID == "net-abc123")
         #expect(event?.Actor.Attributes["name"] == "my-net")
-        #expect(event?.Actor.Attributes["type"] == "nat", "moby network events carry a 'type' attribute")
+        #expect(event?.Actor.Attributes["type"] == "nat", "network event driver should be nat regardless of the Internal request value")
         #expect(event?.Actor.Attributes["image"] == nil, "network events carry no 'image' attribute")
     }
 
@@ -508,7 +508,7 @@ private struct StubNetworkClient: ClientNetworkProtocol {
             IPAM: NetworkIPAM(Driver: "", Config: []), Options: [:], Containers: nil,
             ConfigFrom: nil, Labels: [:], Subnet: nil, Gateway: nil)
     }
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: "net-abc123", Warning: "")
     }
     func delete(id: String, logger: Logger) async throws {}

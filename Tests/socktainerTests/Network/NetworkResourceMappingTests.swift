@@ -1,6 +1,7 @@
 import ContainerResource
 import ContainerizationExtras
 import Foundation
+import Logging
 import Testing
 
 @testable import socktainer
@@ -58,6 +59,16 @@ private func makeNetworkResourceWithDate(
 
 @Suite("NetworkResource → RESTNetworkSummary mapping")
 struct NetworkResourceMappingTests {
+
+    @Test("Internal reflects the backend mode", arguments: [(NetworkMode.nat, false), (NetworkMode.hostOnly, true)])
+    func internalNetworkMode(mode: NetworkMode, expectedInternal: Bool) throws {
+        let summary = RESTNetworkSummary(networkResource: try makeNetworkResource(mode: mode))
+        #expect(summary.Internal == expectedInternal)
+        #expect(summary.Driver == "nat")
+        let filtered = ClientNetworkService.applyFilters(
+            [summary], filters: #"{"driver":["nat"]}"#, logger: Logger(label: "test"))
+        #expect(filtered.count == 1)
+    }
 
     @Test("Name and Id both come from configuration.name")
     func nameAndIdFromConfigurationName() throws {

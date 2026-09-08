@@ -9,7 +9,7 @@ protocol ClientNetworkProtocol: Sendable {
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary]
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary?
     func delete(id: String, logger: Logger) async throws
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
@@ -158,12 +158,11 @@ struct ClientNetworkService: ClientNetworkProtocol {
         logger.debug("Deleted network with id: \(id)")
     }
 
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
-        // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         let pinnedSubnet = try ipv4Subnet.map { try CIDRv4($0) }
         let configuration = try NetworkConfiguration(
             name: name,
-            mode: NetworkMode.nat,
+            mode: mode,
             ipv4Subnet: pinnedSubnet,
             labels: ResourceLabels(labels),
             plugin: "container-network-vmnet"
@@ -177,7 +176,8 @@ struct ClientNetworkService: ClientNetworkProtocol {
 extension RESTNetworkSummary {
     init(networkResource: NetworkResource) {
         let id = networkResource.configuration.name
-        let driver = String(describing: networkResource.configuration.mode)
+        // The backend mode controls isolation, not the public network driver.
+        let driver = "nat"
         let options: [String: String] = [:]  // Not provided by Apple container
         let labels = LabelNormalization.restore(networkResource.configuration.labels.dictionary)
         let subnet =
@@ -200,8 +200,7 @@ extension RESTNetworkSummary {
             Driver: driver,
             EnableIPv4: true,
             EnableIPv6: hasIPv6Prefix,
-            // NOTE: Apple container has no mechanism to set networks as internal
-            Internal: false,
+            Internal: networkResource.configuration.mode == .hostOnly,
             Attachable: false,
             Ingress: false,  // Only applicable for Swarm
             IPAM: NetworkIPAM(

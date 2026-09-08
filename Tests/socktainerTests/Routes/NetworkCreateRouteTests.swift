@@ -18,6 +18,27 @@ import VaporTesting
 @Suite("NetworkCreateRoute — idempotent create")
 struct NetworkCreateRouteTests {
 
+    @Test("duplicate create requires matching Internal settings", arguments: [false, true])
+    func duplicateInternalSetting(internalNetwork: Bool) async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            let requests: [(Bool, HTTPResponseStatus)] = [
+                (internalNetwork, .created),
+                (internalNetwork, .created),
+                (!internalNetwork, .conflict),
+            ]
+            for (requested, expectedStatus) in requests {
+                try await app.testing().test(
+                    .POST, "/v1.51/networks/create",
+                    headers: ["Content-Type": "application/json"],
+                    body: ByteBuffer(string: #"{"Name":"net-a","Internal":\#(requested)}"#)
+                ) { res async in
+                    #expect(res.status == expectedStatus)
+                }
+            }
+        }
+    }
+
     @Test("first create returns 201 with the created network")
     func firstCreateSucceeds() async throws {
         let client = FakeNetworkClient()
@@ -33,6 +54,7 @@ struct NetworkCreateRouteTests {
             }
         }
         #expect(client.createCalls == 1)
+        #expect(client.triedModes == [.nat])
         #expect(client.getNetworkCalls == 0)
     }
 
@@ -107,45 +129,55 @@ struct NetworkCreateRouteTests {
         #expect(client.getNetworkCalls == 1)
     }
 
-    @Test("create with no IPAM auto-pins a stable subnet from the allocator range")
-    func autoPinsSubnetWhenNoneRequested() async throws {
+    @Test(
+        "create with no IPAM auto-pins a stable subnet from the allocator range",
+        arguments: [(false, NetworkMode.nat), (true, NetworkMode.hostOnly)])
+    func autoPinsSubnetWhenNoneRequested(internalNetwork: Bool, expectedMode: NetworkMode) async throws {
         let client = FakeNetworkClient()
         try await withNetworkRouteApp(client: client) { app in
             try await app.testing().test(
                 .POST, "/v1.51/networks/create",
                 headers: ["Content-Type": "application/json"],
-                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+                body: ByteBuffer(string: #"{"Name":"net-a","Internal":\#(internalNetwork)}"#)
             ) { res async in
                 #expect(res.status == .created)
             }
         }
         #expect(client.lastSubnet == "192.168.254.0/24", "an unpinned create must pin the first free allocator subnet")
+        #expect(!client.triedModes.isEmpty)
+        #expect(client.triedModes.allSatisfy { $0 == expectedMode })
     }
 
-    @Test("an explicit IPAM subnet is honored verbatim, not auto-picked")
-    func explicitIPAMSubnetHonored() async throws {
+    @Test(
+        "an explicit IPAM subnet is honored verbatim, not auto-picked",
+        arguments: [(false, NetworkMode.nat), (true, NetworkMode.hostOnly)])
+    func explicitIPAMSubnetHonored(internalNetwork: Bool, expectedMode: NetworkMode) async throws {
         let client = FakeNetworkClient()
         try await withNetworkRouteApp(client: client) { app in
             try await app.testing().test(
                 .POST, "/v1.51/networks/create",
                 headers: ["Content-Type": "application/json"],
-                body: ByteBuffer(string: #"{"Name":"net-a","IPAM":{"Driver":"default","Config":[{"Subnet":"192.168.55.0/24"}]}}"#)
+                body: ByteBuffer(string: #"{"Name":"net-a","Internal":\#(internalNetwork),"IPAM":{"Driver":"default","Config":[{"Subnet":"192.168.55.0/24"}]}}"#)
             ) { res async in
                 #expect(res.status == .created)
             }
         }
         #expect(client.lastSubnet == "192.168.55.0/24", "a client-requested subnet must be pinned as-is")
+        #expect(!client.triedModes.isEmpty)
+        #expect(client.triedModes.allSatisfy { $0 == expectedMode })
     }
 
-    @Test("auto-pick retries on a subnet conflict and pins the next free subnet")
-    func retriesOnSubnetConflict() async throws {
+    @Test(
+        "auto-pick retries on a subnet conflict and pins the next free subnet",
+        arguments: [(false, NetworkMode.nat), (true, NetworkMode.hostOnly)])
+    func retriesOnSubnetConflict(internalNetwork: Bool, expectedMode: NetworkMode) async throws {
         let client = FakeNetworkClient()
         client.subnetConflictsBeforeSuccess = 1
         try await withNetworkRouteApp(client: client) { app in
             try await app.testing().test(
                 .POST, "/v1.51/networks/create",
                 headers: ["Content-Type": "application/json"],
-                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+                body: ByteBuffer(string: #"{"Name":"net-a","Internal":\#(internalNetwork)}"#)
             ) { res async in
                 #expect(res.status == .created)
             }
@@ -154,17 +186,21 @@ struct NetworkCreateRouteTests {
         #expect(
             client.triedSubnets == ["192.168.254.0/24", "192.168.253.0/24"],
             "must exclude the conflicted subnet and pick the next free one")
+        #expect(!client.triedModes.isEmpty)
+        #expect(client.triedModes.allSatisfy { $0 == expectedMode })
     }
 
-    @Test("auto-pick gives up after a bounded number of subnet conflicts and falls back to unpinned")
-    func retryIsBounded() async throws {
+    @Test(
+        "auto-pick gives up after a bounded number of subnet conflicts and falls back to unpinned",
+        arguments: [(false, NetworkMode.nat), (true, NetworkMode.hostOnly)])
+    func retryIsBounded(internalNetwork: Bool, expectedMode: NetworkMode) async throws {
         let client = FakeNetworkClient()
         client.conflictAllPinned = true
         try await withNetworkRouteApp(client: client) { app in
             try await app.testing().test(
                 .POST, "/v1.51/networks/create",
                 headers: ["Content-Type": "application/json"],
-                body: ByteBuffer(string: #"{"Name":"net-a"}"#)
+                body: ByteBuffer(string: #"{"Name":"net-a","Internal":\#(internalNetwork)}"#)
             ) { res async in
                 #expect(res.status == .created)
             }
@@ -173,6 +209,8 @@ struct NetworkCreateRouteTests {
             client.createCalls == NetworkCreateRoute.maxSubnetConflictRetries + 1,
             "must cap pinned attempts and then make one unpinned fallback create")
         #expect(client.lastSubnet == nil, "the final create must be the unpinned fallback")
+        #expect(!client.triedModes.isEmpty)
+        #expect(client.triedModes.allSatisfy { $0 == expectedMode })
     }
 
     @Test("an invalid explicit subnet returns 400, not 500, and never reaches the backend")
@@ -249,10 +287,10 @@ private struct SubnetConflictError: Error, CustomStringConvertible {
     var description: String { "requested subnet is already in use" }
 }
 
-private func makeNetworkResource(name: String) throws -> NetworkResource {
+private func makeNetworkResource(name: String, mode: NetworkMode) throws -> NetworkResource {
     let configuration = try NetworkConfiguration(
         name: name,
-        mode: .nat,
+        mode: mode,
         ipv4Subnet: nil,
         labels: ResourceLabels([:]),
         plugin: "container-network-vmnet"
@@ -284,20 +322,22 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     var conflictAllPinned = false
     /// Every subnet passed to `create`, in order — lets tests assert re-pick behavior.
     private(set) var triedSubnets: [String?] = []
-    private var existing: Set<String> = []
+    private var existing: [String: NetworkMode] = [:]
+    private(set) var triedModes: [NetworkMode] = []
 
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] { [] }
 
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
         getNetworkCalls += 1
-        guard !getNetworkReturnsNil, existing.contains(id) else { return nil }
-        return RESTNetworkSummary(networkResource: try makeNetworkResource(name: id))
+        guard !getNetworkReturnsNil, let mode = existing[id] else { return nil }
+        return RESTNetworkSummary(networkResource: try makeNetworkResource(name: id, mode: mode))
     }
 
     func delete(id: String, logger: Logger) async throws {}
 
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         createCalls += 1
+        triedModes.append(mode)
         lastSubnet = ipv4Subnet
         triedSubnets.append(ipv4Subnet)
         if createThrowsOther { throw OtherError() }
@@ -308,7 +348,8 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
                 throw SubnetConflictError()
             }
         }
-        guard existing.insert(name).inserted else { throw AlreadyExistsError(name: name) }
+        guard existing[name] == nil else { throw AlreadyExistsError(name: name) }
+        existing[name] = mode
         return RESTNetworkCreate(Id: name, Warning: "")
     }
 

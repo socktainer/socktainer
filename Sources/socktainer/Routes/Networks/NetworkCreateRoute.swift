@@ -1,10 +1,10 @@
+import ContainerResource
 import ContainerizationExtras
 import Vapor
 
 struct NetworksCreateQuery: Content {
     let Name: String
-    // NOTE: All fields are optional and are not supported or used
-    //       by Apple container. This should be revisited in the future.
+    // Optional Docker API fields; only a subset is supported by the backend.
     let Driver: String?
     let scope: String?
     let Internal: Bool?
@@ -28,7 +28,7 @@ struct NetworkCreateRoute: RouteCollection {
     func handler(_ req: Request) async throws -> Response {
         let logger = req.logger
         let query = try req.content.decode(NetworksCreateQuery.self)
-        // only pass network name and labels for now
+        let mode: NetworkMode = query.Internal == true ? .hostOnly : .nat
         let originalLabels = query.Labels ?? [:]
         guard !LabelNormalization.containsReservedKey(originalLabels) else {
             throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
@@ -40,7 +40,7 @@ struct NetworkCreateRoute: RouteCollection {
         let response: RESTNetworkCreate
         do {
             response = try await NetworkCreateRoute.createPinned(
-                client: client, name: query.Name, labels: labels, ipam: query.IPAM, logger: logger)
+                client: client, name: query.Name, labels: labels, ipam: query.IPAM, mode: mode, logger: logger)
             // moby network events carry {name, type} where type is the driver.
             // Only broadcast on actual creation — not on the idempotent "already exists" path.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -59,6 +59,9 @@ struct NetworkCreateRoute: RouteCollection {
             // (Mirrors VolumeCreateRoute's idempotent create.)
             guard "\(error)".lowercased().contains("already exists") else { throw error }
             guard let existing = try await client.getNetwork(id: query.Name, logger: logger) else { throw error }
+            guard existing.Internal == (query.Internal ?? false) else {
+                throw Abort(.conflict, reason: "Network '\(query.Name)' already exists with a different Internal setting")
+            }
             response = RESTNetworkCreate(Id: existing.Id, Warning: "")
         }
         // Docker Engine API: POST /networks/create returns 201 Created.
@@ -72,6 +75,7 @@ struct NetworkCreateRoute: RouteCollection {
         name: String,
         labels: [String: String],
         ipam: NetworkIPAM?,
+        mode: NetworkMode,
         logger: Logger
     ) async throws -> RESTNetworkCreate {
         let unsupported = unsupportedIPAMFields(ipam)
@@ -83,7 +87,7 @@ struct NetworkCreateRoute: RouteCollection {
             guard (try? CIDRv4(requestedSubnet)) != nil else {
                 throw Abort(.badRequest, reason: "invalid subnet '\(requestedSubnet)'")
             }
-            return try await client.create(name: name, labels: labels, ipv4Subnet: requestedSubnet, logger: logger)
+            return try await client.create(name: name, labels: labels, ipv4Subnet: requestedSubnet, mode: mode, logger: logger)
         }
 
         let usedSubnets = ((try? await client.list(filters: nil, logger: logger)) ?? []).compactMap { $0.Subnet }
@@ -91,14 +95,14 @@ struct NetworkCreateRoute: RouteCollection {
         for _ in 0..<maxSubnetConflictRetries {
             guard let subnet = SubnetAllocator.nextFreeSubnet(usedSubnets: usedSubnets, excluded: excludedOctets) else { break }
             do {
-                return try await client.create(name: name, labels: labels, ipv4Subnet: subnet, logger: logger)
+                return try await client.create(name: name, labels: labels, ipv4Subnet: subnet, mode: mode, logger: logger)
             } catch {
                 guard isSubnetConflict(error) else { throw error }
                 if let octet = SubnetAllocator.thirdOctet(of: subnet) { excludedOctets.insert(octet) }
             }
         }
         logger.warning("[networks] no free pinnable subnet for \(name); creating without a pinned subnet")
-        return try await client.create(name: name, labels: labels, ipv4Subnet: nil, logger: logger)
+        return try await client.create(name: name, labels: labels, ipv4Subnet: nil, mode: mode, logger: logger)
     }
 
     static let maxSubnetConflictRetries = 5
