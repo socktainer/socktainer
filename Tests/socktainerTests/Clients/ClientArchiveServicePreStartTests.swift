@@ -308,6 +308,34 @@ struct ClientArchiveServicePreStartTests {
     }
 }
 
+@Suite("ClientArchiveService.putArchive on never-started containers")
+struct ClientArchiveServicePreStartPutTests {
+
+    /// buildx's docker-container driver uploads an empty tar to the builder
+    /// container before starting it whenever it has no buildkitd.toml to
+    /// inject. Docker answers 200; `ArchiveReader.extractContents` rejects an
+    /// archive with no entries, so extracting it unconditionally turned the
+    /// whole driver into a 500.
+    @Test("an empty tar is a no-op, not an error")
+    func emptyTarIsANoOp() async throws {
+        let fixture = PreStartFixture()
+        defer { fixture.cleanUp() }
+
+        try fixture.writeSnapshot(digest: "abc123", files: ["/etc/passwd": "root:x:0:0:root\n"])
+        try fixture.writeRuntimeConfig(containerId: "builder", snapshotDigest: "abc123")
+        let container = try fixture.makeContainer(id: "builder")
+
+        // Two zeroed 512-byte blocks: a valid, empty tar.
+        let tarPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("empty-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tarPath) }
+        try Data(count: 1024).write(to: tarPath)
+
+        try await fixture.service.putArchive(
+            container: container, path: "/etc", tarPath: tarPath, noOverwriteDirNonDir: true)
+    }
+}
+
 // MARK: - Fixture
 
 private struct PreStartFixture {

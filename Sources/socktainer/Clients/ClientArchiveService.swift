@@ -422,6 +422,13 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
         }
 
+        // An empty tar carries nothing to stage, and `ArchiveReader.extractContents`
+        // rejects an archive with no entries, so extracting it would turn a no-op
+        // Docker answers with 200 into a 500. buildx's docker-container driver
+        // sends exactly this when it has no buildkitd.toml to inject. Mirrors the
+        // empty-plan return in the running-container path.
+        guard !plan.isEmpty else { return }
+
         let stagingDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("prestart-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: stagingDir) }
