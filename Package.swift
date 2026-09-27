@@ -26,8 +26,8 @@ let package = Package(
         .macOS(.v15)
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/container.git", exact: "1.3.1"),
-        .package(url: "https://github.com/apple/containerization.git", exact: "0.42.0"),
+        .package(url: "https://github.com/apple/container.git", exact: "1.4.1"),
+        .package(url: "https://github.com/apple/containerization.git", exact: "0.45.0"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.121.3"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.1"),
