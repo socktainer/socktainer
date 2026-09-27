@@ -1,5 +1,5 @@
 {
-  "originHash" : "1f607bbb5edd81a39c39ae3e8becd1b5d900cda93b82de3318b05c0da22ac7e8",
+  "originHash" : "8423cdec2d987c0ec5fb6d4a522fdb40f8fc426da3b3cfcf92752fe8788c3281",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/container.git",
       "state" : {
-        "revision" : "0190097d06df0b9065f4c2d2c7873c649d81d493",
-        "version" : "1.2.2"
+        "revision" : "a9a62e28f6beb88940122a3d7b286f2d5ae8053a",
+        "version" : "1.3.1"
       }
     },
     {
@@ -42,8 +42,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/containerization.git",
       "state" : {
-        "revision" : "7800b4642171561c95b5f55500b19e5dce5acd45",
-        "version" : "0.40.1"
+        "revision" : "c0185aea5c04fcd4d1cfe9359e0066a380835403",
+        "version" : "0.42.0"
       }
     },
     {
@@ -132,8 +132,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-asn1.git",
       "state" : {
-        "revision" : "9f542610331815e29cc3821d3b6f488db8715517",
-        "version" : "1.6.0"
+        "revision" : "d9a5b37470adc940d22c3bcd5ca6953a516b727f",
+        "version" : "1.7.2"
       }
     },
     {
@@ -357,8 +357,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/vapor/websocket-kit.git",
       "state" : {
-        "revision" : "8666c92dbbb3c8eefc8008c9c8dcf50bfd302167",
-        "version" : "2.16.1"
+        "revision" : "90bbbdab3ede12c803cfbe91646f291c092517a3",
+        "version" : "2.16.2"
       }
     },
     {

@@ -25,7 +25,7 @@ enum OCILayoutPruner {
 
     static func pruneManifestsWithMissingBlobs(at layout: URL, logger: Logger) throws {
         let indexURL = layout.appendingPathComponent("index.json")
-        var index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
+        var index = try decodeIndex(from: Data(contentsOf: indexURL))
         let originalDigests = index.manifests.map(\.digest)
 
         let cache = PruneCache()
@@ -66,14 +66,23 @@ enum OCILayoutPruner {
         return try cache.result(of: descriptor.digest, as: descriptor.mediaType) {
             guard blobExists(descriptor.digest, in: layout) else { return nil }
             if isManifest(descriptor.mediaType) {
-                guard let manifest = try? JSONDecoder().decode(Manifest.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
+                let manifest: Manifest
+                do {
+                    manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout)))
+                } catch {
+                    // A manifest's config/layer descriptors go through the same digest
+                    // validation as an index's do (containerization 0.42+), but unlike an
+                    // index a manifest is decoded one at a time, so a decode failure here
+                    // only ever drops this one manifest — not a sibling's. Logged because
+                    // it's otherwise indistinguishable from "blob missing".
+                    logger.debug("manifest \(descriptor.digest) failed to decode, treating as absent: \(error)")
                     return nil
                 }
                 let complete = blobExists(manifest.config.digest, in: layout) && manifest.layers.allSatisfy { blobExists($0.digest, in: layout) }
                 return complete ? descriptor : nil
             }
             if isIndex(descriptor.mediaType) {
-                guard var childIndex = try? JSONDecoder().decode(Index.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
+                guard var childIndex = try? decodeIndex(from: Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
                     return nil
                 }
                 let pruned = try childIndex.manifests.compactMap {
@@ -147,5 +156,47 @@ enum OCILayoutPruner {
         let algorithm = components.count == 2 ? String(components[0]) : "sha256"
         let hex = components.count == 2 ? String(components[1]) : digest
         return layout.appendingPathComponent("blobs").appendingPathComponent(algorithm).appendingPathComponent(hex)
+    }
+
+    /// Decodes an index blob leniently with respect to each manifest entry's digest.
+    ///
+    /// containerization 0.42 made `Descriptor.init(from:)` reject a malformed digest at decode
+    /// time (CVE hardening in apple/containerization#898). `Index.manifests` decodes as a single
+    /// JSON array, so `JSONDecoder().decode(Index.self, ...)` now aborts the *whole* array the
+    /// moment one sibling's digest fails validation — dropping otherwise-loadable manifests
+    /// alongside it, rather than letting this file's own `isWellFormedDigest`/`blobExists` gate
+    /// (above) treat just that one entry as absent, which is what this pruner exists to do.
+    /// Decoding through `RawIndex`/`RawDescriptor` — plain mirrors with no validation — and
+    /// reconstructing `Descriptor` via its non-throwing memberwise initializer restores that
+    /// per-entry isolation.
+    private static func decodeIndex(from data: Data) throws -> Index {
+        let raw = try JSONDecoder().decode(RawIndex.self, from: data)
+        return Index(
+            schemaVersion: raw.schemaVersion,
+            mediaType: raw.mediaType ?? MediaTypes.index,
+            manifests: raw.manifests.map(\.descriptor),
+            annotations: raw.annotations
+        )
+    }
+
+    private struct RawDescriptor: Decodable {
+        let mediaType: String
+        let digest: String
+        let size: Int64
+        let urls: [String]?
+        let annotations: [String: String]?
+        let platform: Platform?
+        let artifactType: String?
+
+        var descriptor: Descriptor {
+            Descriptor(mediaType: mediaType, digest: digest, size: size, urls: urls, annotations: annotations, platform: platform, artifactType: artifactType)
+        }
+    }
+
+    private struct RawIndex: Decodable {
+        let schemaVersion: Int
+        let mediaType: String?
+        let manifests: [RawDescriptor]
+        let annotations: [String: String]?
     }
 }
