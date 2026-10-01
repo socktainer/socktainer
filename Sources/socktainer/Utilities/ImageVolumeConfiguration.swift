@@ -5,6 +5,7 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import Foundation
+import Logging
 
 /// Apple's typed OCI config omits Docker's Volumes field. Decode it from the
 /// original config blob rather than re-encoding the lossy OCI model.
@@ -21,6 +22,20 @@ struct ImageVolumeConfiguration: Decodable {
         }
         let decoded: ImageVolumeConfiguration = try content.decode()
         return decoded.config?.Volumes
+    }
+
+    /// Inspect already tolerates incomplete platform metadata. Preserve that
+    /// behavior for this optional field, but log the failure rather than hiding it.
+    /// Container creation uses the strict reader above and must not skip volumes.
+    static func readForInspect(
+        logger: Logger, read: () async throws -> [String: [String: String]]?
+    ) async -> [String: [String: String]]? {
+        do {
+            return try await read()
+        } catch {
+            logger.warning("Could not read image volume declarations: \(error)")
+            return nil
+        }
     }
 
     /// Explicit mounts override declarations at the same destination. A parent

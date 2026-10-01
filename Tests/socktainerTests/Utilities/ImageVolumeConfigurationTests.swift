@@ -1,12 +1,29 @@
 import ContainerAPIClient
 import ContainerResource
 import Foundation
+import Logging
 import Testing
 
 @testable import socktainer
 
 @Suite("Image-declared volumes")
 struct ImageVolumeConfigurationTests {
+    @Test("inspect preserves declarations when the raw config is readable")
+    func readableInspectVolumes() async {
+        let volumes = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
+            ["/var/log": [:]]
+        }
+        #expect(volumes == ["/var/log": [:]])
+    }
+
+    @Test("an optional volume metadata failure does not fail all of image inspect")
+    func unreadableInspectVolumes() async {
+        let volumes = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
+            try JSONDecoder().decode(ImageVolumeConfiguration.self, from: Data("not json".utf8)).config?.Volumes
+        }
+        #expect(volumes == nil)
+    }
+
     @Test("raw Docker image config preserves all k3s volume declarations")
     func k3sVolumes() throws {
         let raw = Data(#"{"config":{"Volumes":{"/var/lib/cni":{},"/var/lib/kubelet":{},"/var/lib/rancher/k3s":{},"/var/log":{}}}}"#.utf8)
