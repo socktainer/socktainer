@@ -88,6 +88,20 @@ extension ContainerAttachRoute {
         }
     }
 
+    /// Preparation can recreate the container, or wait while another request
+    /// starts it. Select the attach path using the fresh state in either case.
+    static func preparedContainer(id: String, client: ClientContainerProtocol) async throws -> ContainerSnapshot {
+        guard let container = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        guard container.status == .stopped else { return container }
+        try await client.prepareForStart(container: container)
+        guard let prepared = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        return prepared
+    }
+
     private static func handleAttachRequest(req: Request, client: ClientContainerProtocol) async throws -> Response {
         guard let id = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing container ID")
@@ -114,9 +128,7 @@ extension ContainerAttachRoute {
             throw Abort(.badRequest, reason: "At least one of stdout or stderr must be true")
         }
 
-        guard let container = try await client.getContainer(id: id) else {
-            throw Abort(.notFound, reason: "No such container: \(id)")
-        }
+        let container = try await preparedContainer(id: id, client: client)
 
         // hijack connection
         let isUpgrade = req.headers.contains(where: { $0.name.lowercased() == "upgrade" && $0.value.lowercased() == "tcp" })
@@ -130,9 +142,6 @@ extension ContainerAttachRoute {
         // before the polling loop finds the log file, silently dropping all output.
         // Pipe-based bootstrapping captures output directly and eliminates the race.
         if container.status == .stopped {
-            // Preparation can recreate the container. Finish it before either
-            // attach path allocates pipes or hands descriptors to bootstrap.
-            try await client.prepareForStart(container: container)
             await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
             guard stdin else {
                 // Output-only attach (docker run / docker run -a STDOUT -a STDERR).

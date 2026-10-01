@@ -90,12 +90,6 @@ protocol ClientContainerProtocol: Sendable {
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
 
-extension ClientContainerProtocol {
-    func prepareForStart(container: ContainerSnapshot) async throws {
-        try await ClientContainerService().prepareForStart(container: container)
-    }
-}
-
 enum ClientContainerError: Error {
     case notFound(id: String)
     case notRunning(id: String)
@@ -235,6 +229,14 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
+        // A pre-start injection briefly removes the native container. Keep
+        // lookups (including /start's lookup) outside that replacement window.
+        try await Self.preStartInjectionAdmission.withSlot {
+            try await self.getContainerWithoutPreparationWait(id: id)
+        }
+    }
+
+    private func getContainerWithoutPreparationWait(id: String) async throws -> ContainerSnapshot? {
         let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
             let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
@@ -301,7 +303,7 @@ struct ClientContainerService: ClientContainerProtocol {
         try await Self.preStartInjectionAdmission.withSlot {
             // Docker can issue /start while attach is preparing the same container.
             // Refresh under the gate so a stale snapshot cannot recreate it twice.
-            guard let current = try await self.getContainer(id: container.id) else {
+            guard let current = try await self.getContainerWithoutPreparationWait(id: container.id) else {
                 throw ClientContainerError.notFound(id: container.id)
             }
             guard current.status == .stopped else { return }

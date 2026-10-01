@@ -37,6 +37,28 @@ struct ContainerAttachPreparationTests {
         #expect(await client.preparedIDs == ["test"])
     }
 
+    @Test("successful preparation refreshes state before choosing the attach path")
+    func concurrentStart() async throws {
+        let client = PreparationClient(status: .stopped, result: .running)
+        let container = try await ContainerAttachRoute.preparedContainer(id: "test", client: client)
+        #expect(container.status == .running)
+        #expect(await client.preparedIDs == ["test"])
+    }
+
+    @Test("successful preparation proceeds to a fresh lookup before any bootstrap", arguments: ["0", "1"])
+    func successfulPreparation(stdin: String) async throws {
+        let client = PreparationClient(status: .stopped, result: .removed)
+        try await withPreparationApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/containers/test/attach?stream=1&stdout=1&stdin=\(stdin)"
+            ) { response async in
+                #expect(response.status == .notFound)
+                #expect(!response.body.string.contains("staged-file preparation failed"))
+            }
+        }
+        #expect(await client.preparedIDs == ["test"])
+    }
+
     @Test("attaching to a running container does not prepare or rebuild it")
     func runningWebsocket() async throws {
         let client = PreparationClient(status: .running)
@@ -66,19 +88,26 @@ private func withPreparationApp(
 }
 
 private actor PreparationClient: ClientContainerProtocol {
+    enum PreparationResult: Sendable { case failure, running, removed }
     let status: RuntimeStatus
+    let result: PreparationResult
     private(set) var preparedIDs: [String] = []
 
-    init(status: RuntimeStatus) { self.status = status }
+    init(status: RuntimeStatus, result: PreparationResult = .failure) {
+        self.status = status
+        self.result = result
+    }
 
     func prepareForStart(container: ContainerSnapshot) async throws {
         preparedIDs.append(container.id)
         // Stop at the preparation boundary: a regression would instead try
         // to bootstrap a real VM (HTTP) or upgrade the connection (WebSocket).
-        throw Abort(.conflict, reason: "staged-file preparation failed")
+        if result == .failure { throw Abort(.conflict, reason: "staged-file preparation failed") }
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
+        if !preparedIDs.isEmpty, result == .removed { return nil }
+        let currentStatus: RuntimeStatus = !preparedIDs.isEmpty && result == .running ? .running : status
         let process = ProcessConfiguration(
             executable: "/bin/sh", arguments: [], environment: [],
             workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
@@ -88,7 +117,7 @@ private actor PreparationClient: ClientContainerProtocol {
                 mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
         return ContainerSnapshot(
             configuration: ContainerConfiguration(id: id, image: image, process: process),
-            status: status, networks: [])
+            status: currentStatus, networks: [])
     }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }

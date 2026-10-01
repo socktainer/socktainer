@@ -31,15 +31,7 @@ extension ContainerAttachWSRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
             let query = try req.query.decode(ContainerAttachWSQuery.self)
-            guard let container = try await client.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
-
-            if container.status == .stopped {
-                // Rebuild with staged docker cp files before upgrading the
-                // connection or allocating the bootstrap pipes.
-                try await client.prepareForStart(container: container)
-            }
+            let container = try await ContainerAttachRoute.preparedContainer(id: id, client: client)
 
             // moby: MuxStreams=false — WebSocket is the mux; raw binary frames,
             // no stdcopy header, matches moby's wsContainersAttach behaviour.
