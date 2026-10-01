@@ -145,14 +145,10 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                result = result.filter { container in
-                    // Docker matches both the API name (with a leading slash)
-                    // and the familiar name, allowing anchored patterns for either.
-                    values.contains { pattern in
-                        container.id.range(of: pattern, options: .regularExpression) != nil
-                            || ("/" + container.id).range(of: pattern, options: .regularExpression) != nil
-                    }
-                }
+                // Docker matches both the API name (with a leading slash)
+                // and the familiar name, allowing anchored patterns for either.
+                let matcher = DockerContainerNameMatcher(patterns: values)
+                result = result.filter { matcher.matches($0.id) }
             case "id":
                 result = result.filter { container in
                     values.contains { value in

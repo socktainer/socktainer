@@ -69,6 +69,25 @@ struct ContainerFilterTests {
         #expect(ClientContainerService.applyFilters(containers, filters: ["name": ["[", "aa"]]).map(\.id) == ["aa-one"])
     }
 
+    @Test("pathological backtracking is bounded without dropping other patterns")
+    func boundedNameMatching() throws {
+        let nearMatch = String(repeating: "a", count: 30) + "b"
+        let containers = [try makeSnapshot(id: nearMatch), try makeSnapshot(id: "ordinary")]
+        let started = ContinuousClock.now
+        let result = ClientContainerService.applyFilters(containers, filters: ["name": ["^(a+)+$", "^ordinary$"]])
+        #expect(result.map(\.id) == ["ordinary"])
+        #expect(ContinuousClock.now - started < .seconds(2))
+    }
+
+    @Test("oversized patterns are ignored without dropping ordinary patterns")
+    func oversizedNamePattern() {
+        let matcher = DockerContainerNameMatcher(patterns: [
+            String(repeating: "a", count: DockerContainerNameMatcher.maximumPatternBytes + 1), "^ordinary$",
+        ])
+        #expect(matcher.matches("ordinary"))
+        #expect(!matcher.matches("other"))
+    }
+
     // MARK: - status
 
     @Test("status=running keeps only running containers")
