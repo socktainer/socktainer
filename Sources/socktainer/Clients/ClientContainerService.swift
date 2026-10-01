@@ -145,7 +145,14 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                result = result.filter { values.contains($0.id) }
+                result = result.filter { container in
+                    // Docker matches both the API name (with a leading slash)
+                    // and the familiar name, allowing anchored patterns for either.
+                    values.contains { pattern in
+                        container.id.range(of: pattern, options: .regularExpression) != nil
+                            || ("/" + container.id).range(of: pattern, options: .regularExpression) != nil
+                    }
+                }
             case "id":
                 result = result.filter { container in
                     values.contains { value in
