@@ -130,6 +130,9 @@ extension ContainerAttachRoute {
         // before the polling loop finds the log file, silently dropping all output.
         // Pipe-based bootstrapping captures output directly and eliminates the race.
         if container.status == .stopped {
+            // Preparation can recreate the container. Finish it before either
+            // attach path allocates pipes or hands descriptors to bootstrap.
+            try await client.prepareForStart(container: container)
             await ContainerStartRoute.ensureDNSSidecarBeforeStart(for: container, req: req)
             guard stdin else {
                 // Output-only attach (docker run / docker run -a STDOUT -a STDERR).

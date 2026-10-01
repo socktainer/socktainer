@@ -80,6 +80,7 @@ protocol ClientContainerProtocol: Sendable {
     func getContainer(id: String) async throws -> ContainerSnapshot?
     func enforceContainerRunning(container: ContainerSnapshot) throws
 
+    func prepareForStart(container: ContainerSnapshot) async throws
     func start(id: String, detachKeys: String?) async throws
     func stop(id: String, signal: String?, timeout: Int?) async throws
     func restart(id: String, signal: String?, timeout: Int?) async throws
@@ -87,6 +88,12 @@ protocol ClientContainerProtocol: Sendable {
     func delete(id: String) async throws
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
+}
+
+extension ClientContainerProtocol {
+    func prepareForStart(container: ContainerSnapshot) async throws {
+        try await ClientContainerService().prepareForStart(container: container)
+    }
 }
 
 enum ClientContainerError: Error {
@@ -285,10 +292,24 @@ struct ClientContainerService: ClientContainerProtocol {
     /// only way to put the files where the guest will see them is to create it
     /// again with the mounts included. The name is kept, and the creation
     /// timestamp travels in a label, so the id the client holds does not change.
-    private func applyPreStartInjections(container: ContainerSnapshot) async throws {
+    private static let preStartInjectionAdmission = VMLifecycleAdmission(limit: 1)
+
+    func prepareForStart(container: ContainerSnapshot) async throws {
         let staged = try await PreStartInjectionStore.shared.mounts(containerId: container.id)
         guard !staged.isEmpty else { return }
 
+        try await Self.preStartInjectionAdmission.withSlot {
+            // Docker can issue /start while attach is preparing the same container.
+            // Refresh under the gate so a stale snapshot cannot recreate it twice.
+            guard let current = try await self.getContainer(id: container.id) else {
+                throw ClientContainerError.notFound(id: container.id)
+            }
+            guard current.status == .stopped else { return }
+            try await self.applyPreStartInjections(container: current, staged: staged)
+        }
+    }
+
+    private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {
         var configuration = container.configuration
         let existing = Set(configuration.mounts.map(\.destination))
         let additions = staged.filter { !existing.contains($0.destination) }
@@ -318,7 +339,7 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let stdio = [stdin, stdout, stderr]
 
-        try await applyPreStartInjections(container: container)
+        try await prepareForStart(container: container)
 
         do {
             let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
