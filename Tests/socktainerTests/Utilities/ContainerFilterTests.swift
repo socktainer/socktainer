@@ -2,12 +2,91 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationExtras
 import ContainerizationOCI
+import Foundation
+import Logging
 import Testing
 
 @testable import socktainer
 
 @Suite("ClientContainerService.applyFilters")
 struct ContainerFilterTests {
+
+    @Test(
+        "map-form filters preserve every accepted key",
+        arguments: [
+            "status", "exited", "label", "name", "id", "ancestor", "before", "since",
+            "health", "volume", "expose", "isolation", "is-task", "network", "publish",
+        ])
+    func mapForm(key: String) throws {
+        let filters = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: "{\"\(key)\":{\"selected\":true,\"disabled\":false}}",
+            logger: Logger(label: "test"))
+        #expect(filters == [key: ["selected"]])
+    }
+
+    @Test(
+        "array and string filter forms remain supported",
+        arguments: [
+            #"{"name":["aa"]}"#, #"{"name":"aa"}"#,
+        ])
+    func otherFilterForms(json: String) throws {
+        let filters = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: json, logger: Logger(label: "test"))
+        #expect(filters == ["name": ["aa"]])
+    }
+
+    @Test(
+        "name filter supports partial, anchored, and k3d expressions",
+        arguments: [
+            "aa-one", "^aa-one$", "^/aa-one$", "^/?(k3d-)?aa-one$", "one$",
+        ])
+    func namePatterns(pattern: String) throws {
+        let containers = [
+            try makeSnapshot(id: "aa-one"), try makeSnapshot(id: "aa-two"),
+            try makeSnapshot(id: "xx-other"),
+        ]
+        let json = try JSONSerialization.data(withJSONObject: ["name": [pattern: true]])
+        let filters = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: String(decoding: json, as: UTF8.self), logger: Logger(label: "test"))
+        #expect(ClientContainerService.applyFilters(containers, filters: filters).map(\.id) == ["aa-one"])
+    }
+
+    @Test("multiple name patterns are ORed and status is ANDed")
+    func multipleNamePatterns() throws {
+        let containers = [
+            try makeSnapshot(id: "aa-one"), try makeSnapshot(id: "aa-two"),
+            try makeSnapshot(id: "xx-other", status: .stopped), try makeSnapshot(id: "unrelated"),
+        ]
+        let result = ClientContainerService.applyFilters(
+            containers, filters: ["name": ["aa", "other"], "status": ["running"]])
+        #expect(result.map(\.id) == ["aa-one", "aa-two"])
+    }
+
+    @Test("invalid name patterns do not match or prevent other patterns matching")
+    func invalidNamePattern() throws {
+        let containers = [try makeSnapshot(id: "aa-one"), try makeSnapshot(id: "other")]
+        #expect(ClientContainerService.applyFilters(containers, filters: ["name": ["["]]).isEmpty)
+        #expect(ClientContainerService.applyFilters(containers, filters: ["name": ["[", "aa"]]).map(\.id) == ["aa-one"])
+    }
+
+    @Test("pathological backtracking is bounded without dropping other patterns")
+    func boundedNameMatching() throws {
+        let nearMatch = String(repeating: "a", count: 30) + "b"
+        let containers = [try makeSnapshot(id: nearMatch), try makeSnapshot(id: "ordinary")]
+        let started = ContinuousClock.now
+        let result = ClientContainerService.applyFilters(containers, filters: ["name": ["^(a+)+$", "^ordinary$"]])
+        #expect(result.map(\.id) == ["ordinary"])
+        #expect(ContinuousClock.now - started < .seconds(2))
+    }
+
+    @Test("oversized patterns are ignored without dropping ordinary patterns")
+    func oversizedNamePattern() {
+        let matcher = DockerContainerNameMatcher(patterns: [
+            String(repeating: "a", count: DockerContainerNameMatcher.maximumPatternBytes + 1), "^ordinary$",
+        ])
+        #expect(matcher.matches("ordinary"))
+        #expect(!matcher.matches("other"))
+    }
 
     // MARK: - status
 
