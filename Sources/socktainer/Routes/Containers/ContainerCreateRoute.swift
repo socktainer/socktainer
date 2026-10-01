@@ -209,6 +209,7 @@ extension ContainerCreateRoute {
                 platform: .current)
 
             let imageConfig = try await img.config(for: requestedPlatform).config
+            let imageVolumes = try await ImageVolumeConfiguration.read(image: img, platform: requestedPlatform)
 
             let workingDirectory = imageConfig?.workingDir ?? "/"
 
@@ -597,131 +598,156 @@ extension ContainerCreateRoute {
                 }
             }
 
-            // Resolve volumes from both volumes and mounts
-            for item in (volumesOrFs + mountsOrFs) {
-                switch item {
-                case .filesystem(let fs):
-                    resolvedMounts.append(fs)
-                case .volume(let parsed):
-                    // Check if volume exists by listing all volumes and finding a match
-                    let existingVolumes = try await ClientVolume.list()
-                    let existingVolume = existingVolumes.first { $0.name == parsed.name }
-
-                    let volume: ContainerResource.VolumeConfiguration
-                    if let existing = existingVolume {
-                        volume = existing
-                    } else {
-                        // Volume doesn't exist, create it automatically (Docker behavior)
-                        // might be revisited if https://github.com/apple/container/issues/690 is closed
-                        req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
-                        volume = try await ClientVolume.create(
-                            name: parsed.name,
-                            driver: "local",
-                            driverOpts: [:],
-                            // moby marks anonymous volumes with this label so that
-                            // volume prune (without all=true) targets only them.
-                            // Apple's own anonymous label keeps `container volume ls`
-                            // displaying it as anonymous too.
-                            labels: parsed.isAnonymous
-                                ? [ClientVolumeService.anonymousVolumeLabel: "", ContainerResource.VolumeConfiguration.anonymousLabel: ""] : [:]
-                        )
-                    }
-
-                    // Strip /lost+found when PGDATA is set (any value) — that
-                    // reliably signals a Postgres container, and named volumes are
-                    // always mounted at their root so /lost+found is always reachable.
-                    // An empty volume is rebuilt by the copy-up below, which drops
-                    // /lost+found as part of it; reformatting here would be undone.
-                    if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
-                        volume.format == "ext4",
-                        VolumeImageCleaner.isEnabled(labels: volume.labels),
-                        !VolumeCopyUp.isEmpty(volumeImagePath: volume.source)
-                    {
-                        VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
-                    }
-
-                    // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
-                    let syncMode =
-                        volume.labels[Filesystem.SyncMode.socktainerLabel]
-                        .flatMap { Filesystem.SyncMode(rawString: $0) }
-                        ?? req.application.storage[VolumeSyncModeKey.self]
-                        ?? .nosync
-                    let volumeMount = Filesystem.volume(
-                        name: parsed.name,
-                        format: volume.format,
-                        source: volume.source,
-                        destination: parsed.destination,
-                        options: parsed.options,
-                        sync: syncMode
-                    )
-                    if volume.format == "ext4" {
-                        copyUpCandidates.append((source: volume.source, destination: parsed.destination))
-                    }
-                    resolvedMounts.append(volumeMount)
-                }
+            let declaredMounts: [VolumeOrFilesystem]
+            do {
+                declaredMounts = try ImageVolumeConfiguration.mounts(
+                    imagePaths: imageVolumes.map { Array($0.keys) } ?? [],
+                    requestPaths: body.Volumes.map { Array($0.keys) } ?? [],
+                    explicit: volumesOrFs + mountsOrFs)
+            } catch {
+                throw Abort(.badRequest, reason: "Invalid volume declaration: \(error)")
             }
-
-            if let dockerSockRelay {
-                if let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"]) {
-                    resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
-                } else {
-                    req.logger.warning("[docker-sock] relay requested for \(dockerSockRelay.guestPath) but $HOME is unavailable — mount skipped")
-                }
-            }
-
-            containerConfiguration.mounts = resolvedMounts
-
-            // Fall back to Apple Container's own `[container]` configuration when the
-            // request carries no explicit limits, so `container system property set
-            // container.cpus` / `container.memory` applies to containers created through
-            // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
-            //
-            // Only loaded when at least one limit is missing: the first load pings the
-            // daemon with a 10s timeout, and a create that specifies both limits would
-            // otherwise wait on a configuration read whose result it never uses.
-            let requestedMemory = body.HostConfig?.Memory
-            let requestedNanoCpus = body.HostConfig?.NanoCpus
-            let needsConfiguredDefaults = !((requestedMemory ?? 0) > 0 && (requestedNanoCpus ?? 0) > 0)
-            let configuredDefaults =
-                needsConfiguredDefaults
-                ? await ContainerResourceDefaults.shared.current(logger: req.logger)
-                : nil
-
-            if let memoryBytes = ContainerResourceResolution.memoryInBytes(
-                requested: requestedMemory,
-                configured: configuredDefaults
-            ) {
-                containerConfiguration.resources.memoryInBytes = memoryBytes
-            }
-
-            if let cpus = ContainerResourceResolution.cpus(
-                requestedNanoCpus: requestedNanoCpus,
-                configured: configuredDefaults
-            ) {
-                containerConfiguration.resources.cpus = cpus
-            }
-
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
+            var createdAnonymousVolumes: [String] = []
             do {
-                let containerClient = ContainerClient()
-                // Recorded before the container exists: recording afterwards turns a
-                // creation that happened into a reported failure, and the retry then
-                // collides with the name.
-                try await PreStartInjectionStore.shared.rememberCreateOptions(
-                    containerId: containerConfiguration.id, autoRemove: options.autoRemove)
-                do {
-                    try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
-                } catch {
-                    try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
-                    throw error
+                // Resolve explicit and declared volumes through the same copy-up path.
+                for item in (volumesOrFs + mountsOrFs + declaredMounts) {
+                    switch item {
+                    case .filesystem(let fs):
+                        resolvedMounts.append(fs)
+                    case .volume(let parsed):
+                        // Check if volume exists by listing all volumes and finding a match
+                        let existingVolumes = try await ClientVolume.list()
+                        let existingVolume = existingVolumes.first { $0.name == parsed.name }
+
+                        let volume: ContainerResource.VolumeConfiguration
+                        if let existing = existingVolume {
+                            volume = existing
+                        } else {
+                            // Volume doesn't exist, create it automatically (Docker behavior)
+                            // might be revisited if https://github.com/apple/container/issues/690 is closed
+                            req.logger.debug("Volume '\(parsed.name)' not found, creating it automatically")
+                            volume = try await ClientVolume.create(
+                                name: parsed.name,
+                                driver: "local",
+                                driverOpts: [:],
+                                // moby marks anonymous volumes with this label so that
+                                // volume prune (without all=true) targets only them.
+                                // Apple's own anonymous label keeps `container volume ls`
+                                // displaying it as anonymous too.
+                                labels: parsed.isAnonymous
+                                    ? [ClientVolumeService.anonymousVolumeLabel: "", ContainerResource.VolumeConfiguration.anonymousLabel: ""] : [:]
+                            )
+                        }
+
+                        if parsed.isAnonymous, existingVolume == nil {
+                            createdAnonymousVolumes.append(volume.name)
+                        }
+
+                        // Strip /lost+found when PGDATA is set (any value) — that
+                        // reliably signals a Postgres container, and named volumes are
+                        // always mounted at their root so /lost+found is always reachable.
+                        // An empty volume is rebuilt by the copy-up below, which drops
+                        // /lost+found as part of it; reformatting here would be undone.
+                        if VolumeImageCleaner.isPostgresDataVolume(mergedEnv: mergedEnv),
+                            volume.format == "ext4",
+                            VolumeImageCleaner.isEnabled(labels: volume.labels),
+                            !VolumeCopyUp.isEmpty(volumeImagePath: volume.source)
+                        {
+                            VolumeImageCleaner.removeLostFound(imagePath: volume.source, logger: req.logger)
+                        }
+
+                        // Per-volume sync label wins; fall back to global --volume-sync (default: nosync).
+                        let syncMode =
+                            volume.labels[Filesystem.SyncMode.socktainerLabel]
+                            .flatMap { Filesystem.SyncMode(rawString: $0) }
+                            ?? req.application.storage[VolumeSyncModeKey.self]
+                            ?? .nosync
+                        let volumeMount = Filesystem.volume(
+                            name: parsed.name,
+                            format: volume.format,
+                            source: volume.source,
+                            destination: parsed.destination,
+                            options: parsed.options,
+                            sync: syncMode
+                        )
+                        if volume.format == "ext4" {
+                            copyUpCandidates.append((source: volume.source, destination: parsed.destination))
+                        }
+                        resolvedMounts.append(volumeMount)
+                    }
                 }
-                container = try await containerClient.get(id: containerConfiguration.id)
-                req.logger.debug("Container created successfully with ID: \(container.id)")
-                ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+
+                if let dockerSockRelay {
+                    if let controlSocketPath = DockerSocketRelay.controlSocketPath(homeDirectory: ProcessInfo.processInfo.environment["HOME"]) {
+                        resolvedMounts.append(.virtiofs(source: controlSocketPath, destination: dockerSockRelay.guestPath, options: []))
+                    } else {
+                        req.logger.warning("[docker-sock] relay requested for \(dockerSockRelay.guestPath) but $HOME is unavailable — mount skipped")
+                    }
+                }
+
+                containerConfiguration.mounts = resolvedMounts
+                // Always overwrite client-supplied metadata, including an empty list.
+                containerConfiguration.labels[ContainerAnonymousVolumes.label] =
+                    try ContainerAnonymousVolumes.encode(createdAnonymousVolumes)
+
+                // Fall back to Apple Container's own `[container]` configuration when the
+                // request carries no explicit limits, so `container system property set
+                // container.cpus` / `container.memory` applies to containers created through
+                // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
+                //
+                // Only loaded when at least one limit is missing: the first load pings the
+                // daemon with a 10s timeout, and a create that specifies both limits would
+                // otherwise wait on a configuration read whose result it never uses.
+                let requestedMemory = body.HostConfig?.Memory
+                let requestedNanoCpus = body.HostConfig?.NanoCpus
+                let needsConfiguredDefaults = !((requestedMemory ?? 0) > 0 && (requestedNanoCpus ?? 0) > 0)
+                let configuredDefaults =
+                    needsConfiguredDefaults
+                    ? await ContainerResourceDefaults.shared.current(logger: req.logger)
+                    : nil
+
+                if let memoryBytes = ContainerResourceResolution.memoryInBytes(
+                    requested: requestedMemory,
+                    configured: configuredDefaults
+                ) {
+                    containerConfiguration.resources.memoryInBytes = memoryBytes
+                }
+
+                if let cpus = ContainerResourceResolution.cpus(
+                    requestedNanoCpus: requestedNanoCpus,
+                    configured: configuredDefaults
+                ) {
+                    containerConfiguration.resources.cpus = cpus
+                }
+
+                do {
+                    let containerClient = ContainerClient()
+                    // Recorded before the container exists: recording afterwards turns a
+                    // creation that happened into a reported failure, and the retry then
+                    // collides with the name.
+                    try await PreStartInjectionStore.shared.rememberCreateOptions(
+                        containerId: containerConfiguration.id, autoRemove: options.autoRemove)
+                    do {
+                        try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                    } catch {
+                        try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                        throw error
+                    }
+                    container = try await containerClient.get(id: containerConfiguration.id)
+                    req.logger.debug("Container created successfully with ID: \(container.id)")
+                    ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+                } catch {
+                    req.logger.error("Failed to create container: \(error)")
+                    throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+                }
+
             } catch {
-                req.logger.error("Failed to create container: \(error)")
-                throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
+                // Reclaim only volumes allocated by this request. The runtime
+                // refuses removal if creation succeeded and they remain in use.
+                await ContainerAnonymousVolumes.remove(names: createdAnonymousVolumes, logger: req.logger)
+                throw error
             }
 
             let hexId = DockerContainerID.hexId(for: container)
