@@ -116,7 +116,7 @@ struct DockerContainerFilterUtility {
                     throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
                 }
                 for (key, value) in filters {
-                    if key == "label", let dict = value as? [String: Any] {
+                    if let dict = value as? [String: Any] {
                         let keys = dict.compactMap { (k, v) in
                             (v as? Bool == true) ? k : nil
                         }
