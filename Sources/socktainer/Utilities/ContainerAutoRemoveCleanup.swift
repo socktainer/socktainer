@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 
 /// Performs the full `--rm` cleanup once `ContainerInfoCache.consumeAutoRemove` grants it:
 /// DNS alias unregistration, the `destroy` event, and clearing the cache entry. Shared by the
@@ -12,10 +13,15 @@ enum ContainerAutoRemoveCleanup {
         fallbackImage: String,
         fallbackLabels: [String: String],
         dnsServer: SocktainerDNSServer?,
-        broadcaster: EventBroadcaster?
+        broadcaster: EventBroadcaster?,
+        removeVolumes: @Sendable ([String]) async -> Void = { names in
+            await ContainerAnonymousVolumes.remove(names: names, logger: Logger(label: "socktainer.autoremove"), retries: 30)
+        }
     ) async {
         let cached = await ContainerInfoCache.shared.get(id: hexId)
         let labels = cached?.labels ?? fallbackLabels
+
+        await removeVolumes(ContainerAnonymousVolumes.names(labels: labels))
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(

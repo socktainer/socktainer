@@ -257,6 +257,9 @@ extension ImageInspectRoute {
 
             if let selectedVariant {
                 let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
+                let imageVolumes = await ImageVolumeConfiguration.readForInspect(logger: req.logger) {
+                    try await ImageVolumeConfiguration.read(image: image, platform: selectedVariant.platform)
+                }
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
                     ImageConfig(
                         User: ociConfig.user,
@@ -265,7 +268,7 @@ extension ImageInspectRoute {
                         Cmd: ociConfig.cmd,
                         Healthcheck: nil,
                         ArgsEscaped: nil,
-                        Volumes: nil,
+                        Volumes: imageVolumes,
                         WorkingDir: ociConfig.workingDir,
                         Entrypoint: ociConfig.entrypoint,
                         OnBuild: nil,

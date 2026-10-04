@@ -83,6 +83,33 @@ struct ContainerDeleteForceTests {
         #expect(calls == ["delete"], "A stopped container is deleted directly, without a stop call")
     }
 
+    @Test("rm -v removes anonymous volumes after deleting the container", arguments: ["v=1", "v=true", "v=0", ""])
+    func removeVolumes(query: String) async throws {
+        let log = CallLog()
+        let initial = Self.snapshot(id: "volume-owner", status: .stopped)
+        var configuration = initial.configuration
+        configuration.labels[ContainerAnonymousVolumes.label] = try ContainerAnonymousVolumes.encode(["owned-volume"])
+        let snapshot = ContainerSnapshot(configuration: configuration, status: .stopped, networks: [])
+        let mock = RecordingDeleteMock(snapshot: snapshot, log: log)
+        try await withApp(configure: { _ in }) { app in
+            let router = app.regexRouter(with: app.logger)
+            app.setRegexRouter(router)
+            router.installMiddleware(on: app)
+            try app.registerVersionedRoute(
+                .DELETE, pattern: "/containers/{id}",
+                use: ContainerDeleteRoute.handler(
+                    client: mock,
+                    removeVolumes: { names, _ in
+                        for name in names { await log.add("volume:\(name)") }
+                    }))
+            try await app.testing().test(.DELETE, "/containers/volume-owner?\(query)") { response async in
+                #expect(response.status == .noContent)
+            }
+        }
+        let expected = query == "v=1" || query == "v=true" ? ["delete", "volume:owned-volume"] : ["delete"]
+        #expect(await log.calls == expected)
+    }
+
     private static func snapshot(id: String, status: RuntimeStatus) -> ContainerSnapshot {
         let proc = ProcessConfiguration(
             executable: "/bin/sh", arguments: [], environment: [],
