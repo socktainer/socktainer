@@ -281,15 +281,12 @@ struct ContainerImageImportTests {
         // for bzip2/xz, which are reserialized to gzip; the zstd decoder for
         // zstd, which is stored as-is) and compare hashes directly, rather
         // than only asserting the layer's file contents extract correctly.
-        let decompressed: Data
+        let expectedDiffID: String
         if fixtureCase.format == "zstd" {
-            let decompressedPath = try ArchiveReader.decompressZstd(layerPath)
-            defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
-            decompressed = try Data(contentsOf: decompressedPath)
+            expectedDiffID = "sha256:" + (try ZstdStreamDecoder.sha256OfDecompressedContent(at: layerPath, cap: 10_000_000))
         } else {
-            decompressed = try #require(layerData.gunzip())
+            expectedDiffID = "sha256:\(try #require(layerData.gunzip()).sha256Hex())"
         }
-        let expectedDiffID = "sha256:\(decompressed.sha256Hex())"
         #expect(try fixture.config(manifest).rootfs.diffIDs == [expectedDiffID])
     }
 

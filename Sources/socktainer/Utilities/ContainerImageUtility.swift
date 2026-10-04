@@ -321,7 +321,7 @@ enum ContainerImageUtility {
     /// something the auto-detecting reader used elsewhere never surfaces as an
     /// error even when it's parsing raw garbage. A real tar entry always has a
     /// non-empty path; garbage forced through the tar parser produces an entry
-    /// with no path instead. A tar with zero entries (`tar cf x -T /dev/null`,
+    /// with no path or a recorded stream failure instead. A tar with zero entries (`tar cf x -T /dev/null`,
     /// the standard way to build a "scratch" image, and something real `docker
     /// import` accepts) cleanly hits EOF with no entry at all on every format —
     /// that has to be accepted too, so only a path-less entry counts as proof
@@ -332,7 +332,12 @@ enum ContainerImageUtility {
             guard let reader = try? ArchiveReader(format: format, filter: filter, file: tarPath) else { continue }
             attempted = true
             var iterator = reader.makeStreamingIterator()
-            guard let (entry, _) = iterator.next() else { continue }
+            guard let (entry, _) = iterator.next() else {
+                // A header the tar parser rejects ends iteration with a
+                // recorded stream failure rather than a path-less entry.
+                guard (try? reader.throwIfStreamFailed()) != nil else { return false }
+                continue
+            }
             guard let path = entry.path, !path.isEmpty else { return false }
             return true
         }
@@ -463,17 +468,17 @@ enum ContainerImageUtility {
                 mediaType: "application/vnd.oci.image.layer.v1.tar+gzip")
 
         case .zstd:
-            // Unlike gzip, zstd needs no in-memory pass at all: both the stored
-            // blob's digest and the decompressed diff_id are computed by
-            // streaming files in chunks, and storage is a plain file copy.
+            // Like gzip, both the stored blob's digest and the decompressed
+            // diff_id are computed by streaming, and storage is a plain file copy.
             let (digest, size) = try FileHashing.sha256OfFile(at: tarPath)
-            let decompressedPath = try ArchiveReader.decompressZstd(tarPath)
-            defer { ArchiveReader.cleanUpDecompressedZstd(decompressedPath) }
-            let decompressedAttributes = try? FileManager.default.attributesOfItem(atPath: decompressedPath.path)
-            guard let decompressedSize = decompressedAttributes?[.size] as? UInt64, decompressedSize <= UInt64(maxExpandedLayerSize) else {
+            let diffID: String
+            do {
+                diffID = try ZstdStreamDecoder.sha256OfDecompressedContent(at: tarPath, cap: maxExpandedLayerSize)
+            } catch ZstdStreamDecoder.Error.exceedsCap {
                 throw Error.invalidTarball(reason: "decompressed layer exceeds the \(maxExpandedLayerSize)-byte limit")
+            } catch {
+                throw Error.invalidTarball(reason: "failed to decompress zstd layer")
             }
-            let (diffID, _) = try FileHashing.sha256OfFile(at: decompressedPath)
             let destination = blobsDir.appendingPathComponent(digest)
             if !FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.copyItem(at: tarPath, to: destination)
