@@ -30,3 +30,10 @@ actor StaticSnapshotClientMock: ClientContainerProtocol {
         ([], 0)
     }
 }
+
+// Test-only clients have no Apple Container staged-file store. Production
+// conformers must implement this requirement explicitly; no mock falls back
+// to a real ClientContainerService and touches native container state.
+extension ClientContainerProtocol {
+    func prepareForStart(container: ContainerSnapshot) async throws {}
+}
