@@ -24,6 +24,38 @@ struct ContainerAttachRoute: RouteCollection {
 }
 
 extension ContainerAttachRoute {
+    // Foreground Compose can start entirely through attach, without POST /start.
+    // Run the same DNS/health setup and exit cleanup for every attach bootstrap path.
+    static func startedContainer(container: ContainerSnapshot, client: ClientContainerProtocol, req: Request) async -> Int {
+        let epoch = await DieEventOwnership.shared.beginRun(id: container.id)
+        await ContainerRestartState.shared.reset(id: container.id)
+        let dns = req.application.storage[SocktainerDNSServerKey.self]
+        let health = req.application.storage[HealthCheckManagerKey.self]
+        if let snapshot = await ContainerStartRoute.performPostStartSetup(
+            id: container.id, client: client, dnsServer: dns, healthManager: health, logger: req.logger),
+            let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        {
+            await ContainerStartRoute.armRestartObserver(
+                nativeId: snapshot.id,
+                eventId: DockerContainerID.hexId(for: snapshot),
+                image: snapshot.configuration.image.reference,
+                name: snapshot.id,
+                labels: LabelNormalization.restore(snapshot.configuration.labels),
+                ip: ContainerStartRoute.dnsAttachmentIP(in: snapshot),
+                refreshCache: true,
+                restartPolicy: RestartPolicyManager.decode(from: snapshot.configuration.labels),
+                generation: await ContainerRestartState.shared.currentGeneration(id: snapshot.id),
+                runEpoch: epoch,
+                broadcaster: broadcaster,
+                dnsServer: dns,
+                healthManager: health,
+                client: client,
+                logger: req.logger
+            )
+        }
+        return epoch
+    }
+
     /// Builds the container event emitted when `docker run --rm` triggers Apple Container's
     /// auto-removal: no DELETE arrives, so ContainerDeleteRoute never fires and this path
     /// substitutes for it. The action MUST be "destroy" — the same action ContainerDeleteRoute
@@ -151,6 +183,7 @@ extension ContainerAttachRoute {
                 // eliminates the race condition for fast-exiting containers (#220).
                 return try await attachStoppedOutputOnly(
                     req: req,
+                    client: client,
                     hexId: id,
                     container: container,
                     query: query,
@@ -294,6 +327,7 @@ extension ContainerAttachRoute {
     // Uses pipes instead of log-file polling to eliminate the race for fast-exiting containers.
     private static func attachStoppedOutputOnly(
         req: Request,
+        client: ClientContainerProtocol,
         hexId: String,
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
@@ -346,7 +380,7 @@ extension ContainerAttachRoute {
 
         // The container is executing now: open a run so this exit's `die` is claimable.
         // `docker compose up` starts a service entirely through this path, never `POST /start`.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+        let runEpoch = await startedContainer(container: container, client: client, req: req)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
@@ -515,7 +549,7 @@ extension ContainerAttachRoute {
         }
 
         // Executing now: open a run so this exit's `die` is claimable exactly once.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+        let runEpoch = await startedContainer(container: container, client: client, req: req)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
