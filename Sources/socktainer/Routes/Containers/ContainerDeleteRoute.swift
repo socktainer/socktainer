@@ -31,10 +31,11 @@ extension ContainerDeleteRoute {
             let force = query.force ?? false
 
             let snapshot = try? await client.getContainer(id: id)
-            let cached = await ContainerInfoCache.shared.get(id: id)
+            let cached = await ContainerInfoCache.shared.get(id: snapshot?.id ?? id)
 
             let eventImage = snapshot?.configuration.image.reference ?? cached?.image ?? ""
             let eventName = snapshot?.id ?? cached?.nativeId ?? id
+            let displayName = await ContainerNameOverrideStore.shared.name(forNativeID: eventName)
             let eventLabels =
                 snapshot.map { LabelNormalization.restore($0.configuration.labels) }
                 ?? cached?.labels ?? [:]
@@ -44,7 +45,7 @@ extension ContainerDeleteRoute {
             let eventId = snapshot.map { DockerContainerID.hexId(for: $0) } ?? cached?.hexId ?? id
 
             func broadcastRemove() async {
-                await ContainerInfoCache.shared.remove(id: id)
+                await ContainerInfoCache.shared.remove(id: eventName)
                 // Prevents a container recreated under the same name from inheriting this one's restart-attempt count.
                 await ContainerRestartState.shared.reset(id: eventName)
                 await RestartPolicyOverrideStore.shared.remove(id: eventId)
@@ -56,7 +57,7 @@ extension ContainerDeleteRoute {
                 await broadcaster.broadcast(
                     DockerEvent.simpleEvent(
                         id: eventId, type: "container", status: "destroy",
-                        image: eventImage, name: eventName, labels: eventLabels
+                        image: eventImage, name: displayName, labels: eventLabels
                     ))
             }
 
@@ -87,8 +88,10 @@ extension ContainerDeleteRoute {
                     // stopped and Apple Container reports an empty live network list — falling
                     // back to the live snapshot for a container never observed via /start.
                     let containerIP = ContainerStartRoute.dnsAttachmentIP(in: container)
+                    let displayName = await ContainerNameOverrideStore.shared.name(forNativeID: container.id)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: container.id,
+                        displayName: displayName,
                         labels: cached?.labels ?? LabelNormalization.restore(container.configuration.labels),
                         cachedIP: cached?.ip ?? containerIP,
                         dnsServer: dnsServer
@@ -103,7 +106,11 @@ extension ContainerDeleteRoute {
                     await removeVolumes(
                         ContainerAnonymousVolumes.names(labels: container?.configuration.labels ?? eventLabels), req.logger)
                 }
+                if let nativeID = container?.id { try await ContainerNameOverrideStore.shared.remove(nativeID: nativeID) }
             } catch ClientContainerError.notFound {
+                if let nativeID = snapshot?.id ?? cached?.nativeId {
+                    try await ContainerNameOverrideStore.shared.remove(nativeID: nativeID)
+                }
                 if snapshot != nil || cached != nil {
                     await broadcastRemove()
                 }

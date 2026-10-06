@@ -7,7 +7,7 @@ struct EventBroadcasterKey: StorageKey {
 
 struct DockerActor: Codable {
     let ID: String
-    let Attributes: [String: String]
+    var Attributes: [String: String]
 }
 
 struct DockerEvent: Codable {
@@ -16,7 +16,7 @@ struct DockerEvent: Codable {
     let from: String
     let `Type`: String
     let Action: String
-    let Actor: DockerActor
+    var Actor: DockerActor
     let scope: String
     let time: Int
     let timeNano: UInt64
@@ -112,7 +112,11 @@ actor EventBroadcaster {
         return stream
     }
 
-    func broadcast(_ event: DockerEvent) {
+    func broadcast(_ original: DockerEvent) async {
+        var event = original
+        if event.Type == "container", let name = event.Actor.Attributes["name"] {
+            event.Actor.Attributes["name"] = await ContainerNameOverrideStore.shared.name(forNativeID: name)
+        }
         for continuation in continuations.values {
             continuation.yield(event)
         }

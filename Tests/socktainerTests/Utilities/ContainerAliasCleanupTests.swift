@@ -34,6 +34,23 @@ struct ContainerAliasCleanupTests {
         #expect(remaining["web.myapp"] == nil)
     }
 
+    @Test("unregisters a Docker-facing rename alias while retaining ownership protection")
+    func unregistersDisplayName() {
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: "web-1-tmp", ip: "10.0.0.5")
+        dnsServer.register(hostname: "web-1", ip: "10.0.0.5")
+
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: "web-1-tmp",
+            displayName: "web-1",
+            labels: [:],
+            cachedIP: "10.0.0.5",
+            dnsServer: dnsServer
+        )
+
+        #expect(dnsServer.listEntries().isEmpty)
+    }
+
     @Test("does not touch any alias when cachedIP is nil — ownership can't be confirmed")
     func skipsAllAliasesWhenCachedIPIsNil() {
         let dnsServer = SocktainerDNSServer()

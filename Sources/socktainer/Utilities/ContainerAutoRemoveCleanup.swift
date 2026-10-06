@@ -20,12 +20,15 @@ enum ContainerAutoRemoveCleanup {
     ) async {
         let cached = await ContainerInfoCache.shared.get(id: hexId)
         let labels = cached?.labels ?? fallbackLabels
+        let resolvedNativeID = cached?.nativeId ?? nativeId
+        let displayName = await ContainerNameOverrideStore.shared.name(forNativeID: resolvedNativeID)
 
         await removeVolumes(ContainerAnonymousVolumes.names(labels: labels))
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
-                nativeId: nativeId,
+                nativeId: resolvedNativeID,
+                displayName: displayName,
                 labels: labels,
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer
@@ -41,6 +44,11 @@ enum ContainerAutoRemoveCleanup {
                 ))
         }
         await ContainerInfoCache.shared.remove(id: hexId)
+        do {
+            try await ContainerNameOverrideStore.shared.remove(nativeID: resolvedNativeID)
+        } catch {
+            Logger(label: "socktainer.autoremove").error("Could not remove container name override: \(error)")
+        }
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
         // `--rm` containers are reaped here instead of through DELETE, so this is where their
         // die-event bookkeeping is released. It also refuses later claims: a second observer
