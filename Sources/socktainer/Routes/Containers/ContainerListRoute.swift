@@ -144,7 +144,7 @@ extension ContainerListRoute {
 
                 let summary = RESTContainerSummary(
                     Id: DockerContainerID.hexId(for: container),
-                    Names: ["/" + (await ContainerNameOverrideStore.shared.name(forNativeID: container.id))],
+                    Names: ["/" + container.id],
                     Image: container.configuration.image.reference,
                     ImageID: container.configuration.image.digest,
                     ImageManifestDescriptor: nil,

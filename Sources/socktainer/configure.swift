@@ -36,10 +36,6 @@ func configure(_ app: Application) async throws {
 
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
-    try await ContainerNameOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
-    if let containers = try? await containerClient.list(showAll: true, filters: [:]) {
-        try await ContainerNameOverrideStore.shared.prune(validNativeIDs: Set(containers.map(\.id)))
-    }
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
@@ -80,7 +76,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerPauseRoute())
     try app.register(collection: ContainerPruneRoute(client: containerClient))
-    try app.register(collection: ContainerRenameRoute(client: containerClient))
+    try app.register(collection: ContainerRenameRoute())
     try app.register(collection: ContainerResizeRoute(client: containerClient))
     try app.register(collection: ContainerRestartRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
@@ -228,7 +224,7 @@ func configure(_ app: Application) async throws {
             guard !ClientContainerService.isDNSSidecar(container)
             else { continue }
 
-            await ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
 
             // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],

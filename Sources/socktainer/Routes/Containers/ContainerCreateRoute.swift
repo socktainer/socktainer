@@ -85,6 +85,16 @@ extension ContainerCreateRoute {
                 throw Abort(.badRequest, reason: "Invalid JSON request body")
             }
 
+            // Compose creates the replacement before removing the old container, then renames it.
+            // Reject here: waiting for the unsupported rename would leave the service down (#385).
+            if body.Labels?["com.docker.compose.replace"] != nil {
+                throw Abort(
+                    .notImplemented,
+                    reason:
+                        "Compose recreation requires container rename, which socktainer does not support. Explicitly remove the old service container before redeploying; this causes downtime."
+                )
+            }
+
             req.logger.info("Creating container for image: \(body.Image)")
 
             let requestedStopSignal = body.StopSignal.flatMap { $0.isEmpty ? nil : $0 }
@@ -722,25 +732,22 @@ extension ContainerCreateRoute {
                     containerConfiguration.resources.cpus = cpus
                 }
 
-                let finalConfiguration = containerConfiguration
                 do {
-                    container = try await ContainerNameOverrideStore.shared.withAvailableName(rawId, client: client) {
-                        let containerClient = ContainerClient()
-                        // Record options before creation so a recording failure cannot orphan a container.
-                        try await PreStartInjectionStore.shared.rememberCreateOptions(
-                            containerId: finalConfiguration.id, autoRemove: options.autoRemove)
-                        do {
-                            try await containerClient.create(configuration: finalConfiguration, options: options, kernel: kernel)
-                        } catch {
-                            try? await PreStartInjectionStore.shared.clear(containerId: finalConfiguration.id)
-                            throw error
-                        }
-                        return try await containerClient.get(id: finalConfiguration.id)
+                    let containerClient = ContainerClient()
+                    // Recorded before the container exists: recording afterwards turns a
+                    // creation that happened into a reported failure, and the retry then
+                    // collides with the name.
+                    try await PreStartInjectionStore.shared.rememberCreateOptions(
+                        containerId: containerConfiguration.id, autoRemove: options.autoRemove)
+                    do {
+                        try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                    } catch {
+                        try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                        throw error
                     }
+                    container = try await containerClient.get(id: containerConfiguration.id)
                     req.logger.debug("Container created successfully with ID: \(container.id)")
                     ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
-                } catch let abort as Abort {
-                    throw abort
                 } catch {
                     req.logger.error("Failed to create container: \(error)")
                     throw Abort(.internalServerError, reason: "Failed to create container: \(error)")

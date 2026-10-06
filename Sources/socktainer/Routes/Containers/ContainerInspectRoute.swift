@@ -200,7 +200,7 @@ extension ContainerInspectRoute {
                 HostnamePath: "/etc/hostname",
                 HostsPath: "/etc/hosts",
                 LogPath: nil,  // Apple containers don't have a log path
-                Name: "/" + (await ContainerNameOverrideStore.shared.name(forNativeID: container.id)),
+                Name: "/" + container.id,
                 RestartCount: await ContainerRestartState.shared.count(id: container.id),
                 Driver: "",
                 Platform: "linux",

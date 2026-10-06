@@ -103,9 +103,7 @@ struct ClientContainerService: ClientContainerProtocol {
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
         let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        return Self.applyFilters(
-            running, filters: filters, allContainers: allContainers,
-            names: await ContainerNameOverrideStore.shared.snapshot())
+        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
@@ -122,8 +120,7 @@ struct ClientContainerService: ClientContainerProtocol {
     static func applyFilters(
         _ containers: [ContainerSnapshot],
         filters: [String: [String]],
-        allContainers: [ContainerSnapshot] = [],
-        names: [String: String] = [:]
+        allContainers: [ContainerSnapshot] = []
     ) -> [ContainerSnapshot] {
         let referencePool = allContainers.isEmpty ? containers : allContainers
         var result = containers
@@ -152,7 +149,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 // Docker matches both the API name (with a leading slash)
                 // and the familiar name, allowing anchored patterns for either.
                 let matcher = DockerContainerNameMatcher(patterns: values)
-                result = result.filter { matcher.matches(names[$0.id] ?? $0.id) }
+                result = result.filter { matcher.matches($0.id) }
             case "id":
                 result = result.filter { container in
                     values.contains { value in
@@ -165,7 +162,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 result = result.filter { container in
                     for beforeId in values {
                         if let beforeContainer = referencePool.first(where: {
-                            names[$0.id] == beforeId || $0.id == beforeId || $0.id.hasPrefix(beforeId)
+                            $0.id == beforeId || $0.id.hasPrefix(beforeId)
                                 || DockerContainerID.hexId(for: $0).hasPrefix(beforeId)
                         }) {
                             if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
@@ -182,7 +179,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 result = result.filter { container in
                     for sinceId in values {
                         if let sinceContainer = referencePool.first(where: {
-                            names[$0.id] == sinceId || $0.id == sinceId || $0.id.hasPrefix(sinceId)
+                            $0.id == sinceId || $0.id.hasPrefix(sinceId)
                                 || DockerContainerID.hexId(for: $0).hasPrefix(sinceId)
                         }) {
                             if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
@@ -243,9 +240,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     private func getContainerWithoutPreparationWait(id: String) async throws -> ContainerSnapshot? {
-        let mappedNativeID = await ContainerNameOverrideStore.shared.nativeID(forName: id)
-        let lookupID = mappedNativeID ?? id
-        let sanitizedId = ContainerNameUtility.sanitize(lookupID)
+        let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
             let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
             return Self.isDNSSidecar(snapshot) ? nil : snapshot
@@ -257,7 +252,7 @@ struct ClientContainerService: ClientContainerProtocol {
             // non-hex strings (containing "-"), which breaks hex prefix matching.
             let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
-            switch DockerContainerID.resolve(reference: lookupID, entries: entries) {
+            switch DockerContainerID.resolve(reference: id, entries: entries) {
             case .match(let nativeId):
                 return allContainers.first { $0.id == nativeId }
             case .ambiguous(let matches):

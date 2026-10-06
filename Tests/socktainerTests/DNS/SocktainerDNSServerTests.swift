@@ -683,27 +683,27 @@ struct DNSAttachmentIPTests {
 struct RegisterDNSAliasesOnResumeTests {
 
     @Test("Re-registers on a named network even when the first attachment is reserved")
-    func reRegistersPastReservedFirstAttachment() async throws {
+    func reRegistersPastReservedFirstAttachment() throws {
         let container = try makeContainerSnapshot(
             nativeId: "web-1",
             networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
             labels: [:]
         )
         let dnsServer = SocktainerDNSServer()
-        await ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
         #expect(dnsServer.listEntries()["web-1"] == "192.168.65.20")
     }
 
     @Test("A container on only reserved networks is not registered")
-    func onlyReservedNetworksSkipsRegistration() async throws {
+    func onlyReservedNetworksSkipsRegistration() throws {
         let container = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
         let dnsServer = SocktainerDNSServer()
-        await ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
         #expect(dnsServer.listEntries().isEmpty)
     }
 
     @Test("Also registers socktainer.dns.names and Compose service/project aliases")
-    func registersAllAliases() async throws {
+    func registersAllAliases() throws {
         let container = try makeContainerSnapshot(
             nativeId: "db-1",
             ip: "192.168.65.20",
@@ -715,7 +715,7 @@ struct RegisterDNSAliasesOnResumeTests {
             ]
         )
         let dnsServer = SocktainerDNSServer()
-        await ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
         let entries = dnsServer.listEntries()
         #expect(entries["db-1"] == "192.168.65.20")
         #expect(entries["postgres"] == "192.168.65.20")

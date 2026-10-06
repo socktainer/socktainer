@@ -111,6 +111,36 @@ struct ContainerCreateRouteTests {
     }
 }
 
+@Suite("ContainerCreateRoute — Compose recreation")
+struct ComposeRecreationTests {
+    @Test("Replacement creation fails before image lookup or container creation", arguments: ["probe-1", ""])
+    func rejectsReplacement(replacedName: String) async throws {
+        let payload = #"{"Image":"socktainer-nonexistent-test-image:missing","Labels":{"com.docker.compose.replace":"\#(replacedName)"}}"#
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=5af00f873b3d_renameprobe-probe-1",
+                headers: ["Content-Type": "application/json"], body: ByteBuffer(string: payload)
+            ) { res async in
+                #expect(res.status == .notImplemented)
+                #expect(res.body.string.contains("Explicitly remove the old service container"))
+            }
+        }
+    }
+
+    @Test("Initial Compose creation still reaches image lookup")
+    func acceptsInitialCreation() async throws {
+        let payload = #"{"Image":"socktainer-nonexistent-test-image:missing","Labels":{"com.docker.compose.project":"renameprobe","com.docker.compose.service":"probe"}}"#
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=renameprobe-probe-1",
+                headers: ["Content-Type": "application/json"], body: ByteBuffer(string: payload)
+            ) { res async in
+                expectReachedImageStage(res)
+            }
+        }
+    }
+}
+
 // MARK: - Env-var rewrite helpers
 
 @Suite("ContainerCreateRoute — 127.0.0.1 gateway rewrite")

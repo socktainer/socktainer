@@ -262,7 +262,6 @@ extension ContainerStartRoute {
                     let cached = await ContainerInfoCache.shared.get(id: nativeId)
                     ContainerAliasCleanup.unregisterAllAliases(
                         nativeId: nativeId,
-                        displayName: await ContainerNameOverrideStore.shared.name(forNativeID: nativeId),
                         labels: cached?.labels ?? labels,
                         cachedIP: cached?.ip,
                         dnsServer: dnsServer
@@ -425,8 +424,37 @@ extension ContainerStartRoute {
             // forwarder so any registration would be unreachable; skip entirely if none of the
             // container's attachments qualify, rather than falling back to the first attachment.
             if let ip = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
-                let name = await ContainerNameOverrideStore.shared.name(forNativeID: snapshot.id)
-                registerDNSAliases(container: snapshot, name: name, ip: ip, dnsServer: dnsServer)
+                if !snapshot.id.isEmpty {
+                    dnsServer.register(hostname: snapshot.id, ip: ip)
+                    logger.info("[dns] registered container name '\(snapshot.id)' → \(ip)")
+                }
+
+                // Names stored at create time (Compose service aliases via socktainer.dns.names)
+                if let namesLabel = snapshot.configuration.labels["socktainer.dns.names"] {
+                    for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
+                        dnsServer.register(hostname: name, ip: ip)
+                    }
+                }
+
+                // Register Docker Compose service names so that containers in the same
+                // project can resolve each other by service name (e.g. "db") or the
+                // project-qualified form (e.g. "db.myapp").
+                //
+                // The qualified form (service.project) matches Docker's own DNS behaviour
+                // and avoids collisions when multiple Compose projects run concurrently.
+                if let serviceName = snapshot.configuration.labels["com.docker.compose.service"],
+                    !serviceName.isEmpty
+                {
+                    dnsServer.register(hostname: serviceName, ip: ip)
+                    if let projectName = snapshot.configuration.labels["com.docker.compose.project"],
+                        !projectName.isEmpty
+                    {
+                        dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
+                        logger.info("[dns] registered compose aliases '\(serviceName)' and '\(serviceName).\(projectName)' → \(ip)")
+                    } else {
+                        logger.info("[dns] registered compose alias '\(serviceName)' → \(ip)")
+                    }
+                }
             }
         }
 
@@ -486,16 +514,10 @@ extension ContainerStartRoute {
     /// across daemon restarts. Uses dnsAttachmentIP so a container whose first network
     /// attachment happens to be reserved (e.g. bridge) still gets re-registered on its
     /// named network, instead of being skipped entirely.
-    static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) async {
+    static func registerDNSAliasesOnResume(container: ContainerSnapshot, dnsServer: SocktainerDNSServer, logger: Logger) {
         guard let ip = ContainerStartRoute.dnsAttachmentIP(in: container) else { return }
 
-        let displayName = await ContainerNameOverrideStore.shared.name(forNativeID: container.id)
-        registerDNSAliases(container: container, name: displayName, ip: ip, dnsServer: dnsServer)
-        logger.info("[dns] re-registered '\(displayName)' → \(ip) on resume")
-    }
-
-    static func registerDNSAliases(container: ContainerSnapshot, name: String, ip: String, dnsServer: SocktainerDNSServer) {
-        dnsServer.register(hostname: name, ip: ip)
+        dnsServer.register(hostname: container.id, ip: ip)
         if let namesLabel = container.configuration.labels["socktainer.dns.names"] {
             for name in namesLabel.split(separator: ",").map(String.init) where !name.isEmpty {
                 dnsServer.register(hostname: name, ip: ip)
@@ -507,5 +529,6 @@ extension ContainerStartRoute {
                 dnsServer.register(hostname: "\(serviceName).\(projectName)", ip: ip)
             }
         }
+        logger.info("[dns] re-registered '\(container.id)' → \(ip) on resume")
     }
 }

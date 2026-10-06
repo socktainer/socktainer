@@ -17,7 +17,7 @@ struct ContainerStatsRoute: RouteCollection {
         let client = ContainerClient()
 
         // Verify container exists before starting to stream
-        guard let container = try await ClientContainerService().getContainer(id: id) else {
+        guard (try? await client.get(id: id)) != nil else {
             throw Abort(.notFound, reason: "No such container: \(id)")
         }
 
@@ -29,7 +29,7 @@ struct ContainerStatsRoute: RouteCollection {
                 defer { _ = writer.write(.end) }
 
                 do {
-                    var prevSample = try await client.stats(id: container.id)
+                    var prevSample = try await client.stats(id: id)
                     var prevRead = Date()
 
                     if stream {
@@ -37,7 +37,7 @@ struct ContainerStatsRoute: RouteCollection {
                         // until the client disconnects or the container stops.
                         while true {
                             try await Task.sleep(nanoseconds: 1_000_000_000)
-                            guard let currSample = try? await client.stats(id: container.id) else { break }
+                            guard let currSample = try? await client.stats(id: id) else { break }
                             let currRead = Date()
                             let stats = RESTContainerStats.build(
                                 id: id, prev: prevSample, curr: currSample,
@@ -55,7 +55,7 @@ struct ContainerStatsRoute: RouteCollection {
                         // One-shot mode: take two samples 1s apart to get a CPU delta,
                         // then return a single JSON object and close.
                         try await Task.sleep(nanoseconds: 1_000_000_000)
-                        guard let currSample = try? await client.stats(id: container.id) else { return }
+                        guard let currSample = try? await client.stats(id: id) else { return }
                         let currRead = Date()
                         let stats = RESTContainerStats.build(
                             id: id, prev: prevSample, curr: currSample,

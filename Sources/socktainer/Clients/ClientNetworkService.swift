@@ -36,7 +36,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 for attachment in container.networks {
                     if attachment.network == network.Id || attachment.network == network.Name {
                         let nc = NetworkContainer(
-                            Name: await ContainerNameOverrideStore.shared.name(forNativeID: container.id),
+                            Name: container.id,
                             EndpointID: nil,  // Apple container doesn't have a matching field
                             MacAddress: nil,  // Apple container doesn't have a matching field
                             IPv4Address: String(describing: attachment.ipv4Address),

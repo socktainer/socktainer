@@ -57,18 +57,6 @@ extension ContainerPruneRoute {
                         type: "container", action: "prune", actorID: "",
                         attributes: ["reclaimed": String(result.spaceReclaimed)]))
             }
-            for containerID in result.deletedContainers {
-                guard let snapshot = snapshotByID[containerID] else { continue }
-                let name = await ContainerNameOverrideStore.shared.name(forNativeID: snapshot.id)
-                if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                    let cached = await ContainerInfoCache.shared.get(id: snapshot.id)
-                    ContainerAliasCleanup.unregisterAllAliases(
-                        nativeId: snapshot.id, displayName: name,
-                        labels: LabelNormalization.restore(snapshot.configuration.labels),
-                        cachedIP: cached?.ip ?? ContainerStartRoute.dnsAttachmentIP(in: snapshot), dnsServer: dnsServer)
-                }
-                try await ContainerNameOverrideStore.shared.remove(nativeID: snapshot.id)
-            }
             return RESTContainerPruneResponse(
                 ContainersDeleted: result.deletedContainers,
                 SpaceReclaimed: result.spaceReclaimed
