@@ -24,8 +24,8 @@ struct ContainerAttachRoute: RouteCollection {
 }
 
 extension ContainerAttachRoute {
-    // Foreground Compose can start entirely through attach, without POST /start.
-    // Run the same DNS/health setup and exit cleanup for every attach bootstrap path.
+    /// Runs DNS/health setup and exit cleanup for containers started through attach,
+    /// including foreground Compose, which may never call `POST /start`.
     static func startedContainer(container: ContainerSnapshot, client: ClientContainerProtocol, req: Request) async -> Int {
         let epoch = await DieEventOwnership.shared.beginRun(id: container.id)
         await ContainerRestartState.shared.reset(id: container.id)
