@@ -406,10 +406,17 @@ struct ExecRoute: RouteCollection {
                 return Response(status: .ok)
             }
 
-            // Check if client requested connection upgrade and attachStdin is true
-            let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
-            let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
+            // Hijack whenever the client asks for `Upgrade: tcp`, with or without stdin
+            // (like dockerd). The HTTP streaming fallback answers 101 with an unframed
+            // body it cannot end, has no handle on the channel to close it, and drops
+            // output when the client half-closes. A client that never half-closes
+            // (e.g. nektos/act) therefore never sees EOF. The TCP path tolerates the
+            // half-close and closes the connection itself once output is drained.
+            let shouldUpgrade = ExecRoute.shouldHijackStart(
+                connection: req.headers.first(name: "Connection"),
+                upgrade: req.headers.first(name: "Upgrade"),
+                attachStdin: config.attachStdin
+            )
 
             guard shouldUpgrade else {
                 // Fallback to HTTP streaming mode
@@ -648,136 +655,23 @@ struct ExecRoute: RouteCollection {
                 await ProcessRegistry.shared.set(id: execId, process: process)
                 if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
-                // Setup bidirectional communication for interactive sessions
+                // Output readers: container stdout/stderr -> channel. Each returns true
+                // only when its pipe reached EOF (Apple closes the write ends when the
+                // process exits), false when it stopped because the client went away.
+                var outputReaders: [@Sendable () async -> Bool] = []
+                if let stdoutHandle = pipes.stdout?.read {
+                    outputReaders.append {
+                        await ExecRoute.pumpHijackedOutput(stdoutHandle, to: channel, streamType: .stdout, tty: tty, highWater: 4096)
+                    }
+                }
+                if let stderrHandle = pipes.stderr?.read {
+                    outputReaders.append {
+                        await ExecRoute.pumpHijackedOutput(stderrHandle, to: channel, streamType: .stderr, tty: tty, highWater: 1024)
+                    }
+                }
+                let readers = outputReaders
+
                 await withTaskGroup(of: Void.self) { group in
-                    // stdout/stderr -> channel (container output to client)
-                    if let stdoutHandle = pipes.stdout?.read {
-                        group.addTask {
-                            let dispatchIO = DispatchIO(
-                                type: .stream,
-                                fileDescriptor: stdoutHandle.fileDescriptor,
-                                queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { _ in
-                                // DispatchIO relinquishes the fd in its cleanup handler.
-                                // Close here to avoid closing a potentially recycled fd.
-                                try? stdoutHandle.close()
-                            }
-
-                            defer {
-                                dispatchIO.close()
-                            }
-
-                            // Set up for streaming
-                            dispatchIO.setLimit(lowWater: 1)
-                            dispatchIO.setLimit(highWater: 4096)
-
-                            let state = DockerConnectionState()
-
-                            // Use a single read operation that processes all available data
-                            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                                var hasCompleted = false
-                                let completionLock = NSLock()
-
-                                func safeComplete() {
-                                    completionLock.lock()
-                                    defer { completionLock.unlock() }
-                                    guard !hasCompleted else { return }
-                                    hasCompleted = true
-                                    continuation.resume()
-                                }
-
-                                // Start a continuous read operation
-                                dispatchIO.read(
-                                    offset: 0,
-                                    length: Int.max,  // Read all available data
-                                    queue: DispatchQueue.global(qos: .userInteractive)
-                                ) { done, data, error in
-
-                                    completionLock.lock()
-                                    let shouldProcess = !hasCompleted && channel.isActive
-                                    completionLock.unlock()
-
-                                    if shouldProcess, let data = data, !data.isEmpty {
-                                        channel.eventLoop.execute {
-                                            let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
-                                            var outputBuffer = channel.allocator.buffer(capacity: bufferSize)
-                                            if tty {
-                                                outputBuffer.writeBytes(data)
-                                            } else {
-                                                outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
-                                            }
-                                            _ = channel.writeAndFlush(outputBuffer)
-                                        }
-                                    }
-
-                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
-                                        safeComplete()
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let stderrHandle = pipes.stderr?.read {
-                        group.addTask {
-                            let dispatchIO = DispatchIO(
-                                type: .stream,
-                                fileDescriptor: stderrHandle.fileDescriptor,
-                                queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { _ in
-                                try? stderrHandle.close()
-                            }
-
-                            defer {
-                                dispatchIO.close()
-                            }
-
-                            // Set up for streaming
-                            dispatchIO.setLimit(lowWater: 1)
-                            dispatchIO.setLimit(highWater: 1024)
-
-                            let state = DockerConnectionState()
-
-                            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                                var hasCompleted = false
-                                let completionLock = NSLock()
-
-                                func safeComplete() {
-                                    completionLock.lock()
-                                    defer { completionLock.unlock() }
-                                    guard !hasCompleted else { return }
-                                    hasCompleted = true
-                                    continuation.resume()
-                                }
-
-                                // Start a continuous read operation
-                                dispatchIO.read(
-                                    offset: 0,
-                                    length: Int.max,  // Read all available data
-                                    queue: DispatchQueue.global(qos: .userInteractive)
-                                ) { done, data, error in
-
-                                    completionLock.lock()
-                                    let shouldProcess = !hasCompleted && channel.isActive
-                                    completionLock.unlock()
-
-                                    if shouldProcess, let data = data, !data.isEmpty {
-                                        channel.eventLoop.execute {
-                                            let bufferSize = min(data.count + 8, 65536)
-                                            var outputBuffer = channel.allocator.buffer(capacity: bufferSize)
-                                            outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: tty)
-                                            _ = channel.writeAndFlush(outputBuffer)
-                                        }
-                                    }
-
-                                    if done || error != 0 || !channel.isActive || state.shouldStop() {
-                                        safeComplete()
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // Connection monitor to handle client disconnection
                     group.addTask {
                         // Monitor channel for closure - simplified approach
@@ -785,7 +679,8 @@ struct ExecRoute: RouteCollection {
                             try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                         }
 
-                        // Connection was closed - the process monitor will handle cleanup.
+                        // A process exit records its code before the channel is closed,
+                        // so this only reports a detach when the client went away first.
                         await ExecRoute.broadcastExecDetach(
                             execRunning: await ExecManager.shared.isRunning(id: execId),
                             execId: execId,
@@ -794,31 +689,47 @@ struct ExecRoute: RouteCollection {
                         )
                     }
 
-                    // Process monitor with proper cleanup
+                    // Close only once all output is drained and flushed and the exit code
+                    // is recorded, so neither the tail of the output nor the client's
+                    // follow-up GET /exec/{id}/json loses the race against the close.
+                    //
+                    // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
+                    // it via writeQueue on channelInactive / inputClosed. Closing it here too
+                    // would be a double-close that can kill a reused fd.
+                    // stdout/stderr write ends are Apple-owned — also do not close them.
                     group.addTask {
-                        // moby emits `exec_die` only on an observed real exit. If wait()
-                        // throws, record a synthetic exit code so the exec leaves the
-                        // Running state (GET /exec/{id}/json), but broadcast no exec_die —
-                        // no clean exit was observed.
-                        let observedCode: Int32? = try? await process.wait()
-                        await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
-                        await ProcessRegistry.shared.remove(id: execId)
-                        if let observedCode {
-                            await broadcastExecEvent("exec_die", exitCode: observedCode)
-                        }
-
-                        // Give a small delay for any final output to be processed
-                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-
-                        // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
-                        // it via writeQueue on channelInactive / inputClosed. Closing it here too
-                        // would be a double-close that can kill a reused fd.
-                        // stdout/stderr write ends are Apple-owned — also do not close them.
-
-                        // Close the channel gracefully
-                        _ = channel.eventLoop.submit {
-                            channel.close(promise: nil)
-                        }
+                        await ExecHijackCompletion.run(
+                            waitForExit: { try? await process.wait() },
+                            awaitOutputEnd: {
+                                let results = await withTaskGroup(of: Bool.self) { readerGroup in
+                                    for reader in readers { readerGroup.addTask { await reader() } }
+                                    var results: [Bool] = []
+                                    for await reachedEOF in readerGroup { results.append(reachedEOF) }
+                                    return results
+                                }
+                                return ExecHijackCompletion.outputEnd(readersReachedEOF: results)
+                            },
+                            recordExit: { observedCode in
+                                // moby emits `exec_die` only on an observed real exit. When wait()
+                                // fails, record a sentinel so the exec leaves the Running state
+                                // (GET /exec/{id}/json), but broadcast no exec_die. A late code
+                                // after a stall overwrites the stall sentinel here.
+                                await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
+                                await ProcessRegistry.shared.remove(id: execId)
+                                if let observedCode {
+                                    await broadcastExecEvent("exec_die", exitCode: observedCode)
+                                }
+                            },
+                            recordStall: {
+                                // wait() has not answered within the bound after output EOF: give
+                                // the client's GET /exec/{id}/json a provisional -1, but keep the
+                                // process registered (resize/kill) and emit no exec_die until the
+                                // exit is observed and recordExit runs.
+                                await ExecManager.shared.setExitCode(id: execId, code: -1)
+                            },
+                            flush: { await ExecRoute.flushHijackedOutput(channel) },
+                            close: { try? await channel.close() }
+                        )
                     }
 
                     for await _ in group {}
@@ -832,11 +743,99 @@ struct ExecRoute: RouteCollection {
 
     /// The client's channel died while the exec still runs (no exit code recorded):
     /// the client detached — moby emits a plain "exec_detach" carrying the execID
-    /// (daemon/exec.go). A process exit records its code before the monitor closes
-    /// the channel, so `execRunning` is false there and nothing is emitted.
+    /// (daemon/exec.go). A process exit records its code before the channel is
+    /// closed, so `execRunning` is false there and nothing is emitted.
     static func broadcastExecDetach(execRunning: Bool, execId: String, container: ContainerSnapshot, broadcaster: EventBroadcaster?) async {
         guard execRunning, let broadcaster else { return }
         await broadcaster.broadcast(DockerEvent.containerEvent("exec_detach", container: container, extraAttributes: ["execID": execId]))
+    }
+
+    /// Whether `POST /exec/{id}/start` takes the hijacked-connection path.
+    ///
+    /// `attachStdin` is accepted but deliberately ignored: Docker hijacks on the
+    /// upgrade headers alone, and the HTTP streaming fallback cannot end a 101
+    /// response, so a stdin-less exec must not be routed there.
+    static func shouldHijackStart(connection: String?, upgrade: String?, attachStdin _: Bool) -> Bool {
+        connection?.lowercased().contains("upgrade") == true
+            && upgrade?.lowercased() == "tcp"
+    }
+
+    /// Copies one container output pipe to the hijacked channel until EOF.
+    ///
+    /// Returns `true` when the pipe reached EOF (or failed), `false` when reading
+    /// stopped early because the client connection went away. Every chunk's write is
+    /// queued on the channel's event loop before the next chunk (and the EOF) is
+    /// processed, so a flush barrier submitted after this returns runs after them.
+    /// The write end is Apple-owned; the read end is closed by DispatchIO's cleanup.
+    static func pumpHijackedOutput(
+        _ handle: FileHandle,
+        to channel: Channel,
+        streamType: DockerStreamFrame.StreamType,
+        tty: Bool,
+        highWater: Int
+    ) async -> Bool {
+        let dispatchIO = DispatchIO(
+            type: .stream,
+            fileDescriptor: handle.fileDescriptor,
+            queue: DispatchQueue.global(qos: .userInteractive)
+        ) { _ in
+            // DispatchIO relinquishes the fd in its cleanup handler.
+            // Close here to avoid closing a potentially recycled fd.
+            try? handle.close()
+        }
+        defer { dispatchIO.close() }
+
+        dispatchIO.setLimit(lowWater: 1)
+        dispatchIO.setLimit(highWater: highWater)
+
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            var hasCompleted = false
+            let completionLock = NSLock()
+
+            func safeComplete(reachedEOF: Bool) {
+                completionLock.lock()
+                defer { completionLock.unlock() }
+                guard !hasCompleted else { return }
+                hasCompleted = true
+                continuation.resume(returning: reachedEOF)
+            }
+
+            dispatchIO.read(
+                offset: 0,
+                length: Int.max,  // Read all available data
+                queue: DispatchQueue.global(qos: .userInteractive)
+            ) { done, data, error in
+                completionLock.lock()
+                let shouldProcess = !hasCompleted && channel.isActive
+                completionLock.unlock()
+
+                if shouldProcess, let data = data, !data.isEmpty {
+                    channel.eventLoop.execute {
+                        let bufferSize = min(data.count + (tty ? 0 : 8), 65536)
+                        var outputBuffer = channel.allocator.buffer(capacity: bufferSize)
+                        outputBuffer.writeDockerFrame(streamType: streamType, data: Data(data), ttyMode: tty)
+                        _ = channel.writeAndFlush(outputBuffer)
+                    }
+                }
+
+                if done || error != 0 {
+                    safeComplete(reachedEOF: true)
+                } else if !channel.isActive {
+                    safeComplete(reachedEOF: false)
+                }
+            }
+        }
+    }
+
+    /// Flush barrier: completes once every write queued on the channel so far has been
+    /// written to the socket (or has failed). Writes complete in order, so an empty
+    /// write submitted after the output readers finished completes after their data.
+    /// Closing before this would fail the still-pending writes and drop output.
+    static func flushHijackedOutput(_ channel: Channel) async {
+        let barrier = channel.eventLoop.flatSubmit {
+            channel.writeAndFlush(channel.allocator.buffer(capacity: 0))
+        }
+        try? await barrier.get()
     }
 
     /// Docker/runc report a missing executable as exit code 127 (the POSIX

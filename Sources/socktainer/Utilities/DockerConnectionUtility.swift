@@ -623,7 +623,7 @@ extension ConnectionHijackingMiddleware {
 
 /// Utility for creating multiplexed stream frames
 public struct DockerStreamFrame {
-    public enum StreamType: UInt8 {
+    public enum StreamType: UInt8, Sendable {
         case stdin = 0  // Written on stdout
         case stdout = 1
         case stderr = 2
