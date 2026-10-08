@@ -356,7 +356,7 @@ struct ClientContainerService: ClientContainerProtocol {
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
             await ContainerExitCodeStore.shared.remove(id: container.id)
-            await ExtraHostsFile.refresh(containerId: container.id)
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.

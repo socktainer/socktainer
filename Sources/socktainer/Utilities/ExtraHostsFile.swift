@@ -2,7 +2,6 @@ import ContainerAPIClient
 import ContainerNetworkClient
 import ContainerResource
 import Foundation
-import Logging
 
 /// Apple Container writes the guest's `/etc/hosts` itself and has no way to add entries
 /// (apple/container#1563), so `HostConfig.ExtraHosts` would be dropped. As Docker and
@@ -21,7 +20,8 @@ enum ExtraHostsFile {
     /// Same rules as moby's `ParseExtraHost`: `host=ip`, or the legacy `host:ip` split on
     /// the first colon (so `host:::1` is IPv6). Brackets around an IPv6 address are dropped.
     /// Returns nil unless the address is an IP or `host-gateway` and the host has no
-    /// whitespace or control characters, which would inject extra lines into the file.
+    /// whitespace or control characters, which would inject extra lines into the file,
+    /// and no colon, which moby rejects too.
     static func parse(_ entry: String) -> (host: String, ip: String)? {
         let separator: Character = entry.contains("=") ? "=" : ":"
         guard let index = entry.firstIndex(of: separator) else { return nil }
@@ -30,7 +30,7 @@ enum ExtraHostsFile {
         if ip.hasPrefix("[") && ip.hasSuffix("]") {
             ip = String(ip.dropFirst().dropLast())
         }
-        let forbidden = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        let forbidden = CharacterSet.whitespacesAndNewlines.union(.controlCharacters).union(CharacterSet(charactersIn: ":"))
         guard !host.isEmpty, host.unicodeScalars.allSatisfy({ !forbidden.contains($0) }),
             ip == hostGateway || isIPAddress(ip)
         else { return nil }
@@ -97,28 +97,25 @@ enum ExtraHostsFile {
     }
 
     /// Call after `bootstrap`, before `process.start()`: adds the container's own address
-    /// and resolves `host-gateway` now that the network is attached.
-    static func refresh(containerId: String, logger: Logger = Logger(label: "socktainer.extra-hosts")) async {
-        do {
-            let snapshot = try await ContainerClient().get(id: containerId)
-            let configuration = snapshot.configuration
-            guard let directory = directory(labels: configuration.labels) else { return }
-            let extraHosts = try JSONDecoder().decode(
-                [String].self, from: Data(contentsOf: directory.appendingPathComponent("extra-hosts.json")))
-            let hostname = configuration.networks.first?.options.hostname ?? configuration.id
-            var attachment = snapshot.networks.first
-            if attachment == nil {
-                attachment = try await allocatedAttachment(configuration)
-            }
-            let content = render(
-                extraHosts: extraHosts,
-                ip: stripSubnetFromIP(attachment.map { String(describing: $0.ipv4Address) }),
-                hostname: hostname,
-                gateway: attachment.map { String(describing: $0.ipv4Gateway) })
-            try content.write(to: directory.appendingPathComponent("hosts"), atomically: false, encoding: .utf8)
-        } catch {
-            logger.warning("[extra-hosts] could not refresh /etc/hosts for \(containerId): \(error)")
+    /// and resolves `host-gateway` now that the network is attached. Throws so the caller
+    /// does not start a container whose `/etc/hosts` lacks the requested entries.
+    static func refresh(containerId: String) async throws {
+        let snapshot = try await ContainerClient().get(id: containerId)
+        let configuration = snapshot.configuration
+        guard let directory = directory(labels: configuration.labels) else { return }
+        let extraHosts = try JSONDecoder().decode(
+            [String].self, from: Data(contentsOf: directory.appendingPathComponent("extra-hosts.json")))
+        let hostname = configuration.networks.first?.options.hostname ?? configuration.id
+        var attachment = snapshot.networks.first
+        if attachment == nil {
+            attachment = try await allocatedAttachment(configuration)
         }
+        let content = render(
+            extraHosts: extraHosts,
+            ip: stripSubnetFromIP(attachment.map { String(describing: $0.ipv4Address) }),
+            hostname: hostname,
+            gateway: attachment.map { String(describing: $0.ipv4Gateway) })
+        try content.write(to: directory.appendingPathComponent("hosts"), atomically: false, encoding: .utf8)
     }
 
     /// A booted container reports no networks until its init process runs, but the

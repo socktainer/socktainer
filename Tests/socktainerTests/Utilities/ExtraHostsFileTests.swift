@@ -22,6 +22,7 @@ struct ExtraHostsFileTests {
         #expect(ExtraHostsFile.parse("foo:10.1.2.3\n6.6.6.6 evil") == nil)
         #expect(ExtraHostsFile.parse("foo\nevil:10.1.2.3") == nil)
         #expect(ExtraHostsFile.parse("foo bar:10.1.2.3") == nil)
+        #expect(ExtraHostsFile.parse("foo:bar=1.2.3.4") == nil)
         #expect(
             ExtraHostsFile.invalidEntries(["ok:10.1.2.3", "foo:", "bad:nope", "gw:host-gateway"]) == ["foo:", "bad:nope"])
     }

@@ -613,6 +613,12 @@ extension ContainerCreateRoute {
             } catch {
                 throw Abort(.badRequest, reason: "Invalid volume declaration: \(error)")
             }
+            // Before any volume is created: a refused request must leave nothing behind.
+            let extraHosts = body.HostConfig?.ExtraHosts ?? []
+            let invalidExtraHosts = ExtraHostsFile.invalidEntries(extraHosts)
+            guard invalidExtraHosts.isEmpty else {
+                throw Abort(.badRequest, reason: "invalid ExtraHosts entries: \(invalidExtraHosts.joined(separator: ", "))")
+            }
             let options = ContainerCreateOptions(autoRemove: body.HostConfig?.AutoRemove ?? false)
             let container: ContainerSnapshot
             var createdAnonymousVolumes: [String] = []
@@ -695,11 +701,6 @@ extension ContainerCreateRoute {
 
                 // Never trust a client-supplied value: it names a directory socktainer deletes.
                 containerConfiguration.labels[ExtraHostsFile.label] = nil
-                let extraHosts = body.HostConfig?.ExtraHosts ?? []
-                let invalidExtraHosts = ExtraHostsFile.invalidEntries(extraHosts)
-                guard invalidExtraHosts.isEmpty else {
-                    throw Abort(.badRequest, reason: "invalid ExtraHosts entries: \(invalidExtraHosts.joined(separator: ", "))")
-                }
 
                 containerConfiguration.mounts = resolvedMounts
                 // Always overwrite client-supplied metadata, including an empty list.
