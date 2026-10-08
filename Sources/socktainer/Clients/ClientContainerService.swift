@@ -474,11 +474,20 @@ struct ClientContainerService: ClientContainerProtocol {
                 throw ClientContainerError.renameRequiresUnstarted(id: oldId)
             }
 
-            var configuration = container.configuration
-            configuration.id = newId
             // Keep the Docker id: clients hold it across the rename (Compose starts by it).
-            configuration.labels[DockerContainerID.idSeedLabel] =
-                container.configuration.labels[DockerContainerID.idSeedLabel] ?? oldId
+            // Pin the creation time too: without the label it is read from the
+            // container's directory, which the rebuild replaces.
+            var original = container.configuration
+            let timestampLabel = AppleContainerTimestampResolver.legacyCreationTimestampLabel
+            if original.labels[timestampLabel] == nil,
+                let created = AppleContainerTimestampResolver.containerCreationDate(container)
+            {
+                original.labels[timestampLabel] = String(created.timeIntervalSince1970)
+            }
+            let restore = original
+            var configuration = original
+            configuration.id = newId
+            configuration.labels[DockerContainerID.idSeedLabel] = original.labels[DockerContainerID.idSeedLabel] ?? oldId
             let renamed = configuration
 
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
@@ -490,8 +499,12 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             } catch {
                 // Put the original back so a failed rename does not lose the container.
-                try? await self.containerClient.withClient {
-                    try await $0.create(configuration: container.configuration, options: options, kernel: kernel)
+                do {
+                    try await self.containerClient.withClient {
+                        try await $0.create(configuration: restore, options: options, kernel: kernel)
+                    }
+                } catch {
+                    throw ClientContainerError.notFound(id: oldId)
                 }
                 throw error
             }
