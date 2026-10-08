@@ -22,6 +22,7 @@ enum ContainerAutoRemoveCleanup {
         let labels = cached?.labels ?? fallbackLabels
 
         await removeVolumes(ContainerAnonymousVolumes.names(labels: labels))
+        ExtraHostsFile.remove(labels: labels)
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(

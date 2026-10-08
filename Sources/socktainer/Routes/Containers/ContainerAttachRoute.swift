@@ -334,6 +334,7 @@ extension ContainerAttachRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
@@ -502,6 +503,7 @@ extension ContainerAttachRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             pipes.closeAfterHandoff()

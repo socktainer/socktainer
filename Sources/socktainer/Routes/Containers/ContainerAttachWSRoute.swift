@@ -97,6 +97,7 @@ extension ContainerAttachWSRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
