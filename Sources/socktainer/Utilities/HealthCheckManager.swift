@@ -169,7 +169,7 @@ actor HealthCheckManager {
                 Output: ""  // stdout capture from container VMs requires pipe infrastructure
             )
 
-            let inStartPeriod = startDeadline.map { Date() < $0 } ?? false
+            let inStartPeriod = startDeadline.map { start < $0 } ?? false  // classify by when the probe began
 
             if exitCode == 0 {
                 startDeadline = nil  // the first success ends the start period
@@ -180,7 +180,8 @@ actor HealthCheckManager {
                 updateStatus(id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
-                let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
+                // Below Retries, keep the current status: a healthy container stays healthy.
+                let status = failingStreak >= maxRetries ? "unhealthy" : (statuses[containerId]?.Status ?? "starting")
                 updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }

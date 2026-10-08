@@ -194,6 +194,31 @@ struct HealthCheckManagerTests {
         await mgr.stop(containerId: "c1")
     }
 
+    @Test("A failure below Retries keeps a healthy container healthy")
+    func healthyStaysHealthyBelowRetries() async throws {
+        actor Calls {
+            var count = 0
+            func next() -> Int {
+                count += 1
+                return count
+            }
+        }
+        let calls = Calls()
+        let mgr = HealthCheckManager(
+            probe: { _, _, _ in await calls.next() == 1 ? 0 : 1 },
+            intervalFloorNs: 1_000_000
+        )
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 1_000, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        for _ in 0..<600 where (await mgr.currentHealth(for: "c1")?.FailingStreak ?? 0) < 2 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.FailingStreak ?? 0) >= 2)
+        #expect(h?.Status == "healthy")
+        await mgr.stop(containerId: "c1")
+    }
+
     // MARK: - Health log entries
 
     @Test("Log entries are recorded after each probe")
