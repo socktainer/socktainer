@@ -12,6 +12,7 @@ struct HealthcheckConfig: Content {
     let Timeout: Int?
     let Retries: Int?
     let StartPeriod: Int?
+    var StartInterval: Int? = nil
 
     /// Docker's create-time merge: an omitted request inherits the image's
     /// HEALTHCHECK, and unset (empty/zero) request fields fall back to it.
@@ -24,7 +25,8 @@ struct HealthcheckConfig: Content {
             Interval: pick(request.Interval, image.Interval),
             Timeout: pick(request.Timeout, image.Timeout),
             Retries: pick(request.Retries, image.Retries),
-            StartPeriod: pick(request.StartPeriod, image.StartPeriod)
+            StartPeriod: pick(request.StartPeriod, image.StartPeriod),
+            StartInterval: pick(request.StartInterval, image.StartInterval)
         )
     }
 }
