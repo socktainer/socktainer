@@ -17,9 +17,8 @@ struct AppleContainerImageStoreResolver {
         // Descriptor model does not expose either field. Recover them from the raw OCI blob
         // only when the underlying content actually contains them.
         guard
-            let document = jsonObject(
-                at: blobURL(appSupportURL: appSupportURL, digest: parentDigest)
-            ),
+            let url = blobURL(appSupportURL: appSupportURL, digest: parentDigest),
+            let document = jsonObject(at: url),
             let descriptor = findDescriptor(in: document, childDigest: childDigest)
         else {
             return nil
@@ -38,10 +37,13 @@ struct AppleContainerImageStoreResolver {
         // Docker exposes GraphDriver details on inspect. Apple does not model an image graph
         // driver directly, but unpacked snapshots persist `snapshot-info`, which is the closest
         // host-side source we can map without inventing values.
+        guard let encoded = try? descriptor.digest.validatedDigestEncoding() else {
+            return nil
+        }
         let infoURL =
             appSupportURL
             .appendingPathComponent("snapshots", isDirectory: true)
-            .appendingPathComponent(descriptor.digest.trimmingDigestPrefix, isDirectory: true)
+            .appendingPathComponent(encoded, isDirectory: true)
             .appendingPathComponent("snapshot-info", isDirectory: false)
 
         guard
@@ -80,12 +82,16 @@ struct AppleContainerImageStoreResolver {
         return DriverData(Name: name, Data: driverData)
     }
 
-    private static func blobURL(appSupportURL: URL, digest: String) -> URL {
-        appSupportURL
+    private static func blobURL(appSupportURL: URL, digest: String) -> URL? {
+        guard let encoded = try? digest.validatedDigestEncoding() else {
+            return nil
+        }
+        return
+            appSupportURL
             .appendingPathComponent("content", isDirectory: true)
             .appendingPathComponent("blobs", isDirectory: true)
             .appendingPathComponent("sha256", isDirectory: true)
-            .appendingPathComponent(digest.trimmingDigestPrefix, isDirectory: false)
+            .appendingPathComponent(encoded, isDirectory: false)
     }
 
     private static func jsonObject(at url: URL) -> Any? {
