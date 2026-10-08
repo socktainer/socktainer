@@ -129,6 +129,30 @@ actor PreStartInjectionStore {
         }
     }
 
+    /// Carry staged files and create options over to a container rebuilt under
+    /// a new name.
+    func move(from oldId: String, to newId: String) throws {
+        if let oldRoot = containerRoot(oldId), let newRoot = containerRoot(newId),
+            FileManager.default.fileExists(atPath: oldRoot.path)
+        {
+            let files = try pending(containerId: oldId)
+            try? FileManager.default.removeItem(at: newRoot)
+            try FileManager.default.moveItem(at: oldRoot, to: newRoot)
+            let moved = files.map {
+                StagedFile(
+                    guestPath: $0.guestPath,
+                    hostPath: newRoot.path + $0.hostPath.dropFirst(oldRoot.path.count))
+            }
+            if let manifest = manifestURL(newId) {
+                try JSONEncoder().encode(moved).write(to: manifest)
+            }
+        }
+        if let remove = autoRemove.removeValue(forKey: oldId) {
+            autoRemove[newId] = remove
+            try persistCreateOptions()
+        }
+    }
+
     func clear(containerId: String) throws {
         if let root = containerRoot(containerId) {
             // Cleanup only: a staging directory that outlives its container is

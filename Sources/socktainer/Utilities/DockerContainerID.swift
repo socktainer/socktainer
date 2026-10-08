@@ -9,6 +9,10 @@ import Foundation
 /// so socktainer derives a stable Docker-shaped ID from the native ID and
 /// resolves hex references back to native IDs.
 enum DockerContainerID {
+    /// The native ID a container was created under, set when a rename rebuilds
+    /// it under a new one, so its Docker ID survives the rename.
+    static let idSeedLabel = "io.github.socktainer.id-seed"
+
     /// Returns the Docker-shaped ID for a container: the SHA-256 digest of
     /// its native ID and creation date, hex-encoded (64 lowercase
     /// characters). Deriving instead of storing keeps the mapping stable
@@ -16,7 +20,9 @@ enum DockerContainerID {
     /// Including the creation date preserves Docker's semantics that
     /// recreating a container under the same name yields a new ID.
     static func hexId(for container: ContainerSnapshot) -> String {
-        hexId(nativeId: container.id, createdAt: AppleContainerTimestampResolver.containerCreationDate(container))
+        hexId(
+            nativeId: container.configuration.labels[idSeedLabel] ?? container.id,
+            createdAt: AppleContainerTimestampResolver.containerCreationDate(container))
     }
 
     static func hexId(nativeId: String, createdAt: Date?) -> String {

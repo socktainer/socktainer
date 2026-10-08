@@ -86,6 +86,7 @@ protocol ClientContainerProtocol: Sendable {
     func restart(id: String, signal: String?, timeout: Int?) async throws
     func kill(id: String, signal: String?) async throws
     func delete(id: String) async throws
+    func rename(id: String, newName: String) async throws
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
@@ -95,6 +96,9 @@ enum ClientContainerError: Error {
     case notRunning(id: String)
     case ambiguousId(reference: String, matches: [String])
     case unsupportedCondition(ContainerWaitCondition)
+    case invalidName(String)
+    case nameConflict(String)
+    case renameRequiresUnstarted(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -439,6 +443,60 @@ struct ClientContainerService: ClientContainerProtocol {
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.
         try await PreStartInjectionStore.shared.clear(containerId: container.id)
+    }
+
+    /// Apple Container has no rename and identifies containers by name, so a
+    /// rename rebuilds the container under the new name, the same way staged
+    /// files are applied before start. Only a container that never booted can
+    /// be rebuilt without losing anything: one that ran has a private rootfs
+    /// the rebuild would discard. That covers Compose's recreate, which renames
+    /// its freshly created replacement before starting it.
+    func rename(id: String, newName: String) async throws {
+        let newId = ContainerNameUtility.sanitize(newName)
+        guard ManagedContainer.nameValid(newId) else {
+            throw ClientContainerError.invalidName(newName)
+        }
+        try await Self.preStartInjectionAdmission.withSlot {
+            guard let container = try await self.getContainerWithoutPreparationWait(id: id) else {
+                throw ClientContainerError.notFound(id: id)
+            }
+            let oldId = container.id
+            guard newId != oldId else { return }
+            if try await self.getContainerWithoutPreparationWait(id: newId)?.id == newId {
+                throw ClientContainerError.nameConflict(newId)
+            }
+            let rootfs = AppleContainerTimestampResolver.appSupportURL
+                .appendingPathComponent("containers").appendingPathComponent(oldId)
+                .appendingPathComponent("rootfs.ext4")
+            guard container.status == .stopped, container.startedDate == nil,
+                !FileManager.default.fileExists(atPath: rootfs.path)
+            else {
+                throw ClientContainerError.renameRequiresUnstarted(id: oldId)
+            }
+
+            var configuration = container.configuration
+            configuration.id = newId
+            // Keep the Docker id: clients hold it across the rename (Compose starts by it).
+            configuration.labels[DockerContainerID.idSeedLabel] =
+                container.configuration.labels[DockerContainerID.idSeedLabel] ?? oldId
+            let renamed = configuration
+
+            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            let options = await PreStartInjectionStore.shared.createOptions(containerId: oldId)
+            try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            do {
+                try await self.containerClient.withClient {
+                    try await $0.create(configuration: renamed, options: options, kernel: kernel)
+                }
+            } catch {
+                // Put the original back so a failed rename does not lose the container.
+                try? await self.containerClient.withClient {
+                    try await $0.create(configuration: container.configuration, options: options, kernel: kernel)
+                }
+                throw error
+            }
+            try await PreStartInjectionStore.shared.move(from: oldId, to: newId)
+        }
     }
 
     // Poll until the container is no longer running, then return the real exit

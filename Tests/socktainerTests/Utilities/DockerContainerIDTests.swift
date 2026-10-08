@@ -1,3 +1,5 @@
+import ContainerResource
+import ContainerizationOCI
 import Foundation
 import Testing
 
@@ -28,6 +30,29 @@ struct DockerContainerIDTests {
         #expect(
             DockerContainerID.hexId(nativeId: "a", createdAt: created) != DockerContainerID.hexId(nativeId: "b", createdAt: created)
         )
+    }
+
+    @Test("A renamed container keeps the ID it was created with")
+    func renameKeepsId() {
+        func snapshot(id: String, labels: [String: String]) -> ContainerSnapshot {
+            let process = ProcessConfiguration(
+                executable: "/bin/sh", arguments: [], environment: [],
+                workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+            let image = ImageDescription(
+                reference: "alpine:latest",
+                descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+            var configuration = ContainerConfiguration(id: id, image: image, process: process)
+            configuration.labels = labels
+            return ContainerSnapshot(configuration: configuration, status: .stopped, networks: [])
+        }
+        let timestamp = [AppleContainerTimestampResolver.legacyCreationTimestampLabel: "1765500000"]
+        let original = snapshot(id: "abc_web-1", labels: timestamp)
+        var renamedLabels = timestamp
+        renamedLabels[DockerContainerID.idSeedLabel] = "abc_web-1"
+        let renamed = snapshot(id: "web-1", labels: renamedLabels)
+
+        #expect(DockerContainerID.hexId(for: renamed) == DockerContainerID.hexId(for: original))
+        #expect(DockerContainerID.hexId(for: renamed) != DockerContainerID.hexId(for: snapshot(id: "web-1", labels: timestamp)))
     }
 
     @Test("Recreating a container under the same name yields a new ID")

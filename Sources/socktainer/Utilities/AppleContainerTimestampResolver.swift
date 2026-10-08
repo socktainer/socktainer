@@ -4,7 +4,7 @@ import Foundation
 enum AppleContainerTimestampResolver {
     static let legacyCreationTimestampLabel = "io.github.socktainer.creation-timestamp"
 
-    private static let appSupportURL = URL(
+    static let appSupportURL = URL(
         fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container"
     )
     private static let epoch = Date(timeIntervalSince1970: 0)
