@@ -149,6 +149,14 @@ struct LoopbackGatewayRewriteTests {
         #expect(result[1] == "BIND=127.0.0.1:80")  // unchanged
         #expect(result[2] == "CACHE=redis://10.1.2.3:6379")
     }
+
+    @Test("Rewrite is off by default so explicit public URLs are preserved (#416)")
+    func rewriteIsOptIn() {
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: nil))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["app": "web"]))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "false"]))
+        #expect(ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "true"]))
+    }
 }
 
 @Suite("ContainerCreateRoute — peer hostname rewrite")

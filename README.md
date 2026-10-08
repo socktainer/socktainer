@@ -280,6 +280,14 @@ automatically removes it when a Postgres container is created, before
 **Opt out** — set `SOCKTAINER_CLEAN_VOLUMES=false` globally, or label a
 specific volume with `socktainer.clean-volumes=false`.
 
+### Loopback URLs in environment variables
+
+Like Docker, Socktainer passes environment values through unchanged, so
+`127.0.0.1` inside a container refers to the container itself. To have
+URL-form values (`scheme://127.0.0.1:PORT` or `user@127.0.0.1:PORT`) rewritten
+to the network gateway for a container on a named network, opt in with the
+`socktainer.rewrite-loopback=true` container label.
+
 ---
 
 ## Building from Source 🏗️
