@@ -247,6 +247,26 @@ jobs:
           sudo docker image ls | grep 'crafted-baseline'
           sudo docker rmi crafted-baseline:latest
 
+      # https://github.com/socktainer/socktainer/issues/399
+      - name: check image lookup by ID
+        run: |
+          sudo docker pull quay.io/podman/hello
+          # Id reported by inspect (config digest)
+          ID=$(sudo docker image inspect quay.io/podman/hello -f '{{.Id}}')
+          sudo docker image inspect "$ID" > /dev/null
+          # ID reported by image ls (index digest): full, bare hex and 12-char short forms
+          LS_ID=$(sudo docker image ls --no-trunc --format '{{.ID}} {{.Repository}}' | awk '/podman\/hello/{print $1; exit}')
+          sudo docker image inspect "$LS_ID" > /dev/null
+          sudo docker image inspect "${LS_ID#sha256:}" > /dev/null
+          sudo docker image inspect "$(echo "${LS_ID#sha256:}" | cut -c1-12)" > /dev/null
+          # other routes accepting an image ID
+          sudo docker history "$ID" > /dev/null
+          sudo docker tag "$ID" hello-by-id:test
+          sudo docker image inspect hello-by-id:test > /dev/null
+          sudo docker rmi hello-by-id:test
+          # unknown IDs keep docker's wording
+          sudo docker image inspect deadbeefdead 2>&1 | grep 'No such image: deadbeefdead'
+
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails
       #       on CI host.

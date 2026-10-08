@@ -135,7 +135,7 @@ extension ImageHistoryRoute {
 
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
+                image = try await ImageIDResolver.get(refOrId, containerSystemConfig: systemConfig)
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }

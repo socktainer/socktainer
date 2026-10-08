@@ -138,7 +138,7 @@ extension ImageInspectRoute {
 
             let image: ClientImage
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
+                image = try await ImageIDResolver.get(refOrId, containerSystemConfig: systemConfig)
             } catch {
                 // Docker phrasing ("No such image: <ref>") is load-bearing: docker-py
                 // only maps a 404 to ImageNotFound when the message contains

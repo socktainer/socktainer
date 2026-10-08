@@ -119,7 +119,7 @@ protocol ImageDeletionStore: Sendable {
 /// Production implementation — delegates straight to Apple Container.
 struct LiveImageDeletionStore: ImageDeletionStore {
     func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
-        let image = try await ClientImage.get(reference: id, containerSystemConfig: config)
+        let image = try await ImageIDResolver.get(id, containerSystemConfig: config)
         return (image.reference, image.digest)
     }
 
