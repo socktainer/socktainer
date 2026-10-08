@@ -3,10 +3,13 @@ import Foundation
 
 enum AppleContainerSnapshotResolver {
     static func unpackedSize(appSupportURL: URL, descriptor: Descriptor) -> Int64 {
+        guard let encoded = try? descriptor.digest.validatedDigestEncoding() else {
+            return 0
+        }
         let snapshotDirectory =
             appSupportURL
             .appendingPathComponent("snapshots", isDirectory: true)
-            .appendingPathComponent(descriptor.digest.trimmingDigestPrefix, isDirectory: true)
+            .appendingPathComponent(encoded, isDirectory: true)
 
         guard FileManager.default.fileExists(atPath: snapshotDirectory.path) else {
             return 0
