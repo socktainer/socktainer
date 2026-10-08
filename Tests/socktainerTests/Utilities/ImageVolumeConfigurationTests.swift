@@ -10,7 +10,7 @@ import Testing
 struct ImageVolumeConfigurationTests {
     @Test("inspect preserves declarations when the raw config is readable")
     func readableInspectVolumes() async {
-        let volumes = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
+        let volumes: [String: [String: String]]? = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
             ["/var/log": [:]]
         }
         #expect(volumes == ["/var/log": [:]])
@@ -46,6 +46,20 @@ struct ImageVolumeConfigurationTests {
         let encoded = try JSONEncoder().encode(config.config?.Volumes)
         let json = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: [String: String]])
         #expect(json["/var/log"] == [:])
+    }
+
+    @Test("raw Docker image config preserves the Dockerfile HEALTHCHECK")
+    func healthcheck() throws {
+        let raw = Data(
+            #"{"config":{"Healthcheck":{"Test":["CMD","python","/app/healthcheck.py"],"Interval":1000000000,"Timeout":10000000000,"StartPeriod":5000000000,"StartInterval":500000000,"Retries":3}}}"#
+                .utf8)
+        let hc = try #require(try JSONDecoder().decode(ImageVolumeConfiguration.self, from: raw).config?.Healthcheck)
+        #expect(hc.Test == ["CMD", "python", "/app/healthcheck.py"])
+        #expect(hc.Interval == 1_000_000_000)
+        #expect(hc.Timeout == 10_000_000_000)
+        #expect(hc.StartPeriod == 5_000_000_000)
+        #expect(hc.StartInterval == 500_000_000)
+        #expect(hc.Retries == 3)
     }
 
     @Test(

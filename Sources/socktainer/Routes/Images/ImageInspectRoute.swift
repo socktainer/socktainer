@@ -259,7 +259,7 @@ extension ImageInspectRoute {
 
             if let selectedVariant {
                 let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
-                let imageVolumes = await ImageVolumeConfiguration.readForInspect(logger: req.logger) {
+                let rawConfig = await ImageVolumeConfiguration.readForInspect(logger: req.logger) {
                     try await ImageVolumeConfiguration.read(image: image, platform: selectedVariant.platform)
                 }
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
@@ -268,9 +268,18 @@ extension ImageInspectRoute {
                         ExposedPorts: nil,
                         Env: ociConfig.env,
                         Cmd: ociConfig.cmd,
-                        Healthcheck: nil,
+                        Healthcheck: rawConfig?.Healthcheck.map {
+                            HealthConfig(
+                                Test: $0.Test,
+                                Interval: $0.Interval.map(Int64.init),
+                                Timeout: $0.Timeout.map(Int64.init),
+                                Retries: $0.Retries,
+                                StartPeriod: $0.StartPeriod.map(Int64.init),
+                                StartInterval: $0.StartInterval.map(Int64.init)
+                            )
+                        },
                         ArgsEscaped: nil,
-                        Volumes: imageVolumes,
+                        Volumes: rawConfig?.Volumes,
                         WorkingDir: ociConfig.workingDir,
                         Entrypoint: ociConfig.entrypoint,
                         OnBuild: nil,

@@ -31,6 +31,7 @@ actor HealthCheckManager {
     static let defaultIntervalNs: UInt64 = 30 * 1_000_000_000
     static let defaultTimeoutNs: UInt64 = 30 * 1_000_000_000
     static let defaultRetries: Int = 3
+    static let defaultStartIntervalNs: UInt64 = 5 * 1_000_000_000
 
     // Lower bounds applied to the user-supplied values. The interval floor is
     // overridable so tests can drive the loop at sub-second cadence; the
@@ -143,9 +144,12 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
-        if startPeriodNs > 0 {
-            try? await Task.sleep(nanoseconds: startPeriodNs)
-        }
+        let configStartIntervalNs = config.StartInterval.map { UInt64(max($0, 0)) } ?? 0
+        let startIntervalNs = max(configStartIntervalNs > 0 ? configStartIntervalNs : Self.defaultStartIntervalNs, intervalFloorNs)
+
+        // Like Docker, probe every StartInterval during StartPeriod rather than waiting it out.
+        var startDeadline: Date? =
+            startPeriodNs > 0 ? Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000) : nil
 
         var failingStreak = 0
 
@@ -165,17 +169,25 @@ actor HealthCheckManager {
                 Output: ""  // stdout capture from container VMs requires pipe infrastructure
             )
 
+            let inStartPeriod = startDeadline.map { start < $0 } ?? false  // classify by when the probe began
+
             if exitCode == 0 {
+                startDeadline = nil  // the first success ends the start period
                 failingStreak = 0
                 updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
+            } else if inStartPeriod {
+                // Failures during the start period don't count toward Retries.
+                updateStatus(id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
-                let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
+                // Below Retries, keep the current status: a healthy container stays healthy.
+                let status = failingStreak >= maxRetries ? "unhealthy" : (statuses[containerId]?.Status ?? "starting")
                 updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
 
-            try? await Task.sleep(nanoseconds: intervalNs)
+            let stillStarting = startDeadline.map { Date() < $0 } ?? false
+            try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
         }
     }
 
