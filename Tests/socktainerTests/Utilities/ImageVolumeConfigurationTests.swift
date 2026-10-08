@@ -48,6 +48,19 @@ struct ImageVolumeConfigurationTests {
         #expect(json["/var/log"] == [:])
     }
 
+    @Test("raw Docker image config preserves the Dockerfile HEALTHCHECK")
+    func healthcheck() throws {
+        let raw = Data(
+            #"{"config":{"Healthcheck":{"Test":["CMD","python","/app/healthcheck.py"],"Interval":1000000000,"Timeout":10000000000,"StartPeriod":5000000000,"Retries":3}}}"#
+                .utf8)
+        let hc = try #require(try JSONDecoder().decode(ImageVolumeConfiguration.self, from: raw).config?.Healthcheck)
+        #expect(hc.Test == ["CMD", "python", "/app/healthcheck.py"])
+        #expect(hc.Interval == 1_000_000_000)
+        #expect(hc.Timeout == 10_000_000_000)
+        #expect(hc.StartPeriod == 5_000_000_000)
+        #expect(hc.Retries == 3)
+    }
+
     @Test(
         "missing and null declarations do not allocate volumes",
         arguments: [
