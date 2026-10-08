@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerNetworkClient
 import ContainerPersistence
 import ContainerizationError
 import Vapor
@@ -198,6 +199,14 @@ func configure(_ app: Application) async throws {
         ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
         .flatMap(Int.init) ?? 2054
     let dnsServer = SocktainerDNSServer()
+    // Forward non-container names to the vmnet gateway resolver (as `default`-network
+    // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
+    do {
+        dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+        app.logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+    } catch {
+        app.logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    }
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
         return

@@ -318,7 +318,7 @@ struct SocktainerDNSQueryTests {
         // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
         server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = dnsRcode(type: 1, names: ["no-such-container"], port: port)
-        #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding to 1.1.1.1")
+        #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding upstream")
     }
 
     @Test("AAAA query for single-label name returns NODATA (RCODE 0, no answers)")
@@ -331,7 +331,7 @@ struct SocktainerDNSQueryTests {
         server.register(hostname: "db", ip: "192.168.67.3")
         // NODATA is RCODE=0 with zero answer records; the test checks RCODE only.
         let rcode = dnsRcode(type: 28, names: ["db"], port: port)
-        #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not NXDOMAIN from 1.1.1.1")
+        #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not an upstream NXDOMAIN")
     }
 
     @Test("AAAA query for unknown single-label name returns NODATA (RCODE 0)")
@@ -343,7 +343,55 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "_warmup", ip: "127.0.0.1")
         let rcode = dnsRcode(type: 28, names: ["unknown-svc"], port: port)
-        #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+        #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward upstream")
+    }
+
+    @Test("Multi-label query is forwarded to the configured upstream, not 1.1.1.1 (#410)")
+    func multiLabelQueryForwardsToConfiguredUpstream() throws {
+        // Stub upstream on loopback: answers every query with RCODE=5 (REFUSED), a code
+        // neither 1.1.1.1 nor the local fast path would return for this name.
+        let stub = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(stub >= 0)
+        defer { Darwin.close(stub) }
+        var tv = timeval(tv_sec: 2, tv_usec: 0)  // lets the stub thread exit after the test
+        setsockopt(stub, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(stub, $0, len) == 0 && getsockname(stub, $0, &len) == 0 }
+        }
+        try #require(bound)
+        let stubPort = Int(UInt16(bigEndian: addr.sin_port))
+        let stubThread = Thread {
+            var buf = [UInt8](repeating: 0, count: 512)
+            var from = sockaddr_in()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            while true {
+                let n = withUnsafeMutablePointer(to: &from) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(stub, &buf, buf.count, 0, $0, &fromLen) }
+                }
+                guard n >= 12 else { return }
+                buf[2] |= 0x80  // QR=1
+                buf[3] = (buf[3] & 0xF0) | 0x05  // RCODE=5
+                _ = withUnsafePointer(to: &from) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(stub, buf, n, 0, $0, fromLen) }
+                }
+            }
+        }
+        stubThread.start()
+
+        let server = SocktainerDNSServer()
+        server.upstreamHost = "127.0.0.1"
+        server.upstreamPort = stubPort
+        guard let port = server.start(preferredPort: 19780, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        let rcode = dnsRcode(type: 1, names: ["host.internal.example"], port: port)
+        #expect(rcode == 5, "multi-label name must be answered by the configured upstream")
     }
 
     @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
