@@ -306,8 +306,9 @@ extension ImageInspectRoute {
                         appSupportURL: appleContainerAppSupportUrl
                     ),
                     Manifests: includeManifests ? manifestSummaries : nil,
-                    RepoTags: [image.reference],
-                    RepoDigests: repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
+                    RepoTags: ImageListFilter.repoTags(for: image.reference),
+                    RepoDigests: ImageListFilter.repoTags(for: image.reference).isEmpty
+                        ? [] : repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
                     Parent: "",
                     Comment: selectedVariant.config.history?.last?.comment ?? "",
                     Created: selectedVariant.config.created,

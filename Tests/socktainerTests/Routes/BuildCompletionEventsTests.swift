@@ -40,4 +40,13 @@ struct BuildCompletionEventsTests {
         #expect(events[0]["stream"] as? String == "Successfully tagged probe:1\n")
         #expect(Self.dockerPyImageID(events[0]) == nil)
     }
+
+    @Test("an untagged build yields no Successfully tagged event")
+    func untaggedBuild() {
+        let events = BuildRoute.completionEvents(imageID: Self.imageID, tag: nil)
+
+        #expect(events.count == 2)
+        #expect(events[1]["stream"] as? String == "Successfully built 83fc7ce1224f\n")
+        #expect(BuildRoute.completionEvents(imageID: nil, tag: nil).isEmpty)
+    }
 }
