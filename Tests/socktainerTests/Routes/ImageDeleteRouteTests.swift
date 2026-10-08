@@ -28,6 +28,9 @@ struct ImageDeleteRouteTests {
         /// Simulates Apple Container normalizing "test:latest" → "docker.io/library/test:latest".
         let storedNormalized: String
         let digest: String
+        /// Whether `normalizedReference(for:)` reports the id as matched by image ID.
+        var byID = false
+        var refsShouldThrow = false
 
         /// Tracks the exact reference passed to each `delete(reference:)` call.
         private(set) var deleteCalls: [String] = []
@@ -41,11 +44,12 @@ struct ImageDeleteRouteTests {
             self.alive = Set([storedNormalized] + otherRefs)
         }
 
-        func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
-            (storedNormalized, digest)
+        func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool) {
+            (storedNormalized, digest, byID)
         }
 
         func refsForDigest(_ digest: String) async throws -> [String] {
+            if refsShouldThrow { throw NSError(domain: "ListFailed", code: 1) }
             // Return alive refs that match the requested digest.
             guard digest == self.digest else { return [] }
             return Array(alive)
@@ -141,6 +145,46 @@ struct ImageDeleteRouteTests {
         #expect(result.deletedDigest == nil, "must not include Deleted when other refs still exist")
     }
 
+    @Test("delete by image ID refuses an image that still has several references")
+    func deleteByIDConflictsWithMultipleRefs() async throws {
+        let store = FakeImageStore(
+            storedNormalized: "docker.io/library/test:v1",
+            otherRefs: ["docker.io/library/test:latest"]
+        )
+        store.byID = true
+
+        do {
+            _ = try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+            Issue.record("expected ClientImageError.conflict")
+        } catch ClientImageError.conflict(let id) {
+            #expect(id == "abc123abc123")
+        }
+        #expect(store.deleteCalls.isEmpty, "no reference may be removed on conflict")
+    }
+
+    @Test("delete by image ID does not delete when the reference lookup fails")
+    func deleteByIDPropagatesRefsFailure() async throws {
+        let store = FakeImageStore(storedNormalized: "docker.io/library/test:v1")
+        store.byID = true
+        store.refsShouldThrow = true
+
+        await #expect(throws: NSError.self) {
+            try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+        }
+        #expect(store.deleteCalls.isEmpty)
+    }
+
+    @Test("delete by image ID removes an image with a single reference")
+    func deleteByIDSingleRef() async throws {
+        let store = FakeImageStore(storedNormalized: "docker.io/library/test:v1")
+        store.byID = true
+
+        let result = try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+
+        #expect(result.untagged == "docker.io/library/test:v1")
+        #expect(result.deletedDigest == "sha256:abc123")
+    }
+
     @Test("result includes Deleted digest when last reference is removed")
     func deletedDigestIncludedForLastRef() async throws {
         // "test:latest" is the only tag for this digest — removing it should emit Deleted.
@@ -194,7 +238,7 @@ struct ImageDeleteRouteTests {
     @Test("delete throws notFound when image does not exist in store")
     func deleteThrowsNotFoundForUnknownImage() async throws {
         struct ThrowingStore: ImageDeletionStore {
-            func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
+            func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool) {
                 throw NSError(domain: "ContainerNotFound", code: 1)
             }
             func refsForDigest(_ digest: String) async throws -> [String] { [] }

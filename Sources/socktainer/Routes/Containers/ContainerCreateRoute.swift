@@ -148,9 +148,10 @@ extension ContainerCreateRoute {
             // Validate the requested platform only if provided
             var requestedPlatform = try Platform(from: containerPlatform)
 
-            // Check if image exists locally
+            // Check if image exists locally; resolve an image ID to its reference
+            let imageReference: String
             do {
-                _ = try await ClientImage.get(reference: body.Image, containerSystemConfig: systemConfig)
+                imageReference = try await ImageIDResolver.get(body.Image, containerSystemConfig: systemConfig).reference
             } catch {
                 throw ContainerCreateRoute.imageExistenceError(error, image: body.Image)
             }
@@ -163,9 +164,9 @@ extension ContainerCreateRoute {
             var img: ClientImage
             do {
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: imageReference,
                     platform: requestedPlatform,
-                    scheme: RegistryScheme.scheme(forReference: body.Image, internalDnsDomain: systemConfig.dns.domain),
+                    scheme: RegistryScheme.scheme(forReference: imageReference, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
                 // Case 2: image exists locally but may have been pulled as amd64
@@ -184,9 +185,9 @@ extension ContainerCreateRoute {
                 let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
                 req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
                 img = try await ClientImage.fetch(
-                    reference: body.Image,
+                    reference: imageReference,
                     platform: amd64,
-                    scheme: RegistryScheme.scheme(forReference: body.Image, internalDnsDomain: systemConfig.dns.domain),
+                    scheme: RegistryScheme.scheme(forReference: imageReference, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
                 requestedPlatform = amd64

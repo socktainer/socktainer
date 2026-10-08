@@ -133,17 +133,17 @@ extension ImageHistoryRoute {
                 preferredPlatform = nil
             }
 
-            let image: ClientImage
+            let resolved: ImageIDResolver.Resolved
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
+                resolved = try await ImageIDResolver.resolve(refOrId, containerSystemConfig: systemConfig)
             } catch {
                 throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
             }
 
             return try await historyResponseItems(
-                for: image,
+                for: resolved.image,
                 requestedName: refOrId,
-                preferredPlatform: preferredPlatform
+                preferredPlatform: preferredPlatform ?? resolved.platform
             )
         }
     }

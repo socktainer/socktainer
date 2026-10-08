@@ -30,6 +30,9 @@ extension ImageDeleteRoute {
                     throw Abort(.notFound, reason: "No such image: \(id)")
                 case .digestReferenceNotAllowed(let repo):
                     throw Abort(.badRequest, reason: "cannot reference \(repo) by digest")
+                case .conflict(let id):
+                    // moby's wording (daemon/images/image_delete.go)
+                    throw Abort(.conflict, reason: "conflict: unable to delete \(id) (must be forced) - image is referenced in multiple repositories")
                 }
             }
 

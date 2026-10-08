@@ -38,7 +38,7 @@ extension ImageTagRoute {
 
         let sourceImage: ClientImage
         do {
-            sourceImage = try await ClientImage.get(reference: sourceImageName, containerSystemConfig: systemConfig)
+            sourceImage = try await ImageIDResolver.get(sourceImageName, containerSystemConfig: systemConfig)
         } catch {
             throw Abort(.notFound, reason: "No such image: \(sourceImageName)")
         }
