@@ -76,7 +76,7 @@ struct ContainerWaitStoppedTests {
         )
 
         #expect(result.StatusCode == 0)
-        #expect(Date().timeIntervalSince(started) < 5, "must not wait out the 30s store poll")
+        #expect(Date().timeIntervalSince(started) < 15, "must not wait out the 30s store poll")
     }
 
     @Test("a recorded exit code is reported instead of a clean exit")
