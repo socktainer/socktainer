@@ -201,11 +201,18 @@ func configure(_ app: Application) async throws {
     let dnsServer = SocktainerDNSServer()
     // Forward non-container names to the vmnet gateway resolver (as `default`-network
     // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
-    do {
-        dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
-        app.logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
-    } catch {
-        app.logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
+    let logger = app.logger
+    let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+        do {
+            dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+            logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+        } catch {
+            logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+        }
+    }
+    if !gatewayLookupFinished {
+        logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
     }
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")

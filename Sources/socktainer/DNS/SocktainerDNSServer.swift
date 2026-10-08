@@ -19,8 +19,14 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: [UInt8]] = [:]  // normalized hostname → 4-byte IPv4
     private var log = Logger(label: "socktainer.dns")
-    /// Upstream for non-container names. Set before `start(...)`; not mutated afterwards.
-    var upstreamHost = "1.1.1.1"
+    private var _upstreamHost = "1.1.1.1"
+    /// Upstream for non-container names. Lock-guarded: startup may set it after the
+    /// server is already answering queries.
+    var upstreamHost: String {
+        get { lock.withLock { _upstreamHost } }
+        set { lock.withLock { _upstreamHost = newValue } }
+    }
+    /// Upstream port; only overridden by tests, before `start(...)`.
     var upstreamPort = 53
 
     func register(hostname: String, ip: String) {
