@@ -154,7 +154,10 @@ actor HealthCheckManager {
         var failingStreak = 0
 
         while !Task.isCancelled {
-            guard isActive(id: containerId) else { return }
+            // Like Docker, wait one interval before each probe, including the first.
+            let stillStarting = startDeadline.map { Date() < $0 } ?? false
+            try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
+            guard !Task.isCancelled, isActive(id: containerId) else { return }
 
             let start = Date()
             let exitCode = await runCheck(containerId: containerId, config: config, timeoutNs: timeoutNs)
@@ -185,9 +188,6 @@ actor HealthCheckManager {
                 updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
-
-            let stillStarting = startDeadline.map { Date() < $0 } ?? false
-            try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
         }
     }
 

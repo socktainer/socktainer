@@ -173,6 +173,22 @@ struct HealthCheckManagerTests {
         let cfg = HealthcheckConfig(
             Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: 60_000_000_000)
         await mgr.start(containerId: "c1", config: cfg)
+        // The first probe fires after the 5s default start interval, well before the 60s start period ends.
+        for _ in 0..<1600 where await mgr.currentHealth(for: "c1")?.Status != "healthy" {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await mgr.currentHealth(for: "c1")?.Status == "healthy")
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("The first probe waits one interval, like Docker")
+    func firstProbeWaitsOneInterval() async throws {
+        let mgr = HealthCheckManager(probe: { _, _, _ in 0 }, intervalFloorNs: 1_000_000)
+        let cfg = HealthcheckConfig(Test: ["CMD", "true"], Interval: 500_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: nil)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await mgr.currentHealth(for: "c1")?.Status == "starting")
+        #expect(await mgr.currentHealth(for: "c1")?.Log.isEmpty == true)
         try await Self.waitForStatus("healthy", on: mgr, id: "c1")
         await mgr.stop(containerId: "c1")
     }
