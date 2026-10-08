@@ -263,6 +263,8 @@ jobs:
           sudo docker history "$ID" > /dev/null
           sudo docker tag "$ID" hello-by-id:test
           sudo docker image inspect hello-by-id:test > /dev/null
+          # an ID naming an image with several tags is refused, like docker
+          sudo docker rmi "$ID" 2>&1 | grep 'must be forced'
           sudo docker rmi hello-by-id:test
           # unknown IDs keep docker's wording
           sudo docker image inspect deadbeefdead 2>&1 | grep 'No such image: deadbeefdead'

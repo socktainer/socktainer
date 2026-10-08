@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerPersistence
+import ContainerizationOCI
 
 /// Resolves an image the way Docker does: by reference, or by (short) image ID.
 ///
@@ -21,29 +22,69 @@ enum ImageIDResolver {
         digest.hasPrefix("sha256:") && digest.dropFirst("sha256:".count).hasPrefix(hex)
     }
 
-    // Linear scan over every image; on an ambiguous short prefix the first match wins
-    // (Docker rejects it instead).
+    struct Candidate {
+        let digest: String
+        let configs: [(platform: Platform, digest: String)]
+    }
+
+    struct Match: Equatable {
+        let digest: String
+        /// The platform whose config digest matched; nil when the index digest matched.
+        let platform: Platform?
+    }
+
+    /// The single image `hex` identifies, or nil when no image or more than one distinct
+    /// image matches (Docker rejects an ambiguous prefix).
+    static func uniqueMatch(_ hex: String, in candidates: [Candidate]) -> Match? {
+        var found: [String: Match] = [:]
+        for candidate in candidates {
+            if matches(hex, digest: candidate.digest) {
+                found[candidate.digest] = Match(digest: candidate.digest, platform: nil)
+            } else if let config = candidate.configs.first(where: { matches(hex, digest: $0.digest) }) {
+                found[candidate.digest] = Match(digest: candidate.digest, platform: config.platform)
+            }
+        }
+        return found.count == 1 ? found.values.first : nil
+    }
+
+    struct Resolved {
+        let image: ClientImage
+        /// Set when the ID was a platform's config digest, so callers can show that variant.
+        let platform: Platform?
+        /// True when `refOrId` was resolved as an image ID rather than a reference.
+        let byID: Bool
+    }
+
     static func get(_ refOrId: String, containerSystemConfig: ContainerSystemConfig) async throws -> ClientImage {
+        try await resolve(refOrId, containerSystemConfig: containerSystemConfig).image
+    }
+
+    /// Tries `refOrId` as a reference first, then as an image ID matched against every
+    /// image's index digest and per-platform config digests. Rethrows the reference
+    /// lookup error when no single image matches.
+    static func resolve(_ refOrId: String, containerSystemConfig: ContainerSystemConfig) async throws -> Resolved {
         do {
-            return try await ClientImage.get(reference: refOrId, containerSystemConfig: containerSystemConfig)
+            let image = try await ClientImage.get(reference: refOrId, containerSystemConfig: containerSystemConfig)
+            return Resolved(image: image, platform: nil, byID: false)
         } catch {
             guard let hex = candidateID(refOrId) else { throw error }
             let images = try await ClientImage.list()
-            if let image = images.first(where: { matches(hex, digest: $0.digest) }) {
-                return image
-            }
-            for image in images {
-                guard let manifests = try? await image.index().manifests else { continue }
-                for descriptor in manifests {
+            var candidates: [Candidate] = []
+            var seen: Set<String> = []
+            for image in images where seen.insert(image.digest).inserted {
+                var configs: [(platform: Platform, digest: String)] = []
+                for descriptor in (try? await image.index().manifests) ?? [] {
                     guard let platform = descriptor.platform,
                         let manifest = try? await image.manifest(for: platform)
                     else { continue }
-                    if matches(hex, digest: manifest.config.digest) {
-                        return image
-                    }
+                    configs.append((platform, manifest.config.digest))
                 }
+                candidates.append(Candidate(digest: image.digest, configs: configs))
             }
-            throw error
+            guard let match = uniqueMatch(hex, in: candidates),
+                let image = images.first(where: { $0.digest == match.digest })
+            else { throw error }
+            return Resolved(image: image, platform: match.platform, byID: true)
         }
     }
 }

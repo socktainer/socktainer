@@ -58,6 +58,8 @@ extension ClientImageProtocol {
 enum ClientImageError: Error {
     case notFound(id: String)
     case digestReferenceNotAllowed(repo: String)
+    /// Deleting by image ID while several references still point at the image.
+    case conflict(id: String)
 }
 
 enum PullProgress: Sendable {
@@ -103,8 +105,9 @@ actor PullByteCounter {
 /// Seam that abstracts the static `ClientImage` API for testing.
 /// The real implementation delegates to Apple Container; tests inject a fake.
 protocol ImageDeletionStore: Sendable {
-    /// Return the (normalizedReference, digest) for the image matching `id`.
-    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String)
+    /// Return the normalized reference and digest for the image matching `id`, and whether
+    /// `id` matched as an image ID rather than as a reference.
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool)
     /// Return all normalized references that share the same digest.
     /// Call this AFTER delete() to determine whether the deletion freed the image layers.
     func refsForDigest(_ digest: String) async throws -> [String]
@@ -118,9 +121,9 @@ protocol ImageDeletionStore: Sendable {
 
 /// Production implementation — delegates straight to Apple Container.
 struct LiveImageDeletionStore: ImageDeletionStore {
-    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
-        let image = try await ImageIDResolver.get(id, containerSystemConfig: config)
-        return (image.reference, image.digest)
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool) {
+        let resolved = try await ImageIDResolver.resolve(id, containerSystemConfig: config)
+        return (resolved.image.reference, resolved.image.digest, resolved.byID)
     }
 
     func refsForDigest(_ digest: String) async throws -> [String] {
@@ -223,10 +226,15 @@ struct ClientImageService: ClientImageProtocol {
     ) async throws -> ImageDeletionResult {
         let normalizedRef: String
         let digest: String
+        let byID: Bool
         do {
-            (normalizedRef, digest) = try await imageStore.normalizedReference(for: id, config: containerSystemConfig)
+            (normalizedRef, digest, byID) = try await imageStore.normalizedReference(for: id, config: containerSystemConfig)
         } catch {
             throw ClientImageError.notFound(id: id)
+        }
+        // Like moby, an ID names the image itself: refuse to drop just one of its references.
+        if byID, ((try? await imageStore.refsForDigest(digest)) ?? []).count > 1 {
+            throw ClientImageError.conflict(id: id)
         }
         try await imageStore.delete(reference: normalizedRef)
 
