@@ -149,6 +149,63 @@ extension BuildRoute {
         return totalBytesWritten
     }
 
+    /// Receives the build context into `tempContextDir` and extracts it, returning
+    /// the directory to build from, or `"."` when no context was supplied. In that
+    /// case, and on error, `tempContextDir` is removed before returning.
+    static func prepareBuildContext(_ req: Request, in tempContextDir: URL) async throws -> String {
+        do {
+            // Create temporary directory for build context
+            try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
+
+            // Write the body data to a temporary tar file using streaming
+            let tarPath = tempContextDir.appendingPathComponent("context.tar")
+            let totalBytesWritten = try await Self.receiveBuildContext(req, into: tarPath)
+
+            guard totalBytesWritten > 0 else {
+                req.logger.warning("No data received in request body")
+                // "." skips the response-side cleanup, so drop the empty tar now.
+                try? FileManager.default.removeItem(at: tempContextDir)
+                return "."
+            }
+            guard FileManager.default.fileExists(atPath: tarPath.path),
+                let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
+                let fileSize = fileAttributes[.size] as? Int64,
+                fileSize > 0
+            else {
+                req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
+                throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+            }
+
+            // `docker compose build` (classic builder) streams a build
+            // context whose final tar entry is not padded out to a 512-byte
+            // block and which omits the end-of-archive marker. The Docker
+            // daemon's Go tar reader tolerates this, but libarchive treats
+            // the short final block as a truncated archive and aborts
+            // extraction. Append a terminator of zero bytes so the last
+            // entry's block is completed and a valid end-of-archive marker
+            // is present. Trailing zeros after a well-formed archive are
+            // ignored, so this is safe for already-terminated contexts too.
+            try Self.appendTarTerminator(to: tarPath)
+
+            // Extract the tar archive
+            let extractDir = tempContextDir.appendingPathComponent("context")
+            try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
+
+            do {
+                try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
+            } catch {
+                req.logger.error("Tar extraction failed: \(error)")
+
+                throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
+            }
+            return extractDir.path
+        } catch {
+            // Clean up on error
+            try? FileManager.default.removeItem(at: tempContextDir)
+            throw error
+        }
+    }
+
     /// `Error.localizedDescription` only produces a useful message for types that
     /// bridge to `NSError` or explicitly conform to `LocalizedError` — most
     /// Swift-native errors this route can throw don't. Notably, a failed BuildKit
@@ -236,62 +293,12 @@ extension BuildRoute {
             }
 
             // Extract tar archive from request body and unpack to temporary directory
-            let contextDir: String
             let buildUUID = UUID().uuidString
             let appSupportDir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
                 .appendingPathComponent("com.apple.container/builder")
             let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
 
-            do {
-                // Create temporary directory for build context
-                try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
-
-                // Write the body data to a temporary tar file using streaming
-                let tarPath = tempContextDir.appendingPathComponent("context.tar")
-                let totalBytesWritten = try await Self.receiveBuildContext(req, into: tarPath)
-
-                if totalBytesWritten > 0 {
-                    guard FileManager.default.fileExists(atPath: tarPath.path),
-                        let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
-                        let fileSize = fileAttributes[.size] as? Int64,
-                        fileSize > 0
-                    else {
-                        req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
-                        throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
-                    }
-
-                    // `docker compose build` (classic builder) streams a build
-                    // context whose final tar entry is not padded out to a 512-byte
-                    // block and which omits the end-of-archive marker. The Docker
-                    // daemon's Go tar reader tolerates this, but libarchive treats
-                    // the short final block as a truncated archive and aborts
-                    // extraction. Append a terminator of zero bytes so the last
-                    // entry's block is completed and a valid end-of-archive marker
-                    // is present. Trailing zeros after a well-formed archive are
-                    // ignored, so this is safe for already-terminated contexts too.
-                    try Self.appendTarTerminator(to: tarPath)
-
-                    // Extract the tar archive
-                    let extractDir = tempContextDir.appendingPathComponent("context")
-                    try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
-
-                    do {
-                        try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
-                    } catch {
-                        req.logger.error("Tar extraction failed: \(error)")
-
-                        throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
-                    }
-                    contextDir = extractDir.path
-                } else {
-                    req.logger.warning("No data received in request body")
-                    contextDir = "."
-                }
-            } catch {
-                // Clean up on error
-                try? FileManager.default.removeItem(at: tempContextDir)
-                throw error
-            }
+            let contextDir = try await Self.prepareBuildContext(req, in: tempContextDir)
 
             let buildArgs = BuildRoute.parseBuildQueryParam(query.buildargs)
             let labels = BuildRoute.parseBuildQueryParam(query.labels)

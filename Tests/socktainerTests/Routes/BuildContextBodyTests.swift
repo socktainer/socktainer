@@ -13,31 +13,34 @@ import VaporTesting
 @Suite("BuildRoute — build context body")
 struct BuildContextBodyTests {
 
-    @Test("a Content-Length build context is written to disk")
+    @Test("a Content-Length build context is extracted with its Dockerfile")
     func contentLengthBodyIsReceived() async throws {
-        let payload = String(repeating: "A", count: 8_192)
-        try await withBuildBodyApp { app, tarPath in
+        let dockerfile = "FROM scratch\n"
+        let tar = try makeContextTar(dockerfile: dockerfile)
+        try await withBuildBodyApp { app, tempContextDir in
             try await app.testing(method: .running(hostname: "127.0.0.1", port: 0)).test(
                 .POST, "/v1.51/probe",
-                headers: ["Content-Type": "application/x-tar", "Content-Length": "\(payload.utf8.count)"],
-                body: ByteBuffer(string: payload)
+                headers: ["Content-Type": "application/x-tar", "Content-Length": "\(tar.count)"],
+                body: ByteBuffer(data: tar)
             ) { res async in
                 #expect(res.status == .ok)
-                #expect(res.body.string == "\(payload.utf8.count)")
+                #expect(res.body.string == tempContextDir.appendingPathComponent("context").path)
             }
-            #expect(try String(contentsOf: tarPath, encoding: .utf8) == payload)
+            let extracted = tempContextDir.appendingPathComponent("context/Dockerfile")
+            #expect(try String(contentsOf: extracted, encoding: .utf8) == dockerfile)
         }
     }
 
-    @Test("an empty body yields zero bytes (daemon falls back to no context)")
+    @Test("an empty body falls back to no context and removes the temporary directory")
     func emptyBodyIsZero() async throws {
-        try await withBuildBodyApp { app, _ in
+        try await withBuildBodyApp { app, tempContextDir in
             try await app.testing(method: .running(hostname: "127.0.0.1", port: 0)).test(
                 .POST, "/v1.51/probe"
             ) { res async in
                 #expect(res.status == .ok)
-                #expect(res.body.string == "0")
+                #expect(res.body.string == ".")
             }
+            #expect(!FileManager.default.fileExists(atPath: tempContextDir.path))
         }
     }
 }
@@ -50,7 +53,7 @@ private func withBuildBodyApp(
     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let tarPath = tmp.appendingPathComponent("context.tar")
+    let tempContextDir = tmp.appendingPathComponent("build")
 
     try await withApp(configure: { app in
         app.middleware.use(ErrorMiddleware.default(environment: app.environment))
@@ -59,8 +62,19 @@ private func withBuildBodyApp(
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
         try app.registerVersionedRoute(.POST, pattern: "/probe") { req async throws -> String in
-            "\(try await BuildRoute.receiveBuildContext(req, into: tarPath))"
+            try await BuildRoute.prepareBuildContext(req, in: tempContextDir)
         }
-        try await test(app, tarPath)
+        try await test(app, tempContextDir)
     }
+}
+
+private func makeContextTar(dockerfile: String) throws -> Data {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let source = dir.appendingPathComponent("src")
+    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try Data(dockerfile.utf8).write(to: source.appendingPathComponent("Dockerfile"))
+    let tarPath = dir.appendingPathComponent("context.tar")
+    try ArchiveUtility.create(tarPath: tarPath, from: source)
+    return try Data(contentsOf: tarPath)
 }
