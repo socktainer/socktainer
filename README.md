@@ -1,7 +1,11 @@
 # Socktainer 🚢
 
-> [!IMPORTANT]
-> Both `socktainer` and [Apple container](https://github.com/apple/container) are still under heavy development!
+[![Website](https://img.shields.io/badge/website-socktainer.github.io-blue)](https://socktainer.github.io)
+[![Release](https://img.shields.io/github/v/release/socktainer/socktainer)](https://github.com/socktainer/socktainer/releases)
+[![Homebrew](https://img.shields.io/homebrew/v/socktainer)](https://formulae.brew.sh/formula/socktainer)
+[![Build](https://github.com/socktainer/socktainer/actions/workflows/next-build.yaml/badge.svg)](https://github.com/socktainer/socktainer/actions/workflows/next-build.yaml)
+[![License](https://img.shields.io/github/license/socktainer/socktainer)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/Pw9VWKcUEt)
 
 > [!NOTE]
 > `socktainer` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
@@ -41,6 +45,8 @@
 Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top of Apple's containerization libraries 🍏📦.
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
+
+📖 Documentation and website: **[socktainer.github.io](https://socktainer.github.io)**
 
 [**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
 
@@ -159,7 +165,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ## Requirements 📋
 
 - **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 0.6.0**
+- **Apple Container 1.5.0**
 
 ---
 
@@ -294,13 +300,11 @@ to the network gateway for a container on a named network, opt in with the
 
 ### Prerequisites
 
-- **Swift 6.2** (requirements from Apple container)
-- **Xcode 26** (select the correct toolchain if installed in a custom location)
+- **Swift 6.4**
+- **Xcode with the Swift 6.4 toolchain** (select the correct toolchain if installed in a custom location)
 
 ```bash
-sudo xcode-select --switch /Applications/Xcode_26.0.0.app/Contents/Developer
-# or
-sudo xcode-select -s /Applications/Xcode-26.app/Contents/Developer
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 ```
 
 ### Build & Run
@@ -488,6 +492,7 @@ The one edge case: if two keys normalize to the same string (e.g. `MyKey` and `m
 
 Join the Socktainer community to ask questions, share ideas, or get help:
 
+- **Website**: [socktainer.github.io](https://socktainer.github.io) – documentation and project news
 - **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users
 - **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
 - **GitHub Issues**: [socktainer/issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features
