@@ -167,6 +167,16 @@ struct HealthCheckManagerTests {
         await mgr.stop(containerId: "c1")
     }
 
+    @Test("Without StartInterval, StartPeriod is probed at Docker's default cadence, not waited out")
+    func defaultStartIntervalProbesDuringStartPeriod() async throws {
+        let mgr = HealthCheckManager(probe: { _, _, _ in 0 }, intervalFloorNs: 1_000_000)
+        let cfg = HealthcheckConfig(
+            Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3, StartPeriod: 60_000_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        await mgr.stop(containerId: "c1")
+    }
+
     @Test("Failures during StartPeriod don't count toward Retries")
     func startPeriodFailuresIgnored() async throws {
         let mgr = HealthCheckManager(probe: { _, _, _ in 1 }, intervalFloorNs: 1_000_000)

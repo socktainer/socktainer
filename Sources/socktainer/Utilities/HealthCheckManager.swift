@@ -31,6 +31,7 @@ actor HealthCheckManager {
     static let defaultIntervalNs: UInt64 = 30 * 1_000_000_000
     static let defaultTimeoutNs: UInt64 = 30 * 1_000_000_000
     static let defaultRetries: Int = 3
+    static let defaultStartIntervalNs: UInt64 = 5 * 1_000_000_000
 
     // Lower bounds applied to the user-supplied values. The interval floor is
     // overridable so tests can drive the loop at sub-second cadence; the
@@ -143,18 +144,12 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
-        let startIntervalNs = config.StartInterval.map { UInt64(max($0, 0)) } ?? 0
+        let configStartIntervalNs = config.StartInterval.map { UInt64(max($0, 0)) } ?? 0
+        let startIntervalNs = max(configStartIntervalNs > 0 ? configStartIntervalNs : Self.defaultStartIntervalNs, intervalFloorNs)
 
-        // With a StartInterval, probe at that cadence during StartPeriod (Docker
-        // semantics); otherwise wait the start period out.
-        var startDeadline: Date? = nil
-        if startPeriodNs > 0 {
-            if startIntervalNs > 0 {
-                startDeadline = Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000)
-            } else {
-                try? await Task.sleep(nanoseconds: startPeriodNs)
-            }
-        }
+        // Like Docker, probe every StartInterval during StartPeriod rather than waiting it out.
+        var startDeadline: Date? =
+            startPeriodNs > 0 ? Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000) : nil
 
         var failingStreak = 0
 
@@ -191,7 +186,7 @@ actor HealthCheckManager {
             }
 
             let stillStarting = startDeadline.map { Date() < $0 } ?? false
-            try? await Task.sleep(nanoseconds: stillStarting ? max(startIntervalNs, intervalFloorNs) : intervalNs)
+            try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
         }
     }
 
