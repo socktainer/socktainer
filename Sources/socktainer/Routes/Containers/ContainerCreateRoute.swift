@@ -693,6 +693,16 @@ extension ContainerCreateRoute {
                     }
                 }
 
+                // Never trust a client-supplied value: it names a directory socktainer deletes.
+                containerConfiguration.labels[ExtraHostsFile.label] = nil
+                if let extraHosts = body.HostConfig?.ExtraHosts, !extraHosts.isEmpty,
+                    !resolvedMounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
+                {
+                    let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
+                    resolvedMounts.append(generated.mount)
+                    containerConfiguration.labels[ExtraHostsFile.label] = generated.label
+                }
+
                 containerConfiguration.mounts = resolvedMounts
                 // Always overwrite client-supplied metadata, including an empty list.
                 containerConfiguration.labels[ContainerAnonymousVolumes.label] =
@@ -739,6 +749,7 @@ extension ContainerCreateRoute {
                         try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
                     } catch {
                         try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
+                        ExtraHostsFile.remove(labels: containerConfiguration.labels)
                         throw error
                     }
                     container = try await containerClient.get(id: containerConfiguration.id)

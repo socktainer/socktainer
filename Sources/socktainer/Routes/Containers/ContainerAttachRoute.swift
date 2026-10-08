@@ -332,6 +332,7 @@ extension ContainerAttachRoute {
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
+        await ExtraHostsFile.refresh(containerId: container.id)
 
         do {
             try await process.start()
@@ -500,6 +501,7 @@ extension ContainerAttachRoute {
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
+        await ExtraHostsFile.refresh(containerId: container.id)
 
         do {
             try await process.start()

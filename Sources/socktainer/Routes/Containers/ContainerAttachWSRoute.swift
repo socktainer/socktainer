@@ -95,6 +95,7 @@ extension ContainerAttachWSRoute {
             try? await ws.close(code: .unexpectedServerError)
             return
         }
+        await ExtraHostsFile.refresh(containerId: container.id)
 
         do {
             try await process.start()

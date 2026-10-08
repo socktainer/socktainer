@@ -356,6 +356,7 @@ struct ClientContainerService: ClientContainerProtocol {
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
             await ContainerExitCodeStore.shared.remove(id: container.id)
+            await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.
@@ -443,6 +444,7 @@ struct ClientContainerService: ClientContainerProtocol {
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.
         try await PreStartInjectionStore.shared.clear(containerId: container.id)
+        ExtraHostsFile.remove(labels: container.configuration.labels)
     }
 
     /// Apple Container has no rename and identifies containers by name, so a
@@ -645,6 +647,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 // it too: those files are whatever a client uploaded, secrets
                 // included.
                 try await PreStartInjectionStore.shared.clear(containerId: container.id)
+                ExtraHostsFile.remove(labels: container.configuration.labels)
                 deletedIds.append(container.id)
             } catch {
                 continue
