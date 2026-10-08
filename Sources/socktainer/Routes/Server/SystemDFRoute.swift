@@ -190,8 +190,8 @@ extension SystemDFRoute {
                         totalSize += descriptor.size
                     }
 
-                    let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                    let repoDigests = image.reference.contains("@sha256:") ? [image.reference] : []
+                    let repoTags = ImageListFilter.repoTags(for: image.reference)
+                    let repoDigests = !repoTags.isEmpty && image.reference.contains("@sha256:") ? [image.reference] : []
                     let containerCount = usageByImageReference[image.reference] ?? 0
 
                     return RESTImageSummary(

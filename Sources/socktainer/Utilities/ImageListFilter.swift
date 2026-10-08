@@ -10,6 +10,14 @@ enum ImageListFilter {
         repoTags.isEmpty || repoTags == ["<none>:<none>"]
     }
 
+    /// Repo tags Docker clients see for a store reference. Apple Container cannot
+    /// store a nameless image, so an image loaded without a name (an untagged
+    /// `docker build`, a tag-less tarball) is stored as "untagged@<digest>" — the
+    /// analogue of moby's "moby-dangling@" name — and shown as `<none>:<none>`.
+    static func repoTags(for reference: String) -> [String] {
+        reference.isEmpty || reference.hasPrefix("untagged@") ? [] : [reference]
+    }
+
     /// moby matches `reference=<pattern>` with `reference.FamiliarMatch`, which
     /// runs `path.Match(pattern, x)` for exactly two forms of each repo tag: the
     /// familiar string (`alpine:latest`) and the familiar name with no tag or

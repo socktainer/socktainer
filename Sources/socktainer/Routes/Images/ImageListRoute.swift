@@ -162,8 +162,8 @@ extension ImageListRoute {
                     }
                 }
 
-                let repoTags = image.reference.isEmpty ? [] : [image.reference]
-                let repoDigests = includeDigests && image.reference.contains("@sha256:") ? [image.reference] : []
+                let repoTags = ImageListFilter.repoTags(for: image.reference)
+                let repoDigests = includeDigests && !repoTags.isEmpty && image.reference.contains("@sha256:") ? [image.reference] : []
                 let containersUsingImage = containers.filter { $0.configuration.image.reference == image.reference }
                 let summary = RESTImageSummary(
                     Id: image.digest,
