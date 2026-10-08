@@ -10,7 +10,7 @@ import Testing
 struct ImageVolumeConfigurationTests {
     @Test("inspect preserves declarations when the raw config is readable")
     func readableInspectVolumes() async {
-        let volumes = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
+        let volumes: [String: [String: String]]? = await ImageVolumeConfiguration.readForInspect(logger: Logger(label: "test")) {
             ["/var/log": [:]]
         }
         #expect(volumes == ["/var/log": [:]])

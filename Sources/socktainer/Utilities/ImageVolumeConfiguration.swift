@@ -26,15 +26,15 @@ struct ImageVolumeConfiguration: Decodable {
     }
 
     /// Inspect already tolerates incomplete platform metadata. Preserve that
-    /// behavior for this optional field, but log the failure rather than hiding it.
+    /// behavior for these optional fields, but log the failure rather than hiding it.
     /// Container creation uses the strict reader above and must not skip volumes.
-    static func readForInspect(
-        logger: Logger, read: () async throws -> [String: [String: String]]?
-    ) async -> [String: [String: String]]? {
+    static func readForInspect<T>(
+        logger: Logger, read: () async throws -> T?
+    ) async -> T? {
         do {
             return try await read()
         } catch {
-            logger.warning("Could not read image volume declarations: \(error)")
+            logger.warning("Could not read image config: \(error)")
             return nil
         }
     }
