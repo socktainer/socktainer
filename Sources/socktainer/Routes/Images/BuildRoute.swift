@@ -135,6 +135,17 @@ extension BuildRoute {
     ///   interpolation, which calls a type's own `description` when it explicitly
     ///   conforms to `CustomStringConvertible` (`RPCError` does) — fixing the
     ///   original #386 gap without depending on the unreliable runtime check above.
+    /// The closing events of a successful build, shaped like moby's classic builder.
+    /// docker-py's `images.build()` takes the image ID from `Successfully built <id>`
+    /// (or a `sha256:<id>` stream) and the Docker CLI from `aux.ID`; without a hex ID
+    /// docker-py raises `BuildError` even though the build succeeded (#414).
+    static func completionEvents(imageID: String?, tag: String) -> [[String: Any]] {
+        let tagged: [String: Any] = ["stream": "Successfully tagged \(tag)\n"]
+        guard let imageID else { return [tagged] }
+        let shortID = String(imageID.dropFirst("sha256:".count).prefix(12))
+        return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"], tagged]
+    }
+
     static func errorMessage(for error: Error) -> String {
         if error is ContainerizationError {
             return "\(error)"
@@ -381,8 +392,11 @@ extension BuildRoute {
         // Helper function to send Docker API compliant streaming messages
         @Sendable func sendStreamMessage(_ message: String) {
             // Preserve the original message with its formatting
-            let streamResponse: [String: Any] = ["stream": message + "\n"]
-            if let jsonData = try? JSONSerialization.data(withJSONObject: streamResponse),
+            sendEvent(["stream": message + "\n"])
+        }
+
+        @Sendable func sendEvent(_ event: [String: Any]) {
+            if let jsonData = try? JSONSerialization.data(withJSONObject: event),
                 let jsonString = String(data: jsonData, encoding: .utf8)
             {
                 let result = writer.write(.buffer(ByteBuffer(string: jsonString + "\n")))
@@ -528,8 +542,18 @@ extension BuildRoute {
             try await image.unpack(platform: nil, progressUpdate: { _ in })
         }
 
-        // Send success message in Docker API format
-        sendStreamMessage("Successfully built \(imageName)")
+        // The image ID is the built platform's config digest, the same `Id` image inspect reports.
+        let builtImage = loaded.images.first { $0.reference == imageName } ?? loaded.images.first
+        var imageID: String?
+        if let builtImage, let platform = platforms.first {
+            imageID = try? await builtImage.manifest(for: platform).config.digest
+        }
+        if imageID == nil {
+            logger.warning("BuildRoute: could not determine the image ID of \(imageName)")
+        }
+        for event in completionEvents(imageID: imageID, tag: imageName) {
+            sendEvent(event)
+        }
 
         _ = writer.write(.end)
     }
