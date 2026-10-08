@@ -84,4 +84,27 @@ struct PreStartInjectionStoreTests {
             _ = try await store.mounts(containerId: "c1")
         }
     }
+
+    @Test("moving a container's staged files carries them and its create options to the new name")
+    func moveFollowsRename() async throws {
+        let storage = temporaryStorage()
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let source = storage.appendingPathComponent("payload")
+        try Data("key".utf8).write(to: source)
+
+        let store = PreStartInjectionStore()
+        await store.configure(storageDirectory: storage, logger: Logger(label: "test"))
+        try await store.stage(containerId: "tmp_web-1", guestPath: "/etc/k", source: source, mode: 0o600)
+        try await store.rememberCreateOptions(containerId: "tmp_web-1", autoRemove: true)
+
+        try await store.move(from: "tmp_web-1", to: "web-1")
+
+        #expect(try await store.pending(containerId: "tmp_web-1").isEmpty)
+        let staged = try await store.pending(containerId: "web-1")
+        #expect(staged.count == 1)
+        #expect(staged[0].hostPath.contains("/web-1/"))
+        #expect(try Data(contentsOf: URL(fileURLWithPath: staged[0].hostPath)) == Data("key".utf8))
+        #expect(await store.createOptions(containerId: "web-1").autoRemove)
+        #expect(await !store.createOptions(containerId: "tmp_web-1").autoRemove)
+    }
 }

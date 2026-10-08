@@ -36,4 +36,5 @@ actor StaticSnapshotClientMock: ClientContainerProtocol {
 // to a real ClientContainerService and touches native container state.
 extension ClientContainerProtocol {
     func prepareForStart(container: ContainerSnapshot) async throws {}
+    func rename(id: String, newName: String) async throws {}
 }
