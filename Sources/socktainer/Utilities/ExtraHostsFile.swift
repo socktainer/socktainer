@@ -20,6 +20,8 @@ enum ExtraHostsFile {
 
     /// Same rules as moby's `ParseExtraHost`: `host=ip`, or the legacy `host:ip` split on
     /// the first colon (so `host:::1` is IPv6). Brackets around an IPv6 address are dropped.
+    /// Returns nil unless the address is an IP or `host-gateway` and the host has no
+    /// whitespace or control characters, which would inject extra lines into the file.
     static func parse(_ entry: String) -> (host: String, ip: String)? {
         let separator: Character = entry.contains("=") ? "=" : ":"
         guard let index = entry.firstIndex(of: separator) else { return nil }
@@ -28,8 +30,22 @@ enum ExtraHostsFile {
         if ip.hasPrefix("[") && ip.hasSuffix("]") {
             ip = String(ip.dropFirst().dropLast())
         }
-        guard !host.isEmpty, !ip.isEmpty else { return nil }
+        let forbidden = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        guard !host.isEmpty, host.unicodeScalars.allSatisfy({ !forbidden.contains($0) }),
+            ip == hostGateway || isIPAddress(ip)
+        else { return nil }
         return (host, ip)
+    }
+
+    /// Entries `parse` rejects; a create carrying any of them is refused.
+    static func invalidEntries(_ extraHosts: [String]) -> [String] {
+        extraHosts.filter { parse($0) == nil }
+    }
+
+    private static func isIPAddress(_ value: String) -> Bool {
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        return inet_pton(AF_INET, value, &v4) == 1 || inet_pton(AF_INET6, value, &v6) == 1
     }
 
     static func render(extraHosts: [String], ip: String?, hostname: String, gateway: String?) -> String {
@@ -62,11 +78,16 @@ enum ExtraHostsFile {
     static func create(extraHosts: [String], hostname: String) throws -> (mount: Filesystem, label: String) {
         let name = UUID().uuidString.lowercased()
         let directory = root.appendingPathComponent(name)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(extraHosts).write(to: directory.appendingPathComponent("extra-hosts.json"))
         let file = directory.appendingPathComponent("hosts")
-        try render(extraHosts: extraHosts, ip: nil, hostname: hostname, gateway: nil)
-            .write(to: file, atomically: false, encoding: .utf8)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try JSONEncoder().encode(extraHosts).write(to: directory.appendingPathComponent("extra-hosts.json"))
+            try render(extraHosts: extraHosts, ip: nil, hostname: hostname, gateway: nil)
+                .write(to: file, atomically: false, encoding: .utf8)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
         return (.virtiofs(source: file.path, destination: guestPath, options: []), name)
     }
 

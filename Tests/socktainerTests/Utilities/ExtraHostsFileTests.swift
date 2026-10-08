@@ -13,6 +13,17 @@ struct ExtraHostsFileTests {
         #expect(ExtraHostsFile.parse("foo=[::1]")! == ("foo", "::1"))
         #expect(ExtraHostsFile.parse("badentry") == nil)
         #expect(ExtraHostsFile.parse("foo:") == nil)
+        #expect(ExtraHostsFile.parse("gw:host-gateway")! == ("gw", "host-gateway"))
+    }
+
+    @Test("Rejects addresses that are not IPs and hosts that would inject lines")
+    func rejectsInvalidEntries() {
+        #expect(ExtraHostsFile.parse("foo:not-an-ip") == nil)
+        #expect(ExtraHostsFile.parse("foo:10.1.2.3\n6.6.6.6 evil") == nil)
+        #expect(ExtraHostsFile.parse("foo\nevil:10.1.2.3") == nil)
+        #expect(ExtraHostsFile.parse("foo bar:10.1.2.3") == nil)
+        #expect(
+            ExtraHostsFile.invalidEntries(["ok:10.1.2.3", "foo:", "bad:nope", "gw:host-gateway"]) == ["foo:", "bad:nope"])
     }
 
     @Test("Renders extra hosts and the container's own address")

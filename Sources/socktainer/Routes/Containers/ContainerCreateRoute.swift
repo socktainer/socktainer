@@ -695,12 +695,10 @@ extension ContainerCreateRoute {
 
                 // Never trust a client-supplied value: it names a directory socktainer deletes.
                 containerConfiguration.labels[ExtraHostsFile.label] = nil
-                if let extraHosts = body.HostConfig?.ExtraHosts, !extraHosts.isEmpty,
-                    !resolvedMounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
-                {
-                    let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
-                    resolvedMounts.append(generated.mount)
-                    containerConfiguration.labels[ExtraHostsFile.label] = generated.label
+                let extraHosts = body.HostConfig?.ExtraHosts ?? []
+                let invalidExtraHosts = ExtraHostsFile.invalidEntries(extraHosts)
+                guard invalidExtraHosts.isEmpty else {
+                    throw Abort(.badRequest, reason: "invalid ExtraHosts entries: \(invalidExtraHosts.joined(separator: ", "))")
                 }
 
                 containerConfiguration.mounts = resolvedMounts
@@ -746,6 +744,14 @@ extension ContainerCreateRoute {
                     try await PreStartInjectionStore.shared.rememberCreateOptions(
                         containerId: containerConfiguration.id, autoRemove: options.autoRemove)
                     do {
+                        // Generated last, inside this cleanup scope, so no earlier failure can strand it.
+                        if !extraHosts.isEmpty,
+                            !containerConfiguration.mounts.contains(where: { $0.destination == ExtraHostsFile.guestPath })
+                        {
+                            let generated = try ExtraHostsFile.create(extraHosts: extraHosts, hostname: hostname)
+                            containerConfiguration.mounts.append(generated.mount)
+                            containerConfiguration.labels[ExtraHostsFile.label] = generated.label
+                        }
                         try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
                     } catch {
                         try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
