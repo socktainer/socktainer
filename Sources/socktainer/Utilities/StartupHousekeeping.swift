@@ -16,7 +16,15 @@ import Foundation
 enum StartupHousekeeping {
     /// Runs `work`, returning `true` if it finished within `timeout` and
     /// `false` if it was abandoned at the deadline.
-    static func runBounded(timeout: Duration, _ work: @escaping @Sendable () async -> Void) async -> Bool {
+    ///
+    /// When `work` finishes first, the deadline timer is cancelled rather than left
+    /// sleeping out the rest of `timeout`. `sleep` is the timer's wait; it defaults to
+    /// `Task.sleep` and is injectable so tests can observe the cancellation.
+    static func runBounded(
+        timeout: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        _ work: @escaping @Sendable () async -> Void
+    ) async -> Bool {
         final class Once: @unchecked Sendable {
             private let lock = NSLock()
             private var resumed = false
@@ -30,13 +38,17 @@ enum StartupHousekeeping {
         }
         let once = Once()
         return await withCheckedContinuation { continuation in
-            Task.detached {
-                await work()
-                if once.claim() { continuation.resume(returning: true) }
+            let timer = Task.detached {
+                try? await sleep(timeout)
+                if once.claim() { continuation.resume(returning: false) }
             }
             Task.detached {
-                try? await Task.sleep(for: timeout)
-                if once.claim() { continuation.resume(returning: false) }
+                await work()
+                if once.claim() {
+                    continuation.resume(returning: true)
+                    // Claimed before cancelling, so the cancelled timer's claim fails.
+                    timer.cancel()
+                }
             }
         }
     }
