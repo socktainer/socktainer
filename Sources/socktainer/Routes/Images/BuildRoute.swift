@@ -246,6 +246,11 @@ extension BuildRoute {
         return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"], tagged]
     }
 
+    /// A build step failure reported by BuildKit, surfaced verbatim to the client.
+    struct BuildFailure: LocalizedError {
+        let errorDescription: String?
+    }
+
     static func errorMessage(for error: Error) -> String {
         if error is ContainerizationError {
             return "\(error)"
@@ -488,6 +493,32 @@ extension BuildRoute {
             return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
         }()
 
+        // BuildKit output is only redirectable through a Terminal; wrap a pipe so
+        // the progress and failure reason reach the client instead of our stderr.
+        // Always wire it, even for `quiet`: upstream's quiet path never acks the
+        // builder's IO packets and the build hangs, so drop lines here instead.
+        guard let outputPipe = ProcessPipe.make() else {
+            throw ContainerizationError(.internalError, message: "Failed to create build output pipe")
+        }
+        let terminal: ContainerizationOS.Terminal
+        do {
+            terminal = try Terminal(descriptor: outputPipe.write.fileDescriptor, setInitState: false)
+        } catch {
+            try? outputPipe.write.close()
+            try? outputPipe.read.close()
+            throw error
+        }
+        let outputReader = Task.detached {
+            var collector = BuildOutputCollector()
+            while case let data = outputPipe.read.availableData, !data.isEmpty {
+                let lines = collector.ingest(data)
+                if !quiet { lines.forEach(sendStreamMessage) }
+            }
+            let lines = collector.finish()
+            if !quiet { lines.forEach(sendStreamMessage) }
+            return collector
+        }
+
         // Build configuration
         let config = ContainerBuild.Builder.BuildConfig(
             buildID: buildID,
@@ -504,10 +535,10 @@ extension BuildRoute {
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
-            terminal: nil,  // No terminal for API
+            terminal: terminal,
             tags: [imageName],
             target: target,
-            quiet: quiet,
+            quiet: false,  // see outputPipe above
             exports: exports,
             cacheIn: [],
             cacheOut: [],
@@ -517,8 +548,22 @@ extension BuildRoute {
 
         sendStreamMessage(" ---> Starting build process")
 
-        // Run build directly without output capture
-        try await builder.build(config)
+        var buildError: Error?
+        do {
+            try await builder.build(config)
+        } catch {
+            buildError = error
+        }
+        try? outputPipe.write.close()
+        let collector = await outputReader.value
+        try? outputPipe.read.close()
+        if let buildError {
+            if let reason = collector.failureReason {
+                logger.debug("BuildRoute: builder error \(buildError)")
+                throw BuildFailure(errorDescription: reason)
+            }
+            throw buildError
+        }
 
         sendStreamMessage(" ---> Build process completed")
 
