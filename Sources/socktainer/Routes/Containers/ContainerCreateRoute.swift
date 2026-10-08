@@ -220,7 +220,9 @@ extension ContainerCreateRoute {
             let mergedEnv = try Parser.allEnv(imageEnvs: imageConfigEnvironment, envFiles: [], envs: requestedEnvironment)
 
             // Inside a VM 127.0.0.1 is the container's own loopback, not the host. Rewrite
-            // URL-form connection strings to the vmnet gateway. host-mode containers are
+            // URL-form connection strings to the vmnet gateway. Opt-in via the
+            // `socktainer.rewrite-loopback=true` label: Docker never rewrites env, and
+            // client-facing URLs must stay intact (#416). host-mode containers are
             // excluded — they stay on "default" with loopback DNS so NPM imports fail fast.
             var finalEnv = mergedEnv
             let envNetworkKeys = body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? []
@@ -230,7 +232,8 @@ extension ContainerCreateRoute {
                 endpointsConfigKeys: envNetworkKeys,
                 networkMode: body.HostConfig?.NetworkMode
             )
-            if let firstNet = namedNet,
+            if ContainerCreateRoute.shouldRewriteLoopback(labels: body.Labels),
+                let firstNet = namedNet,
                 let networkResource = try? await NetworkClient().get(id: firstNet)
             {
                 let gatewayIP = networkResource.status.ipv4Gateway.description
@@ -825,6 +828,13 @@ extension ContainerCreateRoute {
     static func shmSizeBytes(_ raw: Int?) -> UInt64 {
         guard let raw, raw > 0 else { return defaultShmSize }
         return UInt64(raw)
+    }
+
+    /// Container label that opts in to `rewriteLoopbackToGateway` on named networks.
+    static let rewriteLoopbackLabel = "socktainer.rewrite-loopback"
+
+    static func shouldRewriteLoopback(labels: [String: String]?) -> Bool {
+        labels?[rewriteLoopbackLabel] == "true"
     }
 
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).
