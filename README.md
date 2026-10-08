@@ -8,9 +8,7 @@
 [![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/Pw9VWKcUEt)
 
 <p align="center">
-  <a href="https://github.com/socktainer/media/blob/main/socktainer-demo.mp4">
-    <img src="https://raw.githubusercontent.com/socktainer/media/main/socktainer-demo.gif" alt="Socktainer demo: Docker CLI talking to Apple containers through socktainer" width="800">
-  </a>
+  <img src="https://raw.githubusercontent.com/socktainer/media/main/socktainer-demo.gif" alt="Socktainer demo: Docker CLI talking to Apple containers through socktainer" width="800">
 </p>
 
 > [!NOTE]
