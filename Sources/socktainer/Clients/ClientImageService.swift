@@ -233,7 +233,8 @@ struct ClientImageService: ClientImageProtocol {
             throw ClientImageError.notFound(id: id)
         }
         // Like moby, an ID names the image itself: refuse to drop just one of its references.
-        if byID, ((try? await imageStore.refsForDigest(digest)) ?? []).count > 1 {
+        // A failed lookup must not be read as "single reference", so it propagates.
+        if byID, try await imageStore.refsForDigest(digest).count > 1 {
             throw ClientImageError.conflict(id: id)
         }
         try await imageStore.delete(reference: normalizedRef)

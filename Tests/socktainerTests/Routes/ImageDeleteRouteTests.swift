@@ -30,6 +30,7 @@ struct ImageDeleteRouteTests {
         let digest: String
         /// Whether `normalizedReference(for:)` reports the id as matched by image ID.
         var byID = false
+        var refsShouldThrow = false
 
         /// Tracks the exact reference passed to each `delete(reference:)` call.
         private(set) var deleteCalls: [String] = []
@@ -48,6 +49,7 @@ struct ImageDeleteRouteTests {
         }
 
         func refsForDigest(_ digest: String) async throws -> [String] {
+            if refsShouldThrow { throw NSError(domain: "ListFailed", code: 1) }
             // Return alive refs that match the requested digest.
             guard digest == self.digest else { return [] }
             return Array(alive)
@@ -151,10 +153,25 @@ struct ImageDeleteRouteTests {
         )
         store.byID = true
 
-        await #expect(throws: ClientImageError.self) {
-            try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+        do {
+            _ = try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+            Issue.record("expected ClientImageError.conflict")
+        } catch ClientImageError.conflict(let id) {
+            #expect(id == "abc123abc123")
         }
         #expect(store.deleteCalls.isEmpty, "no reference may be removed on conflict")
+    }
+
+    @Test("delete by image ID does not delete when the reference lookup fails")
+    func deleteByIDPropagatesRefsFailure() async throws {
+        let store = FakeImageStore(storedNormalized: "docker.io/library/test:v1")
+        store.byID = true
+        store.refsShouldThrow = true
+
+        await #expect(throws: NSError.self) {
+            try await ClientImageService.delete(id: "abc123abc123", containerSystemConfig: ContainerSystemConfig(), imageStore: store)
+        }
+        #expect(store.deleteCalls.isEmpty)
     }
 
     @Test("delete by image ID removes an image with a single reference")
