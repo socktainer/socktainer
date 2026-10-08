@@ -106,6 +106,49 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
+    /// Writes the request body (the build context tar) to `tarPath` and returns
+    /// the number of bytes written; 0 means no context was supplied.
+    ///
+    /// The body is read unconditionally rather than gated on
+    /// `Transfer-Encoding: chunked`: routes registered through `RegexRouter`
+    /// receive a streamed body over a real socket, so a plain `Content-Length`
+    /// upload (Docker Python SDK) also has `req.body.data == nil` (issue #415).
+    static func receiveBuildContext(_ req: Request, into tarPath: URL) async throws -> Int {
+        var fileHandle: FileHandle?
+        var totalBytesWritten = 0
+
+        do {
+            FileManager.default.createFile(atPath: tarPath.path, contents: nil)
+            fileHandle = try FileHandle(forWritingTo: tarPath)
+
+            // Stream the body directly to the tar file without loading into memory
+            if let bodyData = req.body.data {
+                let data = Data(buffer: bodyData)
+                try fileHandle?.write(contentsOf: data)
+                totalBytesWritten = data.count
+            } else {
+                for try await var chunk in req.body {
+                    guard let data = chunk.readData(length: chunk.readableBytes) else {
+                        continue
+                    }
+                    try fileHandle?.write(contentsOf: data)
+                    totalBytesWritten += data.count
+                }
+            }
+
+            try fileHandle?.synchronize()
+            try fileHandle?.close()
+            fileHandle = nil
+        } catch {
+            // Clean up file handle and partial tar file on error
+            try? fileHandle?.close()
+            try? FileManager.default.removeItem(at: tarPath)
+            req.logger.error("Failed to stream body to tar file: \(error)")
+            throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
+        }
+        return totalBytesWritten
+    }
+
     /// `Error.localizedDescription` only produces a useful message for types that
     /// bridge to `NSError` or explicitly conform to `LocalizedError` — most
     /// Swift-native errors this route can throw don't. Notably, a failed BuildKit
@@ -203,90 +246,45 @@ extension BuildRoute {
                 // Create temporary directory for build context
                 try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
 
-                // Check if we have a request body to process
-                let hasBody = req.body.data != nil || req.headers.first(name: "transfer-encoding")?.lowercased() == "chunked"
+                // Write the body data to a temporary tar file using streaming
+                let tarPath = tempContextDir.appendingPathComponent("context.tar")
+                let totalBytesWritten = try await Self.receiveBuildContext(req, into: tarPath)
 
-                if hasBody {
+                if totalBytesWritten > 0 {
+                    guard FileManager.default.fileExists(atPath: tarPath.path),
+                        let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
+                        let fileSize = fileAttributes[.size] as? Int64,
+                        fileSize > 0
+                    else {
+                        req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
+                        throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+                    }
 
-                    // Write the body data to a temporary tar file using streaming
-                    let tarPath = tempContextDir.appendingPathComponent("context.tar")
-                    var fileHandle: FileHandle?
-                    var totalBytesWritten = 0
+                    // `docker compose build` (classic builder) streams a build
+                    // context whose final tar entry is not padded out to a 512-byte
+                    // block and which omits the end-of-archive marker. The Docker
+                    // daemon's Go tar reader tolerates this, but libarchive treats
+                    // the short final block as a truncated archive and aborts
+                    // extraction. Append a terminator of zero bytes so the last
+                    // entry's block is completed and a valid end-of-archive marker
+                    // is present. Trailing zeros after a well-formed archive are
+                    // ignored, so this is safe for already-terminated contexts too.
+                    try Self.appendTarTerminator(to: tarPath)
+
+                    // Extract the tar archive
+                    let extractDir = tempContextDir.appendingPathComponent("context")
+                    try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
 
                     do {
-                        // Create the tar file and open file handle for writing
-                        FileManager.default.createFile(atPath: tarPath.path, contents: nil)
-                        fileHandle = try FileHandle(forWritingTo: tarPath)
-
-                        // Stream the body directly to the tar file without loading into memory
-                        if let bodyData = req.body.data {
-                            // Direct body data available
-                            let data = Data(buffer: bodyData)
-                            try fileHandle?.write(contentsOf: data)
-                            totalBytesWritten = data.count
-                        } else {
-                            var chunkCount = 0
-                            for try await var chunk in req.body {
-                                guard let data = chunk.readData(length: chunk.readableBytes) else {
-                                    continue
-                                }
-                                chunkCount += 1
-                                try fileHandle?.write(contentsOf: data)
-                                totalBytesWritten += data.count
-                            }
-                        }
-
-                        try fileHandle?.synchronize()
-                        try fileHandle?.close()
-                        fileHandle = nil
+                        try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
                     } catch {
-                        // Clean up file handle and partial tar file on error
-                        try? fileHandle?.close()
-                        try? FileManager.default.removeItem(at: tarPath)
-                        req.logger.error("Failed to stream body to tar file: \(error)")
-                        throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
+                        req.logger.error("Tar extraction failed: \(error)")
+
+                        throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
                     }
-
-                    if totalBytesWritten > 0 {
-                        guard FileManager.default.fileExists(atPath: tarPath.path),
-                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
-                            let fileSize = fileAttributes[.size] as? Int64,
-                            fileSize > 0
-                        else {
-                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
-                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
-                        }
-
-                        // `docker compose build` (classic builder) streams a build
-                        // context whose final tar entry is not padded out to a 512-byte
-                        // block and which omits the end-of-archive marker. The Docker
-                        // daemon's Go tar reader tolerates this, but libarchive treats
-                        // the short final block as a truncated archive and aborts
-                        // extraction. Append a terminator of zero bytes so the last
-                        // entry's block is completed and a valid end-of-archive marker
-                        // is present. Trailing zeros after a well-formed archive are
-                        // ignored, so this is safe for already-terminated contexts too.
-                        try Self.appendTarTerminator(to: tarPath)
-
-                        // Extract the tar archive
-                        let extractDir = tempContextDir.appendingPathComponent("context")
-                        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
-
-                        do {
-                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
-                        } catch {
-                            req.logger.error("Tar extraction failed: \(error)")
-
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
-                        }
-                        contextDir = extractDir.path
-                    } else {
-                        req.logger.warning("No data received in request body")
-                        contextDir = "."
-                    }
+                    contextDir = extractDir.path
                 } else {
-                    // No body provided, use current directory as fallback
-                    req.logger.warning("No build context provided in request body, using current directory as fallback")
+                    req.logger.warning("No data received in request body")
                     contextDir = "."
                 }
             } catch {
