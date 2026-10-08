@@ -7,7 +7,9 @@ struct SocktainerDNSServerKey: StorageKey {
     typealias Value = SocktainerDNSServer
 }
 
-/// UDP DNS server that resolves container service names and forwards unknown queries to 1.1.1.1.
+/// UDP DNS server that resolves container service names and forwards unknown queries to
+/// `upstreamHost` — the vmnet gateway resolver in production, so names resolve as on the host
+/// (VPN split DNS, `/etc/resolver/*`); 1.1.1.1 only when no gateway is known.
 ///
 /// Runs on 0.0.0.0:2054 (covers all interfaces including vmnet gateways).
 /// Port 2053 is reserved by Apple Container's own DNS handler.
@@ -17,6 +19,15 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: [UInt8]] = [:]  // normalized hostname → 4-byte IPv4
     private var log = Logger(label: "socktainer.dns")
+    private var _upstreamHost = "1.1.1.1"
+    /// Upstream for non-container names. Lock-guarded: startup may set it after the
+    /// server is already answering queries.
+    var upstreamHost: String {
+        get { lock.withLock { _upstreamHost } }
+        set { lock.withLock { _upstreamHost = newValue } }
+    }
+    /// Upstream port; only overridden by tests, before `start(...)`.
+    var upstreamPort = 53
 
     func register(hostname: String, ip: String) {
         guard let addr = Self.parseIPv4(ip) else { return }
@@ -124,7 +135,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         // Two-tier dispatch: local lookups (in-table A/AAAA/NODATA) are answered
         // inline so the Rust DNS forwarder sidecar receives the response within
         // microseconds — before any per-task scheduling latency. Upstream queries
-        // (external multi-label names that need 1.1.1.1) are still dispatched to
+        // (external multi-label names that need the upstream) are still dispatched to
         // avoid blocking the recvfrom loop for the 2-second socket timeout.
         while true {
             var clientAddr = sockaddr_in()
@@ -228,7 +239,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let normalized = Self.normalize(qname)
 
         // Single-label names are container names, not real internet domains — never forward
-        // them to 1.1.1.1, whose authoritative NXDOMAIN can poison concurrent A+AAAA resolvers.
+        // them upstream, whose authoritative NXDOMAIN can poison concurrent A+AAAA resolvers.
         let isSingleLabel = !normalized.contains(".")
 
         if qtype == 1 {  // A record
@@ -244,7 +255,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
                 return buildNxdomainResponse(packet: responsePacket)
             }
         } else if qtype == 28 {  // AAAA — container names are IPv4-only
-            // For single-label names return NODATA unconditionally; forwarding to 1.1.1.1
+            // For single-label names return NODATA unconditionally; forwarding upstream
             // would yield an authoritative NXDOMAIN that poisons concurrent A+AAAA resolvers.
             if isSingleLabel { return buildNodataResponse(packet: responsePacket) }
             lock.lock()
@@ -359,8 +370,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var upstream = sockaddr_in()
         upstream.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         upstream.sin_family = sa_family_t(AF_INET)
-        upstream.sin_port = UInt16(53).bigEndian
-        inet_pton(AF_INET, "1.1.1.1", &upstream.sin_addr)
+        upstream.sin_port = UInt16(upstreamPort).bigEndian
+        guard inet_pton(AF_INET, upstreamHost, &upstream.sin_addr) == 1 else { return nil }
 
         let connected = withUnsafePointer(to: &upstream) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
