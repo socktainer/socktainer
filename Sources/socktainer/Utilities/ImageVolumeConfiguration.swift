@@ -7,21 +7,22 @@ import ContainerizationOCI
 import Foundation
 import Logging
 
-/// Apple's typed OCI config omits Docker's Volumes field. Decode it from the
-/// original config blob rather than re-encoding the lossy OCI model.
+/// Apple's typed OCI config omits Docker's Volumes and Healthcheck fields. Decode
+/// them from the original config blob rather than re-encoding the lossy OCI model.
 struct ImageVolumeConfiguration: Decodable {
     struct Config: Decodable {
         let Volumes: [String: [String: String]]?
+        let Healthcheck: HealthcheckConfig?
     }
     let config: Config?
 
-    static func read(image: ClientImage, platform: Platform) async throws -> [String: [String: String]]? {
+    static func read(image: ClientImage, platform: Platform) async throws -> Config? {
         let manifest = try await image.manifest(for: platform)
         guard let content = try await RemoteContentStoreClient().get(digest: manifest.config.digest) else {
             throw ContainerizationError(.notFound, message: "image config blob missing: \(manifest.config.digest)")
         }
         let decoded: ImageVolumeConfiguration = try content.decode()
-        return decoded.config?.Volumes
+        return decoded.config
     }
 
     /// Inspect already tolerates incomplete platform metadata. Preserve that

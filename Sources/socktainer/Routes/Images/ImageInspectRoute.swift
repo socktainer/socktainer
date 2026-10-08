@@ -260,7 +260,7 @@ extension ImageInspectRoute {
             if let selectedVariant {
                 let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
                 let imageVolumes = await ImageVolumeConfiguration.readForInspect(logger: req.logger) {
-                    try await ImageVolumeConfiguration.read(image: image, platform: selectedVariant.platform)
+                    try await ImageVolumeConfiguration.read(image: image, platform: selectedVariant.platform)?.Volumes
                 }
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
                     ImageConfig(

@@ -23,6 +23,44 @@ struct HealthCheckManagerTests {
         #expect(HealthCheckManager.parseTest(["NONE"]) == nil)
     }
 
+    // MARK: - Image healthcheck inheritance (#417)
+
+    private static let imageCheck = HealthcheckConfig(
+        Test: ["CMD", "python", "/app/healthcheck.py"], Interval: 1_000_000_000, Timeout: 10_000_000_000, Retries: 3,
+        StartPeriod: 5_000_000_000)
+
+    @Test("omitted request inherits the image healthcheck")
+    func mergeInheritsImage() {
+        let merged = HealthcheckConfig.merged(request: nil, image: Self.imageCheck)
+        #expect(merged?.Test == ["CMD", "python", "/app/healthcheck.py"])
+        #expect(merged?.Interval == 1_000_000_000)
+        #expect(merged?.Retries == 3)
+    }
+
+    @Test("unset request fields fall back to the image's")
+    func mergePartialOverride() {
+        let request = HealthcheckConfig(Test: [], Interval: 2_000_000_000, Timeout: 0, Retries: nil, StartPeriod: nil)
+        let merged = HealthcheckConfig.merged(request: request, image: Self.imageCheck)
+        #expect(merged?.Test == ["CMD", "python", "/app/healthcheck.py"])
+        #expect(merged?.Interval == 2_000_000_000)
+        #expect(merged?.Timeout == 10_000_000_000)
+        #expect(merged?.Retries == 3)
+        #expect(merged?.StartPeriod == 5_000_000_000)
+    }
+
+    @Test("NONE request disables an image healthcheck")
+    func mergeNoneDisables() {
+        let request = HealthcheckConfig(Test: ["NONE"], Interval: nil, Timeout: nil, Retries: nil, StartPeriod: nil)
+        let merged = HealthcheckConfig.merged(request: request, image: Self.imageCheck)
+        #expect(merged?.Test == ["NONE"])
+        #expect(HealthCheckManager.parseTest(merged?.Test) == nil)
+    }
+
+    @Test("no request and no image healthcheck yields none")
+    func mergeNothing() {
+        #expect(HealthcheckConfig.merged(request: nil, image: nil) == nil)
+    }
+
     @Test("Bare test (no CMD prefix) runs as-is")
     func parseBare() {
         #expect(HealthCheckManager.parseTest(["pg_isready"]) == ["pg_isready"])

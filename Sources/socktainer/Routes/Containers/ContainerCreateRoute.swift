@@ -210,7 +210,8 @@ extension ContainerCreateRoute {
                 platform: .current)
 
             let imageConfig = try await img.config(for: requestedPlatform).config
-            let imageVolumes = try await ImageVolumeConfiguration.read(image: img, platform: requestedPlatform)
+            let rawImageConfig = try await ImageVolumeConfiguration.read(image: img, platform: requestedPlatform)
+            let imageVolumes = rawImageConfig?.Volumes
 
             let workingDirectory = imageConfig?.workingDir ?? "/"
 
@@ -432,11 +433,12 @@ extension ContainerCreateRoute {
                 containerLabels[LabelNormalization.mappingKey] = mapping
             }
 
-            // Persist the requested healthcheck across create → start so the
+            // Persist the effective healthcheck (request merged over the image's
+            // HEALTHCHECK) across create → start so the
             // start route can launch the probe loop and inspect can return it
             // in Config.Healthcheck. Apple Container has no native field for
             // this, so a JSON-encoded label is the carrier.
-            if let healthcheck = body.Healthcheck {
+            if let healthcheck = HealthcheckConfig.merged(request: body.Healthcheck, image: rawImageConfig?.Healthcheck) {
                 do {
                     let json = try JSONEncoder().encode(healthcheck)
                     if let jsonString = String(data: json, encoding: .utf8) {
