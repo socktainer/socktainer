@@ -143,8 +143,17 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
+        let startIntervalNs = config.StartInterval.map { UInt64(max($0, 0)) } ?? 0
+
+        // With a StartInterval, probe at that cadence during StartPeriod (Docker
+        // semantics); otherwise wait the start period out.
+        var startDeadline: Date? = nil
         if startPeriodNs > 0 {
-            try? await Task.sleep(nanoseconds: startPeriodNs)
+            if startIntervalNs > 0 {
+                startDeadline = Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000)
+            } else {
+                try? await Task.sleep(nanoseconds: startPeriodNs)
+            }
         }
 
         var failingStreak = 0
@@ -165,9 +174,15 @@ actor HealthCheckManager {
                 Output: ""  // stdout capture from container VMs requires pipe infrastructure
             )
 
+            let inStartPeriod = startDeadline.map { Date() < $0 } ?? false
+
             if exitCode == 0 {
+                startDeadline = nil  // the first success ends the start period
                 failingStreak = 0
                 updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
+            } else if inStartPeriod {
+                // Failures during the start period don't count toward Retries.
+                updateStatus(id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
                 let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
@@ -175,7 +190,8 @@ actor HealthCheckManager {
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
 
-            try? await Task.sleep(nanoseconds: intervalNs)
+            let stillStarting = startDeadline.map { Date() < $0 } ?? false
+            try? await Task.sleep(nanoseconds: stillStarting ? max(startIntervalNs, intervalFloorNs) : intervalNs)
         }
     }
 

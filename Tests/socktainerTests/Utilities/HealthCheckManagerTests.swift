@@ -27,7 +27,7 @@ struct HealthCheckManagerTests {
 
     private static let imageCheck = HealthcheckConfig(
         Test: ["CMD", "python", "/app/healthcheck.py"], Interval: 1_000_000_000, Timeout: 10_000_000_000, Retries: 3,
-        StartPeriod: 5_000_000_000)
+        StartPeriod: 5_000_000_000, StartInterval: 500_000_000)
 
     @Test("omitted request inherits the image healthcheck")
     func mergeInheritsImage() {
@@ -46,6 +46,7 @@ struct HealthCheckManagerTests {
         #expect(merged?.Timeout == 10_000_000_000)
         #expect(merged?.Retries == 3)
         #expect(merged?.StartPeriod == 5_000_000_000)
+        #expect(merged?.StartInterval == 500_000_000)
     }
 
     @Test("NONE request disables an image healthcheck")
@@ -152,6 +153,34 @@ struct HealthCheckManagerTests {
         let h = await mgr.currentHealth(for: "c1")
         #expect(h?.Status == "unhealthy")
         #expect((h?.FailingStreak ?? 0) >= 2)
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("StartInterval probes during StartPeriod instead of waiting it out")
+    func startIntervalProbesDuringStartPeriod() async throws {
+        let mgr = HealthCheckManager(probe: { _, _, _ in 0 }, intervalFloorNs: 1_000_000)
+        let cfg = HealthcheckConfig(
+            Test: ["CMD", "true"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 3,
+            StartPeriod: 60_000_000_000, StartInterval: 1_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        try await Self.waitForStatus("healthy", on: mgr, id: "c1")
+        await mgr.stop(containerId: "c1")
+    }
+
+    @Test("Failures during StartPeriod don't count toward Retries")
+    func startPeriodFailuresIgnored() async throws {
+        let mgr = HealthCheckManager(probe: { _, _, _ in 1 }, intervalFloorNs: 1_000_000)
+        let cfg = HealthcheckConfig(
+            Test: ["CMD", "false"], Interval: 1_000_000, Timeout: 1_000_000_000, Retries: 1,
+            StartPeriod: 60_000_000_000, StartInterval: 1_000_000)
+        await mgr.start(containerId: "c1", config: cfg)
+        for _ in 0..<600 where (await mgr.currentHealth(for: "c1")?.Log.count ?? 0) < 3 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let h = await mgr.currentHealth(for: "c1")
+        #expect((h?.Log.count ?? 0) >= 3)
+        #expect(h?.Status == "starting")
+        #expect(h?.FailingStreak == 0)
         await mgr.stop(containerId: "c1")
     }
 

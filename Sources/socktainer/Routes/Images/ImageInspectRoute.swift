@@ -275,7 +275,7 @@ extension ImageInspectRoute {
                                 Timeout: $0.Timeout.map(Int64.init),
                                 Retries: $0.Retries,
                                 StartPeriod: $0.StartPeriod.map(Int64.init),
-                                StartInterval: nil
+                                StartInterval: $0.StartInterval.map(Int64.init)
                             )
                         },
                         ArgsEscaped: nil,
