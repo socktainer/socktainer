@@ -242,6 +242,12 @@ extension ContainerStartRoute {
                 return
             }
 
+            // Concurrent attaches can arm observers with the same generation. Only one may
+            // consume the stop flag, spend a retry, or clean up aliases for this exit.
+            guard await DieEventOwnership.shared.claimRestart(id: nativeId, epoch: runEpoch, generation: generation) else {
+                return
+            }
+
             let explicitlyStopped = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let nextAttemptNumber = await ContainerRestartState.shared.count(id: nativeId) + 1
             // The armed policy is the immutable create-time label; a docker update landing

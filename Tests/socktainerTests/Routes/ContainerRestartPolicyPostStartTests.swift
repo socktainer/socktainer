@@ -16,6 +16,57 @@ import VaporTesting
 @Suite("ContainerStartRoute — post-start setup on automatic restart")
 struct ContainerRestartPolicyPostStartTests {
 
+    @Test("Duplicate observers spend one retry per exit, independently of die ownership", arguments: [false, true])
+    func duplicateObserversShareRestartWork(monitorReportedExit: Bool) async throws {
+        let id = "attach-duplicate-restart-\(monitorReportedExit)"
+        let snapshot = try makeSnapshot(nativeId: id, ip: "192.168.65.90", network: "attach_default", restartPolicyName: "on-failure")
+        let mock = RestartMock(snapshot: snapshot)
+        let broadcaster = EventBroadcaster()
+        let collector = EventCollector()
+        let stream = await broadcaster.stream()
+        let capture = Task {
+            for await event in stream where event.Action == "start" {
+                await collector.add(event)
+            }
+        }
+        defer { capture.cancel() }
+        await ContainerRestartState.shared.reset(id: id)
+        let generation = await ContainerRestartState.shared.currentGeneration(id: id)
+        let epoch = await DieEventOwnership.shared.beginRun(id: id)
+        if monitorReportedExit {
+            #expect(await DieEventOwnership.shared.claimForMonitor(id: id, epoch: epoch))
+        }
+
+        // Concurrent attach setup can arm two observers for the same run and generation.
+        for _ in 0..<2 {
+            await ContainerStartRoute.armRestartObserver(
+                nativeId: id, eventId: DockerContainerID.hexId(for: snapshot),
+                image: snapshot.configuration.image.reference, name: id, labels: snapshot.configuration.labels,
+                ip: "192.168.65.90", refreshCache: true,
+                restartPolicy: RestartPolicy(Name: "on-failure", MaximumRetryCount: 2),
+                generation: generation, runEpoch: epoch, broadcaster: broadcaster,
+                dnsServer: nil, healthManager: nil, client: mock, logger: Logger(label: "test")
+            )
+        }
+
+        for attempt in 1...2 {
+            await ContainerExitCodeStore.shared.set(id: id, code: 1)
+            #expect(try await pollUntil(timeoutSeconds: 3) { await collector.events.count >= attempt })
+            // Let both observers leave their 100/200ms backoff before checking for duplicates.
+            try await Task.sleep(nanoseconds: 400_000_000)
+            #expect(await mock.startCallCount() == attempt)
+            #expect(await ContainerRestartState.shared.count(id: id) == attempt)
+        }
+        // A third failure exhausts the two retries and must leave the container stopped.
+        await ContainerExitCodeStore.shared.set(id: id, code: 1)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        #expect(await mock.startCallCount() == 2)
+        await ContainerRestartState.shared.reset(id: id)
+        await ContainerExitCodeStore.shared.remove(id: id)
+        await ContainerInfoCache.shared.remove(id: id)
+        await DieEventOwnership.shared.forget(id: id)
+    }
+
     @Test("An automatic restart re-registers DNS with the container's new IP")
     func automaticRestartRefreshesDNS() async throws {
         let nativeId = "restart-dns-refresh-ctr"
