@@ -94,6 +94,9 @@ extension DockerEvent {
 
 actor EventBroadcaster {
     private var continuations: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
+    /// When each (actor id, action) of container and image events was last broadcast, so `ExternalEventWatcher`
+    /// can skip transitions socktainer's own routes already reported.
+    private var recentEvents: [String: Date] = [:]
 
     func stream() -> AsyncStream<DockerEvent> {
         let id = UUID()
@@ -113,9 +116,19 @@ actor EventBroadcaster {
     }
 
     func broadcast(_ event: DockerEvent) {
+        if event.Type == "container" || event.Type == "image" {
+            let now = Date()
+            recentEvents = recentEvents.filter { now.timeIntervalSince($0.value) < 60 }
+            recentEvents["\(event.Actor.ID)/\(event.Action)"] = now
+        }
         for continuation in continuations.values {
             continuation.yield(event)
         }
+    }
+
+    func emittedRecently(id: String, action: String, within interval: TimeInterval) -> Bool {
+        guard let last = recentEvents["\(id)/\(action)"] else { return false }
+        return Date().timeIntervalSince(last) < interval
     }
 
     private func removeContinuation(id: UUID) {
