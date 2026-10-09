@@ -151,9 +151,41 @@ protocol ClientArchiveProtocol: Sendable {
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
     private let appSupportPath: URL
+    private let flushTimeout: Duration
+    private let flushDeadline: @Sendable (Duration) async throws -> Void
+    private let flushGuest: @Sendable (ContainerSnapshot) async throws -> Void
+    private let flushBreaker: GuestFlushBreaker
 
-    init(appSupportPath: URL) {
+    private static let log = Logger(label: "socktainer.archive")
+
+    /// How long a read waits for the guest flush before it reads whatever is on disk.
+    static let defaultFlushTimeout: Duration = .seconds(5)
+
+    /// - Parameters:
+    ///   - flushTimeout: upper bound on each flush; past it the read proceeds anyway.
+    ///   - flushDeadline: waits out `flushTimeout` for one flush; the flush times out
+    ///     when it returns. Defaults to `Task.sleep`; injectable so tests decide when a
+    ///     flush times out instead of racing a wall-clock cap.
+    ///   - flushGuest: writes a running guest's page cache back to its `rootfs.ext4`
+    ///     before the image is read from the host. Defaults to running `sync` in the
+    ///     guest; injectable so tests need no VM.
+    ///   - flushBreaker: containers whose flush timed out and has not returned (see
+    ///     `GuestFlushBreaker` for when that expires). A reference type, so copies of
+    ///     this service share it; the server creates one service for its lifetime
+    ///     (`configure.swift`), and each new service (each test) starts with an empty
+    ///     breaker.
+    init(
+        appSupportPath: URL,
+        flushTimeout: Duration = ClientArchiveService.defaultFlushTimeout,
+        flushDeadline: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        flushGuest: @escaping @Sendable (ContainerSnapshot) async throws -> Void = ClientArchiveService.syncGuest,
+        flushBreaker: GuestFlushBreaker = GuestFlushBreaker()
+    ) {
         self.appSupportPath = appSupportPath
+        self.flushTimeout = flushTimeout
+        self.flushDeadline = flushDeadline
+        self.flushGuest = flushGuest
+        self.flushBreaker = flushBreaker
     }
 
     /// Get the path to a container's rootfs.ext4 file
@@ -210,6 +242,123 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return snapshotURL
     }
 
+    /// Make recent guest writes visible to a host-side read of `rootfs.ext4`.
+    ///
+    /// The reads below parse the ext4 image from the host while the guest VM owns
+    /// it. A file the guest wrote recently sits in the guest page cache until it is
+    /// written back, so reading it straight away reports "not found" (for example a
+    /// step's `$GITHUB_OUTPUT` file read back by `docker cp`). Only a running
+    /// container has a live guest; stopped and never-started ones are read as-is.
+    ///
+    /// Best effort: a failed or stalled flush is logged and the read goes ahead with
+    /// whatever is already on disk, which is what happened before the flush existed.
+    ///
+    /// A flush that times out is abandoned, not killed (see `boundedFlush`). To keep a
+    /// client polling a wedged guest from piling up abandoned work, the timeout trips
+    /// the container in `flushBreaker`: reads skip the flush and read as-is (the same
+    /// outcome as a timeout) until that flush returns or the trip expires, after which
+    /// one probe flush is tried. Reads that arrive concurrently before the first
+    /// timeout each start their own flush; the breaker bounds sequential and polling
+    /// clients.
+    private func flushIfRunning(_ container: ContainerSnapshot) async {
+        guard container.status == .running else { return }
+        let breaker = flushBreaker
+        guard let attempt = breaker.begin(containerId: container.id) else {
+            Self.log.debug(
+                "Skipping guest sync before archive read for \(container.id): an earlier sync timed out; reading rootfs as-is until it returns or the trip expires"
+            )
+            return
+        }
+        if attempt.isProbe {
+            Self.log.debug("Probing guest sync before archive read for \(container.id) after an earlier timeout")
+        }
+        let flushGuest = flushGuest
+        let outcome = await Self.boundedFlush(timeout: flushTimeout, sleep: flushDeadline) {
+            // Runs inside the work `runBounded` waits on, so it also runs when this
+            // flush returns long after the read gave up on it.
+            defer { breaker.finish(attempt) }
+            try await flushGuest(container)
+        }
+        switch outcome {
+        case .flushed:
+            break
+        case .failed(let error):
+            Self.log.debug("Guest sync before archive read failed for \(container.id): \(error)")
+        case .timedOut:
+            breaker.abandon(attempt)
+            Self.log.warning(
+                "Guest sync before archive read did not finish within \(flushTimeout) for \(container.id); reading rootfs as-is and skipping guest syncs for this container until it returns or the trip expires"
+            )
+        }
+    }
+
+    enum FlushOutcome: Sendable {
+        case flushed
+        case failed(any Error)
+        case timedOut
+    }
+
+    /// Runs `flush`, returning once it finishes or `timeout` passes, whichever is first.
+    ///
+    /// The guest flush is an exec over XPC (`createProcess`, `start`, `wait`), and none
+    /// of those awaits react to task cancellation, so a task-group race would still wait
+    /// for a stuck exec after the deadline. `StartupHousekeeping.runBounded` runs the work
+    /// in an unstructured task and resumes on whichever finishes first; a flush still
+    /// running at the deadline is abandoned, not killed. `sleep` is the deadline's wait
+    /// (see `runBounded`).
+    static func boundedFlush(
+        timeout: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        _ flush: @escaping @Sendable () async throws -> Void
+    ) async -> FlushOutcome {
+        final class ErrorBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var stored: (any Error)?
+            var error: (any Error)? {
+                get { lock.withLock { stored } }
+                set { lock.withLock { stored = newValue } }
+            }
+        }
+        let box = ErrorBox()
+        let finished = await StartupHousekeeping.runBounded(timeout: timeout, sleep: sleep) {
+            do {
+                try await flush()
+            } catch {
+                box.error = error
+            }
+        }
+        guard finished else { return .timedOut }
+        if let error = box.error { return .failed(error) }
+        return .flushed
+    }
+
+    struct GuestSyncExitError: Error, CustomStringConvertible {
+        let status: Int32
+        var description: String { "/bin/sync exited with status \(status)" }
+    }
+
+    /// Run `/bin/sync` as root in the guest, from `/` (the image's working directory
+    /// may not exist). Throws if the exec cannot be created or started (for example
+    /// an image without `/bin/sync`) or exits non-zero.
+    static func syncGuest(container: ContainerSnapshot) async throws {
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sync"
+        processConfig.arguments = []
+        processConfig.workingDirectory = "/"
+        processConfig.terminal = false
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        let process = try await ContainerClient().createProcess(
+            containerId: container.id,
+            processId: UUID().uuidString.lowercased(),
+            configuration: processConfig,
+            stdio: [nil, nil, nil]
+        )
+        try await process.start()
+        let status = try await process.wait()
+        guard status == 0 else { throw GuestSyncExitError(status: status) }
+    }
+
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
     /// Stat a single path, reading the inode and nothing else.
@@ -218,6 +367,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// discards it. For `/` that is the whole filesystem, which is why a HEAD
     /// against a large image took as long as reading it.
     func statPath(container: ContainerSnapshot, path: String) async throws -> PathStat {
+        await flushIfRunning(container)
         let rootfsPath = try resolveRootfsPath(container: container)
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: container.id)
@@ -240,6 +390,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        await flushIfRunning(container)
         let rootfsPath = try resolveRootfsPath(container: container)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
@@ -907,4 +1058,135 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Skip other file types (devices, fifos, sockets)
     }
 
+}
+
+/// Per-container circuit breaker for the guest flush before archive reads.
+///
+/// A container trips when a flush times out and is abandoned. While it is tripped,
+/// reads skip the flush and read rootfs as-is, so a client polling a wedged guest
+/// does not start one abandoned flush per read.
+///
+/// A trip does not last forever: the XPC call behind an abandoned flush may never
+/// return, and a container restarted with the same id would otherwise stay tripped
+/// (and read stale data) for the life of the server. `reArmInterval` after the trip
+/// was last renewed, `begin` grants one probe flush and renews the trip, so other
+/// reads keep skipping while the probe runs. A probe that times out trips the
+/// container again; one that returns untrips it. Abandoned work is therefore bounded
+/// to about one flush per interval per container.
+///
+/// Each flush is an `Attempt`. The flush work calls `finish` when it returns; the read
+/// calls `abandon` after it timed out. Both run under one lock, and `abandon` does
+/// nothing for an attempt that already finished, so a flush that returns right at the
+/// deadline cannot leave the container tripped. An attempt that returns without having
+/// been abandoned proves the guest answers and clears the trip, including attempts
+/// abandoned earlier that may never return. An abandoned attempt that returns late
+/// only counts for the trip it was abandoned into: it untrips the container once no
+/// other abandoned attempt of that trip is still out, and does nothing once that trip
+/// has ended (a later trip is about a later timeout it says nothing about).
+///
+/// Limit: an entry lives until its trip ends, so a container removed while tripped
+/// leaves one small entry behind (reused if a container with the same id is created
+/// later). Only containers whose flush timed out get one, so the map is bounded by
+/// the wedged containers the server has seen.
+final class GuestFlushBreaker: @unchecked Sendable {
+    /// How long a trip lasts before one probe flush is allowed.
+    static let defaultReArmInterval: Duration = .seconds(60)
+
+    final class Attempt: @unchecked Sendable {
+        let containerId: String
+        /// Whether this attempt was granted while the container was tripped.
+        let isProbe: Bool
+        // Guarded by the owning breaker's lock.
+        fileprivate var finished = false
+        /// Set by `abandon`; the attempt then sits in that trip's `pending`.
+        fileprivate var abandoned = false
+
+        fileprivate init(containerId: String, isProbe: Bool) {
+            self.containerId = containerId
+            self.isProbe = isProbe
+        }
+    }
+
+    private struct Trip {
+        /// Abandoned attempts that have not returned.
+        var pending: Set<ObjectIdentifier>
+        /// The last abandon, or the last probe granted.
+        var renewedAt: ContinuousClock.Instant
+    }
+
+    private let lock = NSLock()
+    private let reArmInterval: Duration
+    private let now: @Sendable () -> ContinuousClock.Instant
+    private var trips: [String: Trip] = [:]
+
+    /// - Parameters:
+    ///   - reArmInterval: how long after the last abandoned (or probe) flush a tripped
+    ///     container gets one new flush attempt.
+    ///   - now: the clock; injectable so tests can expire a trip without waiting.
+    init(
+        reArmInterval: Duration = GuestFlushBreaker.defaultReArmInterval,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now }
+    ) {
+        self.reArmInterval = reArmInterval
+        self.now = now
+    }
+
+    /// Whether reads of `containerId` currently skip the flush: an abandoned flush
+    /// has not returned and the trip has not expired yet.
+    func isTripped(containerId: String) -> Bool {
+        lock.withLock {
+            guard let trip = trips[containerId] else { return false }
+            return now() - trip.renewedAt < reArmInterval
+        }
+    }
+
+    /// Starts a flush attempt for `containerId`, or returns `nil` if the container is
+    /// tripped and the read should skip the flush. Once a trip has expired, the first
+    /// caller gets a probe attempt and renews the trip, so concurrent callers skip.
+    func begin(containerId: String) -> Attempt? {
+        lock.withLock {
+            guard var trip = trips[containerId] else {
+                return Attempt(containerId: containerId, isProbe: false)
+            }
+            let instant = now()
+            guard instant - trip.renewedAt >= reArmInterval else { return nil }
+            trip.renewedAt = instant
+            trips[containerId] = trip
+            return Attempt(containerId: containerId, isProbe: true)
+        }
+    }
+
+    /// The flush returned (in time or not).
+    func finish(_ attempt: Attempt) {
+        lock.withLock {
+            attempt.finished = true
+            let id = attempt.containerId
+            guard var trip = trips[id] else { return }
+            guard attempt.abandoned else {
+                // Returned before the read gave up on it: the guest answers.
+                trips[id] = nil
+                return
+            }
+            // Abandoned: it only belongs to the trip whose `pending` holds it. If that
+            // trip already ended, the current one is a later, unrelated timeout.
+            guard trip.pending.remove(ObjectIdentifier(attempt)) != nil else { return }
+            trips[id] = trip.pending.isEmpty ? nil : trip
+        }
+    }
+
+    /// The read stopped waiting for the flush. Trips its container (renewing the trip)
+    /// unless the flush already returned. Returns whether it tripped.
+    @discardableResult
+    func abandon(_ attempt: Attempt) -> Bool {
+        lock.withLock {
+            guard !attempt.finished else { return false }
+            attempt.abandoned = true
+            let id = attempt.containerId
+            var trip = trips[id] ?? Trip(pending: [], renewedAt: now())
+            trip.pending.insert(ObjectIdentifier(attempt))
+            trip.renewedAt = now()
+            trips[id] = trip
+            return true
+        }
+    }
 }

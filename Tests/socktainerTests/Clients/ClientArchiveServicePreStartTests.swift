@@ -344,7 +344,9 @@ private struct PreStartFixture {
 
     init() {
         appSupport = FileManager.default.temporaryDirectory.appendingPathComponent("prestart-\(UUID().uuidString)")
-        service = ClientArchiveService(appSupportPath: appSupport)
+        // No real guest sync: a unit test must not reach XPC (the running-container
+        // test would otherwise exec /bin/sync through ContainerClient).
+        service = ClientArchiveService(appSupportPath: appSupport, flushGuest: { _ in })
     }
 
     func cleanUp() {
