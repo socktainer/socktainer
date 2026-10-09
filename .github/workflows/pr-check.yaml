@@ -284,8 +284,8 @@ jobs:
           # expect specific content returned via `/version` endpoint
           sudo docker version | grep 'socktainer'
           # expect specific Docker engine API versions
-          sudo docker version | grep 'v1.32'
-          sudo docker version | grep 'v1.51'
+          sudo docker version | grep '1.32'
+          sudo docker version | grep '1.51'
 
       - name: check network with socktainer
         run: |

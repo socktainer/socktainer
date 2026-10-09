@@ -25,8 +25,8 @@ export BUILD_VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/nu
 export BUILD_GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 export BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Build information - docker engine API versions
-export DOCKER_ENGINE_API_MIN_VERSION := v1.32
-export DOCKER_ENGINE_API_MAX_VERSION := v1.51
+export DOCKER_ENGINE_API_MIN_VERSION := 1.32
+export DOCKER_ENGINE_API_MAX_VERSION := 1.51
 
 SUDO ?= sudo
 .DEFAULT_GOAL := all
