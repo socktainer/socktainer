@@ -7,12 +7,13 @@ import ContainerizationOCI
 import Foundation
 import Logging
 
-/// Apple's typed OCI config omits Docker's Volumes and Healthcheck fields. Decode
+/// Apple's typed OCI config omits Docker's Volumes, Healthcheck and ExposedPorts fields. Decode
 /// them from the original config blob rather than re-encoding the lossy OCI model.
 struct ImageVolumeConfiguration: Decodable {
     struct Config: Decodable {
         let Volumes: [String: [String: String]]?
         let Healthcheck: HealthcheckConfig?
+        let ExposedPorts: [String: [String: String]]?
     }
     let config: Config?
 

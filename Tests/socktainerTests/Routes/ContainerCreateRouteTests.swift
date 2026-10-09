@@ -720,6 +720,29 @@ struct ConvertPortBindingsTests {
         #expect(ports.count == 1)
         #expect(ports[0].hostPort != 0)
     }
+    @Test("PublishAllPorts allocates a host port for an exposed port with no binding (#434)")
+    func publishAllAllocatesExposedPort() throws {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].containerPort == 5000)
+        #expect(ports[0].hostPort != 0)
+    }
+
+    @Test("PublishAllPorts keeps an explicit binding for an exposed port")
+    func publishAllKeepsExplicitBinding() throws {
+        let bindings = publishAllPortBindings(
+            bindings: ["5000/tcp": [PortBinding(HostIp: nil, HostPort: "15000")]], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort == 15000)
+    }
+
+    @Test("PublishAllPorts treats a bare port as tcp and dedupes image and request ports")
+    func publishAllNormalizesAndDedupes() {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["8080", "8080/tcp", "53/udp"])
+        #expect(Set(bindings.keys) == ["8080/tcp", "53/udp"])
+    }
 }
 
 @Suite("ContainerCreateRoute — image existence error mapping")
