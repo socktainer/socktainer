@@ -7,11 +7,11 @@ struct BuildInfoApiVersionTests {
 
     @Test("min API version is a valid Docker version string even without Makefile env vars")
     func minApiVersionIsAlwaysValid() {
-        #expect(getDockerEngineApiMinVersion().wholeMatch(of: /v\d+\.\d+/) != nil)
+        #expect(getDockerEngineApiMinVersion().wholeMatch(of: /\d+\.\d+/) != nil)
     }
 
     @Test("max API version is a valid Docker version string even without Makefile env vars")
     func maxApiVersionIsAlwaysValid() {
-        #expect(getDockerEngineApiMaxVersion().wholeMatch(of: /v\d+\.\d+/) != nil)
+        #expect(getDockerEngineApiMaxVersion().wholeMatch(of: /\d+\.\d+/) != nil)
     }
 }
