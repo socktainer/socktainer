@@ -190,6 +190,8 @@ func configure(_ app: Application) async throws {
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
     app.storage[EventBroadcasterKey.self] = broadcaster
+    let externalEventWatcher = ExternalEventWatcher(broadcaster: broadcaster, imageClient: imageClient, logger: app.logger)
+    Task { await externalEventWatcher.run() }
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
     // Initialize inter-container DNS infrastructure.
