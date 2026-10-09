@@ -449,7 +449,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// One parsed entry of the uploaded archive.
-    private struct ArchiveEntryPlan {
+    struct ArchiveEntryPlan {
         enum Kind {
             case directory
             case file
@@ -559,6 +559,95 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return plan
     }
 
+    /// The guest process that runs the preparation script, and the bytes to
+    /// write to its stdin.
+    ///
+    /// The script holds one line per directory in the archive, so it grows
+    /// without bound. A single argv string is capped at 128 KiB on Linux
+    /// (MAX_ARG_STRLEN), and exec fails past that, so the script is fed over
+    /// stdin (`sh -s`) and only the destination path travels in argv.
+    struct GuestPreparationLaunch {
+        let configuration: ProcessConfiguration
+        let stdin: Data
+    }
+
+    /// Build the exact process configuration and stdin payload that
+    /// `prepareGuestForCopy` launches in the guest.
+    func makeGuestPreparationLaunch(
+        container: ContainerSnapshot,
+        destinationPath: String,
+        entries: [ArchiveEntryPlan],
+        noOverwriteDirNonDir: Bool
+    ) -> GuestPreparationLaunch {
+        let script = buildPreparationScript(
+            entries: entries,
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
+
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-s", destinationPath]
+        processConfig.terminal = false
+        // Validate as root so restrictive permissions on parent directories
+        // cannot mask the existence checks.
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        return GuestPreparationLaunch(configuration: processConfig, stdin: Data(script.utf8))
+    }
+
+    /// Queue that runs the blocking stdin writes of `feedStdin`.
+    ///
+    /// A dedicated GCD queue rather than a Swift task: the write can block for
+    /// as long as the guest shell does not read, and a task blocked in write(2)
+    /// would hold one of the Swift cooperative pool's threads (about one per
+    /// core) for that whole time, so a few stuck uploads could stall every
+    /// async route in the daemon.
+    ///
+    /// A stuck write still pins one GCD worker thread until the guest process
+    /// exits and the pipe breaks; this only frees the cooperative pool. GCD
+    /// caps its worker pool (about 64 threads), and saturating it would also
+    /// delay other GCD work in the process, such as the DispatchIO-based exec
+    /// and attach output pumping and upstream DNS forwarding. An asynchronous
+    /// DispatchIO write would not pin a thread and is a possible follow-up.
+    static let stdinFeedQueue = DispatchQueue(
+        label: "socktainer.archive.prepare-stdin",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    /// Write `data` to `writer` on `queue`, then close `writer`, then call
+    /// `completion` with the write error, if any.
+    ///
+    /// Returns immediately. The payload can be larger than the pipe buffer, so
+    /// the write blocks until the reader has consumed it; it runs on a GCD
+    /// queue so it holds neither the caller nor a cooperative-pool thread
+    /// (it does occupy one GCD worker thread while blocked).
+    /// Closing the write end gives the reader (`sh -s`) its EOF. The reader may
+    /// exit before consuming everything (e.g. exit 40 when the destination is
+    /// missing), so SIGPIPE is suppressed on this fd before the write is
+    /// queued, and the write fails with EPIPE instead of killing the daemon;
+    /// the write end is closed in that case too. `writer` is owned by the
+    /// queued work item; the caller must not close it.
+    static func feedStdin(
+        writer: FileHandle,
+        data: Data,
+        queue: DispatchQueue = stdinFeedQueue,
+        completion: @escaping @Sendable (Error?) -> Void = { _ in }
+    ) {
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        queue.async {
+            let result: Error?
+            do {
+                try writer.write(contentsOf: data)
+                result = nil
+            } catch {
+                result = error
+            }
+            try? writer.close()
+            completion(result)
+        }
+    }
+
     /// Run Docker's PUT-archive validation inside the running guest and create
     /// the directory/symlink structure for the incoming archive: destination
     /// must exist (404) and be a directory (400), optional per-entry
@@ -570,21 +659,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
         entries: [ArchiveEntryPlan],
         noOverwriteDirNonDir: Bool
     ) async throws {
-        let script = buildPreparationScript(
+        let launch = makeGuestPreparationLaunch(
+            container: container,
+            destinationPath: destinationPath,
             entries: entries,
             noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
-        var processConfig = container.configuration.initProcess
-        processConfig.executable = "/bin/sh"
-        processConfig.arguments = ["-c", script, "sh", destinationPath]
-        processConfig.terminal = false
-        // Validate as root so restrictive permissions on parent directories
-        // cannot mask the existence checks.
-        processConfig.user = .id(uid: 0, gid: 0)
-
-        guard let pipes = StdioPipes.make([.stderr]) else {
-            throw ClientArchiveError.operationFailed(message: "Failed to create stderr pipe")
+        guard let pipes = StdioPipes.make([.stdin, .stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
         }
 
         let process: ClientProcess
@@ -592,7 +675,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             process = try await ContainerClient().createProcess(
                 containerId: container.id,
                 processId: UUID().uuidString.lowercased(),
-                configuration: processConfig,
+                configuration: launch.configuration,
                 stdio: pipes.stdioArray
             )
         } catch {
@@ -605,6 +688,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
             pipes.closeAfterHandoff()
             throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
         }
+
+        // Feed the script over stdin; the write result is not needed because a
+        // shell that stops reading early reports why through its exit code.
+        Self.feedStdin(writer: pipes.stdin!.write, data: launch.stdin)
 
         // Drain stderr concurrently (capped at 16 KiB) while waiting.
         // collectOutput() is not used here because it reads unboundedly via
@@ -651,7 +738,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// Build the validation/preparation shell script run inside the guest.
     /// Only `sh`, `mkdir`, `ln` and `test` are required. Existing directories
     /// are never modified, mirroring how tar treats implicit parents.
-    private func buildPreparationScript(
+    func buildPreparationScript(
         entries: [ArchiveEntryPlan],
         noOverwriteDirNonDir: Bool
     ) -> String {
