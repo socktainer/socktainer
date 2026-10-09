@@ -268,9 +268,14 @@ extension ContainerCreateRoute {
 
             let publishedPorts: [PublishPort]
             do {
-                publishedPorts = try convertPortBindings(
-                    from: body.HostConfig?.PortBindings ?? [:]
-                )
+                var portBindings = body.HostConfig?.PortBindings ?? [:]
+                if body.HostConfig?.PublishAllPorts == true {
+                    portBindings = publishAllPortBindings(
+                        bindings: portBindings,
+                        exposed: Array((rawImageConfig?.ExposedPorts ?? [:]).keys) + Array((body.ExposedPorts ?? [:]).keys)
+                    )
+                }
+                publishedPorts = try convertPortBindings(from: portBindings)
             } catch {
                 req.logger.error("Failed to allocate ports: \(error)")
                 throw Abort(.internalServerError, reason: "Failed to allocate ports: \(error)")
@@ -1069,6 +1074,21 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
     }
 
     return publishedPorts
+}
+
+// Docker `-P` / HostConfig.PublishAllPorts: every exposed port (image + request)
+// without an explicit binding gets an ephemeral host port. Bare "8080" means tcp.
+func publishAllPortBindings(
+    bindings: [String: [PortBinding]], exposed: [String]
+) -> [String: [PortBinding]] {
+    var result = bindings
+    for spec in exposed {
+        let key = spec.contains("/") ? spec : "\(spec)/tcp"
+        if result[key]?.isEmpty ?? true {
+            result[key] = [PortBinding(HostIp: nil, HostPort: nil)]
+        }
+    }
+    return result
 }
 
 // Maps Docker HostConfig.Memory (bytes, 0 = no limit) to Apple Container memoryInBytes.
