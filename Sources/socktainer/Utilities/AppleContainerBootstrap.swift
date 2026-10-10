@@ -27,6 +27,9 @@ public enum AppleContainerBootstrap {
         /// still coming up, kernel install is mid-flight, or something else went wrong that
         /// exit code 0 doesn't surface.
         case startedButUnresponsive
+        /// The `container` CLI that would have been used reports a different version than
+        /// this socktainer expects, so no start was attempted.
+        case versionMismatch(cliPath: String, detected: String, expected: String)
 
         /// User-facing status line for this outcome, or an empty string when there's
         /// nothing worth printing (the common case: the service was already running).
@@ -41,6 +44,10 @@ public enum AppleContainerBootstrap {
             case .startedButUnresponsive:
                 return
                     "[ WARN ] `container system start` exited successfully but the service still isn't responding — run `container system start` manually to see why"
+            case .versionMismatch(let cliPath, let detected, let expected):
+                return
+                    "[ WARN ] \(cliPath) reports container \(detected), but this socktainer expects \(expected) — not starting the service automatically.\n"
+                    + "         Run `container system start` yourself with the install you intend to use, or pass --no-auto-start to skip this step."
             }
         }
     }
@@ -52,14 +59,88 @@ public enum AppleContainerBootstrap {
             return
         }
 
-        print("[ INFO ] Apple Container service not running — attempting to start it...")
+        // Resolved here rather than inside `runContainerSystemStart` so the version it
+        // reports and the binary that gets run are the same resolution, not two.
+        guard let containerCLIPath = discoverContainerCLIPath() else {
+            print(startAttemptMessage)
+            print(Outcome.startFailed.message)
+            return
+        }
+
+        if let mismatch = mismatchOutcome(
+            cliPath: containerCLIPath,
+            cliVersion: await containerCLIVersion(at: containerCLIPath),
+            expectedVersion: getAppleContainerVersion()
+        ) {
+            print(mismatch.message)
+            return
+        }
+
+        print(startAttemptMessage)
         let outcome: Outcome
-        if await runContainerSystemStart() {
+        if await runContainerSystemStart(at: containerCLIPath) {
             outcome = await isReachable() ? .started : .startedButUnresponsive
         } else {
             outcome = .startFailed
         }
         print(outcome.message)
+    }
+
+    private static let startAttemptMessage = "[ INFO ] Apple Container service not running — attempting to start it..."
+
+    /// Whether the CLI at `cliPath` should be used to start the service, expressed as the
+    /// outcome to report instead of starting. `nil` means go ahead: either the versions
+    /// agree, or the CLI's version could not be read — an unreadable version keeps the
+    /// previous behavior (attempt the start) rather than refusing on missing information.
+    ///
+    /// `container system start` registers launchd services scoped to its own install root,
+    /// so issuing it from a CLI that disagrees with the version socktainer was built
+    /// against acts on a service another install may already own. That pairing is what
+    /// `AppleContainerVersionCheck` reports on — but it runs after this bootstrap, so
+    /// without this guard the start has already happened by then.
+    static func mismatchOutcome(cliPath: String, cliVersion: String?, expectedVersion: String) -> Outcome? {
+        guard let cliVersion, cliVersion != expectedVersion else {
+            return nil
+        }
+        return .versionMismatch(cliPath: cliPath, detected: cliVersion, expected: expectedVersion)
+    }
+
+    /// Semver reported by `<cliPath> --version`, or `nil` if it could not be read.
+    ///
+    /// Output is collected through a temporary file rather than a `Pipe()`: `Pipe()` is
+    /// rejected in this source tree (see AGENTS.md and `scripts/lint-pipes.sh`), and a
+    /// file needs no concurrent drain to avoid filling a pipe buffer.
+    static func containerCLIVersion(at cliPath: String, timeout: Duration = .seconds(10)) async -> String? {
+        let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("socktainer-container-version-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else {
+            return nil
+        }
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        guard let handle = try? FileHandle(forWritingTo: outputURL) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: cliPath)
+        process.arguments = ["--version"]
+        process.standardOutput = handle
+        process.standardError = handle
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        guard await Self.waitForExit(of: process, timeout: timeout) else {
+            return nil
+        }
+
+        guard let data = try? Data(contentsOf: outputURL), let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return AppleContainerVersionCheck.extractSemver(from: text)
     }
 
     /// Whether Apple Container's apiserver answers a health-check ping within 2 seconds.
@@ -79,15 +160,11 @@ public enum AppleContainerBootstrap {
     /// runs as a background service with no attached TTY, so an interactive prompt would
     /// hang forever waiting for input that can never arrive — defeating the point of an
     /// automatic bootstrap entirely.
-    private static func runContainerSystemStart() async -> Bool {
-        // Launching via an unqualified `env container ...` depends on PATH already
-        // containing wherever `container` was installed. Background launch contexts
-        // (e.g. launchd) often inherit a minimal PATH that doesn't — resolve the actual
-        // executable instead, matching how ClientRegistryService finds the same binary.
-        guard let containerCLIPath = discoverContainerCLIPath() else {
-            return false
-        }
-
+    ///
+    /// Takes the already-resolved CLI path: launching via an unqualified `env container ...`
+    /// depends on PATH already containing wherever `container` was installed, and background
+    /// launch contexts (e.g. launchd) often inherit a minimal PATH that doesn't.
+    private static func runContainerSystemStart(at containerCLIPath: String) async -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: containerCLIPath)
         process.arguments = ["system", "start", "--enable-kernel-install"]

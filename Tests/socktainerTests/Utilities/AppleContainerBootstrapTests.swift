@@ -121,3 +121,100 @@ struct AppleContainerBootstrapWaitForExitTests {
         #expect(!process.isRunning)
     }
 }
+
+/// `ensureRunning()` issues `container system start` through whichever `container` the host
+/// resolves, and it runs before `AppleContainerVersionCheck` — so on a host with more than
+/// one install (Homebrew's `container` formula alongside Apple's signed `.pkg`, issue #392)
+/// the start could be issued by a CLI that disagrees with the version socktainer was built
+/// against, before anything reported on that pairing. `mismatchOutcome` is the guard; like
+/// `Outcome` above it is tested against its inputs rather than a live service.
+@Suite("AppleContainerBootstrap.mismatchOutcome")
+struct AppleContainerBootstrapMismatchTests {
+
+    @Test("a matching CLI version is cleared to start the service")
+    func matchingVersionProceeds() {
+        let outcome = AppleContainerBootstrap.mismatchOutcome(
+            cliPath: "/usr/local/bin/container",
+            cliVersion: "1.5.0",
+            expectedVersion: "1.5.0"
+        )
+        #expect(outcome == nil)
+    }
+
+    @Test("a mismatched CLI version refuses the start and names both versions")
+    func mismatchedVersionRefuses() {
+        let outcome = AppleContainerBootstrap.mismatchOutcome(
+            cliPath: "/opt/homebrew/bin/container",
+            cliVersion: "1.3.1",
+            expectedVersion: "1.5.0"
+        )
+        #expect(outcome == .versionMismatch(cliPath: "/opt/homebrew/bin/container", detected: "1.3.1", expected: "1.5.0"))
+
+        let message = outcome?.message ?? ""
+        #expect(message.contains("WARN"))
+        #expect(message.contains("/opt/homebrew/bin/container"))
+        #expect(message.contains("1.3.1"))
+        #expect(message.contains("1.5.0"))
+        #expect(message.contains("--no-auto-start"))
+    }
+
+    @Test("an unreadable CLI version keeps the previous behavior rather than refusing")
+    func unknownVersionProceeds() {
+        let outcome = AppleContainerBootstrap.mismatchOutcome(
+            cliPath: "/usr/local/bin/container",
+            cliVersion: nil,
+            expectedVersion: "1.5.0"
+        )
+        #expect(outcome == nil)
+    }
+
+    @Test("the mismatch message is distinct from every other outcome message")
+    func mismatchMessageIsDistinct() {
+        let mismatch = AppleContainerBootstrap.Outcome.versionMismatch(
+            cliPath: "/opt/homebrew/bin/container",
+            detected: "1.3.1",
+            expected: "1.5.0"
+        )
+        let messages: [String] = [
+            AppleContainerBootstrap.Outcome.started.message,
+            AppleContainerBootstrap.Outcome.startFailed.message,
+            AppleContainerBootstrap.Outcome.startedButUnresponsive.message,
+            mismatch.message,
+        ]
+        #expect(Set(messages).count == messages.count)
+    }
+}
+
+/// `containerCLIVersion(at:)` parses whatever the binary prints, so it is exercised against
+/// stand-in executables rather than a real `container` — the host running the suite may have
+/// any version installed, or none.
+@Suite("AppleContainerBootstrap.containerCLIVersion")
+struct AppleContainerBootstrapCLIVersionTests {
+
+    @Test("a semver is extracted from a container-style version banner")
+    func extractsSemverFromBanner() async throws {
+        let script = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("socktainer-fake-container-\(UUID().uuidString).sh")
+        try "#!/bin/sh\necho 'container CLI version 1.4.1 (build: release, commit: 9a8917c)'\n"
+            .write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        let version = await AppleContainerBootstrap.containerCLIVersion(at: script.path)
+        #expect(version == "1.4.1")
+    }
+
+    @Test("output with no version produces nil rather than a wrong answer")
+    func noVersionYieldsNil() async {
+        let version = await AppleContainerBootstrap.containerCLIVersion(at: "/usr/bin/true")
+        #expect(version == nil)
+    }
+
+    @Test("a nonexistent executable produces nil rather than throwing")
+    func nonexistentExecutableYieldsNil() async {
+        let version = await AppleContainerBootstrap.containerCLIVersion(
+            at: "/nonexistent/socktainer-test/container"
+        )
+        #expect(version == nil)
+    }
+}
