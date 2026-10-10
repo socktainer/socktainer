@@ -19,7 +19,7 @@ public func stripSubnetFromIP(_ ipAddress: String?) -> String? {
 public struct AppleContainerVersionCheck {
 
     /// Extracts a semantic version (e.g., 0.6.0) from a longer version string
-    private static func extractSemver(from text: String) -> String? {
+    static func extractSemver(from text: String) -> String? {
         // Look for the first occurrence of X.Y.Z
         let pattern = "\\b\\d+\\.\\d+\\.\\d+\\b"
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
