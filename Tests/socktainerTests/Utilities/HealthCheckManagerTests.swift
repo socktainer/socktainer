@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Testing
 
@@ -217,6 +218,23 @@ struct HealthCheckManagerTests {
         #expect((h?.FailingStreak ?? 0) >= 2)
         #expect(h?.Status == "healthy")
         await mgr.stop(containerId: "c1")
+    }
+
+    // MARK: - Probe process
+
+    @Test("Probe runs as the container's configured user, not root")
+    func probeKeepsContainerUser() {
+        let base = ProcessConfiguration(
+            executable: "/entrypoint.sh", arguments: ["serve"], environment: ["A=1"],
+            workingDirectory: "/app", terminal: true, user: .raw(userString: "501:20")
+        )
+        let probe = HealthCheckManager.probeProcessConfiguration(base: base, cmd: ["/bin/sh", "-c", "/healthcheck.sh"])
+        #expect(probe.user == .raw(userString: "501:20"))
+        #expect(probe.executable == "/bin/sh")
+        #expect(probe.arguments == ["-c", "/healthcheck.sh"])
+        #expect(probe.terminal == false)
+        #expect(probe.environment == ["A=1"])
+        #expect(probe.workingDirectory == "/app")
     }
 
     // MARK: - Health log entries
