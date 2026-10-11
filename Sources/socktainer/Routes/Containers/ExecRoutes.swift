@@ -333,6 +333,39 @@ struct ExecRoute: RouteCollection {
                 await broadcaster.broadcast(event)
             }
 
+            // moby emits `exec_die` only on an observed real exit. Apple Container's XPC
+            // sometimes never acknowledges exec exit, so race process.wait() against a
+            // stall bound: on an observed exit, record the code and broadcast exec_die;
+            // if it stalls/errors, record a sentinel so GET /exec/{id}/json leaves
+            // Running, but emit no exec_die (no death was observed).
+            @Sendable func recordExecExit(_ process: ClientProcess, withinNanoseconds bound: UInt64) async {
+                enum ExecExit {
+                    case observed(Int32)
+                    case unresolved
+                }
+                let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
+                    g.addTask {
+                        if let code = try? await process.wait() { return .observed(code) }
+                        return .unresolved
+                    }
+                    g.addTask {
+                        try? await Task.sleep(nanoseconds: bound)
+                        return .unresolved
+                    }
+                    let result = await g.next() ?? .unresolved
+                    g.cancelAll()
+                    return result
+                }
+                await ProcessRegistry.shared.remove(id: execId)
+                switch outcome {
+                case .observed(let code):
+                    await ExecManager.shared.setExitCode(id: execId, code: code)
+                    await broadcastExecEvent("exec_die", exitCode: code)
+                case .unresolved:
+                    await ExecManager.shared.setExitCode(id: execId, code: -1)
+                }
+            }
+
             let detach = startRequest.Detach ?? false
             let tty = startRequest.Tty ?? config.tty
             // Docker sends ConsoleSize as [height, width] for interactive (-it) exec.
@@ -371,47 +404,14 @@ struct ExecRoute: RouteCollection {
                 // (exit code + exec_die), mirroring the container.die observer. Keep the
                 // ExecManager entry afterwards — the recorded exit code must remain readable
                 // via GET /exec/{id}/json (matching the attached HTTP/TCP paths).
+                // No client is blocked on the detach result, so allow a 60s XPC stall.
                 Task.detached {
-                    // moby emits `exec_die` only when the process is observed to actually
-                    // exit. Race the real exit against a 60-second XPC-stall fallback (no
-                    // client is blocked on the detach result): on an observed exit, record
-                    // the code and broadcast exec_die; if the wait stalls or errors without
-                    // an observed exit, record a sentinel so GET /exec/{id}/json stops
-                    // reporting Running: true, but broadcast no exec_die.
-                    enum ExecExit {
-                        case observed(Int32)
-                        case unresolved
-                    }
-                    let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                        g.addTask {
-                            if let code = try? await process.wait() { return .observed(code) }
-                            return .unresolved
-                        }
-                        g.addTask {
-                            try? await Task.sleep(nanoseconds: 60_000_000_000)
-                            return .unresolved
-                        }
-                        let result = await g.next() ?? .unresolved
-                        g.cancelAll()
-                        return result
-                    }
-                    switch outcome {
-                    case .observed(let code):
-                        await ExecManager.shared.setExitCode(id: execId, code: code)
-                        await broadcastExecEvent("exec_die", exitCode: code)
-                    case .unresolved:
-                        await ExecManager.shared.setExitCode(id: execId, code: -1)
-                    }
+                    await recordExecExit(process, withinNanoseconds: 60_000_000_000)
                 }
                 return Response(status: .ok)
             }
 
-            // Check if client requested connection upgrade and attachStdin is true
-            let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
-            let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp" && config.attachStdin
-
-            guard shouldUpgrade else {
+            guard ExecRoute.shouldHijack(headers: req.headers, config: config) else {
                 // Fallback to HTTP streaming mode
                 return ConnectionHijackingMiddleware.createDockerStreamingResponse(
                     request: req,
@@ -472,36 +472,7 @@ struct ExecRoute: RouteCollection {
                     // obtain the numeric exit code; if it hangs we fall back to -1
                     // after 10 s. The stream is never blocked by exit-code retrieval.
                     Task.detached {
-                        // moby emits `exec_die` only on an observed real exit. Race the exit
-                        // against a 10s XPC-stall fallback: on an observed exit, record the code
-                        // and broadcast exec_die; if it stalls/errors with no observed exit,
-                        // record a sentinel so GET /exec/{id}/json leaves Running, but emit no
-                        // exec_die (no death was observed).
-                        enum ExecExit {
-                            case observed(Int32)
-                            case unresolved
-                        }
-                        let outcome: ExecExit = await withTaskGroup(of: ExecExit.self) { g in
-                            g.addTask {
-                                if let code = try? await process.wait() { return .observed(code) }
-                                return .unresolved
-                            }
-                            g.addTask {
-                                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                                return .unresolved
-                            }
-                            let result = await g.next() ?? .unresolved
-                            g.cancelAll()
-                            return result
-                        }
-                        await ProcessRegistry.shared.remove(id: execId)
-                        switch outcome {
-                        case .observed(let code):
-                            await ExecManager.shared.setExitCode(id: execId, code: code)
-                            await broadcastExecEvent("exec_die", exitCode: code)
-                        case .unresolved:
-                            await ExecManager.shared.setExitCode(id: execId, code: -1)
-                        }
+                        await recordExecExit(process, withinNanoseconds: 10_000_000_000)
                     }
 
                     // Task group: only I/O tasks. Stdout and stderr complete at pipe
@@ -648,10 +619,14 @@ struct ExecRoute: RouteCollection {
                 await ProcessRegistry.shared.set(id: execId, process: process)
                 if let initialTerminalSize { try? await process.resize(initialTerminalSize) }
 
-                // Setup bidirectional communication for interactive sessions
-                await withTaskGroup(of: Void.self) { group in
+                // Setup bidirectional communication for interactive sessions.
+                // Output tasks return true when their pipe is drained.
+                await withTaskGroup(of: Bool.self) { group in
+                    var outputTaskCount = 0
+
                     // stdout/stderr -> channel (container output to client)
                     if let stdoutHandle = pipes.stdout?.read {
+                        outputTaskCount += 1
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
@@ -715,10 +690,12 @@ struct ExecRoute: RouteCollection {
                                     }
                                 }
                             }
+                            return true
                         }
                     }
 
                     if let stderrHandle = pipes.stderr?.read {
+                        outputTaskCount += 1
                         group.addTask {
                             let dispatchIO = DispatchIO(
                                 type: .stream,
@@ -775,6 +752,7 @@ struct ExecRoute: RouteCollection {
                                     }
                                 }
                             }
+                            return true
                         }
                     }
 
@@ -785,49 +763,66 @@ struct ExecRoute: RouteCollection {
                             try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
                         }
 
-                        // Connection was closed - the process monitor will handle cleanup.
+                        // Connection was closed - exit recording below handles cleanup.
                         await ExecRoute.broadcastExecDetach(
                             execRunning: await ExecManager.shared.isRunning(id: execId),
                             execId: execId,
                             container: container,
                             broadcaster: execBroadcaster
                         )
+                        return false
                     }
 
-                    // Process monitor with proper cleanup
-                    group.addTask {
-                        // moby emits `exec_die` only on an observed real exit. If wait()
-                        // throws, record a synthetic exit code so the exec leaves the
-                        // Running state (GET /exec/{id}/json), but broadcast no exec_die —
-                        // no clean exit was observed.
-                        let observedCode: Int32? = try? await process.wait()
-                        await ExecManager.shared.setExitCode(id: execId, code: observedCode ?? -1)
-                        await ProcessRegistry.shared.remove(id: execId)
-                        if let observedCode {
-                            await broadcastExecEvent("exec_die", exitCode: observedCode)
-                        }
-
-                        // Give a small delay for any final output to be processed
-                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-
-                        // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
-                        // it via writeQueue on channelInactive / inputClosed. Closing it here too
-                        // would be a double-close that can kill a reused fd.
-                        // stdout/stderr write ends are Apple-owned — also do not close them.
-
-                        // Close the channel gracefully
-                        _ = channel.eventLoop.submit {
-                            channel.close(promise: nil)
+                    // Close once every attached output pipe reaches EOF (Apple Container
+                    // closes the write ends when the exec exits), not on process.wait(),
+                    // which can hang on an unacknowledged XPC exit. With no output
+                    // attached, exit is the only signal, so allow a long stall instead.
+                    if outputTaskCount > 0 {
+                        var drained = 0
+                        for await isOutput in group where isOutput {
+                            drained += 1
+                            if drained >= outputTaskCount { break }
                         }
                     }
+                    // A short bound only once the output reached a live client: output
+                    // tasks also end when the client disconnects mid-exec.
+                    let exitBound: UInt64 = outputTaskCount > 0 && channel.isActive ? 10_000_000_000 : 3_600_000_000_000
+                    Task.detached {
+                        await recordExecExit(process, withinNanoseconds: exitBound)
+                    }
+                    // Record the exit code before closing so the client's follow-up
+                    // GET /exec/{id}/json reads it; the poll is bounded even if wait() is not.
+                    _ = await ExecManager.shared.waitForExitCode(id: execId, timeoutNanoseconds: exitBound + 2_000_000_000)
 
-                    for await _ in group {}
+                    // Give a small delay for any final output to be processed
+                    try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+
+                    // DockerTCPHandler owns stdinPipe?.write after setStdinWriter(); it closes
+                    // it via writeQueue on channelInactive / inputClosed. Closing it here too
+                    // would be a double-close that can kill a reused fd.
+                    // stdout/stderr write ends are Apple-owned — also do not close them.
+
+                    // Close the channel gracefully, then end the connection monitor.
+                    try? await channel.eventLoop.submit {
+                        channel.close(promise: nil)
+                    }.get()
+                    group.cancelAll()
                 }
 
                 // Keep the exec entry so the client's follow-up
                 // `GET /exec/{id}/json` can read the recorded exit code.
             }
         }
+    }
+
+    /// Hijack the connection whenever the client asks for the upgrade, as moby does.
+    /// The attach flags deliberately play no part: a stdout/stderr-only exec sent to
+    /// the streaming fallback gets a 101 that is never closed, so a client reading to
+    /// EOF without half-closing its write side hangs (issue #442).
+    static func shouldHijack(headers: HTTPHeaders, config: ExecManager.ExecConfig) -> Bool {
+        let connectionHeader = headers.first(name: "Connection")?.lowercased()
+        let upgradeHeader = headers.first(name: "Upgrade")?.lowercased()
+        return connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
     }
 
     /// The client's channel died while the exec still runs (no exit code recorded):
