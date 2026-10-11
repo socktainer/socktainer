@@ -13,11 +13,28 @@ struct SocktainerDNSServerKey: StorageKey {
 ///
 /// Runs on 0.0.0.0:2054 (covers all interfaces including vmnet gateways).
 /// Port 2053 is reserved by Apple Container's own DNS handler.
-/// Container names are registered after start via register(hostname:ip:) and
-/// unregistered on container removal via unregister(hostname:).
+/// Container names are registered after start via register(hostname:ips:) and
+/// unregistered on container removal via unregisterIfOwned(hostname:expectedIP:).
+///
+/// A container on several networks is registered once per network, as CIDRs. Every
+/// network's forwarder sidecar relays to this one server, so an A query is answered with
+/// the address whose subnet contains the querying sidecar's address.
 final class SocktainerDNSServer: @unchecked Sendable {
+    private struct Subnet: Equatable {
+        let network: [UInt8]
+        let prefixLength: UInt8
+    }
+
+    /// `subnet` is nil for a bare-IP registration. `owner` is the first address of the
+    /// registering batch, so `unregisterIfOwned` removes all of a container's addresses.
+    private struct AddressEntry {
+        let ip: [UInt8]
+        let subnet: Subnet?
+        let owner: [UInt8]
+    }
+
     private let lock = NSLock()
-    private var entries: [String: [UInt8]] = [:]  // normalized hostname → 4-byte IPv4
+    private var entries: [String: [AddressEntry]] = [:]  // normalized hostname → addresses, first-registered first
     private var log = Logger(label: "socktainer.dns")
     private var _upstreamHost = "1.1.1.1"
     /// Upstream for non-container names. Lock-guarded: startup may set it after the
@@ -30,12 +47,25 @@ final class SocktainerDNSServer: @unchecked Sendable {
     var upstreamPort = 53
 
     func register(hostname: String, ip: String) {
-        guard let addr = Self.parseIPv4(ip) else { return }
+        register(hostname: hostname, ips: [ip])
+    }
+
+    /// Registers one container's addresses for `hostname`, each optionally a CIDR such as
+    /// "192.168.1.5/24". An address replaces any entry on the same subnet (bare IPs share
+    /// one slot) and is added alongside entries on other subnets.
+    func register(hostname: String, ips: [String]) {
+        let parsed = ips.compactMap(Self.parseIPv4WithSubnet)
+        guard let owner = parsed.first?.address else { return }
         lock.lock()
         defer { lock.unlock() }
         let key = Self.normalize(hostname)
-        entries[key] = addr
-        log.info("[dns] registered \(key) → \(ip)")
+        var routes = entries[key] ?? []
+        for (addr, subnet) in parsed {
+            routes.removeAll { $0.subnet == subnet }
+            routes.append(AddressEntry(ip: addr, subnet: subnet, owner: owner))
+        }
+        entries[key] = routes
+        log.info("[dns] registered \(key) → \(ips.joined(separator: ", "))")
     }
 
     func unregister(hostname: String) {
@@ -47,23 +77,49 @@ final class SocktainerDNSServer: @unchecked Sendable {
         }
     }
 
-    /// Unregisters `hostname` only if it's currently registered to `expectedIP` — atomically,
-    /// so a concurrent re-registration between a caller's ownership check and its unregister
-    /// call can't be dropped. A hostname registered to a different IP, or not registered at
-    /// all, is left untouched.
+    /// Unregisters the addresses `hostname` holds for the container whose first registered
+    /// address is `expectedIP` — atomically, so a concurrent re-registration between a
+    /// caller's ownership check and its unregister call can't be dropped. Addresses
+    /// registered by another container under the same name are left untouched.
     func unregisterIfOwned(hostname: String, expectedIP: String) {
         lock.lock()
         defer { lock.unlock() }
         let key = Self.normalize(hostname)
-        guard let addr = entries[key], let expected = Self.parseIPv4(expectedIP), addr == expected else { return }
-        entries.removeValue(forKey: key)
+        guard let expected = Self.parseIPv4(expectedIP), var routes = entries[key] else { return }
+        let before = routes.count
+        routes.removeAll { $0.owner == expected }
+        guard routes.count != before else { return }
+        entries[key] = routes.isEmpty ? nil : routes
         log.info("[dns] unregistered \(key)")
     }
 
+    /// One address per hostname, the first registered. Used for env-var rewriting at
+    /// create time, which has no querying network to scope by.
     func listEntries() -> [String: String] {
         lock.lock()
         defer { lock.unlock() }
-        return entries.mapValues { ip in "\(ip[0]).\(ip[1]).\(ip[2]).\(ip[3])" }
+        return entries.compactMapValues { routes in
+            routes.first.map { Self.format($0.ip) }
+        }
+    }
+
+    /// The address of `hostname` on the subnet containing `clientIP`, else the
+    /// first-registered address. `hostname` must already be normalized.
+    func lookupAddress(_ hostname: String, clientIP: [UInt8]) -> [UInt8]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let routes = entries[hostname] else { return nil }
+        let match = routes.first { route in
+            guard let subnet = route.subnet else { return false }
+            return Self.networkAddress(clientIP, prefixLength: subnet.prefixLength) == subnet.network
+        }
+        return (match ?? routes.first)?.ip
+    }
+
+    private func hasEntry(_ hostname: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[hostname] != nil
     }
 
     /// Tries to bind to `preferredPort`, then `preferredPort+1`, `+2`, up to `maxAttempts`.
@@ -150,9 +206,11 @@ final class SocktainerDNSServer: @unchecked Sendable {
             let packet = Array(buf[0..<n])
             let capturedAddr = clientAddr
             let capturedLen = clientLen
+            // For containers this is the forwarder sidecar on the network the query came from.
+            let clientIP = withUnsafeBytes(of: capturedAddr.sin_addr.s_addr) { Array($0) }
 
             // Fast path: local resolution — answer inline without dispatch latency.
-            if let local = handleLocalQuery(packet) {
+            if let local = handleLocalQuery(packet, clientIP: clientIP) {
                 var addr = capturedAddr
                 _ = local.withUnsafeBytes { ptr in
                     withUnsafePointer(to: &addr) {
@@ -166,7 +224,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
             // Slow path: upstream query — dispatch so recvfrom stays responsive.
             DispatchQueue.global(qos: .userInitiated).async {
-                guard let response = self.handleQuery(packet) else { return }
+                guard let response = self.handleQuery(packet, clientIP: clientIP) else { return }
                 var addr = capturedAddr
                 _ = response.withUnsafeBytes { ptr in
                     withUnsafePointer(to: &addr) {
@@ -181,7 +239,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
 
     /// Returns a local response without touching the network. Returns nil if the query
     /// needs to be forwarded upstream, letting the caller fall through to the slow path.
-    private func handleLocalQuery(_ packet: [UInt8]) -> [UInt8]? {
+    private func handleLocalQuery(_ packet: [UInt8], clientIP: [UInt8]) -> [UInt8]? {
         guard packet.count >= 12 else { return nil }
         let flags = (UInt16(packet[2]) << 8) | UInt16(packet[3])
         guard (flags & 0x8000) == 0, (flags & 0x7800) == 0 else { return nil }
@@ -194,10 +252,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let normalized = Self.normalize(qname)
         let isSingleLabel = !normalized.contains(".")
         if qtype == 1 {
-            lock.lock()
-            let ip = entries[normalized]
-            lock.unlock()
-            if let ip {
+            if let ip = lookupAddress(normalized, clientIP: clientIP) {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
                 return buildAResponse(packet: responsePacket, ip: ip)
             }
@@ -207,10 +262,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
             }
         } else if qtype == 28 {
             if isSingleLabel { return buildNodataResponse(packet: responsePacket) }
-            lock.lock()
-            let known = entries[normalized] != nil
-            lock.unlock()
-            if known { return buildNodataResponse(packet: responsePacket) }
+            if hasEntry(normalized) { return buildNodataResponse(packet: responsePacket) }
         }
         // Any other single-label query type (HTTPS/SVCB/SRV/TXT/…) is answered NODATA
         // locally rather than forwarded: a single-label name has no public meaning, so
@@ -220,7 +272,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         return nil
     }
 
-    private func handleQuery(_ packet: [UInt8]) -> [UInt8]? {
+    private func handleQuery(_ packet: [UInt8], clientIP: [UInt8]) -> [UInt8]? {
         guard packet.count >= 12 else { return nil }
 
         // Only handle standard queries (QR=0, OPCODE=0)
@@ -243,10 +295,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         let isSingleLabel = !normalized.contains(".")
 
         if qtype == 1 {  // A record
-            lock.lock()
-            let ip = entries[normalized]
-            lock.unlock()
-            if let ip {
+            if let ip = lookupAddress(normalized, clientIP: clientIP) {
                 log.info("[dns] A \(normalized) → \(ip[0]).\(ip[1]).\(ip[2]).\(ip[3]) (local)")
                 return buildAResponse(packet: responsePacket, ip: ip)
             }
@@ -258,10 +307,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
             // For single-label names return NODATA unconditionally; forwarding upstream
             // would yield an authoritative NXDOMAIN that poisons concurrent A+AAAA resolvers.
             if isSingleLabel { return buildNodataResponse(packet: responsePacket) }
-            lock.lock()
-            let known = entries[normalized] != nil
-            lock.unlock()
-            if known { return buildNodataResponse(packet: responsePacket) }
+            if hasEntry(normalized) { return buildNodataResponse(packet: responsePacket) }
         }
 
         // Forward without EDNS0: our 512-byte recv buffer can't hold a large response.
@@ -400,5 +446,33 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var addr = in_addr()
         guard inet_pton(AF_INET, bare, &addr) == 1 else { return nil }
         return withUnsafeBytes(of: addr.s_addr) { Array($0) }
+    }
+
+    /// A bare address, or one with an invalid prefix, parses with a nil subnet.
+    private static func parseIPv4WithSubnet(_ ip: String) -> (address: [UInt8], subnet: Subnet?)? {
+        let parts = ip.split(separator: "/", maxSplits: 1)
+        guard let first = parts.first, let addr = parseIPv4(String(first)) else { return nil }
+        guard parts.count == 2, let prefixLength = UInt8(parts[1]), prefixLength <= 32 else {
+            return (addr, nil)
+        }
+        return (addr, Subnet(network: networkAddress(addr, prefixLength: prefixLength), prefixLength: prefixLength))
+    }
+
+    private static func networkAddress(_ ip: [UInt8], prefixLength: UInt8) -> [UInt8] {
+        var remaining = Int(prefixLength)
+        var result = [UInt8](repeating: 0, count: 4)
+        for i in 0..<4 {
+            if remaining >= 8 {
+                result[i] = ip[i]
+            } else if remaining > 0 {
+                result[i] = ip[i] & UInt8(0xFF - (0xFF >> remaining))
+            }
+            remaining -= 8
+        }
+        return result
+    }
+
+    private static func format(_ ip: [UInt8]) -> String {
+        "\(ip[0]).\(ip[1]).\(ip[2]).\(ip[3])"
     }
 }

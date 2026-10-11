@@ -460,6 +460,89 @@ struct SocktainerDNSQueryTests {
     }
 }
 
+// MARK: - Multi-homed hostname resolution
+//
+// A container on two networks is registered once per network. Every network's forwarder
+// sidecar relays to the same server, so the answer must be the address on the network
+// the query came from, which the querying peer can reach.
+
+@Suite("SocktainerDNSServer — multi-homed hostname resolution")
+struct SocktainerDNSMultiHomedTests {
+
+    @Test("Returns the address on the querying client's subnet")
+    func lookupAddressPrefersQueryingClientsSubnet() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 5])
+    }
+
+    @Test("Registering a second network for a hostname does not evict the first")
+    func registeringSecondNetworkKeepsFirst() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 5])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7])
+    }
+
+    @Test("Re-registering on one subnet replaces only that subnet's entry")
+    func reregisteringSameSubnetOverwritesInPlace() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+        server.register(hostname: "web", ip: "192.168.10.55/24")
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 55])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7], "netB's entry must be untouched")
+    }
+
+    @Test("Falls back to the first-registered address when no subnet matches")
+    func fallsBackToFirstRegisteredAddressWhenNoSubnetMatches() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+
+        #expect(server.lookupAddress("web", clientIP: [10, 0, 0, 1]) == [192, 168, 10, 5])
+        #expect(server.listEntries()["web"] == "192.168.10.5")
+    }
+
+    @Test("unregisterIfOwned with the first address removes every address of that container")
+    func unregisterIfOwnedRemovesAllOfOwnersAddresses() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+        server.unregisterIfOwned(hostname: "web", expectedIP: "192.168.10.5")
+        #expect(server.listEntries()["web"] == nil, "no address on the second network may be left behind")
+    }
+
+    @Test("unregisterIfOwned leaves another container's addresses under the same name")
+    func unregisterIfOwnedKeepsOtherOwners() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24"])
+        server.register(hostname: "web", ips: ["192.168.20.7/24"])
+        server.unregisterIfOwned(hostname: "web", expectedIP: "192.168.10.5")
+
+        #expect(server.listEntries()["web"] == "192.168.20.7")
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 20, 7])
+    }
+
+    // The test client always sends from 127.0.0.1. The loopback entry is registered first
+    // for one name and last for the other, so neither first- nor last-registered wins both.
+    @Test("End-to-end: query is answered with the address on the client's subnet")
+    func endToEndAnswersFromMatchingSubnet() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19790, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "web", ips: ["127.0.0.9/8", "10.99.0.7/24"])
+        server.register(hostname: "api", ips: ["10.99.0.8/24", "127.0.0.10/8"])
+
+        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
+        #expect(dnsResponseTail(type: 1, names: ["api"], port: port)?.ip == "127.0.0.10")
+    }
+}
+
 // MARK: - EmbeddedDNSImage / SocktainerDNSImage
 
 @Suite("EmbeddedDNSImage")
@@ -725,6 +808,44 @@ struct DNSAttachmentIPTests {
     }
 }
 
+// MARK: - ContainerStartRoute.dnsAttachmentCIDRs (every attachment a multi-homed container is registered on)
+
+@Suite("ContainerStartRoute.dnsAttachmentCIDRs")
+struct DNSAttachmentCIDRsTests {
+
+    @Test("A container on two named networks returns a CIDR for each")
+    func multiHomedContainerReturnsBothCIDRs() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "192.168.10.5"), (network: "netB", ip: "192.168.20.7")],
+            labels: [:]
+        )
+        let result = ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot)
+        #expect(result == ["192.168.10.5/24", "192.168.20.7/24"], "must carry a CIDR for every named-network attachment, not just the first")
+    }
+
+    @Test("Reserved attachments are excluded, named ones kept")
+    func reservedAttachmentsExcluded() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
+            labels: [:]
+        )
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot) == ["192.168.65.20/24"])
+    }
+
+    @Test("Only reserved networks returns an empty list")
+    func onlyReservedNetworksReturnsEmpty() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot).isEmpty)
+    }
+
+    @Test("Nil snapshot returns an empty list")
+    func nilSnapshotReturnsEmpty() {
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: nil).isEmpty)
+    }
+}
+
 // MARK: - ContainerStartRoute.registerDNSAliasesOnResume (daemon-restart re-registration)
 
 @Suite("ContainerStartRoute.registerDNSAliasesOnResume")
@@ -770,5 +891,38 @@ struct RegisterDNSAliasesOnResumeTests {
         #expect(entries["pg"] == "192.168.65.20")
         #expect(entries["db"] == "192.168.65.20")
         #expect(entries["db.stackdemo"] == "192.168.65.20")
+    }
+
+    @Test("Re-registers a multi-homed container on every named network")
+    func reRegistersEveryNamedNetwork() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "192.168.10.5"), (network: "netB", ip: "192.168.20.7")],
+            labels: ["com.docker.compose.service": "web"]
+        )
+        let dnsServer = SocktainerDNSServer()
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        #expect(dnsServer.lookupAddress("web", clientIP: [192, 168, 20, 2]) == [192, 168, 20, 7])
+        #expect(dnsServer.lookupAddress("web-1", clientIP: [192, 168, 10, 2]) == [192, 168, 10, 5])
+    }
+
+    // The test client always sends from 127.0.0.1, so it plays a peer that shares only the
+    // container's second network.
+    @Test("End-to-end: a peer on the second network gets the second network's address")
+    func endToEndPeerOnSecondNetworkGetsItsAddress() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "10.99.0.7"), (network: "netB", ip: "127.0.0.9")],
+            labels: ["com.docker.compose.service": "web"]
+        )
+        let dnsServer = SocktainerDNSServer()
+        guard let port = dnsServer.start(preferredPort: 19795, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+
+        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
+        #expect(dnsResponseTail(type: 1, names: ["web-1"], port: port)?.ip == "127.0.0.9")
     }
 }
