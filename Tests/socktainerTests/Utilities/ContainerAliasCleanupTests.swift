@@ -34,6 +34,22 @@ struct ContainerAliasCleanupTests {
         #expect(remaining["web.myapp"] == nil)
     }
 
+    @Test("removes a multi-homed container's addresses on every network")
+    func unregistersEveryNetworkOfMultiHomedContainer() {
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: "web-1", ips: ["10.0.0.5/24", "10.0.1.5/24"])
+        dnsServer.register(hostname: "web", ips: ["10.0.0.5/24", "10.0.1.5/24"])
+
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: "web-1",
+            labels: ["com.docker.compose.service": "web"],
+            cachedIP: "10.0.0.5",
+            dnsServer: dnsServer
+        )
+
+        #expect(dnsServer.listEntries().isEmpty, "no address on the second network may be left behind")
+    }
+
     @Test("does not touch any alias when cachedIP is nil — ownership can't be confirmed")
     func skipsAllAliasesWhenCachedIPIsNil() {
         let dnsServer = SocktainerDNSServer()
