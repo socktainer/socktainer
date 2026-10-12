@@ -213,14 +213,17 @@ actor HealthCheckManager {
         return processConfig
     }
 
+    /// How long the health loop waits for `kill` at the probe deadline before moving on.
+    static let probeKillTimeout: Duration = .seconds(1)
+
     /// Waits up to `timeoutNs` for the probe to exit, returning its exit code, or 1
-    /// after calling `kill` at the deadline. `wait` is an XPC call that ignores task
-    /// cancellation, so it can't be raced in a task group, which waits for every child
-    /// before returning; it runs under the startup housekeeping deadline instead.
+    /// after calling `kill` at the deadline. `wait` and `kill` are XPC calls that ignore
+    /// task cancellation, so they can't be raced in a task group, which waits for every
+    /// child before returning; they run under the startup housekeeping deadline instead.
     static func waitForProbe(
         timeoutNs: UInt64,
         wait: @escaping @Sendable () async throws -> Int32,
-        kill: @Sendable () async -> Void
+        kill: @escaping @Sendable () async -> Void
     ) async -> Int32 {
         let exitCode = ProbeExitCode()
         let exited = await StartupHousekeeping.runBounded(timeout: .nanoseconds(timeoutNs)) {
@@ -228,7 +231,7 @@ actor HealthCheckManager {
             exitCode.value.withLock { $0 = code }
         }
         guard exited else {
-            await kill()
+            _ = await StartupHousekeeping.runBounded(timeout: probeKillTimeout) { await kill() }
             return 1
         }
         return exitCode.value.withLock { $0 }
