@@ -170,18 +170,27 @@ struct DockerTCPHandlerTests {
         #expect(data.isEmpty)
     }
 
-    // MARK: - pendingData cap
+    // MARK: - pendingData threshold (backpressure, issue #453)
 
-    @Test("pendingData cap: data beyond 1 MiB is discarded, buffer stays at cap")
-    func pendingDataCapDiscardsOverflow() {
+    @Test("data beyond 1 MiB before setStdinWriter is kept and flushed in order")
+    func pendingDataBeyondThresholdIsNotDropped() async throws {
         let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
-        let cap = 1 * 1024 * 1024
+        let pipe = Pipe()
+        let chunkSize = 512 * 1024
+        let chunks = [UInt8(0x41), 0x42, 0x43].map { Data(repeating: $0, count: chunkSize) }
 
-        let chunk = Data(repeating: 0x41, count: 512 * 1024)
-        handler.writeToStdin(chunk)
-        handler.writeToStdin(chunk)  // exactly at cap
-        handler.writeToStdin(chunk)  // over cap — discarded
+        #expect(handler.writeToStdin(chunks[0]) == false)
+        #expect(handler.writeToStdin(chunks[1]) == true)  // reaches 1 MiB — pause reads
+        #expect(handler.writeToStdin(chunks[2]) == false)  // late read still buffered, no second pause
+        #expect(handler.readPausedForTesting)
+        #expect(handler.pendingDataSizeForTesting == 3 * chunkSize)
 
-        #expect(handler.pendingDataSizeForTesting == cap)
+        let readTask = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
+        handler.setStdinWriter(pipe.fileHandleForWriting)
+        #expect(handler.readPausedForTesting == false)
+        handler.simulateInputClosed()
+
+        let received = await readTask.value
+        #expect(received == chunks.reduce(Data(), +))
     }
 }

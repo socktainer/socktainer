@@ -318,10 +318,13 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     private let writeQueue = DispatchQueue(label: "DockerTCPHandler.stdin", qos: .userInteractive)
     private var stdinWriter: FileHandle?
     // Buffers stdin bytes arriving before setStdinWriter is called.
-    // Capped at 1 MiB to prevent unbounded growth if setup is delayed.
+    // Once it reaches 1 MiB, socket reads are paused (autoRead off) until
+    // setStdinWriter resumes them — data is never dropped.
     private var pendingData: [Data] = []
     private var pendingDataSize: Int = 0
     private static let pendingDataMaxBytes = 1 * 1024 * 1024  // 1 MiB
+    private var readPaused = false
+    private weak var channel: Channel?
     private var didReceiveInputClosed = false
     private var isChannelInactive = false
 
@@ -341,36 +344,46 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         try? writer?.close()
     }
 
+    public func handlerAdded(context: ChannelHandlerContext) {
+        lock.lock()
+        channel = context.channel
+        lock.unlock()
+    }
+
     public func channelActive(context: ChannelHandlerContext) {}
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let buffer = unwrapInboundIn(data)
         guard let data = buffer.getData(at: 0, length: buffer.readableBytes) else { return }
-        writeToStdin(data)
+        if writeToStdin(data) {
+            context.channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in }
+        }
     }
 
     /// Core write path — buffers when no writer is set yet; dispatches to
     /// writeQueue otherwise. Called by channelRead and exposed for unit tests.
-    func writeToStdin(_ data: Data) {
+    /// Returns true when the buffer just crossed the threshold and socket reads
+    /// should be paused until setStdinWriter.
+    @discardableResult
+    func writeToStdin(_ data: Data) -> Bool {
         lock.lock()
         let writer = stdinWriter
         if writer == nil {
-            if pendingDataSize + data.count <= Self.pendingDataMaxBytes {
-                pendingData.append(data)
-                pendingDataSize += data.count
-            } else {
-                Self.logger.warning(
-                    "[\(execId)] stdin buffer full (\(Self.pendingDataMaxBytes) B) — discarding \(data.count) B"
-                )
-            }
+            // Always buffer: NIO may deliver a few more reads after autoRead is
+            // turned off, so the threshold is soft.
+            pendingData.append(data)
+            pendingDataSize += data.count
+            let shouldPause = pendingDataSize >= Self.pendingDataMaxBytes && !readPaused
+            if shouldPause { readPaused = true }
             lock.unlock()
-            return
+            return shouldPause
         }
         lock.unlock()
 
         writeQueue.async { [execId] in
             do { try writer!.write(contentsOf: data) } catch { Self.logger.error("[\(execId)] stdin write failed: \(error)") }
         }
+        return false
     }
 
     // Fired when Docker CLI half-closes its write side (stdin EOF).
@@ -428,7 +441,15 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
                 if shouldClose { try? writer.close() }
             }
         }
+        // Resume socket reads after the flush is enqueued, so later reads are
+        // ordered behind it on writeQueue.
+        let resume = readPaused
+        readPaused = false
+        let channel = self.channel
         lock.unlock()
+        if resume {
+            channel?.setOption(ChannelOptions.autoRead, value: true).whenFailure { _ in }
+        }
     }
 
     // MARK: - Test helpers
@@ -438,6 +459,13 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         lock.lock()
         defer { lock.unlock() }
         return pendingDataSize
+    }
+
+    /// Whether socket reads are currently paused waiting for setStdinWriter.
+    var readPausedForTesting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return readPaused
     }
 
     /// Blocks until all pending writeQueue work completes. Call before reading
