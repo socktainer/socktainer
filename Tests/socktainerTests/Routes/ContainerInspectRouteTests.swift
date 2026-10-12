@@ -446,3 +446,92 @@ private struct InspectMock: ClientContainerProtocol {
         ([], 0)
     }
 }
+
+@Suite("ContainerInspectRoute — HostConfig.PortBindings")
+struct ContainerInspectRoutePortBindingsTests {
+
+    private func makeSnapshot(nativeId: String, ports: [PublishPort], labels: [String: String] = [:]) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh",
+            arguments: [],
+            environment: [],
+            workingDirectory: "/",
+            terminal: false,
+            user: .id(uid: 0, gid: 0)
+        )
+        let img = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:abc",
+                size: 0
+            )
+        )
+        var containerConfig = ContainerConfiguration(id: nativeId, image: img, process: proc)
+        containerConfig.publishedPorts = ports
+        containerConfig.labels = labels
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+    }
+
+    private func inspect(_ snapshot: ContainerSnapshot) async throws -> RESTContainerInspect {
+        var result: RESTContainerInspect?
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: InspectMock(snapshot: snapshot)))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(snapshot.id)/json") { res async throws in
+                result = try res.content.decode(RESTContainerInspect.self)
+            }
+        }
+        return try #require(result)
+    }
+
+    private func publishPort(_ host: String, _ hostPort: UInt16, _ containerPort: UInt16) throws -> PublishPort {
+        try PublishPort(hostAddress: try IPAddress(host), hostPort: hostPort, containerPort: containerPort, proto: .tcp, count: 1)
+    }
+
+    // The label name is spelled out because it is stored on existing containers.
+    @Test("HostConfig.PortBindings reports the request, NetworkSettings.Ports what was bound")
+    func portBindingsReportTheRequest() async throws {
+        let snapshot = makeSnapshot(
+            nativeId: "inspect-port-request-ctr",
+            ports: [try publishPort("0.0.0.0", 61669, 82), try publishPort("127.0.0.1", 18081, 81)],
+            labels: ["socktainer.port-bindings": #"{"81/tcp":[{"HostIp":"127.0.0.1","HostPort":"18081"}],"82/tcp":[{"HostIp":"","HostPort":""}]}"#]
+        )
+        let inspect = try await inspect(snapshot)
+        let requested = try #require(inspect.HostConfig.PortBindings?["82/tcp"]?.first)
+        #expect(requested.HostIp == "")
+        #expect(requested.HostPort == "")
+        #expect(inspect.HostConfig.PortBindings?["81/tcp"]?.first?.HostPort == "18081")
+        #expect(inspect.NetworkSettings.Ports?["82/tcp"]?.first?.HostPort == "61669")
+    }
+
+    @Test("An empty request reports {}, even when -P published ports")
+    func emptyRequestReportsEmpty() async throws {
+        let snapshot = makeSnapshot(
+            nativeId: "inspect-port-publish-all-ctr",
+            ports: [try publishPort("0.0.0.0", 62163, 80)],
+            labels: ["socktainer.port-bindings": "{}"]
+        )
+        let inspect = try await inspect(snapshot)
+        #expect(inspect.HostConfig.PortBindings?.isEmpty == true)
+        #expect(inspect.NetworkSettings.Ports?["80/tcp"]?.first?.HostPort == "62163")
+    }
+
+    @Test("A container created without the label reports its published ports")
+    func portBindingsFallBackToPublishedPorts() async throws {
+        let snapshot = makeSnapshot(nativeId: "inspect-port-fallback-ctr", ports: [try publishPort("127.0.0.1", 33000, 80)])
+        let inspect = try await inspect(snapshot)
+        let binding = try #require(inspect.HostConfig.PortBindings?["80/tcp"]?.first)
+        #expect(binding.HostIp == "127.0.0.1")
+        #expect(binding.HostPort == "33000")
+    }
+
+    @Test("HostConfig.PortBindings is nil when nothing is published")
+    func portBindingsNilWhenNothingPublished() async throws {
+        let inspect = try await inspect(makeSnapshot(nativeId: "inspect-no-ports-ctr", ports: []))
+        #expect(inspect.HostConfig.PortBindings == nil)
+    }
+}

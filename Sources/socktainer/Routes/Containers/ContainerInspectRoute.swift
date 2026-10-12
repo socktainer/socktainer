@@ -20,6 +20,19 @@ extension ContainerInspectRoute {
         }
     }
 
+    /// Docker's `HostConfig.PortBindings` is the request, which can leave HostIp and
+    /// HostPort unset, while `NetworkSettings.Ports` is what was bound. The request
+    /// comes from the create route's label; a container created without it reports
+    /// its published ports instead.
+    static func hostConfigPortBindings(labels: [String: String], published: [String: [PortBinding]]) -> [String: [PortBinding]]? {
+        if let json = labels[ContainerCreateRoute.portBindingsLabel],
+            let requested = try? JSONDecoder().decode([String: [PortBinding]].self, from: Data(json.utf8))
+        {
+            return requested
+        }
+        return published.isEmpty ? nil : published
+    }
+
     /// Apple Container only reports live network attachments while a
     /// container is running (`container.networks` is hardcoded to `[]` once
     /// stopped), whereas Docker's `NetworkSettings.Networks` reflects the
@@ -148,17 +161,21 @@ extension ContainerInspectRoute {
                 )
             }
 
-            let hostConfig: HostConfig = HostConfig(restartPolicy: restartPolicy)
+            let publishedPorts = Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
+                .mapValues { bindings in
+                    bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
+                }
+            let hostConfig = HostConfig(
+                restartPolicy: restartPolicy,
+                portBindings: Self.hostConfigPortBindings(labels: container.configuration.labels, published: publishedPorts)
+            )
 
             // Enhanced network settings with proper port mapping
             let networkEndpoints = Self.networkEndpoints(for: container)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,
-                Ports: Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
-                    .mapValues { bindings in
-                        bindings.map { PortBinding(HostIp: $0.hostAddress.description, HostPort: "\($0.hostPort)") }
-                    },
+                Ports: publishedPorts,
                 SandboxKey: nil,
                 Networks: networkEndpoints,
                 EndpointsConfig: networkEndpoints
