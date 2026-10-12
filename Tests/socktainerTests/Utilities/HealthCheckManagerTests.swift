@@ -253,9 +253,11 @@ struct HealthCheckManagerTests {
             kill: { killed.set() }
         )
         let returnedWhileStalled = !stalledWait.isReleased
+        let waitWasCalled = await stalledWait.waitUntilCalled()
         stalledWait.release()
         #expect(code == 1)
         #expect(killed.isSet)
+        #expect(waitWasCalled)
         #expect(returnedWhileStalled, "waitForProbe waited for wait() past the deadline")
     }
 
@@ -284,9 +286,11 @@ struct HealthCheckManagerTests {
             kill: { await stalledKill.call() }
         )
         let returnedWhileStalled = !stalledKill.isReleased
+        let killWasCalled = await stalledKill.waitUntilCalled()
         stalledWait.release()
         stalledKill.release()
         #expect(code == 1)
+        #expect(killWasCalled)
         #expect(returnedWhileStalled, "waitForProbe waited for kill() past its limit")
     }
 
@@ -299,7 +303,7 @@ struct HealthCheckManagerTests {
     /// Stands in for an XPC call that ignores cancellation: `call()` returns only once
     /// released, by the test or by a fallback far beyond any deadline under test.
     private final class StalledCall: Sendable {
-        private let state = Mutex<(released: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
+        private let state = Mutex<(called: Bool, released: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, false, []))
 
         init(fallback: Duration = .seconds(30)) {
             Task.detached { [self] in
@@ -310,9 +314,19 @@ struct HealthCheckManagerTests {
 
         var isReleased: Bool { state.withLock { $0.released } }
 
+        /// Waits, up to 30 s, for `call()` to be entered: the callback runs in a detached
+        /// task that a loaded runner may not have started by the time `waitForProbe` returns.
+        func waitUntilCalled() async -> Bool {
+            for _ in 0..<300 where !state.withLock({ $0.called }) {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            return state.withLock { $0.called }
+        }
+
         func call() async {
             await withCheckedContinuation { continuation in
                 let resumeNow = state.withLock { state -> Bool in
+                    state.called = true
                     if state.released { return true }
                     state.waiters.append(continuation)
                     return false
