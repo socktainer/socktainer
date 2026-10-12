@@ -294,6 +294,62 @@ struct HealthCheckManagerTests {
         #expect(returnedWhileStalled, "waitForProbe waited for kill() past its limit")
     }
 
+    @Test("While a timed-out probe is still running, the next one fails without starting another process")
+    func noSecondProbeWhileOneIsRunning() async {
+        let inFlight = HealthCheckManager.ProbesInFlight()
+        let stalledWait = StalledCall()
+        let starts = StartCounter()
+        let stalledStart: () async throws -> HealthCheckManager.StartedProbe = {
+            starts.increment()
+            return (
+                wait: {
+                    await stalledWait.call()
+                    return 0
+                },
+                kill: {}
+            )
+        }
+        let first = await HealthCheckManager.runProbe(containerId: "c1", timeoutNs: 50_000_000, inFlight: inFlight, start: stalledStart)
+        let second = await HealthCheckManager.runProbe(containerId: "c1", timeoutNs: 50_000_000, inFlight: inFlight, start: stalledStart)
+        #expect(first == 1)
+        #expect(second == 1)
+        #expect(starts.count == 1, "a second probe process started beside the stuck one")
+
+        let otherContainer = await HealthCheckManager.runProbe(containerId: "c2", timeoutNs: 5_000_000_000, inFlight: inFlight) {
+            (wait: { 0 }, kill: {})
+        }
+        #expect(otherContainer == 0)
+
+        stalledWait.release()
+        for _ in 0..<300 where inFlight.isRunning("c1") {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        let afterExit = await HealthCheckManager.runProbe(containerId: "c1", timeoutNs: 5_000_000_000, inFlight: inFlight) {
+            (wait: { 0 }, kill: {})
+        }
+        #expect(afterExit == 0)
+    }
+
+    @Test("A probe that fails to start doesn't block the next one")
+    func failedStartFreesTheContainer() async {
+        struct StartFailed: Error {}
+        let inFlight = HealthCheckManager.ProbesInFlight()
+        let failed = await HealthCheckManager.runProbe(containerId: "c1", timeoutNs: 5_000_000_000, inFlight: inFlight) {
+            throw StartFailed()
+        }
+        let next = await HealthCheckManager.runProbe(containerId: "c1", timeoutNs: 5_000_000_000, inFlight: inFlight) {
+            (wait: { 0 }, kill: {})
+        }
+        #expect(failed == 1)
+        #expect(next == 0)
+    }
+
+    private final class StartCounter: Sendable {
+        private let value = Mutex(0)
+        func increment() { value.withLock { $0 += 1 } }
+        var count: Int { value.withLock { $0 } }
+    }
+
     private final class KillFlag: Sendable {
         private let value = Mutex(false)
         func set() { value.withLock { $0 = true } }

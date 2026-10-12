@@ -241,12 +241,52 @@ actor HealthCheckManager {
         let value = Mutex<Int32>(1)
     }
 
+    /// Containers with a probe still running. A timed-out probe's kill can fail
+    /// (apple/container#1941), so a later probe for that container fails at once rather
+    /// than start another process beside it, until the first one exits.
+    final class ProbesInFlight: Sendable {
+        private let ids = Mutex<Set<String>>([])
+        func begin(_ id: String) -> Bool { ids.withLock { $0.insert(id).inserted } }
+        func end(_ id: String) { ids.withLock { _ = $0.remove(id) } }
+        func isRunning(_ id: String) -> Bool { ids.withLock { $0.contains(id) } }
+    }
+
+    static let probesInFlight = ProbesInFlight()
+
+    typealias StartedProbe = (wait: @Sendable () async throws -> Int32, kill: @Sendable () async -> Void)
+
+    /// Starts a probe with `start` and waits for it, or returns 1 without starting one
+    /// while the container's previous probe is still running.
+    static func runProbe(
+        containerId: String,
+        timeoutNs: UInt64,
+        inFlight: ProbesInFlight,
+        start: () async throws -> StartedProbe
+    ) async -> Int32 {
+        guard inFlight.begin(containerId) else { return 1 }
+        let probe: StartedProbe
+        do {
+            probe = try await start()
+        } catch {
+            inFlight.end(containerId)
+            return 1
+        }
+        return await waitForProbe(
+            timeoutNs: timeoutNs,
+            wait: {
+                defer { inFlight.end(containerId) }
+                return try await probe.wait()
+            },
+            kill: probe.kill
+        )
+    }
+
     /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
     /// Returns the exit code, or 1 on any failure.
     static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
-        do {
+        await runProbe(containerId: containerId, timeoutNs: timeoutNs, inFlight: probesInFlight) {
             let containerClient = ContainerClient()
-            guard let container = try? await containerClient.get(id: containerId) else { return 1 }
+            let container = try await containerClient.get(id: containerId)
 
             let processConfig = probeProcessConfiguration(base: container.configuration.initProcess, cmd: cmd)
             let processId = "hc-\(UUID().uuidString.lowercased())"
@@ -257,14 +297,7 @@ actor HealthCheckManager {
                 stdio: [nil, nil, nil]
             )
             try await process.start()
-
-            return await waitForProbe(
-                timeoutNs: timeoutNs,
-                wait: { try await process.wait() },
-                kill: { try? await process.kill(SIGTERM) }
-            )
-        } catch {
-            return 1
+            return (wait: { try await process.wait() }, kill: { try? await process.kill(SIGTERM) })
         }
     }
 }
