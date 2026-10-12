@@ -238,24 +238,25 @@ struct HealthCheckManagerTests {
         #expect(probe.workingDirectory == "/app")
     }
 
+    // These check that waitForProbe returns while the stalled call is still unreleased,
+    // rather than timing it, so a slow runner can't fail them.
     @Test("A probe that outlives Timeout fails and is signalled at the deadline, though wait() ignores cancellation")
     func probeTimeoutDoesNotWaitForWait() async {
+        let stalledWait = StalledCall()
         let killed = KillFlag()
-        let started = ContinuousClock.now
         let code = await HealthCheckManager.waitForProbe(
             timeoutNs: 50_000_000,
-            // A detached task's value ignores the caller's cancellation, as an XPC reply does.
             wait: {
-                try await Task.detached {
-                    try await Task.sleep(for: .seconds(5))
-                    return 0
-                }.value
+                await stalledWait.call()
+                return 0
             },
             kill: { killed.set() }
         )
+        let returnedWhileStalled = !stalledWait.isReleased
+        stalledWait.release()
         #expect(code == 1)
         #expect(killed.isSet)
-        #expect(ContinuousClock.now - started < .seconds(2))
+        #expect(returnedWhileStalled, "waitForProbe waited for wait() past the deadline")
     }
 
     @Test("A probe that exits within Timeout returns its exit code and is not killed")
@@ -272,25 +273,62 @@ struct HealthCheckManagerTests {
 
     @Test("A kill that stalls at the deadline doesn't hold the loop either")
     func stalledKillIsBounded() async {
-        let started = ContinuousClock.now
+        let stalledWait = StalledCall()
+        let stalledKill = StalledCall()
         let code = await HealthCheckManager.waitForProbe(
             timeoutNs: 50_000_000,
             wait: {
-                try await Task.detached {
-                    try await Task.sleep(for: .seconds(5))
-                    return 0
-                }.value
+                await stalledWait.call()
+                return 0
             },
-            kill: { _ = try? await Task.detached { try await Task.sleep(for: .seconds(5)) }.value }
+            kill: { await stalledKill.call() }
         )
+        let returnedWhileStalled = !stalledKill.isReleased
+        stalledWait.release()
+        stalledKill.release()
         #expect(code == 1)
-        #expect(ContinuousClock.now - started < HealthCheckManager.probeKillTimeout + .seconds(2))
+        #expect(returnedWhileStalled, "waitForProbe waited for kill() past its limit")
     }
 
     private final class KillFlag: Sendable {
         private let value = Mutex(false)
         func set() { value.withLock { $0 = true } }
         var isSet: Bool { value.withLock { $0 } }
+    }
+
+    /// Stands in for an XPC call that ignores cancellation: `call()` returns only once
+    /// released, by the test or by a fallback far beyond any deadline under test.
+    private final class StalledCall: Sendable {
+        private let state = Mutex<(released: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
+
+        init(fallback: Duration = .seconds(30)) {
+            Task.detached { [self] in
+                try? await Task.sleep(for: fallback)
+                self.release()
+            }
+        }
+
+        var isReleased: Bool { state.withLock { $0.released } }
+
+        func call() async {
+            await withCheckedContinuation { continuation in
+                let resumeNow = state.withLock { state -> Bool in
+                    if state.released { return true }
+                    state.waiters.append(continuation)
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let waiters = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+                state.released = true
+                defer { state.waiters = [] }
+                return state.waiters
+            }
+            waiters.forEach { $0.resume() }
+        }
     }
 
     // MARK: - Health log entries
