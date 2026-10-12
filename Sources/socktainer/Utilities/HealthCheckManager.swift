@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import Foundation
 import Logging
+import Synchronization
 import Vapor
 
 struct HealthCheckManagerKey: StorageKey {
@@ -200,11 +201,6 @@ actor HealthCheckManager {
 
     // MARK: - Default probe (real exec)
 
-    private enum ProbeOutcome {
-        case exited(Int32)
-        case timedOut
-    }
-
     /// Builds the probe's process from the container's init process. Like Docker,
     /// the probe keeps the container's configured user (as `docker exec` without
     /// `-u` does): a root probe leaves root-owned files, such as a marker in sticky
@@ -215,6 +211,31 @@ actor HealthCheckManager {
         processConfig.arguments = Array(cmd.dropFirst())
         processConfig.terminal = false
         return processConfig
+    }
+
+    /// Waits up to `timeoutNs` for the probe to exit, returning its exit code, or 1
+    /// after calling `kill` at the deadline. `wait` is an XPC call that ignores task
+    /// cancellation, so it can't be raced in a task group, which waits for every child
+    /// before returning; it runs under the startup housekeeping deadline instead.
+    static func waitForProbe(
+        timeoutNs: UInt64,
+        wait: @escaping @Sendable () async throws -> Int32,
+        kill: @Sendable () async -> Void
+    ) async -> Int32 {
+        let exitCode = ProbeExitCode()
+        let exited = await StartupHousekeeping.runBounded(timeout: .nanoseconds(timeoutNs)) {
+            let code = (try? await wait()) ?? 1
+            exitCode.value.withLock { $0 = code }
+        }
+        guard exited else {
+            await kill()
+            return 1
+        }
+        return exitCode.value.withLock { $0 }
+    }
+
+    private final class ProbeExitCode: Sendable {
+        let value = Mutex<Int32>(1)
     }
 
     /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
@@ -234,23 +255,11 @@ actor HealthCheckManager {
             )
             try await process.start()
 
-            let outcome: ProbeOutcome = try await withThrowingTaskGroup(of: ProbeOutcome.self) { group in
-                group.addTask { .exited(try await process.wait()) }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: timeoutNs)
-                    return .timedOut
-                }
-                let result = try await group.next() ?? .timedOut
-                group.cancelAll()
-                return result
-            }
-            switch outcome {
-            case .exited(let code):
-                return code
-            case .timedOut:
-                try? await process.kill(SIGTERM)
-                return 1
-            }
+            return await waitForProbe(
+                timeoutNs: timeoutNs,
+                wait: { try await process.wait() },
+                kill: { try? await process.kill(SIGTERM) }
+            )
         } catch {
             return 1
         }

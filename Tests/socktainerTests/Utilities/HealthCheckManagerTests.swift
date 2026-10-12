@@ -1,5 +1,6 @@
 import ContainerResource
 import Foundation
+import Synchronization
 import Testing
 
 @testable import socktainer
@@ -235,6 +236,38 @@ struct HealthCheckManagerTests {
         #expect(probe.terminal == false)
         #expect(probe.environment == ["A=1"])
         #expect(probe.workingDirectory == "/app")
+    }
+
+    @Test("A probe that outlives Timeout fails and is signalled at the deadline, though wait() ignores cancellation")
+    func probeTimeoutDoesNotWaitForWait() async {
+        let killed = Mutex(false)
+        let started = ContinuousClock.now
+        let code = await HealthCheckManager.waitForProbe(
+            timeoutNs: 50_000_000,
+            // A detached task's value ignores the caller's cancellation, as an XPC reply does.
+            wait: {
+                try await Task.detached {
+                    try await Task.sleep(for: .seconds(5))
+                    return 0
+                }.value
+            },
+            kill: { killed.withLock { $0 = true } }
+        )
+        #expect(code == 1)
+        #expect(killed.withLock { $0 })
+        #expect(ContinuousClock.now - started < .seconds(2))
+    }
+
+    @Test("A probe that exits within Timeout returns its exit code and is not killed")
+    func probeExitWithinTimeout() async {
+        let killed = Mutex(false)
+        let code = await HealthCheckManager.waitForProbe(
+            timeoutNs: 5_000_000_000,
+            wait: { 3 },
+            kill: { killed.withLock { $0 = true } }
+        )
+        #expect(code == 3)
+        #expect(!killed.withLock { $0 })
     }
 
     // MARK: - Health log entries
