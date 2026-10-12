@@ -1,4 +1,6 @@
 import Foundation
+import NIOCore
+import NIOPosix
 import Testing
 
 @testable import socktainer
@@ -192,5 +194,52 @@ struct DockerTCPHandlerTests {
 
         let received = await readTask.value
         #expect(received == chunks.reduce(Data(), +))
+    }
+
+    @Test("on a real socket, reads pause at 1 MiB and resume on setStdinWriter with every byte delivered")
+    func backpressureTogglesAutoReadOnRealChannel() async throws {
+        // EmbeddedChannel always reports autoRead == true, so this uses a loopback socket.
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let handler = DockerTCPHandler(execId: "test", ttyEnabled: false)
+        let childPromise = group.next().makePromise(of: Channel.self)
+        let server = try await ServerBootstrap(group: group)
+            .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(handler).map { childPromise.succeed(channel) }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let client = try await ClientBootstrap(group: group).connect(to: server.localAddress!).get()
+        let child = try await childPromise.futureResult.get()
+
+        let chunkSize = 1024 * 1024
+        let chunks = [UInt8(0x41), 0x42, 0x43, 0x44].map { Data(repeating: $0, count: chunkSize) }
+        for chunk in chunks { client.write(ByteBuffer(bytes: chunk), promise: nil) }
+        client.flush()
+
+        try #require(await waitUntil { try await child.getOption(ChannelOptions.autoRead).get() == false })
+        // The rest is held back in socket buffers, not read into memory.
+        #expect(handler.pendingDataSizeForTesting < 4 * chunkSize)
+
+        let pipe = Pipe()
+        let reader = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
+        handler.setStdinWriter(pipe.fileHandleForWriting)
+        try #require(await waitUntil { try await child.getOption(ChannelOptions.autoRead).get() })
+
+        try await client.writeAndFlush(ByteBuffer(bytes: [0xFF])).get()
+        try await client.close(mode: .output).get()
+        let received = await reader.value
+        #expect(received == chunks.reduce(Data(), +) + Data([0xFF]))
+
+        try await client.close()
+        try await server.close()
+        try await group.shutdownGracefully()
+    }
+
+    private func waitUntil(_ condition: () async throws -> Bool) async throws -> Bool {
+        for _ in 0..<500 {
+            if try await condition() { return true }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
     }
 }
