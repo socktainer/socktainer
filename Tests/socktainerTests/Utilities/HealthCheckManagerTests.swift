@@ -240,7 +240,7 @@ struct HealthCheckManagerTests {
 
     @Test("A probe that outlives Timeout fails and is signalled at the deadline, though wait() ignores cancellation")
     func probeTimeoutDoesNotWaitForWait() async {
-        let killed = Mutex(false)
+        let killed = KillFlag()
         let started = ContinuousClock.now
         let code = await HealthCheckManager.waitForProbe(
             timeoutNs: 50_000_000,
@@ -251,23 +251,46 @@ struct HealthCheckManagerTests {
                     return 0
                 }.value
             },
-            kill: { killed.withLock { $0 = true } }
+            kill: { killed.set() }
         )
         #expect(code == 1)
-        #expect(killed.withLock { $0 })
+        #expect(killed.isSet)
         #expect(ContinuousClock.now - started < .seconds(2))
     }
 
     @Test("A probe that exits within Timeout returns its exit code and is not killed")
     func probeExitWithinTimeout() async {
-        let killed = Mutex(false)
+        let killed = KillFlag()
         let code = await HealthCheckManager.waitForProbe(
             timeoutNs: 5_000_000_000,
             wait: { 3 },
-            kill: { killed.withLock { $0 = true } }
+            kill: { killed.set() }
         )
         #expect(code == 3)
-        #expect(!killed.withLock { $0 })
+        #expect(!killed.isSet)
+    }
+
+    @Test("A kill that stalls at the deadline doesn't hold the loop either")
+    func stalledKillIsBounded() async {
+        let started = ContinuousClock.now
+        let code = await HealthCheckManager.waitForProbe(
+            timeoutNs: 50_000_000,
+            wait: {
+                try await Task.detached {
+                    try await Task.sleep(for: .seconds(5))
+                    return 0
+                }.value
+            },
+            kill: { _ = try? await Task.detached { try await Task.sleep(for: .seconds(5)) }.value }
+        )
+        #expect(code == 1)
+        #expect(ContinuousClock.now - started < HealthCheckManager.probeKillTimeout + .seconds(2))
+    }
+
+    private final class KillFlag: Sendable {
+        private let value = Mutex(false)
+        func set() { value.withLock { $0 = true } }
+        var isSet: Bool { value.withLock { $0 } }
     }
 
     // MARK: - Health log entries
