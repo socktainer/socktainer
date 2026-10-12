@@ -463,6 +463,12 @@ extension ContainerCreateRoute {
                 containerLabels[RestartPolicyManager.label] = restartPolicyLabel
             }
 
+            // Apple Container keeps only the resolved published ports; persist the request so
+            // inspect can report HostConfig.PortBindings as sent, unset HostIp/HostPort included.
+            if let portBindingsLabel = ContainerCreateRoute.portBindingsLabelValue(for: body.HostConfig?.PortBindings, logger: req.logger) {
+                containerLabels[ContainerCreateRoute.portBindingsLabel] = portBindingsLabel
+            }
+
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
             }
@@ -997,6 +1003,21 @@ extension ContainerCreateRoute {
             return String(data: json, encoding: .utf8)
         } catch {
             logger.warning("Failed to encode restart policy: \(error) — restart policy will not be honored")
+            return nil
+        }
+    }
+
+    static let portBindingsLabel = "socktainer.port-bindings"
+
+    static func portBindingsLabelValue(for bindings: [String: [PortBinding]]?, logger: Logger) -> String? {
+        // An empty request is kept too: Docker reports {} for it, even when -P published ports.
+        guard let bindings else { return nil }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            return String(data: try encoder.encode(bindings), encoding: .utf8)
+        } catch {
+            logger.warning("Failed to encode port bindings: \(error) — inspect will report the bound ports instead")
             return nil
         }
     }

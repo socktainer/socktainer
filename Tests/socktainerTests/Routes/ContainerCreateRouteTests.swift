@@ -630,6 +630,28 @@ struct DockerSocketRelayRouteTests {
     }
 }
 
+@Suite("ContainerCreateRoute.portBindingsLabelValue")
+struct PortBindingsLabelTests {
+    private let logger = Logger(label: "test")
+
+    @Test("A request without PortBindings is not persisted, an empty one is")
+    func emptyBindingsPersisted() {
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: nil, logger: logger) == nil)
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: [:], logger: logger) == "{}")
+    }
+
+    @Test("Requested bindings round-trip as JSON, unset HostIp and HostPort included")
+    func bindingsRoundTrip() throws {
+        let request = ["80/tcp": [PortBinding(HostIp: "", HostPort: "")], "81/tcp": [PortBinding(HostIp: "127.0.0.1", HostPort: "18081")]]
+        let label = try #require(ContainerCreateRoute.portBindingsLabelValue(for: request, logger: logger))
+        let decoded = try JSONDecoder().decode([String: [PortBinding]].self, from: Data(label.utf8))
+        #expect(decoded["80/tcp"]?.first?.HostIp == "")
+        #expect(decoded["80/tcp"]?.first?.HostPort == "")
+        #expect(decoded["81/tcp"]?.first?.HostIp == "127.0.0.1")
+        #expect(decoded["81/tcp"]?.first?.HostPort == "18081")
+    }
+}
+
 @Suite("ContainerCreateRoute.restartPolicyLabel")
 struct RestartPolicyLabelTests {
     private let logger = Logger(label: "test")
