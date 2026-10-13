@@ -45,6 +45,9 @@ socktainer: build
 .PHONY: release
 release: BUILD_CONFIGURATION = release
 release: all
+	@echo Extracting dSYM and stripping socktainer binary...
+	@BIN="$$($(SWIFT) build -c release --show-bin-path)/socktainer"; \
+		dsymutil "$$BIN" -o "$$BIN.dSYM" && strip "$$BIN"
 
 .PHONY: version
 version:
