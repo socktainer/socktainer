@@ -150,6 +150,7 @@ jobs:
         run: |
           cd ./.build/arm64-apple-macosx/release/
           zip -r socktainer.zip socktainer
+          zip -r socktainer.dSYM.zip socktainer.dSYM
 
       - name: Submit for notarization
         run: |
@@ -178,6 +179,7 @@ jobs:
         run: |
          gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
          gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
+         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.dSYM.zip
          gh release upload ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
 
   release:
