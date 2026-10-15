@@ -5,7 +5,8 @@ import Vapor
 // MARK: - Docker /containers/{id}/stats response model
 
 struct RESTContainerStats: Content {
-    let id: String
+    let id: String  // Docker-shaped container ID
+    let name: String  // "/" + container name, as Docker reports it
     let read: String  // ISO8601 timestamp of this sample
     let preread: String  // ISO8601 timestamp of previous sample
 
@@ -84,6 +85,7 @@ extension RESTContainerStats {
     /// clients can compute the standard CPU% formula without dividing by zero.
     static func build(
         id: String,
+        name: String,
         prev: ContainerResource.ContainerStats,
         curr: ContainerResource.ContainerStats,
         prevRead: Date,
@@ -135,6 +137,7 @@ extension RESTContainerStats {
 
         return RESTContainerStats(
             id: id,
+            name: name,
             read: iso8601.string(from: currRead),
             preread: iso8601.string(from: prevRead),
             cpu_stats: cpuStats(from: curr, systemCPU: systemCPU),
