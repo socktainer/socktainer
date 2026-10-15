@@ -23,6 +23,13 @@ extension EventsRoute {
             response.headers.add(name: .contentType, value: "application/json")
 
             response.body = .init(asyncStream: { writer in
+                // Vapor queues a streaming response's head without flushing it,
+                // so nothing reaches the client until the first event. Docker
+                // flushes the headers right away, and clients wait on them:
+                // `docker stats` (no arguments) blocks until its events
+                // subscription is established. An empty write flushes the head
+                // without framing a chunk, which would end the stream.
+                _ = try? await writer.write(.buffer(req.application.allocator.buffer(capacity: 0)))
                 for await event in stream {
                     if let json = try? JSONEncoder().encode(event) {
                         var buffer = req.application.allocator.buffer(capacity: json.count + 1)
