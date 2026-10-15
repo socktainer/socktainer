@@ -232,11 +232,11 @@ struct ContainerUpdateRouteTests {
         let id = "update-persist-\(UUID().uuidString.prefix(8))"
 
         let store = RestartPolicyOverrideStore()
-        await store.configure(storageDirectory: dir)
+        try await store.configure(storageDirectory: dir)
         await store.set(id: id, policy: RestartPolicy(Name: "unless-stopped", MaximumRetryCount: nil))
 
         let reloadedStore = RestartPolicyOverrideStore()
-        await reloadedStore.configure(storageDirectory: dir)
+        try await reloadedStore.configure(storageDirectory: dir)
 
         let reloaded = await reloadedStore.get(id: id)
         #expect(reloaded?.Name == "unless-stopped")
