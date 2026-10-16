@@ -40,7 +40,7 @@ struct ContainerStatsTests {
         let curr = makeSample(cpuUsec: 2_000_000)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: prev, curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: prev, curr: curr, prevRead: t0, currRead: t1)
         #expect(stats.cpu_stats.cpu_usage.total_usage == 2_000_000_000)
         #expect(stats.precpu_stats.cpu_usage.total_usage == 1_000_000_000)
     }
@@ -50,7 +50,7 @@ struct ContainerStatsTests {
         let sample = makeSample(cpuUsec: 500_000)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
         #expect(stats.precpu_stats.system_cpu_usage == 0)
     }
 
@@ -59,7 +59,7 @@ struct ContainerStatsTests {
         let sample = makeSample()
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
         let expected = UInt64(hostCPUCoreCount()) * 1_000_000_000
         // Allow ±5ms tolerance for timing
         #expect(abs(Int64(stats.cpu_stats.system_cpu_usage) - Int64(expected)) < 5_000_000)
@@ -70,7 +70,7 @@ struct ContainerStatsTests {
         let sample = makeSample()
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
         #expect(stats.cpu_stats.online_cpus == hostCPUCoreCount())
     }
 
@@ -79,7 +79,7 @@ struct ContainerStatsTests {
         let curr = makeSample(memUsage: 128_000_000, memLimit: 4_000_000_000)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
         #expect(stats.memory_stats.usage == 128_000_000)
         #expect(stats.memory_stats.limit == 4_000_000_000)
     }
@@ -89,7 +89,7 @@ struct ContainerStatsTests {
         let curr = makeSample(memUsage: 64_000_000, memLimit: nil)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
         #expect(stats.memory_stats.limit == hostPhysicalMemory())
     }
 
@@ -98,7 +98,7 @@ struct ContainerStatsTests {
         let curr = makeSample(netRx: 1_234, netTx: 5_678)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
         #expect(stats.networks?["eth0"]?.rx_bytes == 1_234)
         #expect(stats.networks?["eth0"]?.tx_bytes == 5_678)
     }
@@ -107,7 +107,7 @@ struct ContainerStatsTests {
     func networkStatsNil() {
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: makeSample(), prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: makeSample(), prevRead: t0, currRead: t1)
         #expect(stats.networks == nil)
     }
 
@@ -116,7 +116,7 @@ struct ContainerStatsTests {
         let curr = makeSample(blkRead: 10_000, blkWrite: 20_000)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
         let entries = stats.blkio_stats.io_service_bytes_recursive
         #expect(entries?.first(where: { $0.op == "read" })?.value == 10_000)
         #expect(entries?.first(where: { $0.op == "write" })?.value == 20_000)
@@ -127,7 +127,7 @@ struct ContainerStatsTests {
         let curr = makeSample(pids: 7)
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: curr, prevRead: t0, currRead: t1)
         #expect(stats.pids_stats.current == 7)
     }
 
@@ -135,7 +135,7 @@ struct ContainerStatsTests {
     func timestamps() {
         let t0 = Date(timeIntervalSince1970: 1_000_000)
         let t1 = Date(timeIntervalSince1970: 1_000_001)
-        let stats = RESTContainerStats.build(id: "c1", prev: makeSample(), curr: makeSample(), prevRead: t0, currRead: t1)
+        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: makeSample(), curr: makeSample(), prevRead: t0, currRead: t1)
         #expect(stats.read.contains("T"))
         #expect(stats.preread.contains("T"))
         #expect(stats.read != stats.preread)
@@ -147,6 +147,7 @@ struct ContainerStatsTests {
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
         let stats = RESTContainerStats.build(
             id: "c1",
+            name: "/c1",
             prev: makeSample(cpuUsec: 1_000_000, memUsage: 64_000_000, memLimit: 2_000_000_000),
             curr: makeSample(
                 cpuUsec: 2_000_000, memUsage: 128_000_000, memLimit: 2_000_000_000,
@@ -156,6 +157,7 @@ struct ContainerStatsTests {
         let data = try JSONEncoder().encode(stats)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         #expect(json?["id"] as? String == "c1")
+        #expect(json?["name"] as? String == "/c1")
         #expect(json?["cpu_stats"] != nil)
         #expect(json?["memory_stats"] != nil)
         #expect(json?["networks"] != nil)
