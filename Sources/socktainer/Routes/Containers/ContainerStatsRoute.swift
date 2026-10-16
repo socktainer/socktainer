@@ -45,8 +45,16 @@ extension ContainerStatsRoute {
             // Resolve the reference the way the other container routes do, so a
             // Docker-shaped ID or ID prefix (as `docker ps` and `docker stats`
             // with no arguments pass it) finds the container, not just its name.
-            guard let container = try await client.getContainer(id: reference) else {
-                throw Abort(.notFound, reason: "No such container: \(reference)")
+            let container: ContainerSnapshot
+            do {
+                guard let found = try await client.getContainer(id: reference) else {
+                    throw Abort(.notFound, reason: "No such container: \(reference)")
+                }
+                container = found
+            } catch ClientContainerError.ambiguousId(let ambiguousReference, let matches) {
+                let matchList = matches.joined(separator: ", ")
+                throw Abort(
+                    .badRequest, reason: "ambiguous container reference \(ambiguousReference): matches \(matchList)")
             }
             let nativeId = container.id
             let dockerId = DockerContainerID.hexId(for: container)

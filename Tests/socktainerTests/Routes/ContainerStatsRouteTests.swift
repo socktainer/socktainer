@@ -17,13 +17,19 @@ import VaporTesting
 struct ContainerStatsRouteTests {
 
     /// Resolves a reference like `ClientContainerService.getContainer`: the
-    /// native ID, or a full or prefix Docker ID.
+    /// native ID first, then a full or prefix Docker ID, throwing when a
+    /// prefix matches more than one container.
     private struct ResolvingClient: ClientContainerProtocol {
         let containers: [ContainerSnapshot]
 
         func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { containers }
         func getContainer(id: String) async throws -> ContainerSnapshot? {
-            containers.first { $0.id == id || DockerContainerID.hexId(for: $0).hasPrefix(id) }
+            if let container = containers.first(where: { $0.id == id }) { return container }
+            let matches = containers.filter { DockerContainerID.hexId(for: $0).hasPrefix(id) }
+            if matches.count > 1 {
+                throw ClientContainerError.ambiguousId(reference: id, matches: matches.map(\.id))
+            }
+            return matches.first
         }
         func enforceContainerRunning(container: ContainerSnapshot) throws {}
         func start(id: String, detachKeys: String?) async throws {}
@@ -107,6 +113,23 @@ struct ContainerStatsRouteTests {
         }
         // Samples are taken by native ID, whatever form the request used.
         #expect(await sampled.ids == ["web", "web"])
+    }
+
+    @Test("An ambiguous ID prefix returns 400 without sampling, as the other container routes do")
+    func ambiguousPrefixIsBadRequest() async throws {
+        // 17 containers over 16 hex digits: at least two share a first character.
+        let containers = (0...16).map { Self.makeSnapshot(id: "c\($0)") }
+        let firstChars = containers.map { DockerContainerID.hexId(for: $0).prefix(1) }
+        let shared = try #require(firstChars.first { char in firstChars.filter { $0 == char }.count > 1 })
+        let sampled = SampledIDs()
+
+        try await withRoute(containers: containers, sampled: sampled) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/\(shared)/stats?stream=false") { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("ambiguous container reference"))
+            }
+        }
+        #expect(await sampled.ids.isEmpty)
     }
 
     @Test("Unknown container returns 404 without sampling")
