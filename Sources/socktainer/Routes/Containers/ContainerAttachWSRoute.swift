@@ -39,7 +39,7 @@ extension ContainerAttachWSRoute {
                 Task {
                     if container.status == .stopped {
                         await handleStopped(
-                            ws: ws, req: req, hexId: id, container: container, query: query)
+                            ws: ws, req: req, client: client, hexId: id, container: container, query: query)
                     } else {
                         await handleRunning(ws: ws, req: req, container: container, query: query)
                     }
@@ -53,6 +53,7 @@ extension ContainerAttachWSRoute {
     private static func handleStopped(
         ws: WebSocket,
         req: Request,
+        client: ClientContainerProtocol,
         hexId: String,
         container: ContainerSnapshot,
         query: ContainerAttachWSQuery
@@ -110,7 +111,7 @@ extension ContainerAttachWSRoute {
         }
 
         // Executing now: open a run so this exit's `die` is claimable exactly once.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+        let runEpoch = await ContainerAttachRoute.startedContainer(container: container, client: client, req: req)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 

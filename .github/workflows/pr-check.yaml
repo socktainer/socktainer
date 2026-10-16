@@ -313,6 +313,9 @@ jobs:
           # expect to get the label back when inspecting the network
           [[ $(sudo docker network inspect bar | jq -r ".[0].Labels.test // empty") == "true" ]] || { echo "Error: Label 'test=true' not found"; exit 1;}
 
+      - name: check stopped-container attach DNS lifecycle
+        run: sudo bash scripts/test-attach-dns.sh /var/run/docker.sock
+
       # NOTE: Inspecting a volume is not possible in CI
       - name: check volume with socktainer
         run: |

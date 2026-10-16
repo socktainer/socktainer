@@ -15,8 +15,42 @@ import VaporTesting
 ///   docker run -a STDOUT -a STDERR --rm alpine sh -c '...' → Container started
 ///   docker run --rm alpine sh -c 'echo l1; echo l2'        → l1 / l2
 /// These tests cover the parameter validation paths that ARE unit-testable.
-@Suite("ContainerAttachRoute — parameter validation")
+@Suite("ContainerAttachRoute — startup and parameter validation")
 struct ContainerAttachRouteTests {
+    @Test("Attach startup registers Compose DNS without a separate start request and cleans up on exit")
+    func attachedContainerDNSLifecycle() async throws {
+        let id = "attach-compose-database"
+        let ip = "192.168.65.42"
+        let snapshot = try makeContainerSnapshot(
+            nativeId: id, ip: ip, network: "attachproject_default",
+            labels: ["com.docker.compose.service": "database", "com.docker.compose.project": "attachproject"],
+            status: .running)
+        let dns = SocktainerDNSServer()
+        let client = StaticSnapshotClientMock(snapshot: snapshot)
+        try await withApp(configure: { app in
+            app.storage[SocktainerDNSServerKey.self] = dns
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            app.post("attached") { req async -> HTTPStatus in
+                _ = await ContainerAttachRoute.startedContainer(container: snapshot, client: client, req: req)
+                return .noContent
+            }
+        }) { app in
+            try await app.testing().test(.POST, "/attached") { res async in
+                #expect(res.status == .noContent)
+            }
+            #expect(dns.listEntries()[id] == ip)
+            #expect(dns.listEntries()["database"] == ip)
+            #expect(dns.listEntries()["database.attachproject"] == ip)
+            #expect(await ContainerInfoCache.shared.get(id: id)?.ip == ip)
+
+            await ContainerExitCodeStore.shared.set(id: id, code: 0)
+            let cleaned = try await pollUntil(timeoutSeconds: 2) { dns.listEntries().isEmpty }
+            #expect(cleaned, "attached containers must remove their DNS records when they exit")
+        }
+        await ContainerRestartState.shared.reset(id: id)
+        await ContainerExitCodeStore.shared.remove(id: id)
+        await ContainerInfoCache.shared.remove(id: id)
+    }
 
     @Test("Container not found returns 404")
     func unknownContainerReturns404() async throws {

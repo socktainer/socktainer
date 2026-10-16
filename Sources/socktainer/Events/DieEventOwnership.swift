@@ -35,6 +35,8 @@ actor DieEventOwnership {
         var reservedGeneration: Int?
         /// Set once an observer has taken this run's `die` event.
         var emitterDecided = false
+        /// Restart-policy work has its own owner, independent of who reported `die`.
+        var restartClaimed = false
     }
 
     private struct RunKey: Hashable {
@@ -105,6 +107,18 @@ actor DieEventOwnership {
         run.emitterDecided = true
         runs[key] = run
         settle(key)
+        return true
+    }
+
+    /// Claims restart-policy work once for the current run and its reserved generation.
+    /// A monitor may already have reported `die`; that must not suppress a valid restart.
+    func claimRestart(id: String, epoch: Int, generation: Int) -> Bool {
+        let key = RunKey(id: id, epoch: epoch)
+        guard currentEpochs[id] == epoch, var run = runs[key],
+            run.reservedGeneration == generation, !run.restartClaimed
+        else { return false }
+        run.restartClaimed = true
+        runs[key] = run
         return true
     }
 
