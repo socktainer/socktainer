@@ -126,6 +126,9 @@ actor EventBroadcaster {
         }
     }
 
+    /// Open `stream()` subscriptions; one drops once its stream is released.
+    var subscriberCount: Int { continuations.count }
+
     func emittedRecently(id: String, action: String, within interval: TimeInterval) -> Bool {
         guard let last = recentEvents["\(id)/\(action)"] else { return false }
         return Date().timeIntervalSince(last) < interval
