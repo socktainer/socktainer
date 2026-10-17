@@ -376,6 +376,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
         guard reader.exists(FilePath(normalizedPath)) else {
+            // LOCAL PATCH (jcc): the rootfs reader cannot see volume/bind
+            // mounts. For a running container, fall back to a guest exec that
+            // runs in the container's mount namespace before reporting 404.
+            if container.status == .running {
+                return try await statPathViaGuestShell(container: container, path: normalizedPath)
+            }
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
 
@@ -408,6 +414,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // itself (linkTarget + symlink tar entry, dangling included), while
         // intermediate symlink components are followed.
         guard reader.exists(FilePath(normalizedPath)) || reader.exists(FilePath(normalizedPath), followSymlinks: false) else {
+            // LOCAL PATCH (jcc): paths on volume/bind mounts are invisible to
+            // the rootfs reader; serve them via a guest exec when running.
+            if container.status == .running {
+                return try await getArchiveViaGuestShell(container: container, path: normalizedPath)
+            }
             throw ClientArchiveError.pathNotFound(path: normalizedPath)
         }
 
@@ -651,23 +662,111 @@ struct ClientArchiveService: ClientArchiveProtocol {
         defer { try? FileManager.default.removeItem(at: stagingDir) }
         try ArchiveUtility.extract(tarPath: tarPath, to: stagingDir)
 
-        let client = ContainerClient()
+        // LOCAL PATCH (jcc): write file contents via an in-guest `sh` exec
+        // instead of the daemon's copyIn API. copyIn is performed by vminitd
+        // in the VM's init mount namespace, where the container's volume and
+        // bind mounts are not visible: a file written to a path under a mount
+        // point lands on the rootfs BENEATH the mount and silently never
+        // appears inside the container (act's /var/run/act volume being the
+        // motivating case). An exec runs in the container's own mount
+        // namespace, so writes land where the container will read them.
         for file in files {
             let stagedURL = stagingDir.appendingPathComponent(file.relativePath)
             guard FileManager.default.fileExists(atPath: stagedURL.path) else {
                 throw ClientArchiveError.operationFailed(message: "archive entry missing after extraction: \(file.relativePath)")
             }
+            let data: Data
             do {
-                try await client.copyIn(
-                    id: container.id,
-                    source: stagedURL.path,
-                    destination: file.guestPath,
-                    mode: file.mode
-                )
+                data = try Data(contentsOf: stagedURL)
             } catch {
                 throw ClientArchiveError.operationFailed(
-                    message: "Failed to copy \(file.relativePath) into running container: \(error.localizedDescription)")
+                    message: "failed to read staged archive entry \(file.relativePath): \(error.localizedDescription)")
             }
+            try await writeFileViaGuestShell(
+                container: container,
+                guestPath: file.guestPath,
+                mode: file.mode,
+                data: data
+            )
+        }
+    }
+
+    /// Write one regular file into the RUNNING container by exec-ing
+    /// `sh -c 'cat > file && chmod mode file'` and feeding the bytes over
+    /// stdin. Runs in the container's mount namespace (unlike copyIn), so
+    /// destinations under volume/bind mounts receive the file.
+    private func writeFileViaGuestShell(
+        container: ContainerSnapshot,
+        guestPath: String,
+        mode: UInt32,
+        data: Data
+    ) async throws {
+        let quoted = shellSingleQuoted(guestPath)
+        let octal = String(format: "%04o", mode & 0o7777)
+
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-c", "cat > \(quoted) && chmod \(octal) \(quoted)"]
+        processConfig.terminal = false
+        // Write as root so restrictive permissions on parent directories
+        // cannot mask the copy (matches Docker's daemon-side extraction).
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        guard let pipes = StdioPipes.make([.stdin, .stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
+        }
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: pipes.stdioArray
+            )
+        } catch {
+            pipes.closeAll()
+            throw ClientArchiveError.operationFailed(
+                message: "Failed to exec file write into running container: \(error.localizedDescription)")
+        }
+        do {
+            try await process.start()
+        } catch {
+            pipes.closeAfterHandoff()
+            throw ClientArchiveError.operationFailed(
+                message: "Failed to exec file write into running container: \(error.localizedDescription)")
+        }
+
+        Self.feedStdin(writer: pipes.stdin!.write, data: data)
+
+        let stderrReader = pipes.stderr!.read
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader.close() }
+            var collected = Data()
+            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < 16 * 1024 {
+                    collected.append(chunk)
+                }
+            }
+            return collected
+        }
+
+        let exitCode: Int32
+        do {
+            exitCode = try await process.wait()
+        } catch {
+            throw ClientArchiveError.operationFailed(
+                message: "Failed waiting for file write in running container: \(error.localizedDescription)")
+        }
+
+        let stderrText =
+            String(data: await stderrTask.value, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard exitCode == 0 else {
+            let detail = stderrText.isEmpty ? "" : ": \(stderrText)"
+            throw ClientArchiveError.operationFailed(
+                message: "Failed to write \(guestPath) in running container (exit \(exitCode))\(detail)")
         }
     }
 
@@ -954,6 +1053,186 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     private func shellSingleQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    // MARK: - LOCAL PATCH (jcc): guest-exec read fallback for mounted paths
+
+    /// Parsed `stat` output for a guest path.
+    private struct GuestPathProbe {
+        let rawMode: UInt32  // full st_mode (type bits + permissions)
+        let size: UInt64
+        let mtime: Int64
+        let linkTarget: String
+    }
+
+    /// Run `/bin/sh -c <command>` in the RUNNING container as root, capturing
+    /// stdout in full and stderr capped at 16 KiB.
+    private func runGuestCommand(
+        container: ContainerSnapshot,
+        shellCommand: String
+    ) async throws -> (exitCode: Int32, stdout: Data, stderr: String) {
+        var processConfig = container.configuration.initProcess
+        processConfig.executable = "/bin/sh"
+        processConfig.arguments = ["-c", shellCommand]
+        processConfig.terminal = false
+        processConfig.workingDirectory = "/"
+        processConfig.user = .id(uid: 0, gid: 0)
+
+        guard let pipes = StdioPipes.make([.stdout, .stderr]) else {
+            throw ClientArchiveError.operationFailed(message: "Failed to create stdio pipes")
+        }
+
+        let process: ClientProcess
+        do {
+            process = try await ContainerClient().createProcess(
+                containerId: container.id,
+                processId: UUID().uuidString.lowercased(),
+                configuration: processConfig,
+                stdio: pipes.stdioArray
+            )
+        } catch {
+            pipes.closeAll()
+            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+        do {
+            try await process.start()
+        } catch {
+            pipes.closeAfterHandoff()
+            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+        }
+
+        let stdoutReader = pipes.stdout!.read
+        let stdoutTask = Task.detached { () -> Data in
+            defer { try? stdoutReader.close() }
+            var collected = Data()
+            while let chunk = try? stdoutReader.read(upToCount: 1 << 16), !chunk.isEmpty {
+                collected.append(chunk)
+            }
+            return collected
+        }
+        let stderrReader = pipes.stderr!.read
+        let stderrTask = Task.detached { () -> Data in
+            defer { try? stderrReader.close() }
+            var collected = Data()
+            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < 16 * 1024 {
+                    collected.append(chunk)
+                }
+            }
+            return collected
+        }
+
+        let exitCode: Int32
+        do {
+            exitCode = try await process.wait()
+        } catch {
+            throw ClientArchiveError.operationFailed(message: "Failed waiting for exec in running container: \(error.localizedDescription)")
+        }
+        let stdout = await stdoutTask.value
+        let stderr =
+            String(data: await stderrTask.value, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (exitCode, stdout, stderr)
+    }
+
+    /// Stat a path inside the running container's mount namespace.
+    /// `stat` (GNU and busybox) does not follow a final-component symlink by
+    /// default, matching the rootfs reader's lstat-like semantics.
+    private func probeGuestPath(container: ContainerSnapshot, path: String) async throws -> GuestPathProbe {
+        let quoted = shellSingleQuoted(path)
+        let script =
+            "p=\(quoted); if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then exit 40; fi; "
+            + "stat -c '%f %s %Y' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\"; fi"
+        let (exitCode, stdout, stderr) = try await runGuestCommand(container: container, shellCommand: script)
+        if exitCode == 40 {
+            throw ClientArchiveError.pathNotFound(path: path)
+        }
+        guard exitCode == 0, let text = String(data: stdout, encoding: .utf8) else {
+            let detail = stderr.isEmpty ? "" : ": \(stderr)"
+            throw ClientArchiveError.operationFailed(message: "guest stat of \(path) failed (exit \(exitCode))\(detail)")
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let fields = lines[0].split(separator: " ")
+        guard fields.count >= 3,
+            let rawMode = UInt32(fields[0], radix: 16),
+            let size = UInt64(fields[1]),
+            let mtime = Int64(fields[2])
+        else {
+            throw ClientArchiveError.operationFailed(message: "unparseable guest stat output for \(path)")
+        }
+        let linkTarget = lines.count > 1 ? lines[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        return GuestPathProbe(rawMode: rawMode, size: size, mtime: mtime, linkTarget: linkTarget)
+    }
+
+    private func pathStat(from probe: GuestPathProbe, path: String) -> PathStat {
+        PathStat(
+            name: (path as NSString).lastPathComponent,
+            size: Int64(probe.size),
+            mode: goFileMode(posixMode: probe.rawMode),
+            mtime: dockerPathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(probe.mtime))),
+            linkTarget: probe.linkTarget
+        )
+    }
+
+    private func statPathViaGuestShell(container: ContainerSnapshot, path: String) async throws -> PathStat {
+        let probe = try await probeGuestPath(container: container, path: path)
+        return pathStat(from: probe, path: path)
+    }
+
+    /// Serve GET /containers/{id}/archive for a path the rootfs reader cannot
+    /// see (volume/bind mounts) by reading through a guest exec.
+    private func getArchiveViaGuestShell(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
+        let probe = try await probeGuestPath(container: container, path: path)
+        let stat = pathStat(from: probe, path: path)
+        let quoted = shellSingleQuoted(path)
+        let fileType = probe.rawMode & 0xF000
+
+        if fileType == 0x4000 {
+            // Directory: let the guest's tar produce the archive (`./`-prefixed
+            // entries, same shape as the staging-directory path).
+            let (exitCode, stdout, stderr) = try await runGuestCommand(
+                container: container,
+                shellCommand: "command -v tar >/dev/null 2>&1 || exit 42; tar -cf - -C \(quoted) .")
+            if exitCode == 42 {
+                throw ClientArchiveError.operationFailed(
+                    message: "cannot archive mounted directory \(path): no tar binary in the container image")
+            }
+            guard exitCode == 0 else {
+                let detail = stderr.isEmpty ? "" : ": \(stderr)"
+                throw ClientArchiveError.operationFailed(message: "guest tar of \(path) failed (exit \(exitCode))\(detail)")
+            }
+            return (tarData: stdout, stat: stat)
+        }
+
+        // Single file or symlink: one tar entry named after the basename,
+        // mirroring the rootfs reader's single-entry output.
+        let tarPath = FileManager.default.temporaryDirectory.appendingPathComponent("guest-archive-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tarPath) }
+
+        let writer = try ArchiveWriter(format: .paxRestricted, filter: .none, file: tarPath)
+        let entry = WriteEntry(writer)
+        entry.path = (path as NSString).lastPathComponent
+        entry.permissions = UInt16(probe.rawMode & 0o7777)
+        entry.owner = 0
+        entry.group = 0
+        entry.modificationDate = Date(timeIntervalSince1970: TimeInterval(probe.mtime))
+        if fileType == 0xA000 {
+            entry.fileType = .symbolicLink
+            entry.symlinkTarget = probe.linkTarget
+            try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
+        } else {
+            entry.fileType = .regular
+            let (exitCode, stdout, stderr) = try await runGuestCommand(container: container, shellCommand: "cat \(quoted)")
+            guard exitCode == 0 else {
+                let detail = stderr.isEmpty ? "" : ": \(stderr)"
+                throw ClientArchiveError.operationFailed(message: "guest read of \(path) failed (exit \(exitCode))\(detail)")
+            }
+            entry.size = Int64(stdout.count)
+            try writer.writeEntry(entry: entry, data: stdout)
+        }
+        try writer.finishEncoding()
+        let tarData = try Data(contentsOf: tarPath)
+        return (tarData: tarData, stat: stat)
     }
 
     /// Fallback PUT using full read-modify-write approach
