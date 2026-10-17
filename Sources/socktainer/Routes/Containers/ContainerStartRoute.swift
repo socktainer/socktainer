@@ -159,6 +159,21 @@ extension ContainerStartRoute {
         }
     }
 
+    /// Decides whether the restart policy wants this exit restarted.
+    ///
+    /// `on-failure` is the only policy that reasons about *how* the process ended, so it is
+    /// the only one that needs a real exit code: an unknown status (`waitFailureSentinel`)
+    /// is not evidence of failure and must not be read as one. `always` and
+    /// `unless-stopped` restart on an exit regardless of the code, so an unknown code does
+    /// not change their outcome and they keep evaluating normally.
+    static func restartDecision(
+        policy: RestartPolicy, exitCode: Int32, exitCodeKnown: Bool, attempt: Int, hasBeenManuallyStopped: Bool
+    ) -> Bool {
+        if policy.Name == "on-failure" && !exitCodeKnown { return false }
+        return RestartPolicyManager.shouldRestart(
+            policy: policy, exitCode: exitCode, attempt: attempt, hasBeenManuallyStopped: hasBeenManuallyStopped)
+    }
+
     /// Awaits the container's init process exit, fires the "die" event, and — unless it was
     /// created with `--rm` — honors `HostConfig.RestartPolicy` by restarting it and re-arming
     /// this observer for the next lifecycle. Runs as a detached background task.
@@ -196,12 +211,13 @@ extension ContainerStartRoute {
                 return
             }
 
-            // The authoritative wait failed, so the real exit code is unknown. The
-            // sentinel has to be non-zero to stay distinguishable from a real exit 0,
-            // which means it would read as a failure to the restart policy and
-            // restart an `on-failure` container on a crash that may never have
-            // happened. An unknown exit status is not evidence of failure, so no
-            // restart decision is made from it.
+            // The authoritative wait failed, so the real exit code is unknown, and the
+            // sentinel standing in for it has to be non-zero to stay distinguishable
+            // from a genuine exit 0. `on-failure` reads any non-zero code as failure,
+            // so without this the container would restart on a crash that may never
+            // have happened. Only `on-failure` depends on the code, though: `always`
+            // and `unless-stopped` restart on an exit regardless of how the process
+            // ended, so they keep their normal handling.
             let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
 
             let executionDuration = Date().timeIntervalSince(startedAt)
@@ -256,11 +272,11 @@ extension ContainerStartRoute {
             // while the container runs must govern THIS exit, so the override is read now.
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
-                exitCodeKnown
-                && (effectivePolicy.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
-                } ?? false)
+                effectivePolicy.map {
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
+                        attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                } ?? false
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
             // resolution) on every exit, not just --rm. Mirror that here, after the generation
@@ -295,8 +311,9 @@ extension ContainerStartRoute {
             let stoppedDuringBackoff = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let stillWantsRestart =
                 policyAfterBackoff.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber,
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
+                        attempt: nextAttemptNumber,
                         hasBeenManuallyStopped: explicitlyStopped || stoppedDuringBackoff)
                 } ?? false
             guard stillWantsRestart else {
