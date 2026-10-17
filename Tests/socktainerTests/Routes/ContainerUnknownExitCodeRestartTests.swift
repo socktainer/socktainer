@@ -54,7 +54,7 @@ struct ContainerUnknownExitCodeRestartTests {
 
     @Test("An on-failure container still restarts on a real non-zero exit")
     func knownNonZeroExitCodeStillRestarts() async throws {
-        // The guard on unknown status must not disable the policy itself.
+        // An unknown exit bails out of the observer; a real code must not.
         let nativeId = "restart-known-exit-ctr"
         let ip = "192.168.65.91"
         let network = "myapp_default"
@@ -82,37 +82,6 @@ struct ContainerUnknownExitCodeRestartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
-    @Test("An always container still restarts when the exit code is unknown", arguments: ["always", "unless-stopped"])
-    func unknownExitCodeStillRestartsPolicyThatIgnoresTheCode(policyName: String) async throws {
-        // Only `on-failure` reasons about how the process ended. These policies restart on
-        // an exit regardless of the code, so an unknown code must not suppress them — the
-        // guard belongs to the one policy that reads the code, not to the decision itself.
-        let nativeId = "restart-unknown-exit-\(policyName)-ctr"
-        let ip = "192.168.65.92"
-        let network = "myapp_default"
-
-        let mock = UnknownExitMock(
-            snapshot: try unknownExitSnapshot(nativeId: nativeId, ip: ip, network: network, restartPolicyName: policyName))
-
-        try await withApp(configure: { _ in }) { app in
-            let regexRouter = app.regexRouter(with: app.logger)
-            app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
-            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
-            try app.register(collection: ContainerStartRoute(client: mock))
-
-            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
-                #expect(res.status == .noContent)
-            }
-        }
-
-        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
-        let restarted = try await pollUntil(timeoutSeconds: 5) { await mock.startCallCount() >= 2 }
-        #expect(restarted, "\(policyName) must still restart when the exit code is unknown")
-
-        await ContainerRestartState.shared.reset(id: nativeId)
-        await ContainerExitCodeStore.shared.remove(id: nativeId)
-    }
 }
 
 // MARK: - Helpers

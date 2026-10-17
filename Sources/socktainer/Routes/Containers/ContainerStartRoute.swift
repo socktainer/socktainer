@@ -159,21 +159,6 @@ extension ContainerStartRoute {
         }
     }
 
-    /// Decides whether the restart policy wants this exit restarted.
-    ///
-    /// `on-failure` is the only policy that reasons about *how* the process ended, so it is
-    /// the only one that needs a real exit code: an unknown status (`waitFailureSentinel`)
-    /// is not evidence of failure and must not be read as one. `always` and
-    /// `unless-stopped` restart on an exit regardless of the code, so an unknown code does
-    /// not change their outcome and they keep evaluating normally.
-    static func restartDecision(
-        policy: RestartPolicy, exitCode: Int32, exitCodeKnown: Bool, attempt: Int, hasBeenManuallyStopped: Bool
-    ) -> Bool {
-        if policy.Name == "on-failure" && !exitCodeKnown { return false }
-        return RestartPolicyManager.shouldRestart(
-            policy: policy, exitCode: exitCode, attempt: attempt, hasBeenManuallyStopped: hasBeenManuallyStopped)
-    }
-
     /// Awaits the container's init process exit, fires the "die" event, and — unless it was
     /// created with `--rm` — honors `HostConfig.RestartPolicy` by restarting it and re-arming
     /// this observer for the next lifecycle. Runs as a detached background task.
@@ -211,14 +196,17 @@ extension ContainerStartRoute {
                 return
             }
 
-            // The authoritative wait failed, so the real exit code is unknown, and the
-            // sentinel standing in for it has to be non-zero to stay distinguishable
-            // from a genuine exit 0. `on-failure` reads any non-zero code as failure,
-            // so without this the container would restart on a crash that may never
-            // have happened. Only `on-failure` depends on the code, though: `always`
-            // and `unless-stopped` restart on an exit regardless of how the process
-            // ended, so they keep their normal handling.
-            let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
+            // The authoritative wait failed, so it is unknown whether the process exited at
+            // all, let alone with what code. The sentinel standing in for the code has to be
+            // non-zero to stay distinguishable from a genuine exit 0, so letting it through
+            // would report a `die` carrying a fabricated code and let `on-failure` restart an
+            // instance on a crash that may never have happened. Leave the run unclaimed: no
+            // `die` is broadcast and no restart is decided. The external event watcher still
+            // reports the state transition it observes, just without an exit code.
+            guard code != ContainerExitCodeStore.waitFailureSentinel else {
+                logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")
+                return
+            }
 
             let executionDuration = Date().timeIntervalSince(startedAt)
 
@@ -273,9 +261,8 @@ extension ContainerStartRoute {
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
                 effectivePolicy.map {
-                    restartDecision(
-                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
-                        attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                    RestartPolicyManager.shouldRestart(
+                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
                 } ?? false
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
@@ -311,9 +298,8 @@ extension ContainerStartRoute {
             let stoppedDuringBackoff = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let stillWantsRestart =
                 policyAfterBackoff.map {
-                    restartDecision(
-                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
-                        attempt: nextAttemptNumber,
+                    RestartPolicyManager.shouldRestart(
+                        policy: $0, exitCode: code, attempt: nextAttemptNumber,
                         hasBeenManuallyStopped: explicitlyStopped || stoppedDuringBackoff)
                 } ?? false
             guard stillWantsRestart else {
