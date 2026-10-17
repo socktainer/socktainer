@@ -196,6 +196,14 @@ extension ContainerStartRoute {
                 return
             }
 
+            // The authoritative wait failed, so the real exit code is unknown. The
+            // sentinel has to be non-zero to stay distinguishable from a real exit 0,
+            // which means it would read as a failure to the restart policy and
+            // restart an `on-failure` container on a crash that may never have
+            // happened. An unknown exit status is not evidence of failure, so no
+            // restart decision is made from it.
+            let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
+
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
@@ -248,10 +256,11 @@ extension ContainerStartRoute {
             // while the container runs must govern THIS exit, so the override is read now.
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
-                effectivePolicy.map {
+                exitCodeKnown
+                && (effectivePolicy.map {
                     RestartPolicyManager.shouldRestart(
                         policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
-                } ?? false
+                } ?? false)
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
             // resolution) on every exit, not just --rm. Mirror that here, after the generation
