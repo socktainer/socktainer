@@ -124,8 +124,11 @@ struct ContainerUnknownExitCodeRestartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
-    @Test("A still-running container keeps its DNS alias when the exit wait fails")
-    func unknownExitCodePreservesRunningContainerAliases() async throws {
+    @Test("A container that is still running when the exit wait fails is cleaned up once it stops")
+    func unknownExitCodeKeepsObservingUntilTheRunStops() async throws {
+        // The sentinel can be recorded before the init process has actually exited. The
+        // observer must not bail on that: it owns this run (the attach monitor deferred to
+        // `reserveForStart`), so returning would leak the run's DNS alias and cache entry.
         let nativeId = "restart-unknown-exit-running-ctr"
         let ip = "192.168.65.93"
         let network = "myapp_default"
@@ -153,11 +156,53 @@ struct ContainerUnknownExitCodeRestartTests {
         #expect(dnsServer.listEntries()[nativeId] == ip)
 
         await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+        // While the container is still running the alias must survive: the run has not ended,
+        // so tearing its network identity down would break a live container.
         try await Task.sleep(nanoseconds: 300_000_000)
-
         #expect(
             dnsServer.listEntries()[nativeId] == ip,
-            "DNS aliases must not be removed when wait fails while the container is still running")
+            "DNS aliases must not be removed while the container they belong to is still running")
+
+        // Once the run actually stops the same observer must complete the cleanup.
+        await mock.setSnapshot(stoppedSnapshot)
+        let cleaned = try await pollUntil(timeoutSeconds: 2) {
+            dnsServer.listEntries()[nativeId] == nil
+        }
+        #expect(cleaned, "the observer must run exit cleanup once the interrupted run is confirmed stopped")
+        #expect(await mock.startCallCount() == 1, "an unknown exit status must not trigger a restart")
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
+    @Test("A policy that ignores the exit code still restarts when the code is unknown", arguments: ["always", "unless-stopped"])
+    func unknownExitCodeStillRestartsPolicyThatIgnoresTheCode(policyName: String) async throws {
+        // `always` and `unless-stopped` restart on an exit regardless of how the process
+        // ended, so an unknown code must not withhold their restart the way it withholds
+        // `on-failure` — otherwise a restartable container silently stays stopped.
+        let nativeId = "restart-unknown-exit-\(policyName)-ctr"
+        let ip = "192.168.65.94"
+        let network = "myapp_default"
+
+        let mock = UnknownExitMock(
+            snapshot: try unknownExitSnapshot(
+                nativeId: nativeId, ip: ip, network: network, restartPolicyName: policyName, status: .stopped))
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+        let restarted = try await pollUntil(timeoutSeconds: 5) { await mock.startCallCount() >= 2 }
+        #expect(restarted, "\(policyName) does not read the exit code, so an unknown one must not block its restart")
 
         await ContainerRestartState.shared.reset(id: nativeId)
         await ContainerExitCodeStore.shared.remove(id: nativeId)
@@ -189,6 +234,8 @@ private actor UnknownExitMock: ClientContainerProtocol {
     }
 
     func startCallCount() -> Int { startCalls }
+
+    func setSnapshot(_ next: ContainerSnapshot) { snapshot = next }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
     func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
