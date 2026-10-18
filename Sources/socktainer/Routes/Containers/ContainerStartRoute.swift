@@ -229,8 +229,20 @@ extension ContainerStartRoute {
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            var exitSnapshot = try? await client.getContainer(id: nativeId)
-            var confirmedStopped = exitSnapshot == nil || exitSnapshot?.status == .stopped
+            // `try?` would collapse a thrown probe error and a genuinely missing container
+            // into the same `nil`. With a known exit code that is harmless: the container has
+            // already exited and a `--rm` one is expected to be gone. On the unknown-exit path
+            // a failed probe is not evidence of a stop, so it must not be read as one — doing
+            // so skipped the polling loop and tore down a live run's mounts, cache entry, and
+            // DNS aliases.
+            var exitSnapshot: ContainerSnapshot?
+            var initialProbeFailed = false
+            do {
+                exitSnapshot = try await client.getContainer(id: nativeId)
+            } catch {
+                initialProbeFailed = true
+            }
+            var confirmedStopped = !initialProbeFailed && (exitSnapshot == nil || exitSnapshot?.status == .stopped)
 
             if !exitCodeKnown {
                 logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")

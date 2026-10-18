@@ -175,6 +175,60 @@ struct ContainerUnknownExitCodeRestartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
+    @Test("A failed first probe on the unknown-exit path is not read as a stop")
+    func failedInitialProbeKeepsTheLiveRun() async throws {
+        // The first status probe used to swallow its error with `try?`, which made a thrown
+        // error indistinguishable from "the container is gone". On the unknown-exit path that
+        // set `confirmedStopped`, skipped the polling loop, and ran exit cleanup against a
+        // container that was still running — unregistering its DNS aliases and dropping its
+        // cache entry.
+        let nativeId = "restart-unknown-exit-probe-error-ctr"
+        let ip = "192.168.65.95"
+        let network = "myapp_default"
+
+        let stoppedSnapshot = try unknownExitSnapshot(
+            nativeId: nativeId, ip: ip, network: network, restartPolicyName: "on-failure", status: .stopped)
+        let runningSnapshot = try unknownExitSnapshot(
+            nativeId: nativeId, ip: ip, network: network, restartPolicyName: "on-failure", status: .running)
+        let mock = UnknownExitMock(snapshot: stoppedSnapshot, postStartSnapshot: runningSnapshot)
+        let dnsServer = SocktainerDNSServer()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        #expect(dnsServer.listEntries()[nativeId] == ip)
+
+        // The request has completed, so the next probe belongs to the armed observer.
+        await mock.failNextProbe()
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+        #expect(
+            dnsServer.listEntries()[nativeId] == ip,
+            "a probe that threw must not be treated as a confirmed stop while the container is still running")
+        #expect(await mock.startCallCount() == 1, "an unknown exit status must not trigger a restart")
+
+        // Once a later probe confirms the stop, the same observer still finishes the cleanup.
+        await mock.setSnapshot(stoppedSnapshot)
+        let cleaned = try await pollUntil(timeoutSeconds: 2) {
+            dnsServer.listEntries()[nativeId] == nil
+        }
+        #expect(cleaned, "the observer must run exit cleanup once the run is confirmed stopped")
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
     @Test("A policy that ignores the exit code still restarts when the code is unknown", arguments: ["always", "unless-stopped"])
     func unknownExitCodeStillRestartsPolicyThatIgnoresTheCode(policyName: String) async throws {
         // `always` and `unless-stopped` restart on an exit regardless of how the process
@@ -212,6 +266,8 @@ struct ContainerUnknownExitCodeRestartTests {
 
 // MARK: - Helpers
 
+private struct UnknownExitProbeError: Error {}
+
 private func unknownExitSnapshot(
     nativeId: String, ip: String, network: String, restartPolicyName: String, status: RuntimeStatus = .stopped
 ) throws -> ContainerSnapshot {
@@ -227,6 +283,7 @@ private actor UnknownExitMock: ClientContainerProtocol {
     private var snapshot: ContainerSnapshot
     private let postStartSnapshot: ContainerSnapshot?
     private var startCalls = 0
+    private var pendingProbeFailures = 0
 
     init(snapshot: ContainerSnapshot, postStartSnapshot: ContainerSnapshot? = nil) {
         self.snapshot = snapshot
@@ -237,8 +294,17 @@ private actor UnknownExitMock: ClientContainerProtocol {
 
     func setSnapshot(_ next: ContainerSnapshot) { snapshot = next }
 
+    /// Makes the next `count` status probes throw, as an unreachable or erroring client would.
+    func failNextProbe(_ count: Int = 1) { pendingProbeFailures = count }
+
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        if pendingProbeFailures > 0 {
+            pendingProbeFailures -= 1
+            throw UnknownExitProbeError()
+        }
+        return snapshot
+    }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func prepareForStart(container: ContainerSnapshot) async throws {}
     func start(id: String, detachKeys: String?) async throws {
