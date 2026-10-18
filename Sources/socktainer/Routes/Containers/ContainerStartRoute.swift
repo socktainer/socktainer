@@ -196,25 +196,37 @@ extension ContainerStartRoute {
                 return
             }
 
-            // The authoritative wait failed, so it is unknown whether the process exited at
-            // all, let alone with what code. The sentinel standing in for the code has to be
-            // non-zero to stay distinguishable from a genuine exit 0, so letting it through
-            // would report a `die` carrying a fabricated code and let `on-failure` restart an
-            // instance on a crash that may never have happened. Leave the run unclaimed: no
-            // `die` is broadcast and no restart is decided. The external event watcher still
-            // reports the state transition it observes, just without an exit code.
-            guard code != ContainerExitCodeStore.waitFailureSentinel else {
-                logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")
-                return
-            }
-
+            // The authoritative wait failed, so the exit code is unknown. The sentinel
+            // standing in for it has to be non-zero to stay distinguishable from a genuine
+            // exit 0, so letting it through would report a `die` carrying a fabricated code
+            // and let `on-failure` restart an instance on a crash that may never have
+            // happened. Suppress both `die` and any restart decision, and run exit cleanup
+            // only once the container is confirmed stopped (or already reaped under `--rm`)
+            // so a still-running container keeps its mounts, cache entry, and DNS aliases.
+            let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            let exitSnapshot = try? await client.getContainer(id: nativeId)
+            let exitSnapshot: ContainerSnapshot?
+            let confirmedStopped: Bool
+            do {
+                exitSnapshot = try await client.getContainer(id: nativeId)
+                confirmedStopped = exitSnapshot == nil || exitSnapshot?.status == .stopped
+            } catch {
+                exitSnapshot = nil
+                confirmedStopped = false
+            }
+
+            if !exitCodeKnown {
+                logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")
+                guard confirmedStopped else {
+                    return
+                }
+            }
+
             if let exitSnapshot {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
@@ -224,7 +236,7 @@ extension ContainerStartRoute {
             // was already reported by the attach path's exit monitor — that is how
             // `docker compose up` runs a service. Claiming twice would double every exit.
             let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
-            if ownsExit {
+            if ownsExit, exitCodeKnown {
                 var attrs = labels
                 attrs["exitCode"] = String(code)
                 // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
@@ -260,10 +272,11 @@ extension ContainerStartRoute {
             // while the container runs must govern THIS exit, so the override is read now.
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
-                effectivePolicy.map {
+                exitCodeKnown
+                && (effectivePolicy.map {
                     RestartPolicyManager.shouldRestart(
                         policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
-                } ?? false
+                } ?? false)
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
             // resolution) on every exit, not just --rm. Mirror that here, after the generation

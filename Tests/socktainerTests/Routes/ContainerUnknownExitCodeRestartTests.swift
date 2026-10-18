@@ -82,6 +82,87 @@ struct ContainerUnknownExitCodeRestartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
+    @Test("A stopped container still runs DNS and --rm cleanup when its exit code is unknown")
+    func unknownExitCodeCleansUpConfirmedStoppedContainer() async throws {
+        let nativeId = "restart-unknown-exit-stopped-cleanup-ctr"
+        let ip = "192.168.65.92"
+        let network = "myapp_default"
+
+        let snapshot = try unknownExitSnapshot(
+            nativeId: nativeId, ip: ip, network: network, restartPolicyName: "on-failure", status: .stopped)
+        let hexId = DockerContainerID.hexId(for: snapshot)
+        let mock = UnknownExitMock(snapshot: snapshot)
+        let dnsServer = SocktainerDNSServer()
+
+        await ContainerInfoCache.shared.markAutoRemove(hexId: hexId, nativeId: nativeId)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        #expect(dnsServer.listEntries()[nativeId] == ip)
+
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+
+        let cleaned = try await pollUntil(timeoutSeconds: 2) {
+            dnsServer.listEntries()[nativeId] == nil
+        }
+        #expect(cleaned, "a confirmed-stopped container must still unregister its DNS alias when wait fails")
+        #expect(await ContainerInfoCache.shared.get(id: hexId) == nil, "--rm cache entry must be cleaned up when confirmed stopped")
+        #expect(await mock.startCallCount() == 1, "cleanup must not trigger a restart")
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
+    @Test("A still-running container keeps its DNS alias when the exit wait fails")
+    func unknownExitCodePreservesRunningContainerAliases() async throws {
+        let nativeId = "restart-unknown-exit-running-ctr"
+        let ip = "192.168.65.93"
+        let network = "myapp_default"
+
+        let stoppedSnapshot = try unknownExitSnapshot(
+            nativeId: nativeId, ip: ip, network: network, restartPolicyName: "on-failure", status: .stopped)
+        let runningSnapshot = try unknownExitSnapshot(
+            nativeId: nativeId, ip: ip, network: network, restartPolicyName: "on-failure", status: .running)
+        let mock = UnknownExitMock(snapshot: stoppedSnapshot, postStartSnapshot: runningSnapshot)
+        let dnsServer = SocktainerDNSServer()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[SocktainerDNSServerKey.self] = dnsServer
+            app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        #expect(dnsServer.listEntries()[nativeId] == ip)
+
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        #expect(
+            dnsServer.listEntries()[nativeId] == ip,
+            "DNS aliases must not be removed when wait fails while the container is still running")
+
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
 }
 
 // MARK: - Helpers
@@ -99,10 +180,12 @@ private func unknownExitSnapshot(
 
 private actor UnknownExitMock: ClientContainerProtocol {
     private var snapshot: ContainerSnapshot
+    private let postStartSnapshot: ContainerSnapshot?
     private var startCalls = 0
 
-    init(snapshot: ContainerSnapshot) {
+    init(snapshot: ContainerSnapshot, postStartSnapshot: ContainerSnapshot? = nil) {
         self.snapshot = snapshot
+        self.postStartSnapshot = postStartSnapshot
     }
 
     func startCallCount() -> Int { startCalls }
@@ -110,8 +193,12 @@ private actor UnknownExitMock: ClientContainerProtocol {
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [snapshot] }
     func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
+    func prepareForStart(container: ContainerSnapshot) async throws {}
     func start(id: String, detachKeys: String?) async throws {
         startCalls += 1
+        if let postStartSnapshot {
+            snapshot = postStartSnapshot
+        }
         // Mirrors ClientContainerService.startInternal: clear the previous run's code so
         // the newly-armed observer awaits the next exit instead of a stale one.
         await ContainerExitCodeStore.shared.remove(id: id)
@@ -125,6 +212,7 @@ private actor UnknownExitMock: ClientContainerProtocol {
     }
     func kill(id: String, signal: String?) async throws {}
     func delete(id: String) async throws {}
+    func rename(id: String, newName: String) async throws {}
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
         RESTContainerWait(statusCode: 0)
     }
