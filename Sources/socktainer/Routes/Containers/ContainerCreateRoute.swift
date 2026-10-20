@@ -574,8 +574,17 @@ extension ContainerCreateRoute {
                 let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }
 
                 // Handle volume mounts using the volume format (source:destination)
-                if !volumeMounts.isEmpty {
-                    let volumeStrings = volumeMounts.map { mount in
+                // A volume mount without a source is anonymous (compose `- /data`).
+                for mount in volumeMounts where mount.Source.isEmpty {
+                    do {
+                        mountsOrFs.append(.volume(try ContainerCreateRoute.anonymousVolume(for: mount)))
+                    } catch {
+                        throw Abort(.badRequest, reason: "Invalid volume declaration: \(error)")
+                    }
+                }
+                let namedVolumeMounts = volumeMounts.filter { !$0.Source.isEmpty }
+                if !namedVolumeMounts.isEmpty {
+                    let volumeStrings = namedVolumeMounts.map { mount in
                         var volumeString = "\(mount.Source):\(mount.Target)"
                         if mount.ReadOnly == true {
                             volumeString += ":ro"
@@ -962,6 +971,15 @@ extension ContainerCreateRoute {
     /// period/quota knobs are mutually exclusive, NanoCpus must fall within the host's core
     /// count, and CpuShares must be a positive weight. Returns the moby-verbatim error message
     /// to send as a 400, or nil if the request is valid.
+    static func anonymousVolume(for mount: Mount) throws -> ParsedVolume {
+        guard mount.Target.hasPrefix("/") else {
+            throw ContainerizationError(.invalidArgument, message: "invalid volume destination: \(mount.Target)")
+        }
+        return ParsedVolume(
+            name: VolumeStorage.generateAnonymousVolumeName(), destination: mount.Target,
+            options: mount.ReadOnly == true ? ["ro"] : [], isAnonymous: true)
+    }
+
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {
         let nanoCpus = hostConfig?.NanoCpus ?? 0
         let cpuPeriod = hostConfig?.CpuPeriod ?? 0

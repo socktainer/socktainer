@@ -789,3 +789,44 @@ struct ImageExistenceErrorTests {
         #expect((mapped as? ContainerizationError)?.code == .interrupted)
     }
 }
+
+@Suite("ContainerCreateRoute — anonymous volume mounts")
+struct ContainerCreateAnonymousMountTests {
+
+    @Test("a volume mount without Source (compose `- /data`) decodes with an empty source")
+    func mountWithoutSourceDecodes() throws {
+        let json = #"{"Image":"alpine","HostConfig":{"Mounts":[{"Type":"volume","Target":"/data","VolumeOptions":{}}]}}"#
+        let body = try JSONDecoder().decode(CreateContainerRequest.self, from: Data(json.utf8))
+        let mount = try #require(body.HostConfig?.Mounts?.first)
+        #expect(mount.Source.isEmpty)
+        #expect(mount.Target == "/data")
+        #expect(mount.MountType == "volume")
+    }
+
+    private func mount(target: String, readOnly: Bool?) throws -> Mount {
+        let ro = readOnly.map { ",\"ReadOnly\":\($0)" } ?? ""
+        let json = #"{"Type":"volume","Target":"\#(target)"\#(ro)}"#
+        return try JSONDecoder().decode(Mount.self, from: Data(json.utf8))
+    }
+
+    @Test("an anonymous mount becomes an anonymous volume, read-write by default")
+    func anonymousVolumeDefaults() throws {
+        let v = try ContainerCreateRoute.anonymousVolume(for: mount(target: "/data", readOnly: nil))
+        #expect(v.destination == "/data")
+        #expect(v.isAnonymous)
+        #expect(v.options.isEmpty)
+    }
+
+    @Test("ReadOnly is preserved on an anonymous mount")
+    func anonymousVolumeReadOnly() throws {
+        let v = try ContainerCreateRoute.anonymousVolume(for: mount(target: "/data", readOnly: true))
+        #expect(v.options == ["ro"])
+    }
+
+    @Test("a relative anonymous mount target is rejected")
+    func anonymousVolumeRelativeTarget() throws {
+        #expect(throws: (any Error).self) {
+            try ContainerCreateRoute.anonymousVolume(for: mount(target: "data", readOnly: nil))
+        }
+    }
+}
