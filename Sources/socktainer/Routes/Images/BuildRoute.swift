@@ -670,7 +670,7 @@ extension BuildRoute {
 
         // `--manifest <name>`: fold the just-built image's platform(s) into a named manifest
         // list, creating it if it doesn't exist yet — this is podman's real multi-arch
-        // workflow (see containers/podman#27211): a bare multi-platform build alone never
+        // workflow (see podman-container-tools/podman#27211): a bare multi-platform build alone never
         // produces one on the real client. Runs before the success message/stream close
         // (not as a best-effort afterthought) so a registration failure is reported as a
         // build failure instead of silently succeeding with an unregistered manifest.

@@ -611,7 +611,7 @@ jobs:
       # ── Docker multi-arch build API: manifest list amd64+ppc64le+arm64+s390x ──
       # This is NOT equivalent to `podman build --platform ... --manifest name`.
       # Real podman CLI, invoked bare (no --manifest), only builds a single
-      # platform anyway (see containers/podman#27211) — comma-separated
+      # platform anyway (see podman-container-tools/podman#27211) — comma-separated
       # --platform alone does not produce a multi-arch image on the real
       # podman client. Podman's own --manifest flow (BuildRoute now reads the
       # `manifest` query param and registers the built image via

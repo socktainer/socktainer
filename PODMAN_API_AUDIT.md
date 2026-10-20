@@ -3,7 +3,7 @@
 Scope: what the `podman` CLI needs from a remote unix socket (`CONTAINER_HOST` set,
 no podman machine involved — that layer is entirely client-side VM provisioning
 and never touches the wire once a socket connection exists). Paths verified
-against `github.com/containers/podman` `pkg/api/server/register_*.go`
+against `github.com/podman-container-tools/podman` `pkg/api/server/register_*.go`
 (canonical route registration) where fetched; the rest match the long-stable
 libpod API v4/v5 convention (`/libpod/<resource>/...`).
 
@@ -98,7 +98,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 ## Manifest lists (multi-arch)
 
 Real podman's actual multi-arch **build** workflow (confirmed against
-[containers/podman#27211](https://github.com/containers/podman/issues/27211)):
+[podman-container-tools/podman#27211](https://github.com/podman-container-tools/podman/issues/27211)):
 invoked bare (no `--manifest` flag), `podman build --platform a,b,c -t foo .`
 only builds a **single** architecture regardless of how many comma-separated
 `--platform` values are passed — the client never asks the server for a
