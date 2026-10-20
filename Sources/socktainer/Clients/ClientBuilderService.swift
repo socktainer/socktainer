@@ -174,14 +174,20 @@ struct ClientBuilderService: ClientBuilderProtocol {
     private func startBuilder(logger: Logger?) async throws -> ContainerSnapshot {
         // Builder.start fetches over HTTPS only. Fetch first with the scheme the reference
         // calls for, so a builder image on a local insecure registry still works; Builder.start
-        // then finds the image already in the store.
+        // then finds the image already in the store. Best effort: a stopped builder that still
+        // matches restarts without its image, which may have been deleted, so a failure here is
+        // only fatal if Builder.start goes on to need the image.
         let builderImage = containerSystemConfig.build.image
-        _ = try await ClientImage.fetch(
-            reference: builderImage,
-            platform: Platform(arch: "arm64", os: "linux", variant: "v8"),
-            scheme: RegistryScheme.scheme(forReference: builderImage, internalDnsDomain: containerSystemConfig.dns.domain),
-            containerSystemConfig: containerSystemConfig
-        )
+        do {
+            _ = try await ClientImage.fetch(
+                reference: builderImage,
+                platform: Platform(arch: "arm64", os: "linux", variant: "v8"),
+                scheme: RegistryScheme.scheme(forReference: builderImage, internalDnsDomain: containerSystemConfig.dns.domain),
+                containerSystemConfig: containerSystemConfig
+            )
+        } catch {
+            logger?.warning("Could not fetch builder image \(builderImage) ahead of starting the builder: \(error)")
+        }
 
         try await Builder.start(
             cpus: nil,
