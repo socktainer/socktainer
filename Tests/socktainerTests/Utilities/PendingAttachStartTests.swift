@@ -22,6 +22,7 @@ struct PendingAttachStartTests {
         let pipes = try makePipes()
         defer { pipes.closeAll() }
         let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+        #expect(await registry.adopt(containerId: "c1", token: token))
 
         #expect(await registry.claim(containerId: "c1") != nil)
         await registry.finish(containerId: "c1", result: .success(StubProcess(id: "p1")))
@@ -36,6 +37,7 @@ struct PendingAttachStartTests {
         let pipes = try makePipes()
         defer { pipes.closeAll() }
         let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+        #expect(await registry.adopt(containerId: "c1", token: token))
 
         let waiter = Task { try await registry.waitForStart(containerId: "c1", token: token) }
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -51,6 +53,7 @@ struct PendingAttachStartTests {
         let pipes = try makePipes()
         defer { pipes.closeAll() }
         let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+        #expect(await registry.adopt(containerId: "c1", token: token))
 
         let waiter = Task { try await registry.waitForStart(containerId: "c1", token: token) }
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -81,6 +84,7 @@ struct PendingAttachStartTests {
         let pipes = try makePipes()
         defer { pipes.closeAll() }
         let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+        #expect(await registry.adopt(containerId: "c1", token: token))
 
         #expect(await registry.claim(containerId: "c1") != nil)
         #expect(await registry.cancel(containerId: "c1", token: token) == false, "the start path owns the pipes now")
@@ -102,6 +106,56 @@ struct PendingAttachStartTests {
         #expect(await registry.park(containerId: "c1", pipes: first) != nil)
         #expect(await registry.park(containerId: "c1", pipes: second) == nil)
         #expect(await registry.park(containerId: "c2", pipes: second) != nil, "other containers are unaffected")
+    }
+
+    @Test("pipes whose stream never started are released, and the container can be attached again")
+    func unadoptedEntryReleased() async throws {
+        let registry = PendingAttachStart(adoptionTimeoutNs: 50_000_000)
+        let pipes = try makePipes()
+        _ = try #require(await registry.park(containerId: "c1", pipes: pipes))
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        #expect(await registry.claim(containerId: "c1") == nil, "a start must not boot with pipes nobody reads")
+        let again = try makePipes()
+        defer { again.closeAll() }
+        #expect(await registry.park(containerId: "c1", pipes: again) != nil, "a new attach must not get 409")
+    }
+
+    @Test("a start that arrives before the stream adopts its pipes waits for it")
+    func claimWaitsForAdoption() async throws {
+        let registry = PendingAttachStart()
+        let pipes = try makePipes()
+        defer { pipes.closeAll() }
+        let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+
+        let claim = Task { await registry.claim(containerId: "c1") }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        #expect(await registry.adopt(containerId: "c1", token: token))
+
+        #expect(await claim.value != nil)
+    }
+
+    @Test("a start waiting for adoption gets nothing when the entry is released instead")
+    func claimGivesUpWhenUnadopted() async throws {
+        let registry = PendingAttachStart(adoptionTimeoutNs: 50_000_000)
+        let pipes = try makePipes()
+        _ = try #require(await registry.park(containerId: "c1", pipes: pipes))
+
+        #expect(await registry.claim(containerId: "c1") == nil)
+    }
+
+    @Test("an adopted entry outlives the adoption timeout")
+    func adoptedEntryKept() async throws {
+        let registry = PendingAttachStart(adoptionTimeoutNs: 50_000_000)
+        let pipes = try makePipes()
+        defer { pipes.closeAll() }
+        let token = try #require(await registry.park(containerId: "c1", pipes: pipes))
+        #expect(await registry.adopt(containerId: "c1", token: token))
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        #expect(await registry.claim(containerId: "c1") != nil, "Compose can take minutes to start a dependent service")
     }
 
     @Test("a start with no attach waiting boots without parked pipes")
