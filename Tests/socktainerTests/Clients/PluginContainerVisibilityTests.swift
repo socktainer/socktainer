@@ -98,13 +98,24 @@ struct PluginContainerVisibilityTests {
         #expect(!ClientContainerService.namesPluginLabel(["app=\(ResourceLabelKeys.plugin)"]))
     }
 
-    @Test("prune candidates leave out stopped plugin containers unless the plugin label is named")
-    func pruneCandidates() throws {
-        let hidden = ClientContainerService.withoutPluginContainers(try snapshots(), unlessLabelFilters: nil)
-        #expect(hidden.filter { $0.status == .stopped }.map(\.id) == ["old-job"])
+    @Test("prune leaves out stopped plugin containers with no filter")
+    func pruneLeavesOutPluginContainers() throws {
+        let candidates = ClientContainerService.pruneCandidates(try snapshots(), filters: [:])
+        #expect(candidates.map(\.id) == ["old-job"])
 
-        let revealed = ClientContainerService.withoutPluginContainers(
-            try snapshots(), unlessLabelFilters: ["\(ResourceLabelKeys.plugin)=k8s"])
-        #expect(revealed.filter { $0.status == .stopped }.map(\.id) == ["k8s-dev-worker-1", "old-job"])
+        let byRole = ClientContainerService.pruneCandidates(
+            try snapshots(), filters: ["label": ["\(ResourceLabelKeys.role)=worker"]])
+        #expect(byRole.isEmpty)
+    }
+
+    @Test("a label filter on the plugin label prunes stopped plugin containers")
+    func pluginLabelFilterPrunesPluginContainers() throws {
+        let k8s = ClientContainerService.pruneCandidates(
+            try snapshots(), filters: ["label": ["\(ResourceLabelKeys.plugin)=k8s"]])
+        #expect(k8s.map(\.id) == ["k8s-dev-worker-1"])
+
+        let notMachine = ClientContainerService.pruneCandidates(
+            try snapshots(), filters: ["label": ["\(ResourceLabelKeys.plugin)!=machine"]])
+        #expect(notMachine.map(\.id) == ["k8s-dev-worker-1", "old-job"])
     }
 }

@@ -602,10 +602,9 @@ struct ClientContainerService: ClientContainerProtocol {
         return RESTContainerWait(statusCode: Int64(code))
     }
 
-    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-
-        var containersToDelete: [ContainerSnapshot] = Self.withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+    /// The containers `prune(filters:)` deletes from `allContainers`, DNS sidecars already removed.
+    static func pruneCandidates(_ allContainers: [ContainerSnapshot], filters: [String: [String]]) -> [ContainerSnapshot] {
+        var containersToDelete: [ContainerSnapshot] = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
             .filter { $0.status == .stopped }
 
         for (key, values) in filters {
@@ -666,6 +665,12 @@ struct ClientContainerService: ClientContainerProtocol {
                 continue
             }
         }
+        return containersToDelete
+    }
+
+    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
+        let containersToDelete = Self.pruneCandidates(allContainers, filters: filters)
 
         // NOTE: Apple container doesn't return the size of the container, only the
         //       image descriptor size (manifest) is logged.
