@@ -50,7 +50,11 @@ struct ContainerRestartPolicyPostStartTests {
             dnsServer.listEntries()[nativeId] == newIP
         }
         #expect(refreshed, "DNS entry must be refreshed to the new IP after an automatic restart")
-        #expect(await ContainerInfoCache.shared.get(id: nativeId)?.ip == newIP, "ContainerInfoCache must also reflect the new IP")
+        // The restart refreshes the cache after it re-registers DNS, so wait for it separately.
+        let cacheRefreshed = try await pollUntil(timeoutSeconds: 3) {
+            await ContainerInfoCache.shared.get(id: nativeId)?.ip == newIP
+        }
+        #expect(cacheRefreshed, "ContainerInfoCache must also reflect the new IP")
 
         await ContainerRestartState.shared.reset(id: nativeId)
         await ContainerExitCodeStore.shared.remove(id: nativeId)
