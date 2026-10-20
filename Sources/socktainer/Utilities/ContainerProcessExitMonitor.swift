@@ -46,10 +46,9 @@ enum ContainerProcessExitMonitor {
         await ContainerExitCodeStore.shared.set(id: nativeId, code: code)
         await ContainerExitCodeStore.shared.set(id: hexId, code: code)
 
-        // Emit `die` when no start-route observer owns this exit. The attach route bootstraps
-        // stopped containers, which is how `docker compose up` starts a service: it never calls
-        // `POST /start`, so nothing else would ever report the exit and Compose's
-        // --abort-on-container-exit would wait forever.
+        // Emit `die` when no start-route observer owns this exit: a container that exits before
+        // the `POST /start` that started it has armed its observer, which would otherwise never
+        // be reported, leaving `docker wait` and Compose's --abort-on-container-exit blocked.
         //
         // The claim is deliberately not released after broadcasting: it stays held for the rest
         // of this run so a start-route observer arriving moments later cannot take it and emit

@@ -342,43 +342,63 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     private func startInternal(container: ContainerSnapshot) async throws {
-        let stdin: FileHandle? = nil
-        let stdout: FileHandle? = nil
-        let stderr: FileHandle? = nil
-
-        let stdio = [stdin, stdout, stderr]
-
         try await prepareForStart(container: container)
 
+        // A client that attached before this start (`docker run`, `docker start -a`, attached
+        // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
+        let attached = await PendingAttachStart.shared.claim(containerId: container.id)
+        let stdio = attached?.stdioArray ?? [nil, nil, nil]
+
+        let process: ClientProcess
         do {
-            let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+            process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            // A container that is already booted was started by an earlier request.
+            if Self.isAlreadyStarted(error) { return }
+            throw error
+        }
+
+        do {
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
             await ContainerExitCodeStore.shared.remove(id: container.id)
             try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
-            // Wait for the init process in the background so we can capture its
-            // real exit code without blocking the /start response.
-            let containerId = container.id
-            let exitLogger = Logger(label: "socktainer.exitcode")
-            Task.detached {
-                let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
-                    try await process.wait()
-                }
-                await ContainerExitCodeStore.shared.set(id: containerId, code: code)
-            }
         } catch {
-            // NOTE: If bootstrap fails because container is already booted,
-            //       the attach handler may have already bootstrapped it
-            let errorMessage = error.localizedDescription
-            if errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") {
-                return
+            if let attached {
+                attached.closeAfterHandoff()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
             }
-
-            // Re-throw any other errors
+            if Self.isAlreadyStarted(error) { return }
             throw error
         }
+
+        if attached != nil {
+            // The attach stream takes it from here, including recording the exit code.
+            await PendingAttachStart.shared.finish(containerId: container.id, result: .success(process))
+            return
+        }
+
+        // Wait for the init process in the background so we can capture its
+        // real exit code without blocking the /start response.
+        let containerId = container.id
+        let exitLogger = Logger(label: "socktainer.exitcode")
+        Task.detached {
+            let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
+                try await process.wait()
+            }
+            await ContainerExitCodeStore.shared.set(id: containerId, code: code)
+        }
+    }
+
+    private static func isAlreadyStarted(_ error: Error) -> Bool {
+        let errorMessage = error.localizedDescription
+        return errorMessage.contains("booted") || errorMessage.contains("expected to be in created state")
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {

@@ -290,6 +290,35 @@ extension ContainerAttachRoute {
         )
     }
 
+    /// Parks `pipes` for the container's next start, or fails when another client is already
+    /// attached and waiting for it: a container gets one set of stdio when it boots.
+    static func parkForStart(container: ContainerSnapshot, pipes: StdioPipes) async throws -> UUID {
+        guard let token = await PendingAttachStart.shared.park(containerId: container.id, pipes: pipes) else {
+            pipes.closeAll()
+            throw Abort(.conflict, reason: "Container \(container.id) already has a client attached and waiting for it to start")
+        }
+        return token
+    }
+
+    /// Returns once a write to `writer` fails, which is how a streaming body learns that its
+    /// client disconnected while there is nothing to send yet. An empty write never reaches the
+    /// socket, so the probe is an empty multiplexed-stream frame: a header announcing zero bytes,
+    /// which Docker's stdcopy demuxer skips. A TTY stream has no framing, so there is nothing
+    /// harmless to send and this only returns when cancelled.
+    static func untilWriteFails(_ writer: BodyStreamWriter, isTTY: Bool) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !isTTY else { continue }
+            var probe = sharedAllocator.buffer(capacity: 8)
+            probe.writeBytes([DockerStreamFrame.StreamType.stdout.rawValue, 0, 0, 0, 0, 0, 0, 0])
+            do {
+                try await writer.write(.buffer(probe)).get()
+            } catch {
+                return
+            }
+        }
+    }
+
     // Output-only attach for stopped containers (docker run without -i, issue #220).
     // Uses pipes instead of log-file polling to eliminate the race for fast-exiting containers.
     private static func attachStoppedOutputOnly(
@@ -322,33 +351,9 @@ extension ContainerAttachRoute {
         // our write end immediately so the container's stdin sees EOF.
         try? pipes.stdin?.write.close()
 
-        await ContainerExitCodeStore.shared.remove(id: container.id)
-
-        let process: ClientProcess
-        do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
-        } catch {
-            pipes.closeAll()
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
-        }
-
-        do {
-            try await ExtraHostsFile.refresh(containerId: container.id)
-            try await process.start()
-        } catch {
-            if !isBenignStartRace(error) {
-                pipes.closeAfterHandoff()
-                await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-                throw Abort(.internalServerError, reason: "Failed to start container: \(error.localizedDescription)")
-            }
-        }
-
-        // The container is executing now: open a run so this exit's `die` is claimable.
-        // `docker compose up` starts a service entirely through this path, never `POST /start`.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
-
-        await ProcessRegistry.shared.set(id: container.id, process: process)
+        // Docker holds the stream open until the container is started; `POST /start` boots it
+        // with these pipes (PendingAttachStart).
+        let token = try await parkForStart(container: container, pipes: pipes)
 
         await broadcastAttach(
             container: container,
@@ -372,6 +377,15 @@ extension ContainerAttachRoute {
             Task.detached {
                 defer { _ = writer.write(.end) }
                 _ = writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
+
+                guard
+                    let process = await PendingAttachStart.awaitStart(
+                        containerId: container.id, token: token, pipes: pipes,
+                        clientGone: { await untilWriteFails(writer, isTTY: isTTY) })
+                else { return }
+                // Joins the run `POST /start` opened for this start.
+                let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+                await ProcessRegistry.shared.set(id: container.id, process: process)
 
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
@@ -484,40 +498,9 @@ extension ContainerAttachRoute {
             throw Abort(.internalServerError, reason: "Failed to create stdio pipes")
         }
 
-        // Mirror ClientContainerService.start()'s exit-code contract: /wait returns
-        // as soon as ContainerExitCodeStore is non-nil, so clear any stale code
-        // before starting and record a synthetic one if bootstrap/start fails (so
-        // /wait can't return a stale status or poll forever).
-        await ContainerExitCodeStore.shared.remove(id: container.id)
-
-        let process: ClientProcess
-        do {
-            process = try await ContainerClient().bootstrap(id: container.id, stdio: pipes.stdioArray)
-        } catch {
-            pipes.closeAll()
-            if isBenignStartRace(error) {
-                throw Abort(.conflict, reason: "Container is already starting")
-            }
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
-        }
-
-        do {
-            try await ExtraHostsFile.refresh(containerId: container.id)
-            try await process.start()
-        } catch {
-            pipes.closeAfterHandoff()
-            if isBenignStartRace(error) {
-                throw Abort(.conflict, reason: "Container is already starting")
-            }
-            await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
-            throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
-        }
-
-        // Executing now: open a run so this exit's `die` is claimable exactly once.
-        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
-
-        await ProcessRegistry.shared.set(id: container.id, process: process)
+        // Docker holds the stream open until the container is started; `POST /start` boots it
+        // with these pipes (PendingAttachStart).
+        let token = try await parkForStart(container: container, pipes: pipes)
 
         let broadcaster = req.application.storage[EventBroadcasterKey.self]
         await broadcastAttach(
@@ -533,6 +516,20 @@ extension ContainerAttachRoute {
                 request: req,
                 ttyEnabled: isTTY
             ) { streamContinuation in
+
+                // Without an upgrade there is no cheap way to see the client leave before the
+                // start, so this waits for `/start` alone. The Docker CLI always upgrades.
+                guard
+                    let process = await PendingAttachStart.awaitStart(
+                        containerId: container.id, token: token, pipes: pipes,
+                        clientGone: { while !Task.isCancelled { try? await Task.sleep(nanoseconds: 1_000_000_000) } })
+                else {
+                    streamContinuation.finish()
+                    return
+                }
+                // Joins the run `POST /start` opened for this start.
+                let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+                await ProcessRegistry.shared.set(id: container.id, process: process)
 
                 await withTaskGroup(of: Void.self) { group in
                     // Process monitor - when process exits, close pipes and finish stream
@@ -636,6 +633,18 @@ extension ContainerAttachRoute {
             execId: container.id,
             ttyEnabled: isTTY
         ) { channel, tcpHandler in
+
+            guard
+                let process = await PendingAttachStart.awaitStart(
+                    containerId: container.id, token: token, pipes: pipes,
+                    clientGone: { try? await channel.closeFuture.get() })
+            else {
+                _ = try? await channel.close()
+                return
+            }
+            // Joins the run `POST /start` opened for this start.
+            let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+            await ProcessRegistry.shared.set(id: container.id, process: process)
 
             tcpHandler.setStdinWriter(pipes.stdin!.write)
 
