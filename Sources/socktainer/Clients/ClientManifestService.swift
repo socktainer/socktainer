@@ -191,23 +191,25 @@ struct ClientManifestService: ClientManifestServiceProtocol {
         return try await writeIndexAndTag(name: name, manifests: manifests)
     }
 
+    /// A bare hex digest (no algorithm prefix) is assumed sha256, matching real podman's
+    /// own convention — but a digest already carrying a DIFFERENT algorithm's prefix
+    /// (e.g. `sha512:...`) must not be blindly re-prefixed into `sha256:sha512:...`, a
+    /// malformed digest that could never match a real member and would silently succeed as
+    /// "not found" instead of surfacing the actual problem (an unsupported algorithm).
+    static func normalizedDigest(_ digest: String) throws -> String {
+        if digest.hasPrefix("sha256:") {
+            return digest
+        } else if digest.contains(":") {
+            throw ContainerizationError(.invalidArgument, message: "\(digest) is not a supported digest (only sha256 is)")
+        }
+        return "sha256:\(digest)"
+    }
+
     /// `podman manifest remove <name> <digest>` / the "remove" operation of `PUT /libpod/manifests/{name}`.
     @discardableResult
     func removeDigest(name: String, digest: String) async throws -> String {
         var manifests = try await inspect(name: name).manifests
-        // A bare hex digest (no algorithm prefix) is assumed sha256, matching real podman's
-        // own convention — but a digest already carrying a DIFFERENT algorithm's prefix
-        // (e.g. `sha512:...`) must not be blindly re-prefixed into `sha256:sha512:...`, a
-        // malformed digest that could never match a real member and would silently succeed as
-        // "not found" instead of surfacing the actual problem (an unsupported algorithm).
-        let normalizedDigest: String
-        if digest.hasPrefix("sha256:") {
-            normalizedDigest = digest
-        } else if digest.contains(":") {
-            throw ContainerizationError(.invalidArgument, message: "\(digest) is not a supported digest (only sha256 is)")
-        } else {
-            normalizedDigest = "sha256:\(digest)"
-        }
+        let normalizedDigest = try Self.normalizedDigest(digest)
         let countBefore = manifests.count
         manifests.removeAll { $0.digest == normalizedDigest }
         guard manifests.count < countBefore else {
@@ -225,7 +227,7 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     func removeDigests(name: String, digests: [String]) async throws -> String {
         var manifests = try await inspect(name: name).manifests
         let currentDigests = Set(manifests.map(\.digest))
-        let digestSet = Set(digests)
+        let digestSet = Set(try digests.map(Self.normalizedDigest))
         guard digestSet.isSubset(of: currentDigests) else {
             let missing = digestSet.subtracting(currentDigests)
             throw ContainerizationError(.invalidArgument, message: "\(missing.sorted().joined(separator: ", ")) not a member of \(name)")
