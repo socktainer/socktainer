@@ -2,12 +2,13 @@
 ///
 /// Two observers can watch the same exit:
 /// - `ContainerStartRoute.observeExit`, armed when `POST /start` returns;
-/// - `ContainerProcessExitMonitor`, which owns containers the attach route bootstrapped.
+/// - `ContainerProcessExitMonitor`, which watches the process of a container a client attached
+///   to before starting it (PendingAttachStart).
 ///
-/// `docker run` goes through both (attach, then start) and must produce a single `die`.
-/// `docker compose up` attaches to a stopped container and never calls `/start`, so without
-/// the monitor emitting the event nothing does — and Compose's `--abort-on-container-exit`
-/// waits forever for an exit it can never observe.
+/// `docker run` and attached `docker compose up` go through both (attach, then start) and must
+/// produce a single `die`. The start route's observer only arms once `/start` returns, so a
+/// container that exits sooner is reported by the monitor or by nothing at all, and Compose's
+/// `--abort-on-container-exit` would wait forever for an exit it can never observe.
 ///
 /// Ownership is scoped to a *run*, identified by the epoch `beginRun` returns, and the winner
 /// keeps it for the rest of that run: handing it back after broadcasting lets the loser — which
