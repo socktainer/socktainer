@@ -253,6 +253,19 @@ struct Mount: Content {
         case VolumeOptions
         case TmpfsOptions
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        Target = try c.decode(String.self, forKey: .Target)
+        // Docker omits Source for anonymous volumes (e.g. compose `- /data`).
+        Source = try c.decodeIfPresent(String.self, forKey: .Source) ?? ""
+        MountType = try c.decode(String.self, forKey: .MountType)
+        ReadOnly = try c.decodeIfPresent(Bool.self, forKey: .ReadOnly)
+        Consistency = try c.decodeIfPresent(String.self, forKey: .Consistency)
+        BindOptions = try c.decodeIfPresent(socktainer.BindOptions.self, forKey: .BindOptions)
+        VolumeOptions = try c.decodeIfPresent(socktainer.VolumeOptions.self, forKey: .VolumeOptions)
+        TmpfsOptions = try c.decodeIfPresent(socktainer.TmpfsOptions.self, forKey: .TmpfsOptions)
+    }
 }
 
 struct BindOptions: Content {
