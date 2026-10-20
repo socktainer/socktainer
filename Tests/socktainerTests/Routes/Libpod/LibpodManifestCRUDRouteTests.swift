@@ -135,7 +135,9 @@ struct LibpodManifestCreateRouteTests {
 struct LibpodManifestInspectRouteTests {
     @Test("an existing manifest list returns its index as JSON")
     func existingManifestReturnsIndex() async throws {
-        let descriptor = Descriptor(mediaType: MediaTypes.imageManifest, digest: "sha256:cccc", size: 100)
+        // A well-formed digest: `Index` decoding validates it as 64 hex characters.
+        let digest = "sha256:" + String(repeating: "c", count: 64)
+        let descriptor = Descriptor(mediaType: MediaTypes.imageManifest, digest: digest, size: 100)
         let client = MockManifestClient(inspectHandler: { _ in Index(manifests: [descriptor]) })
 
         try await withManifestApp(client: client) { app in
@@ -143,7 +145,7 @@ struct LibpodManifestInspectRouteTests {
                 #expect(res.status == .ok)
                 #expect(res.headers.contentType?.description.contains("application/json") == true)
                 let index = try JSONDecoder().decode(Index.self, from: Data(buffer: res.body))
-                #expect(index.manifests.map(\.digest) == ["sha256:cccc"])
+                #expect(index.manifests.map(\.digest) == [digest])
             }
         }
     }

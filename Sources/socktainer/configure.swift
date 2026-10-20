@@ -209,7 +209,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: LibpodBuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
     try app.register(collection: LibpodContainerLogsRoute(client: containerClient))
     try app.register(collection: LibpodContainerTopRoute())
-    try app.register(collection: LibpodContainerRenameRoute())
+    try app.register(collection: LibpodContainerRenameRoute(client: containerClient))
     try app.register(collection: LibpodContainerRestartRoute(client: containerClient))
     try app.register(collection: LibpodExecCreateRoute(client: containerClient))
     try app.register(collection: LibpodExecStartRoute(client: containerClient))

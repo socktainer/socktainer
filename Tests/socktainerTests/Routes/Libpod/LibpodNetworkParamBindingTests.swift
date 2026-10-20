@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Logging
 import Testing
@@ -92,7 +93,7 @@ private actor StubNetworkClient: ClientNetworkProtocol {
         deletedId = id
     }
 
-    func create(name: String, labels: [String: String], ipv4Subnet: String?, logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         RESTNetworkCreate(Id: name, Warning: "")
     }
 }
