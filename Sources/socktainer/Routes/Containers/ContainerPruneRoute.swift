@@ -30,7 +30,11 @@ extension ContainerPruneRoute {
             // Capture snapshots before pruning so the per-container `destroy` events can
             // carry image/name/labels (moby emits a `destroy` per removed container, then
             // the aggregate `prune`). The container is gone by the time prune() returns.
-            let preSnapshots = (try? await client.list(showAll: true, filters: [:])) ?? []
+            var preSnapshots = (try? await client.list(showAll: true, filters: [:])) ?? []
+            // Plugin containers are only listed when asked for, and only pruned then too.
+            if ClientContainerService.namesPluginLabel(parsedFilters["label"] ?? []) {
+                preSnapshots += (try? await client.list(showAll: true, filters: ["label": [ResourceLabelKeys.plugin]])) ?? []
+            }
             var snapshotByID: [String: ContainerSnapshot] = [:]
             for snapshot in preSnapshots {
                 snapshotByID[DockerContainerID.hexId(for: snapshot)] = snapshot
