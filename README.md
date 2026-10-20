@@ -169,7 +169,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ## Requirements 📋
 
 - **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 1.5.0**
+- **Apple Container 1.6.0**
 
 ---
 
