@@ -106,12 +106,45 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-        let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+        return Self.listing(allContainers, showAll: showAll, filters: filters)
+    }
+
+    /// The `list(showAll:filters:)` result for `allContainers`, DNS sidecars already removed.
+    static func listing(_ allContainers: [ContainerSnapshot], showAll: Bool, filters: [String: [String]]) -> [ContainerSnapshot] {
+        let visible = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+        let running = showAll ? visible : visible.filter { $0.status == .running }
+        return applyFilters(running, filters: filters, allContainers: allContainers)
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
         snapshots.filter { !isDNSSidecar($0) }
+    }
+
+    /// Containers owned by an Apple Container plugin (`container k8s` cluster nodes,
+    /// `container machine` VMs) are managed through that plugin, and removing one from
+    /// under it breaks what it manages, so they stay out of Docker listings and prunes —
+    /// much as `container ls` hides machines. A `label` filter that names the plugin
+    /// label brings them back. Lookups by name or ID still find them.
+    static func isPluginContainer(_ snapshot: ContainerSnapshot) -> Bool {
+        snapshot.configuration.labels[ResourceLabelKeys.plugin] != nil
+    }
+
+    static func withoutPluginContainers(_ snapshots: [ContainerSnapshot], unlessLabelFilters labelFilters: [String]?) -> [ContainerSnapshot] {
+        guard !namesPluginLabel(labelFilters ?? []) else { return snapshots }
+        return snapshots.filter { !isPluginContainer($0) }
+    }
+
+    /// Whether any `key`, `key=value` or `key!=value` label filter has the plugin label as its key.
+    static func namesPluginLabel(_ labelFilters: [String]) -> Bool {
+        labelFilters.contains { filter in
+            let key: Substring
+            if let notEqual = filter.range(of: "!=") {
+                key = filter[..<notEqual.lowerBound]
+            } else {
+                key = filter.prefix { $0 != "=" }
+            }
+            return key == ResourceLabelKeys.plugin
+        }
     }
 
     static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
@@ -572,7 +605,8 @@ struct ClientContainerService: ClientContainerProtocol {
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
 
-        var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
+        var containersToDelete: [ContainerSnapshot] = Self.withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+            .filter { $0.status == .stopped }
 
         for (key, values) in filters {
             switch key {
