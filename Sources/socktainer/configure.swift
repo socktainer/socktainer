@@ -44,7 +44,7 @@ func configure(_ app: Application) async throws {
     let volumeClient = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
+    let builderClient = ClientBuilderService(containerSystemConfig: systemConfig)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)

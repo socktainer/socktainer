@@ -124,7 +124,7 @@ enum ExtraHostsFile {
         guard let network = configuration.networks.first else { return nil }
         let plugin = try await ContainerAPIClient.NetworkClient().get(id: network.network).configuration.plugin
         return try await ContainerNetworkClient.NetworkClient(id: network.network, plugin: plugin)
-            .lookup(hostname: network.options.hostname)
+            .lookup(name: network.options.hostname)?.attachment
     }
 
     static func remove(labels: [String: String]) {
