@@ -168,6 +168,8 @@ podman images    # List available images
 > [!NOTE]
 > Podman uses its own API endpoints (`/libpod/*`), not Docker-compatible ones.
 > Socktainer implements a subset of the libpod API — see [#201](https://github.com/socktainer/socktainer/issues/201) for progress.
+> To opt out of Podman support entirely, start socktainer with `SOCKTAINER_DISABLE_LIBPOD=1`:
+> no `/libpod/*` routes are registered and `/_ping` stops advertising `Libpod-API-Version`.
 
 > [!TIP]
 > Already have Podman Desktop (or `podman machine`) set up, with
