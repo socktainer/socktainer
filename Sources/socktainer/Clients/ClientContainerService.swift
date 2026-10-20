@@ -342,12 +342,21 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     private func startInternal(container: ContainerSnapshot) async throws {
-        try await prepareForStart(container: container)
-
         // A client that attached before this start (`docker run`, `docker start -a`, attached
         // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
+        // Claimed before anything can fail, so every failure below reaches the waiting attach.
         let attached = await PendingAttachStart.shared.claim(containerId: container.id)
         let stdio = attached?.stdioArray ?? [nil, nil, nil]
+
+        do {
+            try await prepareForStart(container: container)
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            throw error
+        }
 
         let process: ClientProcess
         do {
