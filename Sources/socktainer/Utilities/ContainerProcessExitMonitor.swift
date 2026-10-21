@@ -45,6 +45,12 @@ enum ContainerProcessExitMonitor {
         try? await Task.sleep(nanoseconds: outputFlushGraceNs)
         await ContainerExitCodeStore.shared.set(id: nativeId, code: code)
         await ContainerExitCodeStore.shared.set(id: hexId, code: code)
+        // An attached run records its exit here instead of in `startInternal`, so the durable
+        // lifecycle needs the same fact: daemon recovery decides on-failure restarts from the
+        // persisted exit code, and an unrecorded one is indistinguishable from "still running".
+        // Containers the attach route bootstrapped on its own have no lifecycle record, and
+        // `recordExit` leaves those untouched.
+        try? await RestartPolicyOverrideStore.shared.recordExit(id: hexId, code: code)
 
         // Emit `die` when no start-route observer owns this exit: a container that exits before
         // the `POST /start` that started it has armed its observer, which would otherwise never

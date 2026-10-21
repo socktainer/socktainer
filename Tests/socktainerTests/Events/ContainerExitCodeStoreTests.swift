@@ -6,6 +6,24 @@ import Testing
 @Suite("ContainerExitCodeStore — waitForCode")
 struct ContainerExitCodeStoreTests {
 
+    @Test("a recovered waiter cannot overwrite a later run's exit code")
+    func rejectsStaleRecoveredWaiter() async {
+        let store = ContainerExitCodeStore()
+        let token = await store.currentGeneration(id: "reused")
+        await store.remove(id: "reused")
+        await store.set(id: "reused", code: 11)
+        #expect(await store.set(id: "reused", code: 7, generation: token) == false)
+        #expect(await store.get(id: "reused") == 11)
+    }
+
+    @Test("a recovered waiter for the current run publishes the real code")
+    func acceptsCurrentRecoveredWaiter() async {
+        let store = ContainerExitCodeStore()
+        let token = await store.currentGeneration(id: "current")
+        #expect(await store.set(id: "current", code: 23, generation: token))
+        #expect(await store.get(id: "current") == 23)
+    }
+
     @Test("waitForCode returns immediately when the code is already recorded")
     func returnsAlreadyRecorded() async throws {
         let store = ContainerExitCodeStore()
