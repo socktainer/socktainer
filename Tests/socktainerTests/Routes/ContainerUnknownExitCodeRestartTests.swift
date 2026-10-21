@@ -52,6 +52,57 @@ struct ContainerUnknownExitCodeRestartTests {
         await ContainerExitCodeStore.shared.remove(id: nativeId)
     }
 
+    @Test("An unknown exit status still reports die, without a fabricated exit code")
+    func unknownExitCodeStillEmitsDie() async throws {
+        // Not knowing *how* a container exited is not a reason to say nothing happened: the
+        // container is gone either way, and `docker events`, `docker wait`, and Compose's
+        // --abort-on-container-exit all stop waiting on this event. Withhold the unobservable
+        // `exitCode` attribute instead of withholding the exit.
+        let nativeId = "restart-unknown-exit-die-ctr"
+        let ip = "192.168.65.95"
+        let network = "myapp_default"
+
+        let mock = UnknownExitMock(
+            snapshot: try unknownExitSnapshot(
+                nativeId: nativeId, ip: ip, network: network, restartPolicyName: "no"))
+        let broadcaster = EventBroadcaster()
+        let collector = DieEventCollector()
+        let stream = await broadcaster.stream()
+        let captureTask = Task {
+            for await event in stream where event.Action == "die" {
+                await collector.add(event)
+            }
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerStartRoute(client: mock))
+
+            try await app.testing().test(.POST, "/v1.51/containers/\(nativeId)/start") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: ContainerExitCodeStore.waitFailureSentinel)
+
+        let reported = try await pollUntil(timeoutSeconds: 3) { await collector.events.count >= 1 }
+        #expect(reported, "a container that exited must report die even when its status was never observed")
+
+        let event = await collector.events.first
+        #expect(
+            event?.Actor.Attributes["exitCode"] == nil,
+            "an unobserved exit status must not be published as an exit code")
+        #expect(event?.Actor.Attributes["execDuration"] != nil, "die still carries the run duration")
+        #expect(await mock.startCallCount() == 1, "the no-policy container must not be restarted")
+
+        captureTask.cancel()
+        await ContainerRestartState.shared.reset(id: nativeId)
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
     @Test("An on-failure container still restarts on a real non-zero exit")
     func knownNonZeroExitCodeStillRestarts() async throws {
         // An unknown exit bails out of the observer; a real code must not.
@@ -277,6 +328,11 @@ private func unknownExitSnapshot(
         nativeId: nativeId, ip: ip, network: network,
         labels: [RestartPolicyManager.label: policyJSON], status: status
     )
+}
+
+private actor DieEventCollector {
+    private(set) var events: [DockerEvent] = []
+    func add(_ event: DockerEvent) { events.append(event) }
 }
 
 private actor UnknownExitMock: ClientContainerProtocol {

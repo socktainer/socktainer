@@ -288,14 +288,22 @@ extension ContainerStartRoute {
             // was already reported by the attach path's exit monitor — that is how
             // `docker compose up` runs a service. Claiming twice would double every exit.
             let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
-            if ownsExit, exitCodeKnown {
-                var attrs = labels
-                attrs["exitCode"] = String(code)
-                // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
-                attrs["execDuration"] = String(Int(executionDuration))
+            if ownsExit {
+                // The container exited, so `die` is reported even when the status could not be
+                // observed: withholding it would leave `docker events`, `docker wait`, and
+                // Compose's --abort-on-container-exit with no stop signal at all. Only the
+                // `exitCode` attribute is withheld on that path — an unobserved status is not
+                // evidence of any particular code, and moby's consumers read `exitCode` as one.
+                var extraAttributes = [
+                    // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
+                    "execDuration": String(Int(executionDuration))
+                ]
+                if exitCodeKnown {
+                    extraAttributes["exitCode"] = String(code)
+                }
                 let dieEvent = DockerEvent.simpleEvent(
                     id: eventId, type: "container", status: "die",
-                    image: image, name: name, labels: attrs
+                    image: image, name: name, labels: labels, extraAttributes: extraAttributes
                 )
                 await broadcaster.broadcast(dieEvent)
             }
