@@ -17,6 +17,10 @@ struct ContainerStartQuery: Content {
 }
 
 extension ContainerStartRoute {
+    /// How many consecutive `getContainer` failures the unknown-exit observer tolerates
+    /// before it stops polling (100ms apart) and leaves cleanup to the next lifecycle.
+    static let unknownExitProbeFailureLimit = 50
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
 
@@ -159,6 +163,21 @@ extension ContainerStartRoute {
         }
     }
 
+    /// Decides whether the restart policy wants this exit restarted.
+    ///
+    /// `on-failure` is the only policy that reasons about *how* the process ended, so it is
+    /// the only one that needs a real exit code: an unknown status (`waitFailureSentinel`)
+    /// is not evidence of failure and must not be read as one. `always` and
+    /// `unless-stopped` restart on an exit regardless of the code, so an unknown code does
+    /// not change their outcome and they keep evaluating normally.
+    static func restartDecision(
+        policy: RestartPolicy, exitCode: Int32, exitCodeKnown: Bool, attempt: Int, hasBeenManuallyStopped: Bool
+    ) -> Bool {
+        if policy.Name == "on-failure" && !exitCodeKnown { return false }
+        return RestartPolicyManager.shouldRestart(
+            policy: policy, exitCode: exitCode, attempt: attempt, hasBeenManuallyStopped: hasBeenManuallyStopped)
+    }
+
     /// Awaits the container's init process exit, fires the "die" event, and — unless it was
     /// created with `--rm` — honors `HostConfig.RestartPolicy` by restarting it and re-arming
     /// this observer for the next lifecycle. Runs as a detached background task.
@@ -196,13 +215,70 @@ extension ContainerStartRoute {
                 return
             }
 
+            // The authoritative wait failed, so the exit code is unknown. The sentinel
+            // standing in for it has to be non-zero to stay distinguishable from a genuine
+            // exit 0, so letting it through would report a `die` carrying a fabricated code
+            // and let `on-failure` restart an instance on a crash that may never have
+            // happened. Suppress both `die` and any restart decision, and run exit cleanup
+            // only once the container is confirmed stopped (or already reaped under `--rm`)
+            // so a still-running container keeps its mounts, cache entry, and DNS aliases.
+            let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            let exitSnapshot = try? await client.getContainer(id: nativeId)
+            // `try?` would collapse a thrown probe error and a genuinely missing container
+            // into the same `nil`. With a known exit code that is harmless: the container has
+            // already exited and a `--rm` one is expected to be gone. On the unknown-exit path
+            // a failed probe is not evidence of a stop, so it must not be read as one — doing
+            // so skipped the polling loop and tore down a live run's mounts, cache entry, and
+            // DNS aliases.
+            var exitSnapshot: ContainerSnapshot?
+            var initialProbeFailed = false
+            do {
+                exitSnapshot = try await client.getContainer(id: nativeId)
+            } catch {
+                initialProbeFailed = true
+            }
+            var confirmedStopped = !initialProbeFailed && (exitSnapshot == nil || exitSnapshot?.status == .stopped)
+
+            if !exitCodeKnown {
+                logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")
+                // The authoritative wait can fail before the init process has actually
+                // exited. Returning here would leave this run with no observer at all: the
+                // attach monitor defers ownership to us via `reserveForStart`, so nothing
+                // else would broadcast its unmounts, unregister its DNS aliases, or run the
+                // `--rm` cleanup. Keep watching this run until a later status confirms the
+                // stop, re-checking the generation each time so a newer lifecycle can take
+                // over without this observer fighting it. A probe that keeps erroring is
+                // not a stopped container, so an unreachable client eventually gives up
+                // rather than polling forever.
+                var consecutiveProbeFailures = 0
+                while !confirmedStopped, consecutiveProbeFailures < Self.unknownExitProbeFailureLimit {
+                    guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                        return
+                    }
+                    do {
+                        exitSnapshot = try await client.getContainer(id: nativeId)
+                        confirmedStopped = exitSnapshot == nil || exitSnapshot?.status == .stopped
+                        consecutiveProbeFailures = 0
+                    } catch {
+                        consecutiveProbeFailures += 1
+                    }
+                }
+                guard confirmedStopped else {
+                    logger.error(
+                        "restart-policy: container \(nativeId) still has an unknown exit status and could not be probed; leaving its cleanup to the next lifecycle")
+                    return
+                }
+            }
+
             if let exitSnapshot {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
@@ -213,13 +289,21 @@ extension ContainerStartRoute {
             // `docker compose up` runs a service. Claiming twice would double every exit.
             let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
             if ownsExit {
-                var attrs = labels
-                attrs["exitCode"] = String(code)
-                // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
-                attrs["execDuration"] = String(Int(executionDuration))
+                // The container exited, so `die` is reported even when the status could not be
+                // observed: withholding it would leave `docker events`, `docker wait`, and
+                // Compose's --abort-on-container-exit with no stop signal at all. Only the
+                // `exitCode` attribute is withheld on that path — an unobserved status is not
+                // evidence of any particular code, and moby's consumers read `exitCode` as one.
+                var extraAttributes = [
+                    // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
+                    "execDuration": String(Int(executionDuration))
+                ]
+                if exitCodeKnown {
+                    extraAttributes["exitCode"] = String(code)
+                }
                 let dieEvent = DockerEvent.simpleEvent(
                     id: eventId, type: "container", status: "die",
-                    image: image, name: name, labels: attrs
+                    image: image, name: name, labels: labels, extraAttributes: extraAttributes
                 )
                 await broadcaster.broadcast(dieEvent)
             }
@@ -249,8 +333,9 @@ extension ContainerStartRoute {
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
                 effectivePolicy.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
+                        attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
                 } ?? false
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
@@ -286,8 +371,8 @@ extension ContainerStartRoute {
             let stoppedDuringBackoff = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let stillWantsRestart =
                 policyAfterBackoff.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber,
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown, attempt: nextAttemptNumber,
                         hasBeenManuallyStopped: explicitlyStopped || stoppedDuringBackoff)
                 } ?? false
             guard stillWantsRestart else {
