@@ -7,6 +7,30 @@ against `github.com/podman-container-tools/podman` `pkg/api/server/register_*.go
 (canonical route registration) where fetched; the rest match the long-stable
 libpod API v4/v5 convention (`/libpod/<resource>/...`).
 
+## What "✅" means here
+
+A ✅ means the route is registered **and** a real `podman` 6.1.4 client (`CONTAINER_HOST` set,
+`podman --remote`) completed the command against a running socktainer with real data present — an
+empty store is not enough, since most decode failures only show once a list has an entry. The
+libpod API reuses Docker-compat's semantics but not its wire shapes (prune and delete answer
+report arrays, `wait` a bare integer, lists drop Docker's envelopes, create takes podman's whole
+`SpecGenerator`, and some parameters are renamed), so each route runs the Docker-compat handler and
+translates the request and response in `Routes/Libpod/LibpodAdapter.swift` / `LibpodSchema.swift`.
+Routes that only wrap a Docker-compat route which is itself unimplemented say so in their row.
+
+Known limits found while testing against the real client:
+
+- An *attached* `podman run` (no `-d`) printed the container's output but did not return in my
+  environment: the attach connection is not closed after the container exits. The attach code is
+  shared, unmodified, with Docker-compat (which also leaves the connection open and relies on the
+  client ignoring it), and my daemon was Apple Container 1.5.0 under a socktainer built for 1.6.0,
+  so this is **not verified either way** — re-check with matching versions. `podman run -d`,
+  `start`, `exec`, `logs`, `wait` and `stop` all work.
+- `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on
+  macOS (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
+- `podman save` hit "ContentStore missing blob data", an Apple Container image-store limitation
+  that Docker-compat `docker save` shares.
+
 Currently registered in this repo: `Sources/socktainer/configure.swift`
 ("Podman libpod routes" section) + `Sources/socktainer/Routes/Libpod/*.swift`.
 
@@ -31,12 +55,12 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman rm` | DELETE `/libpod/containers/{id}` | ✅ |
 | `podman inspect` (container) | GET `/libpod/containers/{id}/json` | ✅ |
 | `podman logs` | GET `/libpod/containers/{id}/logs` | ✅ |
-| `podman top` | GET `/libpod/containers/{id}/top` | ✅ |
-| `podman rename` | POST `/libpod/containers/{id}/rename` | ✅ |
+| `podman top` | GET `/libpod/containers/{id}/top` | ✅ (wraps `ContainerTopRoute`, which itself returns "not implemented") |
+| `podman rename` | POST `/libpod/containers/{id}/rename` | ✅ (only containers that have never been started, as Docker-compat) |
 | `podman wait` | POST `/libpod/containers/{id}/wait` | ✅ |
 | `podman attach` | POST `/libpod/containers/{id}/attach` | ✅ |
-| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json` | ✅ |
-| `podman stats` | GET `/libpod/containers/{name}/stats` (per-container) | ✅ (all-container `/libpod/containers/stats` variant still missing) |
+| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json`, POST `/libpod/exec/{id}/remove` | ✅ |
+| `podman stats` | GET `/libpod/containers/stats` (batch, what the CLI calls) and `/libpod/containers/{name}/stats` | ✅ |
 | `podman pause` | POST `/libpod/containers/{name}/pause` | ✅ (wraps `ContainerPauseRoute`, which itself returns "not supported" — Apple Container has no pause primitive) |
 | `podman unpause` | POST `/libpod/containers/{name}/unpause` | ✅ (same caveat as pause) |
 | `podman container prune` | POST `/libpod/containers/prune` | ✅ |
@@ -53,7 +77,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 |---|---|---|
 | `podman images` | GET `/libpod/images/json` | ✅ |
 | `podman pull` | POST `/libpod/images/pull` | ✅ |
-| `podman rmi` | DELETE `/libpod/images/{name}` | ✅ |
+| `podman rmi` | DELETE `/libpod/images/remove?images=…` (batch) and `/libpod/images/{name}` | ✅ |
 | `podman inspect` (image) | GET `/libpod/images/{name}/json` | ✅ |
 | `podman tag` | POST `/libpod/images/{name}/tag` | ✅ |
 | `podman build` | POST `/libpod/build` | ✅ |

@@ -231,6 +231,7 @@ func configure(_ app: Application) async throws {
 
         // --- Podman libpod routes: stats/pause/prune/cp/push/save/load/events gaps ---
         try app.register(collection: LibpodContainerStatsRoute(client: containerClient))
+        try app.register(collection: LibpodContainersStatsRoute(client: containerClient))
         try app.register(collection: LibpodContainerPauseRoute())
         try app.register(collection: LibpodContainerUnpauseRoute())
         try app.register(collection: LibpodContainerChangesRoute())

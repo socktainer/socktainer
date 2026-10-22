@@ -143,6 +143,26 @@ struct LibpodSchemaTests {
         #expect(docker["PidsLimit"] as? Int == 9)
     }
 
+    @Test("container stats compute CPU percent like Docker and fold block/network counters")
+    func containerStats() {
+        let docker: [String: Any] = [
+            "name": "/web", "id": "abc",
+            "cpu_stats": ["cpu_usage": ["total_usage": 300], "system_cpu_usage": 2000, "online_cpus": 2],
+            "precpu_stats": ["cpu_usage": ["total_usage": 100], "system_cpu_usage": 1000, "online_cpus": 2],
+            "memory_stats": ["usage": 25, "limit": 100], "pids_stats": ["current": 3],
+            "networks": ["eth0": ["rx_bytes": 10, "tx_bytes": 20]],
+            "blkio_stats": ["io_service_bytes_recursive": [["op": "read", "value": 7], ["op": "Write", "value": 9]]],
+        ]
+        let stats = LibpodSchema.containerStats(docker, containerID: "abc")
+        #expect(stats["Name"] as? String == "web")
+        #expect(stats["CPU"] as? Double == 40)  // (300-100)/(2000-1000) * 2 CPUs * 100
+        #expect(stats["MemPerc"] as? Double == 25)
+        #expect(stats["BlockInput"] as? Int == 7)
+        #expect(stats["BlockOutput"] as? Int == 9)
+        #expect(stats["PIDs"] as? Int == 3)
+        #expect((stats["Network"] as? [String: Any])?["eth0"] != nil)
+    }
+
     @Test("podman's info and df use podman's own top-level shapes")
     func infoAndDF() {
         let info = object(LibpodSchema.info(["Name": "host", "NCPU": 4, "MemTotal": 1000, "ServerVersion": "1.5.0", "Images": 2, "Containers": 3]))

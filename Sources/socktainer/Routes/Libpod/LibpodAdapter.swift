@@ -21,10 +21,22 @@ enum LibpodAdapter {
     static func jsonBody(of response: Response, on req: Request) async -> Any? {
         var collected = response.body.buffer
         if collected == nil {
-            collected = try? await response.body.collect(on: req.eventLoop).get()
+            do {
+                collected = try await response.body.collect(on: req.eventLoop).get()
+            } catch {
+                req.logger.error("LibpodAdapter: collecting a streamed body failed: \(error)")
+            }
         }
-        guard let buffer = collected, buffer.readableBytes > 0 else { return nil }
-        return try? JSONSerialization.jsonObject(with: Data(buffer: buffer), options: [.fragmentsAllowed])
+        guard let buffer = collected, buffer.readableBytes > 0 else {
+            req.logger.error("LibpodAdapter: empty body (status \(response.status.code))")
+            return nil
+        }
+        do {
+            return try JSONSerialization.jsonObject(with: Data(buffer: buffer), options: [.fragmentsAllowed])
+        } catch {
+            req.logger.error("LibpodAdapter: body is not JSON (\(buffer.readableBytes) bytes): \(error)")
+            return nil
+        }
     }
 
     /// Runs the Docker-compat handler and, if it succeeds, answers with `transform` of its JSON

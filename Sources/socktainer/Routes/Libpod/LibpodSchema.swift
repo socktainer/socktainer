@@ -87,6 +87,15 @@ enum LibpodSchema {
         return inspect
     }
 
+    /// podman's image inspect carries bare hex ids, where Docker's keep the `sha256:` prefix.
+    static func imageInspect(_ docker: Any?) -> Any {
+        guard var inspect = docker as? [String: Any] else { return docker ?? [String: Any]() }
+        for key in ["Id", "Parent"] {
+            if let value = inspect[key] as? String { inspect[key] = value.replacingOccurrences(of: "sha256:", with: "") }
+        }
+        return inspect
+    }
+
     /// `[]ImageSummary`: ids are bare hex (no `sha256:`), and podman's own `Names` mirrors `RepoTags`.
     static func imageList(_ docker: Any?) -> Any {
         (docker as? [[String: Any]] ?? []).map { image in
@@ -254,6 +263,51 @@ enum LibpodSchema {
         if let limit = (body["pids"] as? [String: Any])?["limit"] { docker["PidsLimit"] = limit }
         if let weight = (body["blockIO"] as? [String: Any])?["weight"] { docker["BlkioWeight"] = weight }
         return docker
+    }
+
+    /// podman's `define.ContainerStats` from one Docker stats sample. CPU is computed as Docker does
+    /// (container CPU delta over system CPU delta, scaled by the online CPUs).
+    static func containerStats(_ docker: [String: Any], containerID: String) -> [String: Any] {
+        let cpu = docker["cpu_stats"] as? [String: Any] ?? [:]
+        let previous = docker["precpu_stats"] as? [String: Any] ?? [:]
+        func total(_ stats: [String: Any]) -> Double { Double(int((stats["cpu_usage"] as? [String: Any])?["total_usage"])) }
+        func system(_ stats: [String: Any]) -> Double { Double(int(stats["system_cpu_usage"])) }
+        let cpuDelta = total(cpu) - total(previous)
+        let systemDelta = system(cpu) - system(previous)
+        let online = max(Double(int(cpu["online_cpus"])), 1)
+        let cpuPercent = systemDelta > 0 && cpuDelta > 0 ? cpuDelta / systemDelta * online * 100 : 0
+
+        let memory = docker["memory_stats"] as? [String: Any] ?? [:]
+        let usage = int(memory["usage"])
+        let limit = int(memory["limit"])
+
+        var network: [String: Any] = [:]
+        for (name, value) in docker["networks"] as? [String: Any] ?? [:] {
+            let stats = value as? [String: Any] ?? [:]
+            network[name] = [
+                "RxBytes": int(stats["rx_bytes"]), "RxDropped": int(stats["rx_dropped"]), "RxErrors": int(stats["rx_errors"]),
+                "RxPackets": int(stats["rx_packets"]), "TxBytes": int(stats["tx_bytes"]), "TxDropped": int(stats["tx_dropped"]),
+                "TxErrors": int(stats["tx_errors"]), "TxPackets": int(stats["tx_packets"]),
+            ]
+        }
+        var blockInput = 0
+        var blockOutput = 0
+        let entries = (docker["blkio_stats"] as? [String: Any])?["io_service_bytes_recursive"] as? [[String: Any]] ?? []
+        for entry in entries {
+            switch (entry["op"] as? String ?? "").lowercased() {
+            case "read": blockInput += int(entry["value"])
+            case "write": blockOutput += int(entry["value"])
+            default: break
+            }
+        }
+        let name = docker["name"] as? String ?? ""
+        return [
+            "AvgCPU": cpuPercent, "ContainerID": containerID, "Name": name.hasPrefix("/") ? String(name.dropFirst()) : name,
+            "CPU": cpuPercent, "CPUNano": Int(total(cpu)), "CPUSystemNano": Int(system(cpu)), "SystemNano": Int(Date().timeIntervalSince1970 * 1e9),
+            "MemUsage": usage, "MemLimit": limit, "MemPerc": limit > 0 ? Double(usage) / Double(limit) * 100 : 0,
+            "Network": network, "BlockInput": blockInput, "BlockOutput": blockOutput,
+            "PIDs": int((docker["pids_stats"] as? [String: Any])?["current"]), "UpTime": 0, "Duration": 1_000_000_000,
+        ] as [String: Any]
     }
 
     // MARK: Prune
