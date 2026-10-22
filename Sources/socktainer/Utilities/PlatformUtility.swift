@@ -41,6 +41,45 @@ public func platformOrThrow(_ platformString: String) throws -> Platform {
     return try Platform(from: trimmed)
 }
 
+/// Parses a comma-separated platform specification string (e.g. "linux/arm64,linux/s390x")
+/// into an array of `Platform` values. Trims whitespace around each entry.
+/// Throws if the string is empty or any individual platform token is invalid.
+public func parseMultiPlatformString(_ platformString: String) throws -> [Platform] {
+    let parts =
+        platformString
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+    guard !parts.isEmpty else {
+        throw Abort(.badRequest, reason: "Empty platform specification")
+    }
+
+    return try parts.map { part in
+        do {
+            return try Platform(from: part)
+        } catch {
+            throw Abort(
+                .badRequest,
+                reason: "Unsupported platform '\(part)' (expected format: os/architecture, e.g. linux/arm64): \(String(describing: error))"
+            )
+        }
+    }
+}
+
+/// Returns `true` when `platform` requires QEMU emulation inside the BuildKit container
+/// VM – i.e. it is neither `arm64` (native on Apple Silicon) nor `amd64` / `x86_64`
+/// (handled by Rosetta 2 on Apple Silicon).
+public func platformRequiresQEMU(_ platform: Platform) -> Bool {
+    let normalized = dockerInfoArchitecture(platform.architecture.lowercased())
+    return normalized != "aarch64" && normalized != "x86_64"
+}
+
+/// Returns `true` when any of the requested platforms requires QEMU emulation.
+public func platformsRequireQEMU(_ platforms: [Platform]) -> Bool {
+    platforms.contains(where: platformRequiresQEMU)
+}
+
 public func requestedOrDefaultPlatform(_ requestedPlatform: Platform?) -> Platform {
     requestedPlatform ?? Platform.current
 }
