@@ -1,14 +1,18 @@
+import ContainerAPIClient
+import ContainerPersistence
+import ContainerizationError
 import Foundation
 import Vapor
 
 struct LibpodImagePullRoute: RouteCollection {
     let client: ClientImageProtocol
+    let systemConfig: ContainerSystemConfig
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/libpod/images/pull", use: LibpodImagePullRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/images/pull", use: LibpodImagePullRoute.handler(client: client, systemConfig: systemConfig))
     }
 
-    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientImageProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let reference = req.query["reference"] as String?, !reference.isEmpty else {
                 throw Abort(.badRequest, reason: "Missing reference query parameter")
@@ -16,6 +20,29 @@ struct LibpodImagePullRoute: RouteCollection {
             let platformString: String? = req.query["platform"]
 
             let (image, tag) = parseReference(reference)
+
+            // `podman create`/`run` pull with `policy=missing`: an image already in the store must
+            // not be fetched again (and `never` must not fetch at all). `always`/`newer` pull.
+            let policy = (req.query["policy"] as String?) ?? "always"
+            if policy == "missing" || policy == "never" {
+                let present: Bool
+                do {
+                    _ = try await ClientImage.get(reference: reference.removingPercentEncoding ?? reference, containerSystemConfig: systemConfig)
+                    present = true
+                } catch let error as ContainerizationError where error.code == .notFound {
+                    present = false
+                }
+                if present {
+                    let ref = reference.removingPercentEncoding ?? reference
+                    let line = "{\"images\":[\(jsonString(ref))],\"id\":\(jsonString(ref))}\n"
+                    let response = Response(status: .ok, body: .init(string: line))
+                    response.headers.contentType = .json
+                    return response
+                }
+                if policy == "never" {
+                    throw Abort(.notFound, reason: "image not known: \(reference)")
+                }
+            }
 
             let platform: Platform
             if let platformString, !platformString.isEmpty {
@@ -72,6 +99,11 @@ struct LibpodImagePullRoute: RouteCollection {
             })
             return response
         }
+    }
+
+    private static func jsonString(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value), let text = String(data: data, encoding: .utf8) else { return "\"\"" }
+        return text
     }
 
     private static func parseReference(_ reference: String) -> (image: String, tag: String) {

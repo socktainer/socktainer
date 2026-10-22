@@ -15,6 +15,8 @@ enum ClientManifestError: Error {
 struct RetagState: Sendable {
     let reference: String
     let priorDescriptor: Descriptor?
+    /// Ownership of the destination's `PushDestinationGate`, released by `untagPushDestination`.
+    var gateToken: UUID? = nil
 }
 
 /// Backs the `podman manifest` command family, `podman build --manifest`, and manifest-aware
@@ -317,34 +319,48 @@ struct ClientManifestService: ClientManifestServiceProtocol {
             return (storedName, nil)
         }
 
-        let priorDescriptor: Descriptor?
+        // Held until `untagPushDestination` restores the destination: overlapping cycles on one
+        // destination would otherwise capture each other's temporary tag as its "prior" state.
+        let gateToken = await PushDestinationGate.shared.acquire(normalizedDestination)
         do {
-            // Same reasoning as `leafDescriptors`/`exists`: raw, not pre-normalized. But
-            // `_search`'s raw-or-normalized fallback means this can resolve to some OTHER
-            // stored reference than `normalizedDestination` (e.g. an unrelated image
-            // already tagged bare under the same raw string) — that isn't what
-            // `imageStore().tag` below is about to overwrite, so it isn't real "prior
-            // state" for `normalizedDestination` and must not be captured for restore.
-            let existing = try await ClientImage.get(reference: destination, containerSystemConfig: containerSystemConfig)
-            priorDescriptor = existing.reference == normalizedDestination ? existing.descriptor : nil
-        } catch let error as ContainerizationError where error.code == .notFound {
-            priorDescriptor = nil
-        }
+            let priorDescriptor: Descriptor?
+            do {
+                // Same reasoning as `leafDescriptors`/`exists`: raw, not pre-normalized. But
+                // `_search`'s raw-or-normalized fallback means this can resolve to some OTHER
+                // stored reference than `normalizedDestination` (e.g. an unrelated image
+                // already tagged bare under the same raw string) — that isn't what
+                // `imageStore().tag` below is about to overwrite, so it isn't real "prior
+                // state" for `normalizedDestination` and must not be captured for restore.
+                let existing = try await ClientImage.get(reference: destination, containerSystemConfig: containerSystemConfig)
+                priorDescriptor = existing.reference == normalizedDestination ? existing.descriptor : nil
+            } catch let error as ContainerizationError where error.code == .notFound {
+                priorDescriptor = nil
+            }
 
-        _ = try await imageStore().tag(existing: storedName, new: normalizedDestination)
-        return (normalizedDestination, RetagState(reference: normalizedDestination, priorDescriptor: priorDescriptor))
+            _ = try await imageStore().tag(existing: storedName, new: normalizedDestination)
+            return (normalizedDestination, RetagState(reference: normalizedDestination, priorDescriptor: priorDescriptor, gateToken: gateToken))
+        } catch {
+            await PushDestinationGate.shared.release(normalizedDestination, token: gateToken)
+            throw error
+        }
     }
 
     /// Undoes a re-tag created by `retagForPush`: restores what `destination` pointed at before
     /// (if anything), or removes the tag entirely if it didn't exist beforehand. Caller's
     /// responsibility to call this once the push has finished, success or failure.
     func untagPushDestination(_ state: RetagState) async throws {
-        if let priorDescriptor = state.priorDescriptor {
-            try await imageStore().create(description: Image.Description(reference: state.reference, descriptor: priorDescriptor))
-        } else {
-            // `performCleanup: false` — see `delete(name:)`'s own comment on the same call.
-            try await imageStore().delete(reference: state.reference, performCleanup: false)
+        do {
+            if let priorDescriptor = state.priorDescriptor {
+                try await imageStore().create(description: Image.Description(reference: state.reference, descriptor: priorDescriptor))
+            } else {
+                // `performCleanup: false` — see `delete(name:)`'s own comment on the same call.
+                try await imageStore().delete(reference: state.reference, performCleanup: false)
+            }
+        } catch {
+            await PushDestinationGate.shared.release(state.reference, token: state.gateToken)
+            throw error
         }
+        await PushDestinationGate.shared.release(state.reference, token: state.gateToken)
     }
 
     /// Resolves `ref` to the leaf (non-index) manifest descriptors it contributes. Adding a

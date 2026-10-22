@@ -4,6 +4,7 @@ struct LibpodSystemDFRoute: RouteCollection {
     let dockerRoute: SystemDFRoute
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/libpod/system/df", use: dockerRoute.handler)
+        let handler = LibpodAdapter.reshaping(dockerRoute.handler) { body, _ in LibpodSchema.systemDF(body) }
+        try routes.registerVersionedRoute(.GET, pattern: "/libpod/system/df", use: handler)
     }
 }

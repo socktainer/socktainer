@@ -26,8 +26,10 @@ struct LibpodNetworkParamBindingTests {
 
             try await app.testing().test(.GET, "/v1.51/libpod/networks/mynet/json") { res async throws in
                 #expect(res.status == .ok)
-                let body = try JSONDecoder().decode(RESTNetworkSummary.self, from: Data(buffer: res.body))
-                #expect(body.Name == "mynet")
+                // podman's `types.Network` uses lower-case keys and a 64-hex id.
+                let body = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                #expect(body["name"] as? String == "mynet")
+                #expect((body["id"] as? String)?.count == 64)
             }
         }
         #expect(await client.requestedId == "mynet")
@@ -44,7 +46,10 @@ struct LibpodNetworkParamBindingTests {
             try app.register(collection: LibpodNetworkDeleteRoute(dockerRoute: NetworkDeleteRoute(client: client)))
 
             try await app.testing().test(.DELETE, "/v1.51/libpod/networks/mynet") { res async throws in
-                #expect(res.status == .noContent)
+                // podman's `network.Remove` decodes a `[]NetworkRmReport` even on success.
+                #expect(res.status == .ok)
+                let reports = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [[String: Any]])
+                #expect(reports.first?["Name"] as? String == "mynet")
             }
         }
         #expect(await client.deletedId == "mynet")

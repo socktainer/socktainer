@@ -4,6 +4,7 @@ struct LibpodNetworkPruneRoute: RouteCollection {
     let client: ClientNetworkProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/libpod/networks/prune", use: NetworkPruneRoute.handler)
+        let handler = LibpodAdapter.reshaping(NetworkPruneRoute.handler) { body, _ in LibpodSchema.networkPruneReports(body) }
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/networks/prune", use: handler)
     }
 }

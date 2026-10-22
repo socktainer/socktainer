@@ -4,6 +4,7 @@ struct LibpodImageListRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/libpod/images/json", use: ImageListRoute.handler(client: client))
+        let handler = LibpodAdapter.reshaping(ImageListRoute.handler(client: client)) { body, _ in LibpodSchema.imageList(body) }
+        try routes.registerVersionedRoute(.GET, pattern: "/libpod/images/json", use: handler)
     }
 }

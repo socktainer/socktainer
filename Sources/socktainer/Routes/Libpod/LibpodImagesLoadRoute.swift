@@ -24,8 +24,32 @@ struct LibpodImagesLoadRoute: RouteCollection {
     let client: ClientImageProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/libpod/images/load", use: ImagesLoadRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/images/load", use: LibpodImagesLoadRoute.streamHandler(client: client))
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/local/images/load", use: LibpodImagesLoadRoute.localHandler(client: client))
+    }
+
+    /// Runs the Docker-compat load (which streams progress frames) and answers podman's single
+    /// `ImageLoadReport`, with every reference the archive loaded.
+    static func streamHandler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
+        let docker = ImagesLoadRoute.handler(client: client)
+        return { req in
+            let response = try await docker(req)
+            let body = try await response.body.collect(on: req.eventLoop).get()
+            var names: [String] = []
+            for line in String(buffer: body ?? ByteBuffer()).split(separator: "\n") {
+                guard let frame = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+                if let message = frame["error"] as? String {
+                    throw Abort(.internalServerError, reason: message)
+                }
+                if let stream = frame["stream"] as? String, stream.hasPrefix("Loaded image: ") {
+                    names.append(String(stream.dropFirst("Loaded image: ".count)).trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+            guard !names.isEmpty else {
+                throw Abort(.internalServerError, reason: "Archive contained no images")
+            }
+            return try LibpodAdapter.jsonResponse(["Names": names])
+        }
     }
 
     static func localHandler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {

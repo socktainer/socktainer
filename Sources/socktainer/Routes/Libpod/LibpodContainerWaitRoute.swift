@@ -7,30 +7,20 @@ struct LibpodContainerWaitRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/containers/{id}/wait", use: LibpodContainerWaitRoute.handler(client: client))
     }
 
+    /// Delegates to the Docker-compat wait — which also resolves a container that already exited
+    /// before `/wait` arrived (the usual order for `podman run`) — then answers with the bare
+    /// integer exit code podman's binding decodes, not Docker's `{"StatusCode": N}` object.
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
-        { req in
-            guard let containerId = req.parameters.get("id") else {
-                throw Abort(.badRequest, reason: "Missing container ID")
+        LibpodAdapter.reshaping(
+            ContainerWaitRoute.handler(client: client),
+            prepare: { req in
+                if let raw = req.query["condition"] as String? {
+                    LibpodAdapter.setQuery(req, "condition", to: try mapLibpodCondition(raw).rawValue)
+                }
+                return req
             }
-
-            let conditionString = req.query["condition"] as String?
-            let condition: ContainerWaitCondition
-
-            if let conditionString = conditionString {
-                condition = try Self.mapLibpodCondition(conditionString)
-            } else {
-                condition = ContainerWaitCondition.default
-            }
-
-            do {
-                let waitResponse = try await client.wait(id: containerId, condition: condition)
-                return try await waitResponse.encodeResponse(for: req)
-            } catch ClientContainerError.notFound(let id) {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            } catch {
-                req.logger.error("Failed to wait for container \(containerId): \(error)")
-                throw Abort(.internalServerError, reason: "Failed to wait for container")
-            }
+        ) { body, _ in
+            (body as? [String: Any])?["StatusCode"] ?? 0
         }
     }
 
@@ -44,7 +34,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
     /// which would need genuine target-state polling this daemon's `client.wait` doesn't
     /// implement (it only supports "block until the container stops and report its exit
     /// code," matching Docker's own `wait`).
-    private static func mapLibpodCondition(_ raw: String) throws -> ContainerWaitCondition {
+    static func mapLibpodCondition(_ raw: String) throws -> ContainerWaitCondition {
         let first = raw.split(separator: ",").first.map(String.init) ?? raw
         switch first {
         case "stopped", "exited":

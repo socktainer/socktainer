@@ -4,6 +4,7 @@ struct LibpodNetworkInspectRoute: RouteCollection {
     let client: ClientNetworkProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.GET, pattern: "/libpod/networks/{id}/json", use: NetworkInspectRoute.handler(client: client))
+        let handler = LibpodAdapter.reshaping(NetworkInspectRoute.handler(client: client)) { body, _ in LibpodSchema.networkInspect(body) }
+        try routes.registerVersionedRoute(.GET, pattern: "/libpod/networks/{id}/json", use: handler)
     }
 }

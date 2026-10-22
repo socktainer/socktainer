@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationOCI
 import Foundation
 import Testing
 import Vapor
@@ -27,6 +28,9 @@ struct LibpodContainerWaitRouteTests {
 
             try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=stopped") { res async throws in
                 #expect(res.status == .ok)
+                // Podman's binding decodes the exit code as a bare JSON integer, not Docker's
+                // `{"StatusCode": N}` object.
+                #expect(String(buffer: res.body).trimmingCharacters(in: .whitespacesAndNewlines) == "0")
             }
         }
         #expect(await client.receivedCondition == .notRunning)
@@ -71,7 +75,7 @@ private actor RecordingWaitClient: ClientContainerProtocol {
     private(set) var receivedCondition: ContainerWaitCondition?
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { nil }
+    func getContainer(id: String) async throws -> ContainerSnapshot? { makeStoppedSnapshot() }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws {}
@@ -85,4 +89,15 @@ private actor RecordingWaitClient: ClientContainerProtocol {
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
         ([], 0)
     }
+}
+
+/// The Docker-compat wait handler (which this route delegates to) 404s on a container that doesn't exist.
+private func makeStoppedSnapshot() -> ContainerSnapshot {
+    let process = ProcessConfiguration(
+        executable: "/bin/sh", arguments: [], environment: [], workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+    let image = ImageDescription(
+        reference: "alpine:latest",
+        descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+    let config = ContainerConfiguration(id: "ctr", image: image, process: process)
+    return ContainerSnapshot(configuration: config, status: .stopped, networks: [])
 }

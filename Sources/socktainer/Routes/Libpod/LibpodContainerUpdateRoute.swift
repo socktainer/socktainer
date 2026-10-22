@@ -4,6 +4,17 @@ struct LibpodContainerUpdateRoute: RouteCollection {
     let client: ClientContainerProtocol
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/libpod/containers/{id}/update", use: ContainerUpdateRoute.handler(client: client))
+        let handler = LibpodAdapter.reshaping(
+            ContainerUpdateRoute.handler(client: client), status: .created,
+            prepare: { req in
+                let body = try await LibpodAdapter.jsonObjectBody(of: req)
+                let docker = LibpodSchema.dockerContainerUpdateBody(
+                    fromLibpod: body, restartPolicy: req.query["restartPolicy"] as String?, restartRetries: req.query["restartRetries"] as Int?)
+                return try LibpodAdapter.replacingBody(of: req, with: docker)
+            }
+        ) { _, req in
+            ["Id": req.parameters.get("id") ?? ""]
+        }
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/containers/{id}/update", use: handler)
     }
 }

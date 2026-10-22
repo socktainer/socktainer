@@ -4,6 +4,7 @@ struct LibpodVolumePruneRoute: RouteCollection {
     let dockerRoute: VolumePruneRoute
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/libpod/volumes/prune", use: dockerRoute.handler)
+        let handler = LibpodAdapter.reshaping(dockerRoute.handler) { body, _ in LibpodSchema.volumePruneReports(body) }
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/volumes/prune", use: handler)
     }
 }
