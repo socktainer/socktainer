@@ -69,9 +69,10 @@ extension ContainerListRoute {
 
                 let networkMode = container.networks.first?.network ?? "default"
 
+                let aliasesByNetwork = container.configuration.endpointAliasesByNetwork
                 let networkSettings = Dictionary(
                     container.networks.map { attachment in
-                        (attachment.network, ContainerEndpointSettings.live(attachment))
+                        (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))
                     },
                     uniquingKeysWith: { first, _ in first }
                 )
