@@ -1,11 +1,23 @@
 import ContainerResource
 
+extension ContainerConfiguration {
+    /// The aliases per network attachment. Apple's live `Attachment` carries none — only
+    /// the persisted configuration does — and duplicate network names keep the first entry
+    /// instead of trapping.
+    var endpointAliasesByNetwork: [String: [String]] {
+        Dictionary(
+            networks.map { ($0.network, $0.options.aliases) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+}
+
 extension ContainerEndpointSettings {
-    static func live(_ attachment: Attachment) -> ContainerEndpointSettings {
+    static func live(_ attachment: Attachment, aliases: [String]? = nil) -> ContainerEndpointSettings {
         ContainerEndpointSettings(
             IPAMConfig: nil,
             Links: nil,
-            Aliases: nil,
+            Aliases: nonEmpty(aliases),
             NetworkID: attachment.network,
             EndpointID: nil,
             Gateway: stripSubnetFromIP(String(describing: attachment.ipv4Gateway)),
@@ -19,11 +31,11 @@ extension ContainerEndpointSettings {
         )
     }
 
-    static func configured(networkID: String) -> ContainerEndpointSettings {
+    static func configured(networkID: String, aliases: [String]? = nil) -> ContainerEndpointSettings {
         ContainerEndpointSettings(
             IPAMConfig: nil,
             Links: nil,
-            Aliases: nil,
+            Aliases: nonEmpty(aliases),
             NetworkID: networkID,
             EndpointID: nil,
             Gateway: nil,
@@ -35,5 +47,12 @@ extension ContainerEndpointSettings {
             MacAddress: nil,
             DriverOpts: nil
         )
+    }
+
+    /// Docker clients read `Aliases` as a list of names; emitting `[]` for an
+    /// attachment without aliases is noise, so an empty list becomes absent.
+    private static func nonEmpty(_ aliases: [String]?) -> [String]? {
+        guard let aliases, !aliases.isEmpty else { return nil }
+        return aliases
     }
 }

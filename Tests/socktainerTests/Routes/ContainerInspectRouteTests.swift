@@ -96,6 +96,81 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("A running container reports the aliases from its configured attachment")
+    func runningContainerReportsConfiguredAliases() async throws {
+        // The live attachment carries no aliases; only the persisted configuration does.
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [
+                AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1", aliases: ["api.test", "db.test"]))
+            ],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                let endpoint = inspect.NetworkSettings.Networks?["mynet"]
+                #expect(endpoint?.IPAddress == "192.168.64.5")
+                #expect(endpoint?.Aliases == ["api.test", "db.test"])
+            }
+        }
+    }
+
+    @Test("A stopped container reports the aliases from its configured attachment")
+    func stoppedContainerReportsConfiguredAliases() async throws {
+        let container = makeSnapshot(
+            id: "c1",
+            status: .stopped,
+            configuredNetworks: [
+                AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1", aliases: ["api.test"]))
+            ],
+            liveNetworks: []
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?["mynet"]?.Aliases == ["api.test"])
+            }
+        }
+    }
+
+    @Test("A network without aliases reports no Aliases key at all")
+    func networkWithoutAliasesReportsNoAliases() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1"))],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let body = try #require(JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                let networkSettings = try #require(body["NetworkSettings"] as? [String: Any])
+                let networks = try #require(networkSettings["Networks"] as? [String: Any])
+                let endpoint = try #require(networks["mynet"] as? [String: Any])
+                // Aliases must be absent, never an empty list.
+                #expect(endpoint["Aliases"] == nil)
+            }
+        }
+    }
+
     @Test("A running container reports its live network attachment with IP info")
     func runningContainerReportsLiveNetwork() async throws {
         let attachment = try ContainerResource.Attachment(

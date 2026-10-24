@@ -42,17 +42,21 @@ extension ContainerInspectRoute {
     private static func networkEndpoints(for container: ContainerSnapshot) -> [String: ContainerEndpointSettings] {
         // uniquingKeysWith rather than uniqueKeysWithValues: nothing in Attachment's array-based
         // storage guarantees distinct .network names, and a duplicate would otherwise trap.
+        let aliasesByNetwork = container.configuration.endpointAliasesByNetwork
         if !container.networks.isEmpty {
             return Dictionary(
                 container.networks.map { attachment in
-                    (attachment.network, ContainerEndpointSettings.live(attachment))
+                    (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))
                 },
                 uniquingKeysWith: { first, _ in first }
             )
         }
         return Dictionary(
             container.configuration.networks.map { attachment in
-                (attachment.network, ContainerEndpointSettings.configured(networkID: attachment.network))
+                (
+                    attachment.network,
+                    ContainerEndpointSettings.configured(networkID: attachment.network, aliases: attachment.options.aliases)
+                )
             },
             uniquingKeysWith: { first, _ in first }
         )
