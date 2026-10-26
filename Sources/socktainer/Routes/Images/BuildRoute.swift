@@ -246,6 +246,52 @@ extension BuildRoute {
         return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"]] + tagged
     }
 
+    /// The builder's configuration for a build. It is never quiet, whatever the request's
+    /// `q`: in quiet mode apple/container's `BuildStdio` drops the builder's output without
+    /// answering it, and the builder waits for that answer, so any build that produces
+    /// output (a `RUN` step) hangs (apple/container#2387). The builder's output goes to the
+    /// daemon's stderr either way (no terminal), never to the client.
+    static func buildConfig(
+        buildID: String,
+        buildArgs: [String],
+        contextDir: String,
+        dockerfile: Data,
+        labels: [String],
+        noCache: Bool,
+        platforms: [Platform],
+        tag: String,
+        target: String,
+        exports: [Builder.BuildExport],
+        pull: Bool,
+        systemConfig: ContainerSystemConfig
+    ) -> ContainerBuild.Builder.BuildConfig {
+        ContainerBuild.Builder.BuildConfig(
+            buildID: buildID,
+            contentStore: RemoteContentStoreClient(),
+            buildArgs: buildArgs,
+            // TODO: Implement secrets once integration with buildkit materializes
+            secrets: [:],
+            // Same as secrets: the Docker API's SSH forwarding for builds is not
+            // wired through yet, so nothing is offered to the builder.
+            ssh: "",
+            contextDir: contextDir,
+            dockerfile: dockerfile,
+            dockerignore: nil,
+            labels: labels,
+            noCache: noCache,
+            platforms: platforms,
+            terminal: nil,  // No terminal for API
+            tags: [tag],
+            target: target,
+            quiet: false,
+            exports: exports,
+            cacheIn: [],
+            cacheOut: [],
+            pull: pull,
+            containerSystemConfig: systemConfig
+        )
+    }
+
     static func errorMessage(for error: Error) -> String {
         if error is ContainerizationError {
             return "\(error)"
@@ -276,7 +322,6 @@ extension BuildRoute {
             let dockerfile = query.dockerfile!
             // nil for an untagged build, which performBuild stores as dangling.
             let targetImageName = query.t
-            let quiet = query.q!
             let noCache = query.nocache!
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
@@ -319,7 +364,6 @@ extension BuildRoute {
                             target: target,
                             platform: platform,
                             memory: memory,
-                            quiet: quiet,
                             builderClient: builderClient,
                             systemConfig: systemConfig,
                             writer: writer,
@@ -388,7 +432,6 @@ extension BuildRoute {
         target: String,
         platform: String,
         memory: Int,
-        quiet: Bool,
         builderClient: ClientBuilderProtocol,
         systemConfig: ContainerSystemConfig,
         writer: BodyStreamWriter,
@@ -492,31 +535,19 @@ extension BuildRoute {
             return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
         }()
 
-        // Build configuration
-        let config = ContainerBuild.Builder.BuildConfig(
+        let config = buildConfig(
             buildID: buildID,
-            contentStore: RemoteContentStoreClient(),
             buildArgs: buildArgs,
-            // TODO: Implement secrets once integration with buildkit materializes
-            secrets: [:],
-            // Same as secrets: the Docker API's SSH forwarding for builds is not
-            // wired through yet, so nothing is offered to the builder.
-            ssh: "",
             contextDir: contextDir,
             dockerfile: dockerfileData,
-            dockerignore: nil,
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
-            terminal: nil,  // No terminal for API
-            tags: [buildName],
+            tag: buildName,
             target: target,
-            quiet: quiet,
             exports: exports,
-            cacheIn: [],
-            cacheOut: [],
             pull: pull,
-            containerSystemConfig: systemConfig
+            systemConfig: systemConfig
         )
 
         sendStreamMessage(" ---> Starting build process")
