@@ -584,7 +584,8 @@ enum LibpodSchema {
             if let gateway = entry["gateway"] as? String { result["Gateway"] = gateway }
             return result
         }
-        if !config.isEmpty { docker["IPAM"] = ["Config": config] }
+        // Docker's `IPAM` object requires its `Driver` (the create handler decodes it as non-optional).
+        if !config.isEmpty { docker["IPAM"] = ["Driver": "default", "Config": config] as [String: Any] }
         return docker
     }
 }

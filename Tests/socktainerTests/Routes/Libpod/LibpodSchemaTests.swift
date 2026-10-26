@@ -97,7 +97,9 @@ struct LibpodSchemaTests {
         ])
         #expect(docker["Name"] as? String == "n")
         #expect(docker["Internal"] as? Bool == true)
-        let config = (docker["IPAM"] as? [String: Any])?["Config"] as? [[String: Any]]
+        let ipam = docker["IPAM"] as? [String: Any]
+        #expect(ipam?["Driver"] as? String == "default")
+        let config = ipam?["Config"] as? [[String: Any]]
         #expect(config?.first?["Subnet"] as? String == "10.1.0.0/24")
     }
 
