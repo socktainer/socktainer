@@ -44,6 +44,11 @@ func configure(_ app: Application) async throws {
         )
     }
 
+    // The configured domain, used to report the aliases a client sent.
+    if let dnsDomain = systemConfig.dns.domain {
+        app.storage[DNSDomainKey.self] = dnsDomain
+    }
+
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)

@@ -204,6 +204,32 @@ struct NetworkAliasDNSTests {
                 == "web.other.")
     }
 
+    // MARK: - unqualify
+
+    @Test("a zone-qualified alias is shortened to the name the client sent")
+    func unqualifyShortensTheZone() {
+        #expect(
+            NetworkAliasDNS.unqualify("web.myapp_default.test", network: "myapp_default", dnsDomain: "test")
+                == "web"
+        )
+    }
+
+    @Test("a name that is not zone-qualified is left alone")
+    func unqualifyLeavesOtherNames() {
+        #expect(
+            NetworkAliasDNS.unqualify("api.test", network: "myapp_default", dnsDomain: "test")
+                == "api.test"
+        )
+        #expect(
+            NetworkAliasDNS.unqualify("web", network: "myapp_default", dnsDomain: "test")
+                == "web"
+        )
+        #expect(
+            NetworkAliasDNS.unqualify("web.myapp_default.test", network: "myapp_default", dnsDomain: nil)
+                == "web.myapp_default.test"
+        )
+    }
+
     // MARK: - searchDomains
 
     @Test("search domains follow network order with the bare domain last")

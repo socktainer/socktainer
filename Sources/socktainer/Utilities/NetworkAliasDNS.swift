@@ -70,6 +70,16 @@ enum NetworkAliasDNS {
         return "\(name).\(zone(network, dnsDomain: dnsDomain))"
     }
 
+    /// The inverse of `qualify`: the name as the client sent it, with the per-network zone
+    /// stripped from the tail. A name that is not zone-qualified is returned as it is.
+    static func unqualify(_ name: String, network: String, dnsDomain: String?) -> String {
+        guard let dnsDomain, !dnsDomain.isEmpty else { return name }
+        let suffix = ".\(zone(network, dnsDomain: dnsDomain))"
+        guard name.lowercased().hasSuffix(suffix.lowercased()) else { return name }
+        let shortened = String(name.dropLast(suffix.count))
+        return shortened.isEmpty ? name : shortened
+    }
+
     /// The `ndots:N` resolver option: max(user value, 2), or `ndots:2` when absent.
     static func ndots(from userOptions: [String]) -> String {
         guard let entry = userOptions.first(where: { $0.lowercased().hasPrefix("ndots:") }),
