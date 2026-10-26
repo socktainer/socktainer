@@ -4,9 +4,16 @@ extension ContainerConfiguration {
     /// The aliases per network attachment. Apple's live `Attachment` carries none — only
     /// the persisted configuration does — and duplicate network names keep the first entry
     /// instead of trapping.
-    var endpointAliasesByNetwork: [String: [String]] {
+    func endpointAliasesByNetwork(dnsDomain: String? = nil) -> [String: [String]] {
         Dictionary(
-            networks.map { ($0.network, $0.options.aliases) },
+            networks.map { attachment in
+                (
+                    attachment.network,
+                    attachment.options.aliases.map {
+                        NetworkAliasDNS.unqualify($0, network: attachment.network, dnsDomain: dnsDomain)
+                    }
+                )
+            },
             uniquingKeysWith: { first, _ in first }
         )
     }

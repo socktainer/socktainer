@@ -69,7 +69,7 @@ extension ContainerListRoute {
 
                 let networkMode = container.networks.first?.network ?? "default"
 
-                let aliasesByNetwork = container.configuration.endpointAliasesByNetwork
+                let aliasesByNetwork = container.configuration.endpointAliasesByNetwork(dnsDomain: req.application.dnsDomain)
                 let networkSettings = Dictionary(
                     container.networks.map { attachment in
                         (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))

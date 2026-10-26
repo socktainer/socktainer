@@ -39,10 +39,10 @@ extension ContainerInspectRoute {
     /// container's configured attachments regardless of run state. Falling
     /// back to the persisted `configuration.networks` keeps that parity,
     /// though the IP/gateway are unknown without a live sandbox.
-    private static func networkEndpoints(for container: ContainerSnapshot) -> [String: ContainerEndpointSettings] {
+    private static func networkEndpoints(for container: ContainerSnapshot, dnsDomain: String?) -> [String: ContainerEndpointSettings] {
         // uniquingKeysWith rather than uniqueKeysWithValues: nothing in Attachment's array-based
         // storage guarantees distinct .network names, and a duplicate would otherwise trap.
-        let aliasesByNetwork = container.configuration.endpointAliasesByNetwork
+        let aliasesByNetwork = container.configuration.endpointAliasesByNetwork(dnsDomain: dnsDomain)
         if !container.networks.isEmpty {
             return Dictionary(
                 container.networks.map { attachment in
@@ -55,7 +55,12 @@ extension ContainerInspectRoute {
             container.configuration.networks.map { attachment in
                 (
                     attachment.network,
-                    ContainerEndpointSettings.configured(networkID: attachment.network, aliases: attachment.options.aliases)
+                    ContainerEndpointSettings.configured(
+                        networkID: attachment.network,
+                        aliases: attachment.options.aliases.map {
+                            NetworkAliasDNS.unqualify($0, network: attachment.network, dnsDomain: dnsDomain)
+                        }
+                    )
                 )
             },
             uniquingKeysWith: { first, _ in first }
@@ -175,7 +180,7 @@ extension ContainerInspectRoute {
             )
 
             // Enhanced network settings with proper port mapping
-            let networkEndpoints = Self.networkEndpoints(for: container)
+            let networkEndpoints = Self.networkEndpoints(for: container, dnsDomain: req.application.dnsDomain)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,

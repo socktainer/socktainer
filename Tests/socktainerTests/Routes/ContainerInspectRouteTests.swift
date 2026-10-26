@@ -125,6 +125,36 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("A zone-qualified alias is reported as the client sent it")
+    func zoneQualifiedAliasIsShortened() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [
+                AttachmentConfiguration(
+                    network: "mynet",
+                    options: AttachmentOptions(hostname: "c1", aliases: ["api.mynet.test"])
+                )
+            ],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            app.storage[DNSDomainKey.self] = "test"
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?["mynet"]?.Aliases == ["api"])
+            }
+        }
+    }
+
     @Test("A stopped container reports the aliases from its configured attachment")
     func stoppedContainerReportsConfiguredAliases() async throws {
         let container = makeSnapshot(

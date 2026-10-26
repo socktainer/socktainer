@@ -82,7 +82,10 @@ struct SystemDFRoute: RouteCollection {
 
         let containerSummaries: [RESTContainerSummary]?
         if includeAll || requestedTypes.contains("container") {
-            containerSummaries = try await Self.buildContainerSummaries(containers: allContainers, diskUsageProvider: diskUsageProvider)
+            containerSummaries = try await Self.buildContainerSummaries(
+                containers: allContainers, diskUsageProvider: diskUsageProvider,
+                dnsDomain: req.application.dnsDomain
+            )
         } else {
             containerSummaries = nil
         }
@@ -220,13 +223,14 @@ extension SystemDFRoute {
 
     fileprivate static func buildContainerSummaries(
         containers: [ContainerSnapshot],
-        diskUsageProvider: ContainerDiskUsageProviding
+        diskUsageProvider: ContainerDiskUsageProviding,
+        dnsDomain: String?
     ) async throws -> [RESTContainerSummary] {
         try await withThrowingTaskGroup(of: RESTContainerSummary.self) { group in
             for container in containers {
                 group.addTask {
                     let size = try await diskUsageProvider.diskUsage(id: container.id)
-                    return containerSummary(from: container, size: Int64(clamping: size))
+                    return containerSummary(from: container, size: Int64(clamping: size), dnsDomain: dnsDomain)
                 }
             }
 
@@ -282,7 +286,7 @@ extension SystemDFRoute {
         }
     }
 
-    fileprivate static func containerSummary(from container: ContainerSnapshot, size: Int64) -> RESTContainerSummary {
+    fileprivate static func containerSummary(from container: ContainerSnapshot, size: Int64, dnsDomain: String?) -> RESTContainerSummary {
         let ports = container.configuration.publishedPorts.map { port in
             ContainerPort(
                 IP: port.hostAddress.description,
@@ -293,7 +297,7 @@ extension SystemDFRoute {
         }
 
         let networkMode = container.networks.first?.network ?? "default"
-        let aliasesByNetwork = container.configuration.endpointAliasesByNetwork
+        let aliasesByNetwork = container.configuration.endpointAliasesByNetwork(dnsDomain: dnsDomain)
         let networkSettings = Dictionary(
             container.networks.map { attachment in
                 (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))

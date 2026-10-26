@@ -53,10 +53,19 @@ struct DNSModeKey: StorageKey {
     typealias Value = DNSMode
 }
 
+struct DNSDomainKey: StorageKey {
+    typealias Value = String
+}
+
 extension Application {
     /// Daemon-wide DNS resolution mode; `socktainer-dns` when unset.
     var dnsMode: DNSMode {
         storage[DNSModeKey.self] ?? .socktainerDNS
+    }
+
+    /// The DNS domain configured in apple/container's system config, when set.
+    var dnsDomain: String? {
+        storage[DNSDomainKey.self]
     }
 }
 
