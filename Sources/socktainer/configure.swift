@@ -203,37 +203,47 @@ func configure(_ app: Application) async throws {
     Task { await externalEventWatcher.run() }
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
-    // Initialize inter-container DNS infrastructure.
-    // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
-    // is taken, Socktainer auto-increments until a free port is found.
-    let preferredDNSPort =
-        ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
-        .flatMap(Int.init) ?? 2054
-    let dnsServer = SocktainerDNSServer()
-    // Forward non-container names to the vmnet gateway resolver (as `default`-network
-    // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
-    // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
-    let logger = app.logger
-    let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
-        do {
-            dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
-            logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
-        } catch {
-            logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    // Initialize inter-container DNS infrastructure (socktainer-dns mode only).
+    // `apple-dns` mode resolves through apple/container: no server is constructed
+    // (no port bind, no gateway lookup) and nothing is stored under its key, so every
+    // storage read below is nil there — no call site needs to gate on the mode.
+    let dnsManager: NetworkDNSManager?
+    if app.dnsMode == .socktainerDNS {
+        // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
+        // is taken, Socktainer auto-increments until a free port is found.
+        let preferredDNSPort =
+            ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
+            .flatMap(Int.init) ?? 2054
+        let dnsServer = SocktainerDNSServer()
+        // Forward non-container names to the vmnet gateway resolver (as `default`-network
+        // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
+        // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
+        let logger = app.logger
+        let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+            do {
+                dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+                logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+            } catch {
+                logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+            }
         }
-    }
-    if !gatewayLookupFinished {
-        logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
-    }
-    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
-        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
-        return
-    }
-    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
-    app.storage[SocktainerDNSServerKey.self] = dnsServer
+        if !gatewayLookupFinished {
+            logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
+        }
+        guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
+            app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
+            return
+        }
+        app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+        app.storage[SocktainerDNSServerKey.self] = dnsServer
 
-    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
-    app.storage[NetworkDNSManagerKey.self] = dnsManager
+        let manager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
+        app.storage[NetworkDNSManagerKey.self] = manager
+        dnsManager = manager
+    } else {
+        app.logger.notice("DNS server: not started (apple-dns mode — apple/container serves names)")
+        dnsManager = nil
+    }
 
     // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and
     // tracks status so `/containers/{id}/json` can return `.State.Health`.
@@ -251,7 +261,10 @@ func configure(_ app: Application) async throws {
             guard !ClientContainerService.isDNSSidecar(container)
             else { continue }
 
-            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            // apple-dns mode starts no DNS server, so there is nothing to re-register.
+            if let dnsServer = app.storage[SocktainerDNSServerKey.self] {
+                ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            }
 
             // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
@@ -273,7 +286,10 @@ func configure(_ app: Application) async throws {
     // routing (EHOSTUNREACH).
     let housekeepingLogger = app.logger
     let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
-        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        // No manager in apple-dns mode (sidecars never exist there) — nothing to adopt.
+        if let dnsManager {
+            await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        }
         await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
     }
     if !housekeepingFinished {
