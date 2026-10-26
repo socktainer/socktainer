@@ -32,6 +32,18 @@ struct BuildCompletionEventsTests {
         }
     }
 
+    /// podman's build client (`pkg/bindings/images/build.go`) accepts only `stream` and `error`
+    /// lines and fails the whole build with "unexpected input" on an `aux` one.
+    @Test("the libpod variant leaves out aux so podman's stream parser accepts it")
+    func withoutAuxForPodman() {
+        let events = BuildRoute.completionEvents(imageID: Self.imageID, tag: "probe:1", includeAux: false)
+
+        #expect(events.count == 2)
+        #expect(events.allSatisfy { $0["aux"] == nil && $0["stream"] is String })
+        #expect(events[0]["stream"] as? String == "Successfully built 83fc7ce1224f\n")
+        #expect(events[1]["stream"] as? String == "Successfully tagged probe:1\n")
+    }
+
     @Test("an unknown ID yields only the tagged event")
     func withoutImageID() {
         let events = BuildRoute.completionEvents(imageID: nil, tag: "probe:1")

@@ -126,6 +126,13 @@ struct LibpodSchemaTests {
         #expect(state["FinishedAt"] as? String == "0001-01-01T00:00:00Z")
     }
 
+    @Test("image inspect has bare ids and top-level Labels copied from Config")
+    func imageInspect() {
+        let inspected = object(LibpodSchema.imageInspect(["Id": "sha256:abc", "Labels": NSNull(), "Config": ["Labels": ["a": "b"]]]))
+        #expect(inspected["Id"] as? String == "abc")
+        #expect(inspected["Labels"] as? [String: String] == ["a": "b"])
+    }
+
     @Test("image lists use bare ids and Names")
     func imageList() {
         let list = array(LibpodSchema.imageList([["Id": "sha256:abc", "ParentId": "", "RepoTags": ["a:1"]]]))

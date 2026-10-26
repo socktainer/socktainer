@@ -309,11 +309,15 @@ extension BuildRoute {
     /// docker-py's `images.build()` takes the image ID from `Successfully built <id>`
     /// (or a `sha256:<id>` stream) and the Docker CLI from `aux.ID`; without a hex ID
     /// docker-py raises `BuildError` even though the build succeeded (#414).
-    static func completionEvents(imageID: String?, tag: String?) -> [[String: Any]] {
+    ///
+    /// `includeAux: false` drops the `aux` event: podman's build client only accepts `stream` and
+    /// `error` lines and fails the whole build with "unexpected input" on anything else.
+    static func completionEvents(imageID: String?, tag: String?, includeAux: Bool = true) -> [[String: Any]] {
         let tagged: [[String: Any]] = tag.map { [["stream": "Successfully tagged \($0)\n"]] } ?? []
         guard let imageID else { return tagged }
         let shortID = String(imageID.dropFirst("sha256:".count).prefix(12))
-        return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"]] + tagged
+        let aux: [[String: Any]] = includeAux ? [["aux": ["ID": imageID]]] : []
+        return aux + [["stream": "Successfully built \(shortID)\n"]] + tagged
     }
 
     static func errorMessage(for error: Error) -> String {
@@ -326,9 +330,10 @@ extension BuildRoute {
         return "\(error)"
     }
 
-    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig, manifestClient: ClientManifestServiceProtocol)
-        -> @Sendable (Request) async throws -> Response
-    {
+    static func handler(
+        client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig, manifestClient: ClientManifestServiceProtocol,
+        includeAux: Bool = true
+    ) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
 
@@ -429,6 +434,7 @@ extension BuildRoute {
                             systemConfig: systemConfig,
                             manifestClient: manifestClient,
                             manifestName: manifestName,
+                            includeAux: includeAux,
                             writer: writer,
                             logger: req.logger
                         )
@@ -500,6 +506,7 @@ extension BuildRoute {
         systemConfig: ContainerSystemConfig,
         manifestClient: ClientManifestServiceProtocol,
         manifestName: String?,
+        includeAux: Bool,
         writer: BodyStreamWriter,
         logger: Logger
     ) async throws {
@@ -707,7 +714,7 @@ extension BuildRoute {
         if imageID == nil {
             logger.warning("BuildRoute: could not determine the image ID of \(imageName ?? "untagged build")")
         }
-        for event in completionEvents(imageID: imageID, tag: imageName) {
+        for event in completionEvents(imageID: imageID, tag: imageName, includeAux: includeAux) {
             sendEvent(event)
         }
 

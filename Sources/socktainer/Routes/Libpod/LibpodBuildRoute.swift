@@ -9,6 +9,8 @@ struct LibpodBuildRoute: RouteCollection {
 
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
-            .POST, pattern: "/libpod/build", use: BuildRoute.handler(client: client, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
+            .POST, pattern: "/libpod/build",
+            use: BuildRoute.handler(
+                client: client, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient, includeAux: false))
     }
 }

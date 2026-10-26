@@ -87,11 +87,15 @@ enum LibpodSchema {
         return inspect
     }
 
-    /// podman's image inspect carries bare hex ids, where Docker's keep the `sha256:` prefix.
+    /// podman's image inspect carries bare hex ids (Docker's keep the `sha256:` prefix) and a top-level `Labels`.
     static func imageInspect(_ docker: Any?) -> Any {
         guard var inspect = docker as? [String: Any] else { return docker ?? [String: Any]() }
         for key in ["Id", "Parent"] {
             if let value = inspect[key] as? String { inspect[key] = value.replacingOccurrences(of: "sha256:", with: "") }
+        }
+        // podman's `ImageData` carries the labels at the top level as well as under `Config`.
+        if inspect["Labels"] is NSNull || inspect["Labels"] == nil {
+            inspect["Labels"] = (inspect["Config"] as? [String: Any])?["Labels"] ?? [String: Any]()
         }
         return inspect
     }
