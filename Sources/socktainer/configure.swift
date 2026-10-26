@@ -35,6 +35,15 @@ func configure(_ app: Application) async throws {
         systemConfig = ContainerSystemConfig()
     }
 
+    // Refuse to start in `apple-dns` mode: the configured DNS domain must be one
+    // apple/container has registered in /etc/resolver.
+    if app.dnsMode == .appleDNS {
+        try app.dnsMode.validateStartup(
+            domain: systemConfig.dns.domain,
+            registeredDomains: HostDNSResolver().listDomains().map { $0.pqdn }
+        )
+    }
+
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
