@@ -18,18 +18,28 @@ report arrays, `wait` a bare integer, lists drop Docker's envelopes, create take
 translates the request and response in `Routes/Libpod/LibpodAdapter.swift` / `LibpodSchema.swift`.
 Routes that only wrap a Docker-compat route which is itself unimplemented say so in their row.
 
-Known limits found while testing against the real client:
+Verified on macOS 26.6.2 with Apple Container 1.6.0 (matching this build) and `podman` 6.1.4:
+about 230 `podman` commands across handshake, images, volumes, networks, containers (lifecycle,
+exec, logs, stats, cp, filters, formats, error mapping, ~40 `run` flags), `build` (single and
+multi-platform, Rosetta and QEMU builders), push to a local registry, and manifest lists.
 
-- An *attached* `podman run` (no `-d`) printed the container's output but did not return in my
-  environment: the attach connection is not closed after the container exits. The attach code is
-  shared, unmodified, with Docker-compat (which also leaves the connection open and relies on the
-  client ignoring it), and my daemon was Apple Container 1.5.0 under a socktainer built for 1.6.0,
-  so this is **not verified either way** — re-check with matching versions. `podman run -d`,
-  `start`, `exec`, `logs`, `wait` and `stop` all work.
-- `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on
-  macOS (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
-- `podman save` hit "ContentStore missing blob data", an Apple Container image-store limitation
-  that Docker-compat `docker save` shares.
+Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it):
+
+- **Attach never closes the connection.** For a stopped container with output-only attach (what
+  `podman run` without `-i` uses) the route answers `101` with a body stream and leaves the TCP
+  connection open after the container exits. The Docker CLI tolerates that; `podman run` (attached)
+  and `podman start -a` wait for EOF and do not return. `podman run -d`, `start`, `exec`, `logs`,
+  `wait` and `stop` all work. Fixing it means closing the upgraded channel in
+  `ContainerAttachRoute.attachStoppedOutputOnly`.
+- `podman events --since/--until`: Docker-compat's events route ignores both, so `--until` never ends.
+- `podman build -q` hangs (the Docker-compat `?q=1` build hangs the same way).
+- A never-started container reports `exited` (not `created`), so `ps --filter status=created` is empty.
+- `network rm` of a missing network answers 500 instead of 404.
+- `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
+  has no implementation either); `rename` only works before the first start.
+- `podman save` fails with "ContentStore missing blob data", an Apple Container image-store limitation.
+- `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
+  (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
 
 Currently registered in this repo: `Sources/socktainer/configure.swift`
 ("Podman libpod routes" section) + `Sources/socktainer/Routes/Libpod/*.swift`.
