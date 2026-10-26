@@ -239,7 +239,13 @@ extension BuildRoute {
     /// docker-py's `images.build()` takes the image ID from `Successfully built <id>`
     /// (or a `sha256:<id>` stream) and the Docker CLI from `aux.ID`; without a hex ID
     /// docker-py raises `BuildError` even though the build succeeded (#414).
-    static func completionEvents(imageID: String?, tag: String?) -> [[String: Any]] {
+    ///
+    /// A quiet build (`q`) closes with nothing but the full image ID, as moby does: the
+    /// Docker CLI prints the stream as it comes, so `docker build -q` outputs just the ID.
+    static func completionEvents(imageID: String?, tag: String?, quiet: Bool = false) -> [[String: Any]] {
+        if quiet {
+            return imageID.map { [["stream": "\($0)\n"]] } ?? []
+        }
         let tagged: [[String: Any]] = tag.map { [["stream": "Successfully tagged \($0)\n"]] } ?? []
         guard let imageID else { return tagged }
         let shortID = String(imageID.dropFirst("sha256:".count).prefix(12))
@@ -322,6 +328,7 @@ extension BuildRoute {
             let dockerfile = query.dockerfile!
             // nil for an untagged build, which performBuild stores as dangling.
             let targetImageName = query.t
+            let quiet = query.q!
             let noCache = query.nocache!
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
@@ -364,6 +371,7 @@ extension BuildRoute {
                             target: target,
                             platform: platform,
                             memory: memory,
+                            quiet: quiet,
                             builderClient: builderClient,
                             systemConfig: systemConfig,
                             writer: writer,
@@ -432,6 +440,7 @@ extension BuildRoute {
         target: String,
         platform: String,
         memory: Int,
+        quiet: Bool,
         builderClient: ClientBuilderProtocol,
         systemConfig: ContainerSystemConfig,
         writer: BodyStreamWriter,
@@ -440,6 +449,8 @@ extension BuildRoute {
 
         // Helper function to send Docker API compliant streaming messages
         @Sendable func sendStreamMessage(_ message: String) {
+            // A quiet build sends no progress, only the image ID at the end.
+            guard !quiet else { return }
             // Preserve the original message with its formatting
             sendEvent(["stream": message + "\n"])
         }
@@ -600,7 +611,7 @@ extension BuildRoute {
         if imageID == nil {
             logger.warning("BuildRoute: could not determine the image ID of \(imageName ?? "untagged build")")
         }
-        for event in completionEvents(imageID: imageID, tag: imageName) {
+        for event in completionEvents(imageID: imageID, tag: imageName, quiet: quiet) {
             sendEvent(event)
         }
 
