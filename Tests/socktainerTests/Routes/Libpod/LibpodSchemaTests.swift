@@ -57,6 +57,16 @@ struct LibpodSchemaTests {
         #expect(array(LibpodSchema.containerPruneReports(["ContainersDeleted": [String]()])).isEmpty)
     }
 
+    @Test("podman's volume prune asks for every unused volume, Docker's only anonymous ones")
+    func volumePruneFilters() throws {
+        func filters(_ input: String?) throws -> [String: [String]] {
+            try #require(try JSONSerialization.jsonObject(with: Data(LibpodSchema.volumePruneFilters(input).utf8)) as? [String: [String]])
+        }
+        #expect(try filters(nil)["all"] == ["true"])
+        #expect(try filters(#"{"label":["e2e=1"]}"#) == ["label": ["e2e=1"], "all": ["true"]])
+        #expect(try filters(#"{"all":["false"]}"#)["all"] == ["false"])  // an explicit choice is kept
+    }
+
     @Test("a volume list is a bare array of volumes")
     func volumeList() {
         let list = array(LibpodSchema.volumeList(["Volumes": [["Name": "v1", "Driver": "local", "CreatedAt": "2026-01-01T00:00:00Z"]], "Warnings": [String]()]))
@@ -244,10 +254,25 @@ struct LibpodCreateBodyTests {
         #expect(ulimit?["Name"] as? String == "nofile")
     }
 
+    @Test("a tmpfs mount carries no source (podman sends one, Docker's create rejects it)")
+    func tmpfsMount() {
+        let mounts = LibpodSchema.dockerMounts(fromSpec: ["mounts": [["destination": "/scratch", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid"]]]])
+        #expect(mounts.count == 1)
+        #expect(mounts.first?["Type"] as? String == "tmpfs")
+        #expect(mounts.first?["Target"] as? String == "/scratch")
+        #expect(mounts.first?["Source"] == nil)
+    }
+
     @Test("a port range expands to one binding per port")
     func portRange() {
         let bindings = LibpodSchema.dockerPortBindings(fromSpec: ["portmappings": [["container_port": 80, "host_port": 9000, "range": 3, "protocol": "tcp"]]])
         #expect(Set(bindings.keys) == ["80/tcp", "81/tcp", "82/tcp"])
+    }
+
+    @Test("an empty protocol (a plain `podman run -p 8080:80`) means tcp")
+    func emptyPortProtocol() {
+        let bindings = LibpodSchema.dockerPortBindings(fromSpec: ["portmappings": [["container_port": 80, "host_port": 8080, "range": 1, "protocol": "", "host_ip": ""]]])
+        #expect(Set(bindings.keys) == ["80/tcp"])
     }
 
     @Test("a named network wins over the namespace mode")

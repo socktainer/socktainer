@@ -28,7 +28,7 @@ enum LibpodAdapter {
             }
         }
         guard let buffer = collected, buffer.readableBytes > 0 else {
-            req.logger.error("LibpodAdapter: empty body (status \(response.status.code))")
+            req.logger.debug("LibpodAdapter: empty body (status \(response.status.code))")
             return nil
         }
         do {

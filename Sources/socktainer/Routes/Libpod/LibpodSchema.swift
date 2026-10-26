@@ -199,7 +199,8 @@ enum LibpodSchema {
             guard let target = mount["destination"] as? String else { continue }
             let options = mount["options"] as? [String] ?? []
             var entry: [String: Any] = ["Type": mount["type"] as? String ?? "bind", "Target": target]
-            if let source = mount["source"] as? String { entry["Source"] = source }
+            // podman sends `source: "tmpfs"` for a tmpfs mount; Docker's create rejects any source there.
+            if entry["Type"] as? String != "tmpfs", let source = mount["source"] as? String { entry["Source"] = source }
             if options.contains("ro") || options.contains("readonly") { entry["ReadOnly"] = true }
             result.append(entry)
         }
@@ -221,7 +222,9 @@ enum LibpodSchema {
             let host = (mapping["host_port"] as? NSNumber)?.intValue ?? 0
             let count = max((mapping["range"] as? NSNumber)?.intValue ?? 1, 1)
             for offset in 0..<count {
-                let proto = mapping["protocol"] as? String ?? "tcp"
+                // podman sends an empty protocol for a plain `-p host:container` (meaning tcp).
+                let requested = mapping["protocol"] as? String ?? ""
+                let proto = requested.isEmpty ? "tcp" : requested
                 for protocolName in proto.split(separator: ",") {
                     let key = "\(container + offset)/\(protocolName)"
                     result[key, default: []].append(["HostIp": mapping["host_ip"] as? String ?? "", "HostPort": host == 0 ? "" : String(host + offset)])
@@ -311,6 +314,21 @@ enum LibpodSchema {
     }
 
     // MARK: Prune
+
+    /// `podman volume prune` removes every unused volume; Docker-compat's prune only removes
+    /// anonymous ones unless its `all` filter is true. Returns podman's `filters` JSON with
+    /// `all=true` added when the caller did not say otherwise.
+    static func volumePruneFilters(_ filters: String?) -> String {
+        var parsed: [String: [String]] = [:]
+        if let filters, let data = filters.data(using: .utf8),
+            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String]]
+        {
+            parsed = decoded
+        }
+        if parsed["all"] == nil { parsed["all"] = ["true"] }
+        let data = (try? JSONSerialization.data(withJSONObject: parsed)) ?? Data("{\"all\":[\"true\"]}".utf8)
+        return String(data: data, encoding: .utf8) ?? "{\"all\":[\"true\"]}"
+    }
 
     /// `[]PruneReport` (`Id`, optional `Err`, `Size`). The reclaimed total is attributed to the
     /// first report since Docker's response carries no per-item size.
