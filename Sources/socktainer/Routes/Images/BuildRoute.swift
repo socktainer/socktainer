@@ -146,12 +146,15 @@ extension BuildRoute {
     ///
     /// The Docker Engine API sends these as a JSON-encoded `{"KEY":"VALUE"}` map.
     /// Returns `["KEY=VALUE", ...]` strings suitable for passing to BuildKit.
+    /// Docker sends `buildargs`/`labels` as a JSON object; podman sends its `labels` as a JSON array
+    /// of `key=value` strings.
     static func parseBuildQueryParam(_ value: String?) -> [String] {
-        guard let value,
-            let data = value.data(using: .utf8),
-            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else { return [] }
-        return dict.map { "\($0.key)=\($0.value)" }
+        guard let value, let data = value.data(using: .utf8) else { return [] }
+        let json = try? JSONSerialization.jsonObject(with: data)
+        if let dict = json as? [String: String] {
+            return dict.map { "\($0.key)=\($0.value)" }
+        }
+        return json as? [String] ?? []
     }
 
     /// Appends a zero-filled end-of-archive terminator to a received build

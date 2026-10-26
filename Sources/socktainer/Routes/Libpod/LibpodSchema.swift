@@ -196,6 +196,15 @@ enum LibpodSchema {
         return body
     }
 
+    /// `os/arch[/variant]` from the spec's `image_os`/`image_arch`/`image_variant`, if a platform was requested.
+    static func platform(fromSpec spec: [String: Any]) -> String? {
+        let arch = spec["image_arch"] as? String ?? ""
+        guard !arch.isEmpty else { return nil }
+        let os = (spec["image_os"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "linux"
+        let variant = spec["image_variant"] as? String ?? ""
+        return variant.isEmpty ? "\(os)/\(arch)" : "\(os)/\(arch)/\(variant)"
+    }
+
     /// `mounts` (OCI mounts) and `volumes` (named volumes) → Docker `HostConfig.Mounts`.
     static func dockerMounts(fromSpec spec: [String: Any]) -> [[String: Any]] {
         var result: [[String: Any]] = []

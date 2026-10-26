@@ -24,4 +24,10 @@ struct ClientManifestServiceDigestTests {
             try ClientManifestService.normalizedDigest("sha512:\(hex)")
         }
     }
+
+    @Test("a docker:// transport prefix on a push destination is dropped")
+    func dockerTransportPrefix() {
+        #expect(ClientManifestService.registryReference(fromDestination: "docker://localhost:5000/e2e/ml:1") == "localhost:5000/e2e/ml:1")
+        #expect(ClientManifestService.registryReference(fromDestination: "localhost:5000/e2e/ml:1") == "localhost:5000/e2e/ml:1")
+    }
 }

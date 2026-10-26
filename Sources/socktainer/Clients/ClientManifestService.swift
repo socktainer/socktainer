@@ -301,7 +301,14 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// stray tag leaks into image listings and outlives the single push it existed for.
     /// `performCleanup` stays `false` throughout since the underlying index blob is still
     /// referenced by `name`'s own tag.
-    func retagForPush(name: String, destination: String) async throws -> (reference: String, priorState: RetagState?) {
+    /// podman accepts a transport-qualified destination (`podman push img docker://host/repo:tag`) and
+    /// sends it as typed; only the `docker://` transport maps onto a registry reference here.
+    static func registryReference(fromDestination destination: String) -> String {
+        destination.hasPrefix("docker://") ? String(destination.dropFirst("docker://".count)) : destination
+    }
+
+    func retagForPush(name: String, destination rawDestination: String) async throws -> (reference: String, priorState: RetagState?) {
+        let destination = Self.registryReference(fromDestination: rawDestination)
         // Resolve to the reference as ACTUALLY stored: `ImageStore.tag`'s own lookup
         // (`ReferenceManager.get`) is an exact string match against the stored reference,
         // with none of `ClientImage.get`'s `_search` raw/normalized fallback — reconstructing

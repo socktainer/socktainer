@@ -21,6 +21,10 @@ struct LibpodContainerCreateRoute: RouteCollection {
             if let name = spec["name"] as? String, !name.isEmpty {
                 LibpodAdapter.setQuery(req, "name", to: name)
             }
+            // `--platform` travels in the spec; Docker-compat create takes it as a query parameter.
+            if let platform = LibpodSchema.platform(fromSpec: spec) {
+                LibpodAdapter.setQuery(req, "platform", to: platform)
+            }
             return try LibpodAdapter.replacingBody(of: req, with: LibpodSchema.dockerContainerCreateBody(fromSpec: spec))
         }
     }

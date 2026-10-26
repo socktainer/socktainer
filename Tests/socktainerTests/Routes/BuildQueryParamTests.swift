@@ -18,6 +18,13 @@ struct BuildQueryParamTests {
 
     // MARK: - buildargs
 
+    @Test("podman's JSON array of key=value strings is accepted too")
+    func podmanLabelArray() {
+        #expect(BuildRoute.parseBuildQueryParam(#"["a=1","b=2"]"#) == ["a=1", "b=2"])
+        #expect(BuildRoute.parseBuildQueryParam("[]").isEmpty)
+        #expect(BuildRoute.parseBuildQueryParam("not json").isEmpty)
+    }
+
     @Test("Single build arg is parsed correctly")
     func singleBuildArg() {
         let result = BuildRoute.parseBuildQueryParam(#"{"FOO":"bar"}"#)

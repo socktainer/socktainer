@@ -282,6 +282,14 @@ struct LibpodCreateBodyTests {
         #expect(Set(bindings.keys) == ["80/tcp"])
     }
 
+    @Test("--platform in the spec becomes os/arch[/variant]")
+    func platformFromSpec() {
+        #expect(LibpodSchema.platform(fromSpec: ["image_os": "linux", "image_arch": "amd64"]) == "linux/amd64")
+        #expect(LibpodSchema.platform(fromSpec: ["image_arch": "arm64", "image_variant": "v8"]) == "linux/arm64/v8")
+        #expect(LibpodSchema.platform(fromSpec: ["image_os": "linux"]) == nil)
+        #expect(LibpodSchema.platform(fromSpec: [:]) == nil)
+    }
+
     @Test("a named network wins over the namespace mode")
     func networkMode() {
         #expect(LibpodSchema.dockerNetworkMode(fromSpec: ["Networks": ["mynet": [String: Any]()], "netns": ["nsmode": "bridge"]]) == "mynet")
