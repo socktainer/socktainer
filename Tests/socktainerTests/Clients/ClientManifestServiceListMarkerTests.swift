@@ -1,3 +1,4 @@
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import Testing
@@ -32,5 +33,20 @@ struct ClientManifestServiceListMarkerTests {
         #expect(!ClientManifestService.isManifestList(Index(manifests: [member])))
         #expect(!ClientManifestService.isManifestList(Index(manifests: [member], annotations: ["org.opencontainers.image.ref.name": "latest"])))
         #expect(!ClientManifestService.isManifestList(Index(manifests: [member], annotations: [ClientManifestService.manifestListAnnotation: "false"])))
+    }
+
+    @Test("write paths get a manifest list's members")
+    func manifestListMembersOfList() throws {
+        let index = ClientManifestService.manifestListIndex(manifests: [member])
+        #expect(try ClientManifestService.manifestListMembers(of: index, name: "mylist").map(\.digest) == [member.digest])
+    }
+
+    @Test("write paths refuse an ordinary image instead of turning it into a manifest list")
+    func manifestListMembersRejectsOrdinaryImage() {
+        let error = #expect(throws: ContainerizationError.self) {
+            try ClientManifestService.manifestListMembers(of: Index(manifests: [member]), name: "alpine:latest")
+        }
+        #expect(error?.code == .invalidArgument)
+        #expect(error?.message.contains("not a manifest list") == true)
     }
 }

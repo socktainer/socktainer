@@ -99,6 +99,16 @@ struct ClientManifestService: ClientManifestServiceProtocol {
         index.annotations?[manifestListAnnotation] == "true"
     }
 
+    /// The members of `index` when it is a manifest list. Every write path (`add`, `remove`,
+    /// `build --manifest`) goes through this, so an ordinary image tagged `name` is never turned
+    /// into a list; real podman refuses those with "not a manifest list" too.
+    static func manifestListMembers(of index: Index, name: String) throws -> [Descriptor] {
+        guard isManifestList(index) else {
+            throw ContainerizationError(.invalidArgument, message: "\(name) exists but is not a manifest list")
+        }
+        return index.manifests
+    }
+
     func exists(name: String) async throws -> Bool {
         let image: ClientImage
         do {
@@ -224,7 +234,7 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// `podman manifest remove <name> <digest>` / the "remove" operation of `PUT /libpod/manifests/{name}`.
     @discardableResult
     func removeDigest(name: String, digest: String) async throws -> String {
-        var manifests = try await inspect(name: name).manifests
+        var manifests = try Self.manifestListMembers(of: try await inspect(name: name), name: name)
         let normalizedDigest = try Self.normalizedDigest(digest)
         let countBefore = manifests.count
         manifests.removeAll { $0.digest == normalizedDigest }
@@ -241,7 +251,7 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// (or race against) a partially-modified list.
     @discardableResult
     func removeDigests(name: String, digests: [String]) async throws -> String {
-        var manifests = try await inspect(name: name).manifests
+        var manifests = try Self.manifestListMembers(of: try await inspect(name: name), name: name)
         let currentDigests = Set(manifests.map(\.digest))
         let digestSet = Set(try digests.map(Self.normalizedDigest))
         guard digestSet.isSubset(of: currentDigests) else {
@@ -271,11 +281,13 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// silently treating those the same as "doesn't exist yet" would let a transient read failure
     /// clobber a real, valid manifest list with a fresh, near-empty one.
     private func existingManifestsOrEmpty(name: String) async throws -> [Descriptor] {
+        let index: Index
         do {
-            return try await inspect(name: name).manifests
+            index = try await inspect(name: name)
         } catch ClientManifestError.notFound {
             return []
         }
+        return try Self.manifestListMembers(of: index, name: name)
     }
 
     /// `podman manifest rm <name>` — deletes the whole tag, not a single member.
@@ -342,7 +354,7 @@ struct ClientManifestService: ClientManifestServiceProtocol {
 
         // Held until `untagPushDestination` restores the destination: overlapping cycles on one
         // destination would otherwise capture each other's temporary tag as its "prior" state.
-        let gateToken = await PushDestinationGate.shared.acquire(normalizedDestination)
+        let gateToken = try await PushDestinationGate.shared.acquire(normalizedDestination)
         do {
             let priorDescriptor: Descriptor?
             do {
