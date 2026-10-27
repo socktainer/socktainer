@@ -226,6 +226,14 @@ struct ArchiveUtility {
                 // or copied elsewhere — baking in the transient extraction destination's own
                 // absolute path would leave the link dangling the moment that happens.
                 let isAbsoluteTarget = target.hasPrefix("/")
+                // A relative target is written to disk verbatim, so the kernel resolves its `..`
+                // physically: `a/b/s/..` climbs out of wherever the symlink `a/b/s` points, while
+                // the lexical checks below collapse it to the harmless `a/b`. Leading `..`s are
+                // fine (the checks see them); a `..` after a real component is not.
+                guard isAbsoluteTarget || !Self.hasInteriorParentReference(target) else {
+                    rejectedPaths.append(rawPath)
+                    continue
+                }
                 let resolvedTarget =
                     isAbsoluteTarget
                     ? destination.appendingPathComponent(String(target.dropFirst())).standardizedFileURL
@@ -322,6 +330,19 @@ struct ArchiveUtility {
     /// checking while still being WRITTEN to disk as a portable, relative link — one that
     /// keeps resolving correctly if the extracted tree is later moved or copied elsewhere,
     /// unlike baking in the transient extraction destination's own absolute path.
+    /// Whether a relative symlink target has a `..` component after a normal one (`a/../b`).
+    static func hasInteriorParentReference(_ target: String) -> Bool {
+        var sawNormal = false
+        for component in target.split(separator: "/", omittingEmptySubsequences: true) where component != "." {
+            if component == ".." {
+                if sawNormal { return true }
+            } else {
+                sawNormal = true
+            }
+        }
+        return false
+    }
+
     private static func relativePath(from sourceDir: URL, to target: URL) -> String {
         let sourceComponents = sourceDir.standardizedFileURL.pathComponents
         let targetComponents = target.standardizedFileURL.pathComponents

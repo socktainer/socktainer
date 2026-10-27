@@ -314,6 +314,46 @@ struct ArchiveExtractionSafetyTests {
         // sentinel entry that was extracted before the malicious root entry was rejected.
         #expect(FileManager.default.fileExists(atPath: dest.appendingPathComponent("sentinel.txt").path))
     }
+
+    @Test("A relative symlink target with `..` after a symlinked component is rejected")
+    func relativeSymlinkTargetThroughEarlierSymlinkIsRejected() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // `a/b/s -> ../..` resolves to the destination itself and is accepted. `y -> a/b/s/..`
+        // collapses lexically to the harmless `a/b`, but the kernel resolves the `..` through
+        // `a/b/s`, i.e. to the destination's parent.
+        let tar = tmp.appendingPathComponent("malicious.tar")
+        try writeRawTar(
+            at: tar,
+            entries: [
+                RawTarEntry(path: "a", fileType: .directory),
+                RawTarEntry(path: "a/b", fileType: .directory),
+                RawTarEntry(path: "a/b/s", fileType: .symbolicLink, symlinkTarget: "../.."),
+                RawTarEntry(path: "y", fileType: .symbolicLink, symlinkTarget: "a/b/s/.."),
+            ])
+
+        let dest = tmp.appendingPathComponent("out")
+        do {
+            try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the symlink escaping through a/b/s")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths == ["y"])
+        }
+        var info = stat()
+        #expect(lstat(dest.appendingPathComponent("y").path, &info) != 0)
+    }
+
+    @Test("Only a `..` after a normal component counts as an interior parent reference")
+    func interiorParentReference() {
+        #expect(ArchiveUtility.hasInteriorParentReference("a/b/s/.."))
+        #expect(ArchiveUtility.hasInteriorParentReference("../a/../b"))
+        #expect(ArchiveUtility.hasInteriorParentReference("./a/./../b"))
+        #expect(!ArchiveUtility.hasInteriorParentReference("../../lib/x"))
+        #expect(!ArchiveUtility.hasInteriorParentReference("./../x"))
+        #expect(!ArchiveUtility.hasInteriorParentReference("x"))
+    }
 }
 
 private struct RawTarEntry {
