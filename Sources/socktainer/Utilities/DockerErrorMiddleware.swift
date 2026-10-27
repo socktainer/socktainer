@@ -22,7 +22,7 @@ struct DockerErrorMiddleware: AsyncMiddleware {
             // A downstream error middleware may already have rendered the error as a
             // Response. Ensure error-status JSON bodies carry a `message` field.
             if response.status.code >= 400 {
-                return Self.ensureMessageField(in: response)
+                return Self.ensureMessageField(in: response, libpod: Self.isLibpod(request))
             }
             return response
         } catch is CancellationError {
@@ -42,6 +42,9 @@ struct DockerErrorMiddleware: AsyncMiddleware {
                 reason = String(describing: error)
             }
             request.logger.debug("DockerErrorMiddleware: rendering \(status.code) as Docker error: \(reason)")
+            if Self.isLibpod(request) {
+                return Self.makeDockerError(status: status, message: Self.libpodMessage(reason), libpod: true)
+            }
             return Self.makeDockerError(status: status, message: reason)
         }
     }
@@ -49,7 +52,7 @@ struct DockerErrorMiddleware: AsyncMiddleware {
     /// Rewrites an already-rendered error response so its JSON body includes a
     /// `message` field. Non-JSON bodies are wrapped so clients always get
     /// `{"message": ...}`.
-    static func ensureMessageField(in response: Response) -> Response {
+    static func ensureMessageField(in response: Response, libpod: Bool = false) -> Response {
         guard let bodyData = response.body.data, !bodyData.isEmpty else {
             // An error status with no body still lacks `message` — the exact shape that
             // breaks docker-py. Synthesise a Docker error so `message` is always present.
@@ -61,12 +64,17 @@ struct DockerErrorMiddleware: AsyncMiddleware {
             let text = response.body.string ?? "error"
             return makeDockerError(status: response.status, message: text, headers: response.headers)
         }
-        if json["message"] != nil {
+        if json["message"] != nil, !libpod {
             return response  // already Docker-compatible
         }
-        let message = (json["reason"] as? String) ?? "error"
+        let rawMessage = (json["message"] as? String) ?? (json["reason"] as? String) ?? "error"
+        let message = libpod ? libpodMessage(rawMessage) : rawMessage
         var merged = json
         merged["message"] = message
+        if libpod {
+            merged["cause"] = merged["cause"] ?? message
+            merged["response"] = merged["response"] ?? Int(response.status.code)
+        }
         let newResponse = Response(status: response.status)
         newResponse.headers = response.headers
         if let data = try? JSONSerialization.data(withJSONObject: merged) {
@@ -76,15 +84,33 @@ struct DockerErrorMiddleware: AsyncMiddleware {
         return newResponse
     }
 
+    static func isLibpod(_ request: Request) -> Bool {
+        request.url.path.contains("/libpod/")
+    }
+
+    /// podman recognizes errors it must tolerate by their own lower-case texts inside the message
+    /// (`no such container` for the cleanup of a `--rm` container the server already reaped), so
+    /// libpod routes say `no such container: id` where Docker-compat says `No such container: id`.
+    static func libpodMessage(_ message: String) -> String {
+        message.hasPrefix("No such ") ? "n" + message.dropFirst() : message
+    }
+
+    /// `libpod: true` renders podman's `ErrorModel` (`cause`, `message`, `response`) next to the
+    /// Docker fields; podman's client parses those.
     static func makeDockerError(
         status: HTTPResponseStatus,
         message: String,
-        headers: HTTPHeaders = HTTPHeaders()
+        headers: HTTPHeaders = HTTPHeaders(),
+        libpod: Bool = false
     ) -> Response {
         let response = Response(status: status)
         response.headers = headers
         response.headers.replaceOrAdd(name: .contentType, value: "application/json")
-        let payload: [String: Any] = ["message": message, "error": true, "reason": message]
+        var payload: [String: Any] = ["message": message, "error": true, "reason": message]
+        if libpod {
+            payload["cause"] = message
+            payload["response"] = Int(status.code)
+        }
         if let data = try? JSONSerialization.data(withJSONObject: payload) {
             response.body = .init(data: data)
         } else {
