@@ -73,6 +73,32 @@ struct LibpodManifestCreateRouteTests {
         #expect(await receivedImages.get() == ["alpine:latest", "busybox:latest"])
     }
 
+    /// Over a real socket a `RegexRouter` route gets a streamed body whenever it doesn't arrive
+    /// in the same read as the request head, and then `req.body.data` is nil (issue #415). The
+    /// in-memory tester above always delivers a collected body, so this uses a live server and
+    /// pads the JSON with whitespace to span several reads.
+    @Test("images via a JSON request body over a real socket are forwarded to create")
+    func imagesRequestBodyOverSocket() async throws {
+        let receivedImages = Box<[String]?>(nil)
+        let client = MockManifestClient(createHandler: { _, images, _ in
+            await receivedImages.set(images)
+            return "sha256:bbbb"
+        })
+
+        try await withManifestApp(client: client) { app in
+            let padding = String(repeating: " ", count: 256 * 1024)
+            let body = ByteBuffer(string: #"{"images":["alpine:latest","busybox:latest"]"# + padding + "}")
+            try await app.testing(method: .running(hostname: "127.0.0.1", port: 0)).test(
+                .POST, "/v1.51/libpod/manifests/mylist",
+                headers: ["Content-Type": "application/json", "Content-Length": "\(body.readableBytes)"],
+                body: body
+            ) { res async throws in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(await receivedImages.get() == ["alpine:latest", "busybox:latest"])
+    }
+
     @Test("a source image ClientImage.get can't find surfaces as 400, not a raw error")
     func notFoundSourceImageIs400() async throws {
         let client = MockManifestClient(createHandler: { _, _, _ in

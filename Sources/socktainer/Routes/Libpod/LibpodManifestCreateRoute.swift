@@ -49,23 +49,17 @@ struct LibpodManifestCreateRoute: RouteCollection {
 
             // Real podman's client (matching `LibpodManifestModifyRoute`'s own documented
             // behavior for the same family of endpoints) can send a JSON body WITHOUT a
-            // `Content-Type` header — `req.content.decode` unconditionally fails against
-            // that ("Can't decode data without a content type"), regardless of whether the
-            // body itself is well-formed. Decode the raw bytes directly with `JSONDecoder`
-            // in that case instead of skipping the body entirely — a manifest create with
-            // no query images and all its data in a Content-Type-less body must still see
-            // that data, not silently proceed as if no images were requested. A
-            // malformed/undecodable body still shouldn't fail a request that already has
+            // `Content-Type` header, so the raw bytes are decoded with `JSONDecoder` whatever
+            // the header says — a manifest create with no query images and all its data in a
+            // Content-Type-less body must still see that data. The body is collected rather
+            // than read from `req.body.data`: routes registered through `RegexRouter` receive
+            // a streamed body over a real socket, where `req.body.data` is nil (issue #415).
+            // A malformed/undecodable body still shouldn't fail a request that already has
             // everything it needs via the `image`/`images` query params.
-            let bodyBytes = req.body.data
+            let bodyBytes = try await req.body.collect(max: 1 << 20).get()
             if let bodyBytes, bodyBytes.readableBytes > 0 {
                 do {
-                    let body: RESTManifestCreateRequest
-                    if req.headers.contentType != nil {
-                        body = try req.content.decode(RESTManifestCreateRequest.self)
-                    } else {
-                        body = try JSONDecoder().decode(RESTManifestCreateRequest.self, from: Data(buffer: bodyBytes))
-                    }
+                    let body = try JSONDecoder().decode(RESTManifestCreateRequest.self, from: Data(buffer: bodyBytes))
                     images.append(contentsOf: body.images ?? [])
                 } catch {
                     guard !images.isEmpty else {
