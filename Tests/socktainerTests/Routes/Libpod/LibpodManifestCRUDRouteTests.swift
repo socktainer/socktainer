@@ -239,6 +239,29 @@ struct LibpodManifestDeleteRouteTests {
         }
         #expect(await !deleteCalled.get())
     }
+
+    @Test("an empty manifest list name is a 400 and never reaches exists/delete")
+    func emptyNameIs400() async throws {
+        let existsCalled = Box(false)
+        let client = MockManifestClient(existsHandler: { _ in
+            await existsCalled.set(true)
+            return false
+        })
+
+        try await withManifestApp(client: client) { app in
+            // The regex router compiles every `{param}` to `(.+)`, so no URL reaches this
+            // handler with an empty name today; call the handler directly to pin the guard.
+            let req = Request(application: app, method: .DELETE, url: "/libpod/manifests/", on: app.eventLoopGroup.next())
+            req.parameters.set("name", to: "")
+            do {
+                _ = try await LibpodManifestDeleteRoute.handler(client: client)(req)
+                Issue.record("expected an empty name to be rejected")
+            } catch let error as Abort {
+                #expect(error.status == .badRequest)
+            }
+        }
+        #expect(await !existsCalled.get())
+    }
 }
 
 // MARK: - Helpers

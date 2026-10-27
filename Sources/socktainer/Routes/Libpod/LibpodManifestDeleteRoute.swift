@@ -24,7 +24,7 @@ struct LibpodManifestDeleteRoute: RouteCollection {
 
     static func handler(client: ClientManifestServiceProtocol) -> @Sendable (Request) async throws -> RESTManifestRemoveReport {
         { req in
-            guard let name = req.parameters.get("name") else {
+            guard let name = req.parameters.get("name"), !name.isEmpty else {
                 throw Abort(.badRequest, reason: "Missing manifest list name")
             }
             let query: RESTManifestDeleteQuery

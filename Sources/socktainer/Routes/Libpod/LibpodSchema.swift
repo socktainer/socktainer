@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Vapor
 
 /// Pure translations from Docker-compat JSON bodies to the shapes the real podman client decodes
 /// for `/libpod/*` endpoints (field names and types taken from podman's own
@@ -330,12 +331,17 @@ enum LibpodSchema {
 
     /// `podman volume prune` removes every unused volume; Docker-compat's prune only removes
     /// anonymous ones unless its `all` filter is true. Returns podman's `filters` JSON with
-    /// `all=true` added when the caller did not say otherwise.
-    static func volumePruneFilters(_ filters: String?) -> String {
-        var parsed: [String: [String]] = [:]
-        if let filters, let data = filters.data(using: .utf8),
-            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String]]
-        {
+    /// `all=true` added when the caller did not say otherwise. A non-empty `filters` that is not
+    /// a JSON object is rejected (as real podman does) rather than dropped: dropping it would
+    /// turn a filtered prune into "prune every unused volume".
+    static func volumePruneFilters(_ filters: String?) throws -> String {
+        var parsed: [String: Any] = [:]
+        if let filters, !filters.isEmpty {
+            guard let data = filters.data(using: .utf8),
+                let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                throw Abort(.badRequest, reason: "Invalid filters: \(filters)")
+            }
             parsed = decoded
         }
         if parsed["all"] == nil { parsed["all"] = ["true"] }

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Vapor
 
 @testable import socktainer
 
@@ -65,6 +66,20 @@ struct LibpodSchemaTests {
         #expect(try filters(nil)["all"] == ["true"])
         #expect(try filters(#"{"label":["e2e=1"]}"#) == ["label": ["e2e=1"], "all": ["true"]])
         #expect(try filters(#"{"all":["false"]}"#)["all"] == ["false"])  // an explicit choice is kept
+        #expect(try filters("")["all"] == ["true"])
+    }
+
+    @Test("malformed volume prune filters are rejected, not widened into 'prune every unused volume'")
+    func volumePruneFiltersRejectMalformed() throws {
+        for input in ["not json", #"["label=e2e"]"#, #"{"label":"#] {
+            #expect(throws: Abort.self) { try LibpodSchema.volumePruneFilters(input) }
+        }
+        // Docker's map form ({"label":{"e2e=1":true}}) is a valid object the Docker-compat
+        // prune understands; it is kept, not replaced by a bare all=true.
+        let mapForm = try LibpodSchema.volumePruneFilters(#"{"label":{"e2e=1":true}}"#)
+        let decoded = try #require(try JSONSerialization.jsonObject(with: Data(mapForm.utf8)) as? [String: Any])
+        #expect((decoded["label"] as? [String: Bool]) == ["e2e=1": true])
+        #expect((decoded["all"] as? [String]) == ["true"])
     }
 
     @Test("a volume list is a bare array of volumes")

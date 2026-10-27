@@ -7,7 +7,7 @@ struct LibpodVolumePruneRoute: RouteCollection {
         let handler = LibpodAdapter.reshaping(
             dockerRoute.handler,
             prepare: { req in
-                LibpodAdapter.setQuery(req, "filters", to: LibpodSchema.volumePruneFilters(req.query["filters"] as String?))
+                LibpodAdapter.setQuery(req, "filters", to: try LibpodSchema.volumePruneFilters(req.query["filters"] as String?))
                 return req
             }
         ) { body, _ in LibpodSchema.volumePruneReports(body) }
