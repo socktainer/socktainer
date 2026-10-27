@@ -255,26 +255,33 @@ else
 fi
 ```
 
-To undo — restores whatever was linked before (e.g. Podman Desktop's socket), or just removes the link if there was nothing to restore:
+To undo — restores whatever was linked before (e.g. Podman Desktop's socket), or just removes the link if there was nothing to restore. A path that no longer links to socktainer (another tool changed it since) is left alone, along with its backup:
 
 ```bash
 # Docker
-if [ -f "$HOME/.socktainer-docker-sock-backup" ]; then
-  sudo ln -sf "$(cat "$HOME/.socktainer-docker-sock-backup")" /var/run/docker.sock
-  rm -f "$HOME/.socktainer-docker-sock-backup"
+if [ -L /var/run/docker.sock ] && [ "$(readlink /var/run/docker.sock)" = "$HOME/.socktainer/container.sock" ]; then
+  if [ -f "$HOME/.socktainer-docker-sock-backup" ]; then
+    sudo ln -sf "$(cat "$HOME/.socktainer-docker-sock-backup")" /var/run/docker.sock
+    rm -f "$HOME/.socktainer-docker-sock-backup"
+  else
+    sudo rm -f /var/run/docker.sock
+  fi
 else
-  [ -L /var/run/docker.sock ] && sudo rm -f /var/run/docker.sock
+  echo "skipped: /var/run/docker.sock does not link to socktainer — leaving it (and any backup) in place" >&2
 fi
 
 # Podman
 PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
 PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
-if [ -f "$HOME/.socktainer-podman-sock-backup" ]; then
-  mkdir -p "$PODMAN_SOCK_DIR"
-  ln -sf "$(cat "$HOME/.socktainer-podman-sock-backup")" "$PODMAN_SOCK_DIR/podman.sock"
-  rm -f "$HOME/.socktainer-podman-sock-backup"
+if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" = "$HOME/.socktainer/container.sock" ]; then
+  if [ -f "$HOME/.socktainer-podman-sock-backup" ]; then
+    ln -sf "$(cat "$HOME/.socktainer-podman-sock-backup")" "$PODMAN_SOCK_DIR/podman.sock"
+    rm -f "$HOME/.socktainer-podman-sock-backup"
+  else
+    rm -f "$PODMAN_SOCK_DIR/podman.sock"
+  fi
 else
-  [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && rm -f "$PODMAN_SOCK_DIR/podman.sock"
+  echo "skipped: $PODMAN_SOCK_DIR/podman.sock does not link to socktainer — leaving it (and any backup) in place" >&2
 fi
 ```
 
