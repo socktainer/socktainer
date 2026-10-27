@@ -129,6 +129,7 @@ jobs:
     timeout-minutes: 40
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DNS_TEST_DOMAIN: socktainer-e2e.test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -150,6 +151,14 @@ jobs:
 
       - name: install apple container
         run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
+
+      # `container system start` copies this file into the apiserver's app
+      # root, and the daemon reads that copy.
+      - name: configure the DNS domain
+        run: |
+          sudo mkdir -p /var/root/.config/container
+          printf '[dns]\ndomain = "%s"\n' "$DNS_TEST_DOMAIN" \
+            | sudo tee /var/root/.config/container/config.toml > /dev/null
 
       # `container system start` writes the apiserver launchd plist, then
       # bootstraps it via a launchctl call whose output and exit status it
@@ -337,3 +346,40 @@ jobs:
           # prune all images end ensure no volumes are left
           sudo docker volume prune --all --force
           [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+
+      # The apple-dns mode needs the domain registered with apple/container —
+      # that is what an /etc/resolver entry does.
+      - name: check apple-dns mode
+        # The daemon answers in seconds; this only guards against a hang.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          DOMAIN=$DNS_TEST_DOMAIN
+          RESOLVER="/etc/resolver/containerization.$DOMAIN"
+
+          if sudo -H env SOCKTAINER_DNS_MODE=apple-dns ./socktainer > daemon.log 2>&1; then
+            echo "Error: the daemon started without a resolver entry"
+            exit 1
+          fi
+          if ! grep -q "^error: --dns-mode apple-dns requires the DNS domain '$DOMAIN' to be registered" daemon.log; then
+            echo "Error: the daemon failed without the expected diagnostic"
+            cat daemon.log
+            exit 1
+          fi
+
+          # Create the resolver entry with apple/container's own CLI.
+          sudo container system dns create "$DOMAIN" || [ -f "$RESOLVER" ] \
+            || { echo "Error: could not create $RESOLVER"; exit 1; }
+
+          sudo -H env SOCKTAINER_DNS_MODE=apple-dns ./socktainer > daemon.log 2>&1 &
+          DAEMON_PID=$!
+          sleep 5
+          if ! sudo curl -sf --unix-socket /var/root/.socktainer/container.sock http://localhost/_ping > /dev/null; then
+            echo "Error: the daemon did not serve /_ping"
+            cat daemon.log
+            kill "$DAEMON_PID" 2>/dev/null || true
+            exit 1
+          fi
+          kill "$DAEMON_PID" 2>/dev/null || true
+
+          sudo container system dns delete "$DOMAIN" || true

@@ -113,6 +113,31 @@ struct ContainerListRouteNetworkSettingsTests {
         }
     }
 
+    @Test("A running container lists the aliases from its configured attachment")
+    func listReportsConfiguredAliases() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        var container = makeRunningSnapshot(id: "c1", networks: [attachment])
+        container.configuration.networks = [
+            AttachmentConfiguration(
+                network: "mynet",
+                options: AttachmentOptions(hostname: "c1", aliases: ["api.test", "db.test"])
+            )
+        ]
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json") { res async throws in
+                let summaries = try res.content.decode([RESTContainerSummary].self)
+                #expect(summaries.first?.NetworkSettings.Networks?["mynet"]?.Aliases == ["api.test", "db.test"])
+            }
+        }
+    }
+
     @Test("Duplicate live network names do not crash list")
     func duplicateLiveNetworkNamesDoNotCrash() async throws {
         let attachment = try ContainerResource.Attachment(

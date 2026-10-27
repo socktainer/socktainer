@@ -454,6 +454,34 @@ services:
 > (e.g. both have a `db` service) will share the short-form alias — last
 > started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
 
+### DNS modes
+
+Socktainer resolves container names in one of two modes, selected at daemon start:
+
+| Mode | Flag | How it works |
+|---|---|---|
+| `socktainer-dns` (default) | `--dns-mode socktainer-dns` | One DNS forwarder container per named network; names are served by socktainer's in-process DNS server. |
+| `apple-dns` | `--dns-mode apple-dns` | No sidecars: names are registered as network aliases on each attachment and served by Apple Container's built-in DNS. |
+
+The mode can also be set via the `SOCKTAINER_DNS_MODE` environment variable
+(the flag takes precedence). `apple-dns` requires a DNS domain in the
+system config (`config.toml`) that is registered with apple/container
+(`container system dns create <domain>` writes the `/etc/resolver` entry);
+the daemon refuses to start without it. See apple/container's
+[networking guide](https://github.com/apple/container/blob/main/docs/networking.md)
+for the two setup steps.
+
+In `apple-dns` mode:
+
+- A container's hostname, name and aliases on a named network become
+  `<label>.<network>.<domain>` unless they already end in a dot or the configured
+  `<domain>`. Search domains let containers reach each other by short name.
+- **`--internal` (host-only) networks get no DNS at all**: neither external nor
+  container names resolve. Use `--dns-mode socktainer-dns` (the default) when containers
+  on internal networks need name resolution.
+- **Unregistered short names can leak to your upstream DNS**: `socktainer-dns` mode
+  answers them locally; `apple-dns` mode forwards them to your normal resolver.
+
 ### Container-to-container connections fail with `EHOSTUNREACH`
 
 If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
