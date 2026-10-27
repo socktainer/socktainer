@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationError
 import ContainerizationOCI
 import Testing
 
@@ -87,5 +88,39 @@ struct ClientBuilderServiceConfigurationTests {
             nameserver: "192.168.65.1"
         )
         #expect(qemuBuilderConfig.initProcess.arguments.contains("--enable-qemu"))
+    }
+}
+
+/// A request that loses the race to create the QEMU builder must wait for the winner to start
+/// it, not start (and on failure tear down) the same container a second time.
+@Suite("ClientBuilderService.waitUntilRunning")
+struct ClientBuilderServiceWaitTests {
+    @Test("returns once the container reports running")
+    func returnsWhenRunning() async throws {
+        let states = StatusSequence([.stopped, .stopped, .running])
+        let container = try await ClientBuilderService.waitUntilRunning(id: "buildkit-qemu", timeout: .seconds(5), pollInterval: .milliseconds(1)) {
+            try makeContainerSnapshot(nativeId: "buildkit-qemu", networks: [], labels: [:], status: await states.next())
+        }
+        #expect(container.status == .running)
+        #expect(await states.calls == 3)
+    }
+
+    @Test("fails with a timeout when the container never starts")
+    func timesOut() async throws {
+        await #expect(throws: ContainerizationError.self) {
+            _ = try await ClientBuilderService.waitUntilRunning(id: "buildkit-qemu", timeout: .milliseconds(20), pollInterval: .milliseconds(5)) {
+                try makeContainerSnapshot(nativeId: "buildkit-qemu", networks: [], labels: [:], status: .stopped)
+            }
+        }
+    }
+}
+
+private actor StatusSequence {
+    private var remaining: [RuntimeStatus]
+    private(set) var calls = 0
+    init(_ statuses: [RuntimeStatus]) { remaining = statuses }
+    func next() -> RuntimeStatus {
+        calls += 1
+        return remaining.count > 1 ? remaining.removeFirst() : remaining[0]
     }
 }

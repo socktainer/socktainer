@@ -337,17 +337,39 @@ struct ClientBuilderService: ClientBuilderProtocol {
                 // issue genuinely concurrent build requests, some of which may need the same
                 // cold-started builder. If someone else won the race, use what they created
                 // instead of failing this request; if `get` also fails, this wasn't a race —
-                // propagate the original creation error. Routed through the same status
-                // handling below (not returned directly) — the race winner's container could
-                // still be `.stopped`/`.stopping` at the exact moment we observe it.
-                guard let existing = try? await containerClient.withClient({ try await $0.get(id: containerID) }) else {
+                // propagate the original creation error. The winner may still be between its
+                // `create` and `startBuildKit`, so wait for it to come up rather than starting
+                // it a second time (a failed second bootstrap would tear down the winner's
+                // container).
+                guard (try? await containerClient.withClient({ try await $0.get(id: containerID) })) != nil else {
                     throw error
                 }
-                return try await ensureRunning(existing, qemu: qemu, logger: logger)
+                let containerClient = self.containerClient
+                return try await Self.waitUntilRunning(id: containerID, timeout: .seconds(120), pollInterval: .milliseconds(500)) {
+                    try await containerClient.withClient { try await $0.get(id: containerID) }
+                }
             }
         }
 
         return try await ensureRunning(container, qemu: qemu, logger: logger)
+    }
+
+    /// Polls `fetch` until the container reports `.running`, failing once `timeout` passes.
+    static func waitUntilRunning(
+        id: String, timeout: Duration, pollInterval: Duration, fetch: @Sendable () async throws -> ContainerSnapshot
+    ) async throws -> ContainerSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            let container = try await fetch()
+            if container.status == .running {
+                return container
+            }
+            guard clock.now < deadline else {
+                throw ContainerizationError(.timeout, message: "BuildKit container '\(id)' did not start within \(timeout)")
+            }
+            try await Task.sleep(for: pollInterval)
+        }
     }
 
     private func ensureRunning(_ container: ContainerSnapshot, qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
