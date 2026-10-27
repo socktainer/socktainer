@@ -34,15 +34,25 @@ struct PushDestinationGateTests {
 
     @Test("an expired lease no longer blocks, and its stale holder cannot release the new one")
     func expiredLease() async throws {
-        let gate = PushDestinationGate(leaseDuration: 0.05, pollInterval: .milliseconds(5))
+        // Long enough that `fresh` stays valid through the checks below, so a waiter that gets in
+        // can only have been let in by the stale release.
+        let gate = PushDestinationGate(leaseDuration: 0.5, pollInterval: .milliseconds(5))
         let stale = await gate.acquire("d")
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(600))
         let fresh = await gate.acquire("d")  // would hang if the expired lease still blocked
         await gate.release("d", token: stale)  // stale token: must not free `fresh`
-        let third = Task { await gate.acquire("d") }
-        try await Task.sleep(for: .milliseconds(40))
+
+        let order = Order()
+        let third = Task {
+            let token = await gate.acquire("d")
+            await order.record("third")
+            await gate.release("d", token: token)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        await order.record("fresh-releasing")
         await gate.release("d", token: fresh)
-        _ = await third.value
+        await third.value
+        #expect(await order.events == ["fresh-releasing", "third"])
     }
 }
 

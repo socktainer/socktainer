@@ -35,6 +35,15 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
 - `podman build -q` hangs (the Docker-compat `?q=1` build hangs the same way).
 - A never-started container reports `exited` (not `created`), so `ps --filter status=created` is empty.
 - `network rm` of a missing network answers 500 instead of 404.
+- `podman logs --since/--until`: Docker-compat's logs route ignores both.
+- `podman stop`/`restart` without `--time` waits 5 seconds (podman and Docker default to 10).
+- Container inspect `Image` carries the image reference, not the image ID.
+- `container prune --filter label!=x` is rejected with 400 (the Docker-compat prune has no negative
+  label filter).
+- `network rm -f` and `volume rm -f` do not remove the containers using them; Docker-compat's force
+  has no such cleanup.
+- `podman update --env/--unset-env` and `podman volume create --uid/--gid` are refused (400): the
+  backend has no way to apply them.
 - `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
   has no implementation either); `rename` only works before the first start.
 - `podman save` fails with "ContentStore missing blob data", an Apple Container image-store limitation.
@@ -205,17 +214,10 @@ back-to-back to narrow, not close, the window.
   machinery in reverse or a dedicated untag call; low priority, rarely used.
 - `podman generate systemd` — out of scope (systemd unit generation is a
   Linux-host concept, not meaningful under Apple Container).
-- All-container `/libpod/containers/stats` (no name): the per-container
-  `/libpod/containers/{name}/stats` above is real podman server behavior
-  (confirmed: podman's own route registration uses the Docker-compat handler
-  for that deprecated per-container path). The all-container variant is
-  genuinely different — it uses libpod's own `ContainerStats` schema
-  (`CPU`/`MemPerc`/`UpTime` as pre-computed values, not raw counters podman
-  computes percentages from) which needs host-CPU-time accounting and
-  container start-time tracking this codebase doesn't currently have.
-  Deliberately not implemented with fabricated/approximated values for those
-  fields — flagging as a real gap rather than shipping a wrong-looking-right
-  response.
+- `/libpod/containers/stats` reports `UpTime` as 0: each sample comes from the
+  Docker-compat stats handler, which carries no container uptime. The other
+  fields (`CPU`, `MemPerc`, ...) are computed from those samples the way
+  podman's client does.
 
 ## Top gaps worth implementing next (priority order)
 
@@ -234,5 +236,4 @@ back-to-back to narrow, not close, the window.
    it as "just return `currentHealth`", which would silently diverge from
    what `podman healthcheck run` actually means (a fresh probe, not a cached
    status read).
-2. Remaining low priority: `podman untag`, `podman manifest annotate`,
-   all-container `/libpod/containers/stats`.
+2. Remaining low priority: `podman untag`, `podman manifest annotate`.

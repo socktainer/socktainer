@@ -51,14 +51,7 @@ struct LibpodManifestModifyRoute: RouteCollection {
                     var normalizedDigests: [String] = []
                     var seenDigests = Set<String>()
                     for digest in images {
-                        let normalized: String
-                        if digest.hasPrefix("sha256:") {
-                            normalized = digest
-                        } else if digest.contains(":") {
-                            throw Abort(.badRequest, reason: "\(digest) is not a supported digest (only sha256 is)")
-                        } else {
-                            normalized = "sha256:\(digest)"
-                        }
+                        let normalized = try ClientManifestService.normalizedDigest(digest)
                         guard currentDigests.contains(normalized) else {
                             throw Abort(.badRequest, reason: "\(normalized) is not a member of \(name)")
                         }
