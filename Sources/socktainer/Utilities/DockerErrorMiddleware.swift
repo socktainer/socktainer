@@ -84,8 +84,19 @@ struct DockerErrorMiddleware: AsyncMiddleware {
         return newResponse
     }
 
+    /// Only the route prefix counts (`/libpod/...` or `/v1.2.3/libpod/...`): Docker-compat paths
+    /// can carry a `libpod` segment inside an image name (`/images/quay.io/libpod/alpine/json`).
     static func isLibpod(_ request: Request) -> Bool {
-        request.url.path.contains("/libpod/")
+        isLibpodPath(request.url.path)
+    }
+
+    static func isLibpodPath(_ path: String) -> Bool {
+        let segments = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard let first = segments.first else { return false }
+        if first == "libpod" { return true }
+        let version = first.dropFirst()
+        let isVersion = first.hasPrefix("v") && !version.isEmpty && version.allSatisfy { $0.isNumber || $0 == "." }
+        return isVersion && segments.dropFirst().first == "libpod"
     }
 
     /// podman recognizes errors it must tolerate by their own lower-case texts inside the message

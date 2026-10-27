@@ -25,6 +25,17 @@ struct DockerErrorMiddlewareLibpodTests {
         #expect(DockerErrorMiddleware.libpodMessage("Missing container ID") == "Missing container ID")
     }
 
+    @Test("only the route prefix marks a libpod request, not a `libpod` segment in an image name")
+    func libpodPathPrefix() {
+        #expect(DockerErrorMiddleware.isLibpodPath("/libpod/containers/json"))
+        #expect(DockerErrorMiddleware.isLibpodPath("/v5.0.0/libpod/containers/json"))
+        #expect(DockerErrorMiddleware.isLibpodPath("/v1.51/libpod/info"))
+        #expect(!DockerErrorMiddleware.isLibpodPath("/v1.51/images/quay.io/libpod/alpine:latest/json"))
+        #expect(!DockerErrorMiddleware.isLibpodPath("/images/quay.io/libpod/alpine/json"))
+        #expect(!DockerErrorMiddleware.isLibpodPath("/volumes/libpod"))
+        #expect(!DockerErrorMiddleware.isLibpodPath("/v1.51/volumes/libpod"))
+    }
+
     @Test("libpod error bodies carry podman's cause and response next to the Docker fields")
     func libpodErrorBody() throws {
         let response = DockerErrorMiddleware.makeDockerError(status: .notFound, message: "no such container: x", libpod: true)

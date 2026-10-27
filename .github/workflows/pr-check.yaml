@@ -362,8 +362,8 @@ jobs:
       - name: check podman version with socktainer
         run: |
           sudo -E podman version
-          # Verify socktainer is responding with expected API version
-          sudo -E podman version | grep 'v1.51'
+          # Verify socktainer is responding with the libpod API version it advertises on /_ping
+          [[ "$(sudo -E podman version --format '{{.Server.APIVersion}}')" == "5.0.0" ]]
 
       - name: check podman images with socktainer
         run: |

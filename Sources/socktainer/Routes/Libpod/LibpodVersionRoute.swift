@@ -14,7 +14,12 @@ struct LibpodVersionRoute: RouteCollection {
             GoVersion: "N/A",
             MinAPIVersion: getDockerEngineApiMinVersion(),
             Os: "linux",
-            Version: getBuildVersion()
+            Version: getBuildVersion(),
+            Components: [
+                LibpodVersionComponent(
+                    Name: "Podman Engine", Version: getBuildVersion(),
+                    Details: ["APIVersion": LibpodSupport.apiVersion])
+            ]
         )
         return try await version.encodeResponse(for: req)
     }

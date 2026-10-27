@@ -92,8 +92,10 @@ struct LibpodImagePullRoute: RouteCollection {
                         _ = writer.write(.buffer(encodeLine(PullStreamLine(images: [imageRef], id: imageRef))))
                         _ = writer.write(.end)
                     } catch {
-                        _ = writer.write(.buffer(encodeLine(PullStreamLine(error: error.localizedDescription))))
-                        _ = writer.write(.error(error))
+                        // The error frame is the failure report; end the stream cleanly after it
+                        // (as Docker-compat's pull does) so podman reads it instead of a broken body.
+                        _ = writer.write(.buffer(encodeLine(PullStreamLine(error: BuildRoute.errorMessage(for: error)))))
+                        _ = writer.write(.end)
                     }
                 }
             })

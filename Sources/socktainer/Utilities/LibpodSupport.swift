@@ -7,6 +7,9 @@ import Foundation
 enum LibpodSupport {
     static let disableEnvironmentVariable = "SOCKTAINER_DISABLE_LIBPOD"
 
+    /// The libpod API version advertised on `/_ping` and in `/libpod/version`.
+    static let apiVersion = "5.0.0"
+
     static func isEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
         guard let value = environment[disableEnvironmentVariable] else { return true }
         return !["1", "true", "yes", "on"].contains(value.trimmingCharacters(in: .whitespaces).lowercased())
