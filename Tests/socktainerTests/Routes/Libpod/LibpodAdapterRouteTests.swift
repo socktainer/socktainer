@@ -78,6 +78,26 @@ struct LibpodAdapterRouteTests {
         #expect(await client.deleted == "ctr")
     }
 
+    @Test("delete of a missing container is 404, but an empty success with ignore=true")
+    func deleteIgnoresMissing() async throws {
+        let client = RecordingClient(status: .stopped, missing: true)
+        try await withApp(configure: { app in app.storage[EventBroadcasterKey.self] = EventBroadcaster() }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: LibpodContainerDeleteRoute(client: client))
+
+            try await app.testing().test(.DELETE, "/v1.51/libpod/containers/gone") { res async throws in
+                #expect(res.status == .notFound)
+            }
+            try await app.testing().test(.DELETE, "/v1.51/libpod/containers/gone?ignore=true") { res async throws in
+                #expect(res.status == .ok)
+                let reports = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [Any])
+                #expect(reports.isEmpty)
+            }
+        }
+    }
+
     @Test("a body-less libpod request is decoded as JSON once defaulted")
     func defaultsContentType() async throws {
         try await withApp(configure: { app in app.storage[EventBroadcasterKey.self] = EventBroadcaster() }) { app in
@@ -98,19 +118,26 @@ private struct ProbeBody: Vapor.Content { let Detach: Bool }
 
 private actor RecordingClient: ClientContainerProtocol {
     private let status: RuntimeStatus
-    init(status: RuntimeStatus = .running) { self.status = status }
+    private let missing: Bool
+    init(status: RuntimeStatus = .running, missing: Bool = false) {
+        self.status = status
+        self.missing = missing
+    }
     private(set) var stopTimeout: Int?
     private(set) var restartTimeout: Int?
     private(set) var deleted: String?
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { makeSnapshot(status: status) }
+    func getContainer(id: String) async throws -> ContainerSnapshot? { missing ? nil : makeSnapshot(status: status) }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws { stopTimeout = timeout }
     func restart(id: String, signal: String?, timeout: Int?) async throws { restartTimeout = timeout }
     func kill(id: String, signal: String?) async throws {}
-    func delete(id: String) async throws { deleted = id }
+    func delete(id: String) async throws {
+        if missing { throw ClientContainerError.notFound(id: id) }
+        deleted = id
+    }
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait { RESTContainerWait(statusCode: 0) }
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) { ([], 0) }
 }
