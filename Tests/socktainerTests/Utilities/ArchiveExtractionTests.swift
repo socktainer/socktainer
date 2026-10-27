@@ -315,6 +315,87 @@ struct ArchiveExtractionSafetyTests {
         #expect(FileManager.default.fileExists(atPath: dest.appendingPathComponent("sentinel.txt").path))
     }
 
+    @Test("A hard-link entry whose target climbs out of the destination is rejected and not linked")
+    func hardLinkTargetTraversalIsRejected() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // `tmp/outside.txt` sits beside `tmp/out`, the extraction destination.
+        try Data("secret".utf8).write(to: tmp.appendingPathComponent("outside.txt"))
+
+        let tar = tmp.appendingPathComponent("malicious.tar")
+        try writeRawTar(
+            at: tar,
+            entries: [RawTarEntry(path: "linked.txt", fileType: .regular, hardlinkTarget: "../outside.txt")])
+
+        let dest = tmp.appendingPathComponent("out")
+        do {
+            try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the escaping hard-link target")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("linked.txt"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: dest.appendingPathComponent("linked.txt").path))
+    }
+
+    @Test("A hard-link entry whose target runs through an earlier symlink is rejected and not linked")
+    func hardLinkTargetThroughSymlinkIsRejected() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let outside = tmp.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("secret".utf8).write(to: outside.appendingPathComponent("file"))
+
+        let tar = tmp.appendingPathComponent("malicious.tar")
+        try writeRawTar(
+            at: tar,
+            entries: [
+                RawTarEntry(path: "evil", fileType: .symbolicLink, symlinkTarget: outside.path),
+                RawTarEntry(path: "linked.txt", fileType: .regular, hardlinkTarget: "evil/file"),
+            ])
+
+        let dest = tmp.appendingPathComponent("out")
+        do {
+            try ArchiveUtility.extract(tarPath: tar, to: dest)
+            Issue.record("expected extraction to reject the hard-link target behind a symlink")
+        } catch ArchiveUtilityError.rejectedArchiveEntries(let paths) {
+            #expect(paths.contains("linked.txt"))
+        }
+        var info = stat()
+        #expect(lstat(dest.appendingPathComponent("linked.txt").path, &info) != 0)
+    }
+
+    @Test("A hard-link entry naming a symlink links the symlink itself, never the host file it points at")
+    func hardLinkToSymlinkDoesNotFollowIt() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let outside = tmp.appendingPathComponent("outside.txt")
+        try Data("secret".utf8).write(to: outside)
+
+        // A symlink already in the destination (not one this extraction validated) pointing at
+        // an absolute host path.
+        let dest = tmp.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: dest.appendingPathComponent("evil").path, withDestinationPath: outside.path)
+
+        let tar = tmp.appendingPathComponent("malicious.tar")
+        try writeRawTar(at: tar, entries: [RawTarEntry(path: "linked.txt", fileType: .regular, hardlinkTarget: "evil")])
+        try ArchiveUtility.extract(tarPath: tar, to: dest)
+
+        var linkedInfo = stat()
+        var outsideInfo = stat()
+        #expect(lstat(dest.appendingPathComponent("linked.txt").path, &linkedInfo) == 0)
+        #expect(stat(outside.path, &outsideInfo) == 0)
+        #expect((linkedInfo.st_mode & S_IFMT) == S_IFLNK)
+        #expect(linkedInfo.st_ino != outsideInfo.st_ino)
+        #expect(outsideInfo.st_nlink == 1)
+    }
+
     @Test("A relative symlink target with `..` after a symlinked component is rejected")
     func relativeSymlinkTargetThroughEarlierSymlinkIsRejected() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

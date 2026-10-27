@@ -131,7 +131,12 @@ struct ArchiveUtility {
                 try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 // "Last entry wins", matching `.regular`/`.directory`/`.symbolicLink`.
                 try? fileManager.removeItem(at: fullPath)
-                guard link(linkSource.path, fullPath.path) == 0 else {
+                // `linkat` without `AT_SYMLINK_FOLLOW`, not `link`: macOS `link` follows a
+                // symlink at the source, so a hard-link entry naming a symlink (one extracted
+                // earlier, or one already in `destination` pointing at an absolute host path)
+                // would hard-link the symlink's TARGET — possibly a host file — into the tree.
+                // tar links the entry itself.
+                guard linkat(AT_FDCWD, linkSource.path, AT_FDCWD, fullPath.path, 0) == 0 else {
                     // ENOENT (the archive references a hard-link target that hasn't been
                     // extracted, e.g. malformed ordering) is an unsupported/malformed entry,
                     // not a host-side failure — anything else still deserves a hard failure.
