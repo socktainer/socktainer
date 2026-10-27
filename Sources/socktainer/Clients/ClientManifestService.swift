@@ -88,15 +88,28 @@ struct ClientManifestService: ClientManifestServiceProtocol {
         try LocalContentStore(path: appSupportURL.appendingPathComponent("content"))
     }
 
+    /// Set on every index `writeIndexAndTag` writes. Apple's image store roots ordinary
+    /// single-platform images at an OCI index too, so the root media type alone cannot tell a
+    /// manifest list from a plain image. Real podman only treats lists made by `manifest
+    /// create`/`add` or `build --manifest` as manifest lists (a pulled image is stored as one
+    /// platform instance), and those all go through `writeIndexAndTag`.
+    static let manifestListAnnotation = "io.socktainer.manifest-list"
+
+    static func isManifestList(_ index: Index) -> Bool {
+        index.annotations?[manifestListAnnotation] == "true"
+    }
+
     func exists(name: String) async throws -> Bool {
+        let image: ClientImage
         do {
             // See `leafDescriptors`: pass the raw name so `ClientImage.get`'s own
             // raw/normalized fallback isn't collapsed into two identical attempts.
-            let image = try await ClientImage.get(reference: name, containerSystemConfig: containerSystemConfig)
-            return image.descriptor.mediaType == MediaTypes.index || image.descriptor.mediaType == MediaTypes.dockerManifestList
+            image = try await ClientImage.get(reference: name, containerSystemConfig: containerSystemConfig)
         } catch let error as ContainerizationError where error.code == .notFound {
             return false
         }
+        guard image.descriptor.mediaType == MediaTypes.index else { return false }
+        return Self.isManifestList(try await image.index())
     }
 
     /// Resolves `name`'s current index digest — used as the `Id` of the final completion
@@ -136,8 +149,9 @@ struct ClientManifestService: ClientManifestServiceProtocol {
             // `add` would happily append new members to ANY index-rooted reference, but
             // `--amend` specifically means "update this existing MANIFEST LIST" — silently
             // amending an ordinary single-platform image (which also happens to be
-            // index-rooted, per this framework's own tagging convention) would convert it
-            // into a multi-platform list the caller never asked for.
+            // index-rooted, per this framework's own tagging convention, hence the
+            // `manifestListAnnotation` check in `exists`) would convert it into a
+            // multi-platform list the caller never asked for.
             guard try await exists(name: name) else {
                 throw ContainerizationError(.invalidArgument, message: "\(name) exists but is not a manifest list")
             }
@@ -150,8 +164,8 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// `podman manifest exists`) — this is `create`'s own duplicate-name check, which must
     /// also catch an ORDINARY single-platform image already tagged `name`: real podman's
     /// underlying storage layer rejects a duplicate name regardless of what kind of content
-    /// it already holds, and `exists(name:)` alone would miss that case (a non-index
-    /// descriptor doesn't match its media-type check), letting `mergeAndTag` silently
+    /// it already holds, and `exists(name:)` alone would miss that case (an ordinary image
+    /// carries no `manifestListAnnotation`), letting `mergeAndTag` silently
     /// overwrite an unrelated existing image.
     private func referenceExists(name: String) async throws -> Bool {
         do {
@@ -405,13 +419,17 @@ struct ClientManifestService: ClientManifestServiceProtocol {
         return descriptors
     }
 
+    static func manifestListIndex(manifests: [Descriptor]) -> Index {
+        Index(manifests: manifests, annotations: [manifestListAnnotation: "true"])
+    }
+
     /// Writes a new OCI index blob and (re)tags `name` to point at it. Ingest and create are kept
     /// adjacent (no other `await` in between) to minimize, not eliminate, the window described in
     /// this type's doc comment.
     @discardableResult
     private func writeIndexAndTag(name: String, manifests: [Descriptor]) async throws -> String {
         let normalized = try ClientImage.normalizeReference(name, containerSystemConfig: containerSystemConfig)
-        let index = Index(manifests: manifests)
+        let index = Self.manifestListIndex(manifests: manifests)
         let data = try JSONEncoder().encode(index)
 
         // Computed independently rather than captured from inside the ingest closure
