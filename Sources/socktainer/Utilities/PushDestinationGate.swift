@@ -29,10 +29,11 @@ actor PushDestinationGate {
     }
 
     /// Waits until no unexpired lease is held on `destination`, then takes it. The returned token
-    /// identifies this holder to `release`.
-    func acquire(_ destination: String) async -> UUID {
+    /// identifies this holder to `release`. Throws `CancellationError` if the waiting task is
+    /// cancelled; a cancelled waiter holds no lease.
+    func acquire(_ destination: String) async throws -> UUID {
         while let lease = leases[destination], lease.expires > Date() {
-            try? await Task.sleep(for: pollInterval)
+            try await Task.sleep(for: pollInterval)
         }
         let token = UUID()
         leases[destination] = Lease(token: token, expires: Date().addingTimeInterval(leaseDuration))
