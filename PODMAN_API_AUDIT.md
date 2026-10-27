@@ -104,9 +104,9 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman search` | GET `/libpod/images/search` | ✅ |
 | `podman history` | GET `/libpod/images/{name}/history` | ✅ |
 | `podman image prune` | POST `/libpod/images/prune` (confirmed in podman source) | ✅ |
-| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ |
+| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ⚠️ route registered; real `podman save` currently fails with "ContentStore missing blob data" (see limits above) |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
-| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
+| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (decodes `reference` and calls the image client's import directly, answering with podman's single `{"Id": <digest>}` object instead of Docker's progress stream; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
 ## Volumes
 
@@ -182,7 +182,7 @@ back-to-back to narrow, not close, the window.
 |---|---|---|
 | `podman manifest create` | POST `/libpod/manifests/{name}` | ✅ |
 | `podman manifest inspect` | GET `/libpod/manifests/{name}/json` | ✅ |
-| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ |
+| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ (only lists made by `manifest create`/`add` or `build --manifest` count; an ordinary image is not a manifest list, as in podman) |
 | `podman manifest add` | PUT `/libpod/manifests/{name}` (`operation: "update"`) | ✅ |
 | `podman manifest remove` | PUT `/libpod/manifests/{name}` (`operation: "remove"`) | ✅ |
 | `podman manifest rm` | DELETE `/libpod/manifests/{name}` | ✅ |
