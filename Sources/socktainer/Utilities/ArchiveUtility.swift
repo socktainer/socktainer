@@ -71,8 +71,9 @@ struct ArchiveUtility {
         // Applied only after every entry is processed (see below the loop) — a directory's
         // recorded mode can be restrictive (e.g. read+execute only), and tar conventionally
         // lists a directory before its own contents, so applying it immediately could block
-        // creating that directory's later children.
-        var pendingDirectoryPermissions: [(path: String, mode: mode_t)] = []
+        // creating that directory's later children. Keyed by path so a later entry for the
+        // same directory replaces an earlier one's mode ("last entry wins").
+        var pendingDirectoryPermissions: [String: mode_t] = [:]
         // Allocated once and reused for every regular-file entry's copy loop, instead of a
         // fresh 128 KiB zero-filled array per entry — a real archive can contain thousands
         // of small files.
@@ -172,7 +173,7 @@ struct ArchiveUtility {
                 // entry's recorded mode for the archive's own top-level directory (which can be
                 // arbitrarily restrictive) has no business overriding that.
                 if fullPath.standardizedFileURL.path != destinationPath {
-                    pendingDirectoryPermissions.append((fullPath.path, mode_t(entry.permissions & 0o777)))
+                    pendingDirectoryPermissions[fullPath.path] = mode_t(entry.permissions & 0o777)
                 }
             case .regular:
                 try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -293,11 +294,21 @@ struct ArchiveUtility {
         // Applied only now that every entry (including any of this directory's own children)
         // has already been created — a restrictive mode set immediately, per the comment on
         // `pendingDirectoryPermissions` above, could otherwise block creating later entries.
-        // Reversed (deepest child first): chmod'ing a path requires execute/search permission
-        // on every ancestor directory to resolve it — applying a restrictive parent mode
-        // before a still-pending child chmod underneath it could make that child's own path
-        // unresolvable.
-        for (path, mode) in pendingDirectoryPermissions.reversed() {
+        // Deepest path first, whatever order the archive listed them in: chmod'ing a path
+        // requires execute/search permission on every ancestor directory to resolve it —
+        // applying a restrictive parent mode before a still-pending child chmod underneath it
+        // could make that child's own path unresolvable.
+        let deepestFirst = pendingDirectoryPermissions.sorted {
+            $0.key.split(separator: "/").count > $1.key.split(separator: "/").count
+        }
+        for (path, mode) in deepestFirst {
+            // A later entry may have replaced the directory (or one of its ancestors) with a
+            // file or symlink, whose own mode wins; `lstat` and the ancestor check keep a
+            // symlink from redirecting this chmod onto some other path.
+            var info = stat()
+            guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
+                hasSafeAncestors(of: URL(fileURLWithPath: path), under: destination)
+            else { continue }
             try? fileManager.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
         }
 

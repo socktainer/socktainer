@@ -437,6 +437,80 @@ struct ArchiveExtractionSafetyTests {
     }
 }
 
+/// Directory modes are applied after every entry is written, so they must not clobber a later
+/// entry that replaced the directory, must honor the last entry for a repeated directory, and
+/// must not depend on the archive listing parents before children.
+@Suite("ArchiveUtility.extract — deferred directory modes")
+struct ArchiveExtractionDirectoryModeTests {
+    @Test("A regular file replacing an earlier directory entry keeps its own mode")
+    func fileReplacingDirectoryKeepsItsMode() throws {
+        try withExtractedRawTar(entries: [
+            RawTarEntry(path: "foo", fileType: .directory, permissions: 0o700),
+            RawTarEntry(path: "foo", fileType: .regular, data: Data("x".utf8), permissions: 0o644),
+        ]) { dest in
+            var info = stat()
+            #expect(lstat(dest.appendingPathComponent("foo").path, &info) == 0)
+            #expect((info.st_mode & S_IFMT) == S_IFREG)
+            #expect(info.st_mode & 0o777 == 0o644)
+        }
+    }
+
+    @Test("A repeated directory entry ends up with the last entry's mode")
+    func repeatedDirectoryLastEntryWins() throws {
+        try withExtractedRawTar(entries: [
+            RawTarEntry(path: "d", fileType: .directory, permissions: 0o700),
+            RawTarEntry(path: "d", fileType: .directory, permissions: 0o750),
+        ]) { dest in
+            let extractedMode = try mode(of: dest.appendingPathComponent("d"))
+            #expect(extractedMode == 0o750)
+        }
+    }
+
+    @Test("A child listed before its restrictive parent still gets its own mode")
+    func childBeforeRestrictiveParent() throws {
+        try withExtractedRawTar(entries: [
+            RawTarEntry(path: "p/c", fileType: .directory, permissions: 0o750),
+            // No search bit: chmod'ing `p/c` after this would fail with EACCES.
+            RawTarEntry(path: "p", fileType: .directory, permissions: 0o600),
+        ]) { dest in
+            let parent = dest.appendingPathComponent("p")
+            #expect(try mode(of: parent) == 0o600)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+            #expect(try mode(of: parent.appendingPathComponent("c")) == 0o750)
+        }
+    }
+}
+
+private func mode(of url: URL) throws -> Int {
+    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+    return (attrs[.posixPermissions] as? NSNumber)?.intValue ?? -1
+}
+
+/// Extracts a raw tar into a temporary destination, then restores owner rwx on every directory
+/// so a restrictive extracted mode can't block cleanup.
+private func withExtractedRawTar(entries: [RawTarEntry], check: (URL) throws -> Void) throws {
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer {
+        if let walker = FileManager.default.enumerator(atPath: tmp.path) {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tmp.path)
+            while let relative = walker.nextObject() as? String {
+                let path = tmp.appendingPathComponent(relative).path
+                var info = stat()
+                if lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR {
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
+                }
+            }
+        }
+        try? FileManager.default.removeItem(at: tmp)
+    }
+    let tar = tmp.appendingPathComponent("context.tar")
+    try writeRawTar(at: tar, entries: entries)
+    let dest = tmp.appendingPathComponent("out")
+    try ArchiveUtility.extract(tarPath: tar, to: dest)
+    try check(dest)
+}
+
 private struct RawTarEntry {
     let path: String
     let fileType: URLFileResourceType
@@ -444,6 +518,7 @@ private struct RawTarEntry {
     var hardlinkTarget: String? = nil
     var data: Data? = nil
     var modificationDate: Date? = nil
+    var permissions: mode_t? = nil
 }
 
 /// Writes a tar with entries exactly as specified, bypassing `ArchiveUtility.create`'s
@@ -455,7 +530,7 @@ private func writeRawTar(at tarPath: URL, entries: [RawTarEntry]) throws {
         let entry = WriteEntry(writer)
         entry.path = raw.path
         entry.fileType = raw.fileType
-        entry.permissions = raw.fileType == .directory ? 0o755 : 0o644
+        entry.permissions = raw.permissions ?? (raw.fileType == .directory ? 0o755 : 0o644)
         if let target = raw.symlinkTarget {
             entry.symlinkTarget = target
         }
