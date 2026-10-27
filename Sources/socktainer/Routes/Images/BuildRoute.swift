@@ -323,6 +323,14 @@ extension BuildRoute {
         return aux + [["stream": "Successfully built \(shortID)\n"]] + tagged
     }
 
+    /// How long `POST /build` waits for a builder's BuildKit socket to accept connections.
+    /// `ensureReachable` may first create and start the builder container, and starting it only
+    /// waits for the init process: a fresh QEMU builder still registers its binfmt handlers
+    /// before BuildKit listens, so it gets more than the Rosetta builder's three seconds.
+    static func builderReachabilityTimeout(qemu: Bool) -> Duration {
+        qemu ? .seconds(30) : .seconds(3)
+    }
+
     static func errorMessage(for error: Error) -> String {
         if error is ContainerizationError {
             return "\(error)"
@@ -396,11 +404,11 @@ extension BuildRoute {
             do {
                 if needsRosettaBuilder {
                     try await builderClient.ensureReachable(
-                        timeout: .seconds(3), retryInterval: .milliseconds(250), qemu: false, logger: req.logger)
+                        timeout: builderReachabilityTimeout(qemu: false), retryInterval: .milliseconds(250), qemu: false, logger: req.logger)
                 }
                 if needsQEMU {
                     try await builderClient.ensureReachable(
-                        timeout: .seconds(3), retryInterval: .milliseconds(250), qemu: true, logger: req.logger)
+                        timeout: builderReachabilityTimeout(qemu: true), retryInterval: .milliseconds(250), qemu: true, logger: req.logger)
                 }
             } catch {
                 throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
