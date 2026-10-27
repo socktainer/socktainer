@@ -24,14 +24,12 @@ struct LibpodContainersStatsRoute: RouteCollection {
         return { req in
             let items = URLComponents(string: "?" + (req.url.query ?? ""))?.queryItems ?? []
             var references = items.filter { $0.name == "containers" }.compactMap(\.value)
-            let all = (req.query["all"] as Bool?) ?? false
             let stream = (req.query["stream"] as Bool?) ?? true
             let interval = max((req.query["interval"] as Int?) ?? 5, 1)
-            if references.isEmpty && all {
+            // A bare `podman stats` names no containers and means every running one (`all` only
+            // adds stopped containers, which have no stats to sample here).
+            if references.isEmpty {
                 references = try await client.list(showAll: false, filters: [:]).map(\.id)
-            }
-            guard !references.isEmpty else {
-                throw Abort(.badRequest, reason: "no containers specified")
             }
             let requested = references
 

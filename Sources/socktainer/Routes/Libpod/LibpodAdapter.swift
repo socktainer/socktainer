@@ -94,7 +94,15 @@ enum LibpodAdapter {
     /// The request body decoded as a JSON object (empty when there is none).
     static func jsonObjectBody(of req: Request) async throws -> [String: Any] {
         guard let buffer = try await req.body.collect(max: 1 << 20).get(), buffer.readableBytes > 0 else { return [:] }
-        guard let object = try JSONSerialization.jsonObject(with: Data(buffer: buffer)) as? [String: Any] else {
+        // A malformed body is the client's error (400), not a server failure: `NSError` from
+        // `JSONSerialization` is no `AbortError`, so it would otherwise render as a 500.
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: Data(buffer: buffer))
+        } catch {
+            throw Abort(.badRequest, reason: "request body is not valid JSON")
+        }
+        guard let object = parsed as? [String: Any] else {
             throw Abort(.badRequest, reason: "request body must be a JSON object")
         }
         return object
@@ -112,6 +120,28 @@ enum LibpodAdapter {
             collectedBody: ByteBuffer(data: data), remoteAddress: req.remoteAddress, logger: req.logger, on: req.eventLoop)
         copy.parameters = req.parameters
         return copy
+    }
+
+    /// The libpod routes report a network's id as a hash of its name (`LibpodSchema.networkID`),
+    /// which the backend does not know. Resolves a full or abbreviated such id to the network's
+    /// name; any other reference (a name, a backend id) is returned unchanged.
+    static func resolveNetworkReference(_ reference: String, client: ClientNetworkProtocol, logger: Logger) async throws -> String {
+        guard !reference.isEmpty, reference.allSatisfy(\.isHexDigit), try await client.getNetwork(id: reference, logger: logger) == nil else {
+            return reference
+        }
+        let lowered = reference.lowercased()
+        let matches = try await client.list(filters: nil, logger: logger).map(\.Name).filter { LibpodSchema.networkID($0).hasPrefix(lowered) }
+        return matches.count == 1 ? matches[0] : reference
+    }
+
+    /// Rewrites the route parameter `name` from a libpod network id to the network's name.
+    static func resolvingNetworkParameter(_ name: String, client: ClientNetworkProtocol) -> @Sendable (Request) async throws -> Request {
+        { req in
+            if let reference = req.parameters.get(name) {
+                req.parameters.set(name, to: try await resolveNetworkReference(reference, client: client, logger: req.logger))
+            }
+            return req
+        }
     }
 
     /// A body-less copy of `req` addressed to the Docker-compat handler for one resource, with

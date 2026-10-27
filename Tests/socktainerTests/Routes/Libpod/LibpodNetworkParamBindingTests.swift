@@ -56,7 +56,84 @@ struct LibpodNetworkParamBindingTests {
     }
 }
 
-private func makeSummary(name: String) -> RESTNetworkSummary {
+/// The libpod routes report a network's id as a hash of its name; podman then sends that id (or
+/// its first 12 characters, as `podman network ls` prints it) back to inspect/rm/exists.
+@Suite("Libpod network routes — libpod network ids")
+struct LibpodNetworkIDTests {
+    private let shortID = String(LibpodSchema.networkID("mynet").prefix(12))
+
+    private func withLibpodApp(_ body: (Application) async throws -> Void) async throws {
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try await body(app)
+        }
+    }
+
+    @Test("inspect resolves a full or abbreviated libpod id to the network")
+    func inspectByLibpodID() async throws {
+        let client = StubNetworkClient(summary: makeSummary(name: "mynet"))
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodNetworkInspectRoute(client: client))
+            for id in [shortID, LibpodSchema.networkID("mynet")] {
+                try await app.testing().test(.GET, "/v1.51/libpod/networks/\(id)/json") { res async throws in
+                    #expect(res.status == .ok)
+                    let body = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                    #expect(body["name"] as? String == "mynet")
+                }
+            }
+        }
+    }
+
+    @Test("delete and exists resolve an abbreviated libpod id")
+    func deleteAndExistsByLibpodID() async throws {
+        let client = StubNetworkClient(summary: makeSummary(name: "mynet"))
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodNetworkExistsRoute(client: client))
+            try app.register(collection: LibpodNetworkDeleteRoute(dockerRoute: NetworkDeleteRoute(client: client)))
+            try await app.testing().test(.GET, "/v1.51/libpod/networks/\(shortID)/exists") { res async in
+                #expect(res.status == .noContent)
+            }
+            try await app.testing().test(.GET, "/v1.51/libpod/networks/abcdef123456/exists") { res async in
+                #expect(res.status == .notFound)
+            }
+            try await app.testing().test(.DELETE, "/v1.51/libpod/networks/\(shortID)") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+        #expect(await client.deletedId == "mynet")
+    }
+
+    @Test("a failed network removal fails the prune instead of reporting success")
+    func pruneSurfacesErrors() throws {
+        #expect(throws: Abort.self) {
+            try LibpodNetworkPruneRoute.reports(from: ["NetworksDeleted": ["a"], "Errors": ["b": "in use"]] as [String: Any])
+        }
+        let reports = try #require(try LibpodNetworkPruneRoute.reports(from: ["NetworksDeleted": ["a"], "Errors": [String: Any]()]) as? [[String: Any]])
+        #expect(reports.map { $0["Name"] as? String } == ["a"])
+    }
+
+    @Test("create reports the subnet the backend allocated when the request named none")
+    func createReportsAllocatedSubnet() async throws {
+        let client = StubNetworkClient(
+            summary: makeSummary(name: "mynet", config: [NetworkIPAMConfig(Subnet: "192.168.64.0/24", IPRange: nil, Gateway: "192.168.64.1", AuxiliaryAddresses: nil)]))
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodNetworkCreateRoute(dockerRoute: NetworkCreateRoute(client: client)))
+            try await app.testing().test(
+                .POST, "/v1.51/libpod/networks/create", beforeRequest: { req in req.body = ByteBuffer(string: #"{"name":"mynet"}"#) }
+            ) { res async throws in
+                #expect(res.status == .ok)
+                let body = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                let subnets = body["subnets"] as? [[String: Any]]
+                #expect(subnets?.first?["subnet"] as? String == "192.168.64.0/24")
+                #expect(subnets?.first?["gateway"] as? String == "192.168.64.1")
+            }
+        }
+    }
+}
+
+private func makeSummary(name: String, config: [NetworkIPAMConfig] = []) -> RESTNetworkSummary {
     RESTNetworkSummary(
         Name: name,
         Id: name,
@@ -68,7 +145,7 @@ private func makeSummary(name: String) -> RESTNetworkSummary {
         Internal: false,
         Attachable: false,
         Ingress: false,
-        IPAM: NetworkIPAM(Driver: "default", Config: []),
+        IPAM: NetworkIPAM(Driver: "default", Config: config),
         Options: [:],
         Containers: nil,
         ConfigFrom: nil,

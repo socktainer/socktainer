@@ -14,9 +14,18 @@ struct LibpodNetworkCreateRoute: RouteCollection {
                 req.storage[LibpodRequestBodyKey.self] = try JSONSerialization.data(withJSONObject: body)
                 return try LibpodAdapter.replacingBody(of: req, with: LibpodSchema.dockerNetworkCreateBody(fromLibpod: body))
             }
-        ) { _, req in
-            let original = req.storage[LibpodRequestBodyKey.self].flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-            return LibpodSchema.networkCreated(fromLibpod: original ?? [:])
+        ) { [client = dockerRoute.client] _, req in
+            let original = req.storage[LibpodRequestBodyKey.self].flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            var created = LibpodSchema.networkCreated(fromLibpod: original)
+            // The backend allocates a subnet when the request names none; report the one it chose.
+            if let name = original["name"] as? String,
+                let network = try await client.getNetwork(id: name, logger: req.logger),
+                let summary = try JSONSerialization.jsonObject(with: JSONEncoder().encode(network)) as? [String: Any],
+                let subnets = LibpodSchema.network(summary)["subnets"] as? [[String: Any]], !subnets.isEmpty
+            {
+                created["subnets"] = subnets
+            }
+            return created
         }
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/networks/create", use: handler)
     }

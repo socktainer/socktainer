@@ -12,7 +12,8 @@ struct LibpodNetworkExistsRoute: RouteCollection {
             guard let name = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing network name")
             }
-            guard try await client.getNetwork(id: name, logger: req.logger) != nil else {
+            let resolved = try await LibpodAdapter.resolveNetworkReference(name, client: client, logger: req.logger)
+            guard try await client.getNetwork(id: resolved, logger: req.logger) != nil else {
                 throw Abort(.notFound, reason: "No such network: \(name)")
             }
             return Response(status: .noContent)

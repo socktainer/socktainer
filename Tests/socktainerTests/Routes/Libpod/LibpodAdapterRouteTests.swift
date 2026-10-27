@@ -114,6 +114,122 @@ struct LibpodAdapterRouteTests {
     }
 }
 
+/// Requests podman's client sends that the Docker-compat handlers read differently.
+@Suite("Libpod routes — podman request translation")
+struct LibpodRequestTranslationTests {
+    private func withLibpodApp(_ body: (Application) async throws -> Void) async throws {
+        try await withApp(configure: { app in app.storage[EventBroadcasterKey.self] = EventBroadcaster() }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try await body(app)
+        }
+    }
+
+    @Test("a malformed JSON body is a 400, not a 500")
+    func malformedJSONIsBadRequest() async throws {
+        try await withApp(configure: { app in app.middleware.use(DockerErrorMiddleware()) }) { app in
+            app.post("probe") { req async throws -> String in
+                _ = try await LibpodAdapter.jsonObjectBody(of: req)
+                return "ok"
+            }
+            try await app.testing().test(.POST, "probe", beforeRequest: { req in req.body = ByteBuffer(string: "{not json") }) { res async in
+                #expect(res.status == .badRequest)
+            }
+            try await app.testing().test(.POST, "probe", beforeRequest: { req in req.body = ByteBuffer(string: "[1]") }) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("`podman rm -v` (volumes=true) reaches Docker-compat as v=true")
+    func deleteAliasesVolumes() async throws {
+        try await withApp(configure: { _ in }) { app in
+            app.delete("probe") { req async throws -> String in
+                LibpodContainerDeleteRoute.prepare(req).query[String.self, at: "v"] ?? "unset"
+            }
+            try await app.testing().test(.DELETE, "probe?volumes=true") { res async in
+                #expect(String(buffer: res.body) == "true")
+            }
+        }
+    }
+
+    @Test("`podman ps --last` reaches Docker-compat as limit, overriding an explicit limit")
+    func listAliasesLast() async throws {
+        try await withApp(configure: { _ in }) { app in
+            app.get("probe") { req async throws -> String in
+                LibpodContainerListRoute.prepare(req).query[String.self, at: "limit"] ?? "unset"
+            }
+            try await app.testing().test(.GET, "probe?last=1") { res async in
+                #expect(String(buffer: res.body) == "1")
+            }
+            try await app.testing().test(.GET, "probe?limit=5&last=2") { res async in
+                #expect(String(buffer: res.body) == "2")
+            }
+            try await app.testing().test(.GET, "probe?limit=5") { res async in
+                #expect(String(buffer: res.body) == "5")
+            }
+        }
+    }
+
+    @Test("the libpod path-stat header uses the URL-safe base64 alphabet podman decodes with")
+    func statHeaderIsURLSafe() {
+        #expect(Data([0xfb, 0xff]).base64EncodedString() == "+/8=")
+        #expect(LibpodContainerArchiveRoute.urlSafeBase64(Data([0xfb, 0xff])) == "-_8=")
+    }
+
+    @Test("podman's infinite stop timeout (4294967295) is clamped instead of trapping")
+    func infiniteStopTimeoutIsClamped() {
+        #expect(ClientContainerService.stopTimeoutSeconds(4_294_967_295) == Int32.max)
+        #expect(ClientContainerService.stopTimeoutSeconds(nil) == 5)
+        #expect(ClientContainerService.stopTimeoutSeconds(-1) == -1)
+    }
+
+    @Test("a bare `podman stats` (no containers, all=false) reports running containers instead of a 400")
+    func statsWithoutNamesListsRunning() async throws {
+        let client = RecordingClient()
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodContainersStatsRoute(client: client))
+            try await app.testing().test(.GET, "/v1.51/libpod/containers/stats?stream=false") { res async throws in
+                #expect(res.status == .ok)
+                let report = try #require(try JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                #expect((report["Stats"] as? [Any])?.isEmpty == true)
+            }
+        }
+    }
+
+    @Test("update refuses an environment change instead of dropping it")
+    func updateRejectsEnv() async throws {
+        let client = RecordingClient()
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodContainerUpdateRoute(client: client))
+            try await app.testing().test(
+                .POST, "/v1.51/libpod/containers/ctr/update?restartPolicy=no",
+                beforeRequest: { req in req.body = ByteBuffer(string: #"{"Env":["A=1"]}"#) }
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
+
+    @Test("update answers the container's full ID as a bare JSON string")
+    func updateAnswersFullID() async throws {
+        let client = RecordingClient()
+        let fullID = DockerContainerID.hexId(for: makeSnapshot(status: .running))
+        try await withLibpodApp { app in
+            try app.register(collection: LibpodContainerUpdateRoute(client: client))
+            try await app.testing().test(
+                .POST, "/v1.51/libpod/containers/ctr/update?restartPolicy=no",
+                beforeRequest: { req in req.body = ByteBuffer(string: #"{"Env":[],"UnsetEnv":null}"#) }
+            ) { res async throws in
+                #expect(res.status == .created)
+                let id = try JSONSerialization.jsonObject(with: Data(buffer: res.body), options: [.fragmentsAllowed]) as? String
+                #expect(id == fullID)
+            }
+        }
+    }
+}
+
 private struct ProbeBody: Vapor.Content { let Detach: Bool }
 
 private actor RecordingClient: ClientContainerProtocol {

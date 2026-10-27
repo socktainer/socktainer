@@ -46,9 +46,15 @@ struct LibpodContainerArchiveRoute: RouteCollection {
                 stat["linkTarget"] = absolute.count > 1 && absolute.hasSuffix("/") ? String(absolute.dropLast()) : absolute
             }
             if let updated = try? JSONSerialization.data(withJSONObject: stat) {
-                response.headers.replaceOrAdd(name: statHeader, value: updated.base64EncodedString())
+                response.headers.replaceOrAdd(name: statHeader, value: urlSafeBase64(updated))
             }
             return response
         }
+    }
+
+    /// podman decodes the stat header with Go's `base64.URLEncoding` (moby uses `StdEncoding`), so
+    /// a payload whose encoding contains `+` or `/` would otherwise fail to decode.
+    static func urlSafeBase64(_ data: Data) -> String {
+        data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
     }
 }
