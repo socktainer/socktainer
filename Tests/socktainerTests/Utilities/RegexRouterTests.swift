@@ -267,4 +267,21 @@ import VaporTesting
         }
     }
 
+    /// Captured path parameters are percent-decoded before reaching the handler, so a push
+    /// destination sent with an encoded `/` arrives as the real reference.
+    @Test
+    func capturedGroupsArePercentDecoded() async throws {
+        try await withRegexRouter { app in
+            try app.registerVersionedRoute(.POST, pattern: "/manifests/{name:.*}/registry/{destination:.*}") { req in
+                ["name": req.parameters.get("name") ?? "", "destination": req.parameters.get("destination") ?? ""]
+            }
+            try await app.testing().test(.POST, "/manifests/my%2Flist/registry/192.168.1.1:5000%2Frepo:tag") { res async throws in
+                #expect(res.status == .ok)
+                let response = try res.content.decode([String: String].self)
+                #expect(response["name"] == "my/list")
+                #expect(response["destination"] == "192.168.1.1:5000/repo:tag")
+            }
+        }
+    }
+
 }

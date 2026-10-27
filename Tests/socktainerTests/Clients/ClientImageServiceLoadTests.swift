@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerPersistence
 import Containerization
 import ContainerizationArchive
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import Logging
@@ -214,16 +215,18 @@ struct ClientManifestServiceRetagTests {
             Issue.record("expected retagForPush to throw for a nonexistent source image")
         } catch ClientImageError.notFound(let id) {
             #expect(id == missingReference)
-        } catch {
+        } catch let error as ContainerizationError where error.message.hasPrefix("XPC connection error") {
             // `ClientImage.get` always reaches the real container-apiserver daemon over
             // XPC (see the suite doc comment above). A CI job that never installs/starts
-            // Apple Container (e.g. formatters & tests) surfaces a raw XPC connection
-            // failure here instead of this fix's ClientImageError.notFound mapping —
-            // that's an environment gap, not a regression in the mapping being tested.
-            guard String(describing: error).contains("XPC") else {
-                Issue.record("expected ClientImageError.notFound, got: \(error)")
-                return
+            // Apple Container (e.g. formatters & tests) fails here with the XPC client's
+            // connection error before the mapping under test runs — an environment gap, not
+            // a regression. Report it as a known issue so the run shows the gap instead of
+            // a silent pass.
+            withKnownIssue("container-apiserver unreachable over XPC; notFound mapping not exercised") {
+                throw error
             }
+        } catch {
+            Issue.record("expected ClientImageError.notFound, got: \(error)")
         }
     }
 }
