@@ -242,16 +242,11 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     }
     // With an override, apply it before the server starts so no query is ever forwarded to the
     // built-in default instead. A loop is not possible meanwhile: forwardToUpstream answers SERVFAIL
-    // while the upstream points at this server. The host's own addresses (and the gateway, used as
-    // the fallback) are gathered up front so the post-start check needs no await.
-    var localAddresses: Set<String> = []
+    // while the upstream points at this server. The gateway (also the fallback) is looked up up
+    // front so the post-start check needs no await.
     var gateway: String?
     if let upstream = upstreamResolution.upstream {
-        localAddresses = DNSUpstream.localIPv4Addresses()
         gateway = await defaultGatewayAddress()
-        if let gateway {
-            localAddresses.insert(gateway)
-        }
         dnsServer.upstreamHost = upstream.host
         dnsServer.upstreamPort = upstream.port
     } else {
@@ -263,6 +258,12 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     }
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
     if let upstream = upstreamResolution.upstream {
+        // Read interface addresses only now, after every await, so an interface that appeared
+        // during the gateway lookup is still caught.
+        var localAddresses = DNSUpstream.localIPv4Addresses()
+        if let gateway {
+            localAddresses.insert(gateway)
+        }
         if upstream.pointsAtSelf(dnsPort: resolvedDNSPort, localAddresses: localAddresses) {
             // Forwarding to ourselves would loop and amplify every query. Switch synchronously to the
             // gateway already looked up above (or the built-in default if it could not be read).
