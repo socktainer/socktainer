@@ -749,22 +749,20 @@ struct ClientImageService: ClientImageProtocol {
         let exportPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
 
+        // Not `imageStore.save`: it exports every platform the index lists and fails on
+        // the first blob a single-platform pull never fetched ("content with digest ...
+        // not found"). See `OCILayoutPruner.exportComplete`.
         do {
-            try await imageStore.save(
+            try await Self.writeOCILayout(
                 references: resolvedReferences,
-                out: exportPath,
-                platform: platform
+                imageStore: imageStore,
+                contentRoot: appleContainerAppSupportUrl.appendingPathComponent("content"),
+                to: exportPath,
+                platform: platform,
+                logger: logger
             )
         } catch {
-            let errorDescription = String(describing: error)
-            logger.error("Failed to export images: \(errorDescription)")
-
-            if errorDescription.contains("notFound") && errorDescription.localizedCaseInsensitiveContains("content with digest") {
-                let detailedMessage =
-                    "Export failed: ContentStore missing blob data. This is a limitation of Apple's Containerization framework. The image metadata exists but the underlying content blobs are not available."
-                logger.error("\(detailedMessage)")
-                throw ClientImageError.notFound(id: detailedMessage)
-            }
+            try? FileManager.default.removeItem(at: tempDir)
             throw error
         }
 
@@ -775,6 +773,7 @@ struct ClientImageService: ClientImageProtocol {
             ociLayoutPath: exportPath,
             dockerFormatPath: dockerFormatPath,
             resolvedRefs: resolvedReferences,
+            preferredPlatform: platform ?? .current,
             logger: logger
         )
 
@@ -788,6 +787,40 @@ struct ClientImageService: ClientImageProtocol {
         logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
         return tarballPath
+    }
+
+    /// Writes an OCI image layout holding `references`, each limited to the manifests whose
+    /// content is fully present in the store (and matching `platform` when given).
+    static func writeOCILayout(
+        references: [String],
+        imageStore: ImageStore,
+        contentRoot: URL,
+        to out: URL,
+        platform: Platform?,
+        logger: Logger
+    ) async throws {
+        var saved: [Descriptor] = []
+        for reference in references {
+            let image = try await imageStore.get(reference: reference)
+            guard
+                var descriptor = try OCILayoutPruner.exportComplete(
+                    image.descriptor, from: contentRoot, to: out, platform: platform, logger: logger)
+            else {
+                let scope = platform.map { " for platform \($0.description)" } ?? ""
+                throw ClientImageError.notFound(id: "\(reference) has no locally available content\(scope)")
+            }
+            var annotations = descriptor.annotations ?? [:]
+            annotations[AnnotationKeys.containerizationImageName] = reference
+            annotations[AnnotationKeys.containerdImageName] = reference
+            annotations[AnnotationKeys.openContainersImageName] = reference
+            descriptor.annotations = annotations
+            saved.append(descriptor)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        try encoder.encode(["imageLayoutVersion": "1.0.0"]).write(to: out.appendingPathComponent("oci-layout"))
+        try encoder.encode(Index(schemaVersion: 2, manifests: saved)).write(to: out.appendingPathComponent("index.json"))
     }
 
     /// `docker import`: synthesizes a single-layer OCI image from `tarPath` (the

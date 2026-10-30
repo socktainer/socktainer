@@ -555,6 +555,7 @@ enum ContainerImageUtility {
         ociLayoutPath: URL,
         dockerFormatPath: URL,
         resolvedRefs: [String],
+        preferredPlatform: Platform = .current,
         logger: Logger
     ) async throws -> [[String: Any]] {
         let indexData = try Data(contentsOf: ociLayoutPath.appendingPathComponent("index.json"))
@@ -567,23 +568,23 @@ enum ContainerImageUtility {
             let blobPath = ociLayoutPath.appendingPathComponent("blobs/sha256/\(descriptorDigest)")
             let blobData = try Data(contentsOf: blobPath)
 
-            if descriptor.mediaType == "application/vnd.oci.image.index.v1+json" {
+            if isIndexMediaType(descriptor.mediaType) {
                 logger.debug("Found nested OCI index, processing manifests inside")
-                let nestedIndex = try JSONDecoder().decode(OCILayoutIndex.self, from: blobData)
-
-                for nestedDescriptor in nestedIndex.manifests {
-                    if nestedDescriptor.mediaType == "application/vnd.oci.image.manifest.v1+json" {
-                        let manifest = try processOCIManifest(
-                            descriptor: nestedDescriptor,
-                            ociLayoutPath: ociLayoutPath,
-                            dockerFormatPath: dockerFormatPath,
-                            repoTag: idx < resolvedRefs.count ? resolvedRefs[idx] : "unknown:latest",
-                            logger: logger
-                        )
-                        dockerManifests.append(manifest)
-                    }
+                // A docker-archive `manifest.json` entry is one image per tag: listing
+                // every platform under the same RepoTags makes `docker load` keep
+                // whichever comes last. Pick the one platform to carry.
+                let nestedIndex = try JSONDecoder().decode(Index.self, from: blobData)
+                if let chosen = preferredManifest(in: nestedIndex.manifests, for: preferredPlatform) {
+                    let manifest = try processOCIManifest(
+                        descriptor: OCILayoutDescriptor(mediaType: chosen.mediaType, digest: chosen.digest, size: Int(chosen.size)),
+                        ociLayoutPath: ociLayoutPath,
+                        dockerFormatPath: dockerFormatPath,
+                        repoTag: idx < resolvedRefs.count ? resolvedRefs[idx] : "unknown:latest",
+                        logger: logger
+                    )
+                    dockerManifests.append(manifest)
                 }
-            } else if descriptor.mediaType == "application/vnd.oci.image.manifest.v1+json" {
+            } else if isManifestMediaType(descriptor.mediaType) {
                 let manifest = try processOCIManifest(
                     descriptor: descriptor,
                     ociLayoutPath: ociLayoutPath,
@@ -598,6 +599,29 @@ enum ContainerImageUtility {
         }
 
         return dockerManifests
+    }
+
+    /// The image manifest of `manifests` to export for `platform`: an exact platform match,
+    /// else the first image manifest. Attestation manifests (BuildKit's provenance/SBOM,
+    /// platform `unknown/unknown`) are never images.
+    static func preferredManifest(in manifests: [Descriptor], for platform: Platform) -> Descriptor? {
+        let images = manifests.filter { descriptor in
+            isManifestMediaType(descriptor.mediaType)
+                && descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
+                && descriptor.platform?.os != "unknown"
+        }
+        let matches = createPlatformMatcher(for: platform)
+        return images.first { $0.platform.map(matches) ?? false } ?? images.first
+    }
+
+    /// Images pulled from registries that still serve Docker schema 2 content keep
+    /// those media types in the store, so both families are converted.
+    private static func isIndexMediaType(_ mediaType: String) -> Bool {
+        mediaType == MediaTypes.index || mediaType == MediaTypes.dockerManifestList
+    }
+
+    private static func isManifestMediaType(_ mediaType: String) -> Bool {
+        mediaType == MediaTypes.imageManifest || mediaType == MediaTypes.dockerManifest
     }
 
     private static func processOCIManifest(

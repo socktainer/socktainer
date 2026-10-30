@@ -46,7 +46,8 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
   backend has no way to apply them.
 - `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
   has no implementation either); `rename` only works before the first start.
-- `podman save` fails with "ContentStore missing blob data", an Apple Container image-store limitation.
+- `podman save` writes the platforms whose content is in the local store: one platform per tag in the
+  docker-archive (the requested one, else the host's), since a pull only fetches the platform it resolved.
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
 
@@ -104,7 +105,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman search` | GET `/libpod/images/search` | ✅ |
 | `podman history` | GET `/libpod/images/{name}/history` | ✅ |
 | `podman image prune` | POST `/libpod/images/prune` (confirmed in podman source) | ✅ |
-| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ⚠️ route registered; real `podman save` currently fails with "ContentStore missing blob data" (see limits above) |
+| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ docker-archive of the locally present platform; `save` → `load` round-trips (see limits above) |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
 | `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (decodes `reference` and calls the image client's import directly, answering with podman's single `{"Id": <digest>}` object instead of Docker's progress stream; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
