@@ -44,16 +44,11 @@ struct LibpodImagePullRoute: RouteCollection {
                 }
             }
 
-            let platform: Platform
-            if let platformString, !platformString.isEmpty {
-                do {
-                    platform = try platformOrThrow(platformString)
-                } catch {
-                    throw Abort(.badRequest, reason: "Failed to parse platform '\(platformString)': \(error.localizedDescription)")
-                }
-            } else {
-                platform = currentPlatform()
-            }
+            let platform = try requestedPlatform(
+                platform: platformString,
+                os: req.query["os"] ?? req.query["OS"],
+                arch: req.query["arch"] ?? req.query["Arch"],
+                variant: req.query["variant"] ?? req.query["Variant"])
 
             let response = Response()
             response.headers.add(name: .contentType, value: "application/json")
@@ -100,6 +95,32 @@ struct LibpodImagePullRoute: RouteCollection {
                 }
             })
             return response
+        }
+    }
+
+    /// `podman pull --platform os/arch[/variant]` (like `--os`/`--arch`/`--variant`) sends separate
+    /// `os`, `arch` and `variant` query parameters, not Docker's `platform`; a part left out
+    /// defaults to the host's, as on podman. A `platform` parameter still takes precedence.
+    static func requestedPlatform(platform: String?, os: String?, arch: String?, variant: String?) throws -> Platform {
+        if let platform, !platform.isEmpty {
+            do {
+                return try platformOrThrow(platform)
+            } catch {
+                throw Abort(.badRequest, reason: "Failed to parse platform '\(platform)': \(error.localizedDescription)")
+            }
+        }
+        let os = os.flatMap { $0.isEmpty ? nil : $0 }
+        let arch = arch.flatMap { $0.isEmpty ? nil : $0 }
+        let variant = variant.flatMap { $0.isEmpty ? nil : $0 }
+        guard os != nil || arch != nil || variant != nil else {
+            return currentPlatform()
+        }
+        let host = currentPlatform()
+        let spec = ["\(os ?? host.os)/\(arch ?? host.architecture)", variant].compactMap { $0 }.joined(separator: "/")
+        do {
+            return try Platform(from: spec)
+        } catch {
+            throw Abort(.badRequest, reason: "Failed to parse platform '\(spec)': \(error.localizedDescription)")
         }
     }
 
