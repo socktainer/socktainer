@@ -283,8 +283,9 @@ services:
 
 ### DNS upstream
 
-Socktainer runs an embedded DNS server that resolves container names and forwards every
-other name to an upstream resolver. By default the upstream is the IPv4 gateway of the
+Socktainer runs an embedded DNS server that resolves container names and forwards other
+multi-label names (e.g. `github.com`) to an upstream resolver; unknown single-label names are
+answered locally (NXDOMAIN/NODATA) and never forwarded. By default the upstream is the IPv4 gateway of the
 `default` network (the vmnet gateway, e.g. `192.168.64.1`), falling back to `1.1.1.1` if the
 gateway cannot be read.
 
