@@ -240,6 +240,9 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
             // Forwarding to ourselves would loop and amplify every query.
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
+            // Restore both defaults first: if the gateway lookup fails or times out, the
+            // documented 1.1.1.1:53 fallback applies instead of the rejected host.
+            dnsServer.upstreamHost = SocktainerDNSServer.defaultUpstreamHost
             dnsServer.upstreamPort = DNSUpstream.defaultPort
             await useGatewayUpstream()
         } else {

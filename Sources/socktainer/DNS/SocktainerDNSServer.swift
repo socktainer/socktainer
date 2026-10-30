@@ -37,7 +37,9 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: [AddressEntry]] = [:]  // normalized hostname → addresses, first-registered first
     private var log = Logger(label: "socktainer.dns")
-    private var _upstreamHost = "1.1.1.1"
+    /// Upstream used until (or unless) the gateway or a configured override is known.
+    static let defaultUpstreamHost = "1.1.1.1"
+    private var _upstreamHost = SocktainerDNSServer.defaultUpstreamHost
     /// Upstream for non-container names: the vmnet gateway or the configured
     /// `--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM` override. Lock-guarded: startup may set it after the
     /// server is already answering queries.
