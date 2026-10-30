@@ -240,16 +240,20 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         }
         return box.value
     }
-    // With an override, gather the host's own addresses before the server starts listening: the
-    // self-reference check needs them, and nothing may be awaited between binding and applying the
-    // override, or early queries could be forwarded back to this server. Until the override is
-    // validated, the server keeps its default upstream.
+    // With an override, apply it before the server starts so no query is ever forwarded to the
+    // built-in default instead. A loop is not possible meanwhile: forwardToUpstream answers SERVFAIL
+    // while the upstream points at this server. The host's own addresses (and the gateway, used as
+    // the fallback) are gathered up front so the post-start check needs no await.
     var localAddresses: Set<String> = []
-    if upstreamResolution.upstream != nil {
+    var gateway: String?
+    if let upstream = upstreamResolution.upstream {
         localAddresses = DNSUpstream.localIPv4Addresses()
-        if let gateway = await defaultGatewayAddress() {
+        gateway = await defaultGatewayAddress()
+        if let gateway {
             localAddresses.insert(gateway)
         }
+        dnsServer.upstreamHost = upstream.host
+        dnsServer.upstreamPort = upstream.port
     } else {
         await useGatewayUpstream()
     }
@@ -260,15 +264,18 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
     if let upstream = upstreamResolution.upstream {
         if upstream.pointsAtSelf(dnsPort: resolvedDNSPort, localAddresses: localAddresses) {
-            // Forwarding to ourselves would loop and amplify every query. The override was never
-            // applied, so the server keeps forwarding to its default while the gateway is looked up.
+            // Forwarding to ourselves would loop and amplify every query. Switch synchronously to the
+            // gateway already looked up above (or the built-in default if it could not be read).
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
-            await useGatewayUpstream()
+            dnsServer.upstreamHost = gateway ?? SocktainerDNSServer.defaultUpstreamHost
+            dnsServer.upstreamPort = DNSUpstream.defaultPort
+            if gateway == nil {
+                logger.warning("Could not read default network gateway — DNS upstream falls back to \(dnsServer.upstreamHost)")
+            } else {
+                logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+            }
         } else {
-            // Applied right after validation, with no await since the server started.
-            dnsServer.upstreamHost = upstream.host
-            dnsServer.upstreamPort = upstream.port
             logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
         }
     }
