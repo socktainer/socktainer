@@ -247,8 +247,7 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     var gateway: String?
     if let upstream = upstreamResolution.upstream {
         gateway = await defaultGatewayAddress()
-        dnsServer.upstreamHost = upstream.host
-        dnsServer.upstreamPort = upstream.port
+        dnsServer.setUpstream(host: upstream.host, port: upstream.port)
     } else {
         await useGatewayUpstream()
     }
@@ -269,8 +268,7 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
             // gateway already looked up above (or the built-in default if it could not be read).
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
-            dnsServer.upstreamHost = gateway ?? SocktainerDNSServer.defaultUpstreamHost
-            dnsServer.upstreamPort = DNSUpstream.defaultPort
+            dnsServer.setUpstream(host: gateway ?? SocktainerDNSServer.defaultUpstreamHost, port: DNSUpstream.defaultPort)
             if gateway == nil {
                 logger.warning("Could not read default network gateway — DNS upstream falls back to \(dnsServer.upstreamHost)")
             } else {

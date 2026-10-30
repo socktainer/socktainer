@@ -394,6 +394,17 @@ struct SocktainerDNSQueryTests {
         #expect(rcode == 5, "multi-label name must be answered by the configured upstream")
     }
 
+    @Test("setUpstream updates host and port as one pair")
+    func setUpstreamIsAtomicPair() {
+        let server = SocktainerDNSServer()
+        server.setUpstream(host: "10.1.2.3", port: 5353)
+        let snapshot = server.upstreamSnapshot()
+        #expect(snapshot.host == "10.1.2.3")
+        #expect(snapshot.port == 5353)
+        #expect(server.upstreamHost == "10.1.2.3")
+        #expect(server.upstreamPort == 5353)
+    }
+
     @Test("Upstream that points back at the server answers SERVFAIL instead of looping")
     func selfReferencingUpstreamAnswersServfail() throws {
         let server = SocktainerDNSServer()

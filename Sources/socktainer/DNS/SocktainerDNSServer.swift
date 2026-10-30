@@ -50,6 +50,17 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private var _upstreamPort = 53
     private var _listeningPort: Int?
     private var selfForwardReported = false
+    /// Sets host and port as one atomic pair, so a concurrent forward never sees a mixed upstream.
+    func setUpstream(host: String, port: Int) {
+        lock.withLock {
+            _upstreamHost = host
+            _upstreamPort = port
+        }
+    }
+    /// Host and port read as one consistent pair.
+    func upstreamSnapshot() -> (host: String, port: Int) {
+        lock.withLock { (host: _upstreamHost, port: _upstreamPort) }
+    }
     /// Port the server is bound to, once `start(...)` succeeds.
     var listeningPort: Int? { lock.withLock { _listeningPort } }
     /// Upstream port (default 53). Lock-guarded for consistency with `upstreamHost`.
@@ -419,8 +430,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
     }
 
     private func forwardToUpstream(_ packet: [UInt8]) -> [UInt8]? {
-        let host = upstreamHost
-        let upstreamPortValue = upstreamPort
+        let (host, upstreamPortValue) = upstreamSnapshot()
         // A host address that appears after startup (e.g. a named-network gateway) can make the
         // upstream point back at this server. Answer SERVFAIL rather than forward in a loop.
         if let ownPort = listeningPort, upstreamPortValue == ownPort,
