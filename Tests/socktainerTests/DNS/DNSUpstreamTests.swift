@@ -92,7 +92,20 @@ struct DNSUpstreamTests {
     @Test("Other ports or non-loopback hosts do not point at self")
     func pointsAtSelfFalse() {
         #expect(!DNSUpstream(host: "127.0.0.1", port: 53).pointsAtSelf(dnsPort: 2054))
-        #expect(!DNSUpstream(host: "10.0.0.1", port: 2054).pointsAtSelf(dnsPort: 2054))
+        #expect(!DNSUpstream(host: "10.0.0.1", port: 2054).pointsAtSelf(dnsPort: 2054, localAddresses: ["192.168.1.10"]))
+    }
+
+    @Test("Any local interface address on the server's own port points at self")
+    func pointsAtSelfLocalInterface() {
+        let local: Set<String> = ["192.168.1.10", "192.168.64.1"]
+        #expect(DNSUpstream(host: "192.168.1.10", port: 2054).pointsAtSelf(dnsPort: 2054, localAddresses: local))
+        #expect(DNSUpstream(host: "192.168.64.1", port: 2054).pointsAtSelf(dnsPort: 2054, localAddresses: local))
+        #expect(!DNSUpstream(host: "192.168.1.10", port: 53).pointsAtSelf(dnsPort: 2054, localAddresses: local))
+    }
+
+    @Test("Local IPv4 addresses include loopback")
+    func localAddressesIncludeLoopback() {
+        #expect(DNSUpstream.localIPv4Addresses().contains("127.0.0.1"))
     }
 
     // MARK: - Precedence

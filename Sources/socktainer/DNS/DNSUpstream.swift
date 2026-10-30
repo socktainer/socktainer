@@ -77,10 +77,30 @@ struct DNSUpstream: Equatable {
     }
 
     /// Whether forwarding to this upstream would reach the embedded DNS server itself
-    /// (loopback 127.0.0.0/8 on the server's own port), causing a forwarding loop.
-    func pointsAtSelf(dnsPort: Int) -> Bool {
-        guard port == dnsPort, let first = host.split(separator: ".").first else { return false }
-        return first == "127"
+    /// on the server's own port, causing a forwarding loop. The server binds 0.0.0.0, so that is
+    /// any loopback address (127.0.0.0/8) or any address in `localAddresses` (the host's
+    /// interface addresses and vmnet gateways).
+    func pointsAtSelf(dnsPort: Int, localAddresses: Set<String> = []) -> Bool {
+        guard port == dnsPort else { return false }
+        if host.split(separator: ".").first == "127" { return true }
+        return localAddresses.contains(host)
+    }
+
+    /// IPv4 addresses currently assigned to this host's interfaces, in canonical dotted-quad form.
+    static func localIPv4Addresses() -> Set<String> {
+        var result: Set<String> = []
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return result }
+        defer { freeifaddrs(ifaddr) }
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let sa = entry.pointee.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            var addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            if inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                result.insert(String(cString: buffer))
+            }
+        }
+        return result
     }
 
     /// Applies precedence: CLI value > environment variable > `nil` (auto-detect).

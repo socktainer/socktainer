@@ -235,8 +235,32 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         return
     }
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+    // The default network's gateway is a host address too, but its vmnet bridge only exists while
+    // containers run, so it may be missing from the interface list at startup.
+    func defaultGatewayAddress() async -> String? {
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _value: String?
+            var value: String? {
+                get { lock.withLock { _value } }
+                set { lock.withLock { _value = newValue } }
+            }
+        }
+        let box = Box()
+        _ = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+            box.value = try? await NetworkClient().get(id: "default").status.ipv4Gateway.description
+        }
+        return box.value
+    }
     if let upstream = upstreamResolution.upstream {
-        if upstream.pointsAtSelf(dnsPort: resolvedDNSPort) {
+        var localAddresses: Set<String> = []
+        if upstream.port == resolvedDNSPort {
+            localAddresses = DNSUpstream.localIPv4Addresses()
+            if let gateway = await defaultGatewayAddress() {
+                localAddresses.insert(gateway)
+            }
+        }
+        if upstream.pointsAtSelf(dnsPort: resolvedDNSPort, localAddresses: localAddresses) {
             // Forwarding to ourselves would loop and amplify every query.
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
