@@ -223,18 +223,6 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
             logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
         }
     }
-    if let upstream = upstreamResolution.upstream {
-        // Logged after the DNS port is known: an override pointing at our own port is rejected below.
-        dnsServer.upstreamHost = upstream.host
-        dnsServer.upstreamPort = upstream.port
-    } else {
-        await useGatewayUpstream()
-    }
-    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
-        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
-        return
-    }
-    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
     // The default network's gateway is a host address too, but its vmnet bridge only exists while
     // containers run, so it may be missing from the interface list at startup.
     func defaultGatewayAddress() async -> String? {
@@ -252,24 +240,35 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         }
         return box.value
     }
-    if let upstream = upstreamResolution.upstream {
-        var localAddresses: Set<String> = []
-        if upstream.port == resolvedDNSPort {
-            localAddresses = DNSUpstream.localIPv4Addresses()
-            if let gateway = await defaultGatewayAddress() {
-                localAddresses.insert(gateway)
-            }
+    // With an override, gather the host's own addresses before the server starts listening: the
+    // self-reference check needs them, and nothing may be awaited between binding and applying the
+    // override, or early queries could be forwarded back to this server. Until the override is
+    // validated, the server keeps its default upstream.
+    var localAddresses: Set<String> = []
+    if upstreamResolution.upstream != nil {
+        localAddresses = DNSUpstream.localIPv4Addresses()
+        if let gateway = await defaultGatewayAddress() {
+            localAddresses.insert(gateway)
         }
+    } else {
+        await useGatewayUpstream()
+    }
+    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
+        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
+        return
+    }
+    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+    if let upstream = upstreamResolution.upstream {
         if upstream.pointsAtSelf(dnsPort: resolvedDNSPort, localAddresses: localAddresses) {
-            // Forwarding to ourselves would loop and amplify every query.
+            // Forwarding to ourselves would loop and amplify every query. The override was never
+            // applied, so the server keeps forwarding to its default while the gateway is looked up.
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
-            // Restore both defaults first: if the gateway lookup fails or times out, the
-            // documented 1.1.1.1:53 fallback applies instead of the rejected host.
-            dnsServer.upstreamHost = SocktainerDNSServer.defaultUpstreamHost
-            dnsServer.upstreamPort = DNSUpstream.defaultPort
             await useGatewayUpstream()
         } else {
+            // Applied right after validation, with no await since the server started.
+            dnsServer.upstreamHost = upstream.host
+            dnsServer.upstreamPort = upstream.port
             logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
         }
     }
