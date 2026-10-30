@@ -48,6 +48,10 @@ final class SocktainerDNSServer: @unchecked Sendable {
         set { lock.withLock { _upstreamHost = newValue } }
     }
     private var _upstreamPort = 53
+    private var _listeningPort: Int?
+    private var selfForwardReported = false
+    /// Port the server is bound to, once `start(...)` succeeds.
+    var listeningPort: Int? { lock.withLock { _listeningPort } }
     /// Upstream port (default 53). Lock-guarded for consistency with `upstreamHost`.
     var upstreamPort: Int {
         get { lock.withLock { _upstreamPort } }
@@ -138,6 +142,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         for offset in 0..<maxAttempts {
             let port = preferredPort + offset
             if canBind(port: port) {
+                lock.withLock { _listeningPort = port }
                 Thread.detachNewThread { self.serverLoop(port: port) }
                 return port
             }
@@ -414,6 +419,28 @@ final class SocktainerDNSServer: @unchecked Sendable {
     }
 
     private func forwardToUpstream(_ packet: [UInt8]) -> [UInt8]? {
+        let host = upstreamHost
+        let upstreamPortValue = upstreamPort
+        // A host address that appears after startup (e.g. a named-network gateway) can make the
+        // upstream point back at this server. Answer SERVFAIL rather than forward in a loop.
+        if let ownPort = listeningPort, upstreamPortValue == ownPort,
+            DNSUpstream(host: host, port: upstreamPortValue)
+                .pointsAtSelf(dnsPort: ownPort, localAddresses: DNSUpstream.localIPv4Addresses())
+        {
+            let firstReport = lock.withLock { () -> Bool in
+                defer { selfForwardReported = true }
+                return !selfForwardReported
+            }
+            if firstReport {
+                log.error("[dns] upstream \(host):\(upstreamPortValue) points at this DNS server — answering SERVFAIL instead of forwarding")
+            }
+            guard packet.count >= 4 else { return nil }
+            var response = packet
+            response[2] |= 0x80  // QR=1
+            response[3] = (response[3] & 0xF0) | 0x02  // RCODE=2 (SERVFAIL)
+            return response
+        }
+
         let sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard sockfd >= 0 else { return nil }
         defer { Darwin.close(sockfd) }
@@ -424,9 +451,9 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var upstream = sockaddr_in()
         upstream.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         upstream.sin_family = sa_family_t(AF_INET)
-        guard let port = UInt16(exactly: upstreamPort) else { return nil }
+        guard let port = UInt16(exactly: upstreamPortValue) else { return nil }
         upstream.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, upstreamHost, &upstream.sin_addr) == 1 else { return nil }
+        guard inet_pton(AF_INET, host, &upstream.sin_addr) == 1 else { return nil }
 
         let connected = withUnsafePointer(to: &upstream) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

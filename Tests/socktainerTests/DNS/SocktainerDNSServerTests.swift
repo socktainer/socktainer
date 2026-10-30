@@ -394,6 +394,20 @@ struct SocktainerDNSQueryTests {
         #expect(rcode == 5, "multi-label name must be answered by the configured upstream")
     }
 
+    @Test("Upstream that points back at the server answers SERVFAIL instead of looping")
+    func selfReferencingUpstreamAnswersServfail() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19790, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        // Simulates a host address that starts matching the upstream after startup.
+        server.upstreamHost = "127.0.0.1"
+        server.upstreamPort = port
+        let rcode = dnsRcode(type: 1, names: ["host.internal.example"], port: port)
+        #expect(rcode == 2, "a self-referencing upstream must be answered SERVFAIL, not forwarded")
+    }
+
     @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
     func qdcountGreaterThanOneReturnsFormerr() throws {
         let server = SocktainerDNSServer()
