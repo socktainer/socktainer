@@ -8,7 +8,7 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
     typealias Value = URL
 }
 
-func configure(_ app: Application) async throws {
+func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
 
     // Docker container-create payloads (large env / config — e.g. Supabase's
     // edge-runtime + storage-api) exceed Vapor's 16 KB default collected-body
@@ -201,26 +201,51 @@ func configure(_ app: Application) async throws {
         ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
         .flatMap(Int.init) ?? 2054
     let dnsServer = SocktainerDNSServer()
+    let logger = app.logger
+    // Upstream precedence: --dns-upstream > SOCKTAINER_DNS_UPSTREAM > default-network gateway.
+    let upstreamResolution = DNSUpstream.resolve(cliValue: dnsUpstreamCLI, environment: ProcessInfo.processInfo.environment)
+    if let warning = upstreamResolution.warning {
+        logger.warning("\(warning)")
+    }
     // Forward non-container names to the vmnet gateway resolver (as `default`-network
     // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
     // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
-    let logger = app.logger
-    let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
-        do {
-            dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
-            logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
-        } catch {
-            logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    func useGatewayUpstream() async {
+        let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+            do {
+                dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+                logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+            } catch {
+                logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+            }
+        }
+        if !gatewayLookupFinished {
+            logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
         }
     }
-    if !gatewayLookupFinished {
-        logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    if let upstream = upstreamResolution.upstream {
+        // Logged after the DNS port is known: an override pointing at our own port is rejected below.
+        dnsServer.upstreamHost = upstream.host
+        dnsServer.upstreamPort = upstream.port
+    } else {
+        await useGatewayUpstream()
     }
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
         return
     }
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+    if let upstream = upstreamResolution.upstream {
+        if upstream.pointsAtSelf(dnsPort: resolvedDNSPort) {
+            // Forwarding to ourselves would loop and amplify every query.
+            logger.error(
+                "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
+            dnsServer.upstreamPort = DNSUpstream.defaultPort
+            await useGatewayUpstream()
+        } else {
+            logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
+        }
+    }
     app.storage[SocktainerDNSServerKey.self] = dnsServer
 
     let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)

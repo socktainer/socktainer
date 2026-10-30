@@ -32,6 +32,7 @@
   - [Usage 🚀](#usage-🚀)
     - [Volume sync mode](#volume-sync-mode)
     - [VM memory](#vm-memory)
+    - [DNS upstream](#dns-upstream)
     - [Volume compatibility — Postgres](#volume-compatibility--postgres)
   - [Building from Source 🏗️](#building-from-source-🏗️)
     - [Prerequisites](#prerequisites)
@@ -279,6 +280,35 @@ services:
     image: redis:alpine
     mem_limit: 256m
 ```
+
+### DNS upstream
+
+Socktainer runs an embedded DNS server that resolves container names and forwards every
+other name to an upstream resolver. By default the upstream is the IPv4 gateway of the
+`default` network (the vmnet gateway, e.g. `192.168.64.1`), falling back to `1.1.1.1` if the
+gateway cannot be read.
+
+On some managed Macs the vmnet gateway does not answer DNS queries, so containers on named
+networks cannot resolve external names. The override only affects the embedded server, so it
+applies to containers on named networks (including Docker Compose); containers on the
+`default` network still query the vmnet gateway directly.
+
+Point it at a resolver that already runs on the host (macOS has none on `127.0.0.1:53` by
+default), for example a local DNS proxy installed by security or VPN software, or one you run
+yourself. The address must be an IPv4 literal, with an optional port (default `53`):
+
+```bash
+socktainer --dns-upstream 127.0.0.1
+SOCKTAINER_DNS_UPSTREAM=127.0.0.1:5353 socktainer
+```
+
+Do not point it at socktainer's own DNS port; that configuration is ignored with an error.
+
+The `--dns-upstream` flag takes precedence over `SOCKTAINER_DNS_UPSTREAM`, which takes
+precedence over gateway auto-detection. An invalid `--dns-upstream` value stops startup; an
+invalid `SOCKTAINER_DNS_UPSTREAM` value is ignored with a warning. If you run socktainer as a
+Homebrew service, the service does not read your shell environment, so set the variable in the
+service's environment or run `socktainer` manually.
 
 ### Volume compatibility — Postgres
 

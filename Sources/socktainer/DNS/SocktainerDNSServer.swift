@@ -8,8 +8,9 @@ struct SocktainerDNSServerKey: StorageKey {
 }
 
 /// UDP DNS server that resolves container service names and forwards unknown queries to
-/// `upstreamHost` — the vmnet gateway resolver in production, so names resolve as on the host
-/// (VPN split DNS, `/etc/resolver/*`); 1.1.1.1 only when no gateway is known.
+/// `upstreamHost` — the vmnet gateway resolver in production (so names resolve as on the host:
+/// VPN split DNS, `/etc/resolver/*`) or the configured `--dns-upstream` /
+/// `SOCKTAINER_DNS_UPSTREAM` override; 1.1.1.1 only when no upstream is known.
 ///
 /// Runs on 0.0.0.0:2054 (covers all interfaces including vmnet gateways).
 /// Port 2053 is reserved by Apple Container's own DNS handler.
@@ -37,14 +38,19 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private var entries: [String: [AddressEntry]] = [:]  // normalized hostname → addresses, first-registered first
     private var log = Logger(label: "socktainer.dns")
     private var _upstreamHost = "1.1.1.1"
-    /// Upstream for non-container names. Lock-guarded: startup may set it after the
+    /// Upstream for non-container names: the vmnet gateway or the configured
+    /// `--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM` override. Lock-guarded: startup may set it after the
     /// server is already answering queries.
     var upstreamHost: String {
         get { lock.withLock { _upstreamHost } }
         set { lock.withLock { _upstreamHost = newValue } }
     }
-    /// Upstream port; only overridden by tests, before `start(...)`.
-    var upstreamPort = 53
+    private var _upstreamPort = 53
+    /// Upstream port (default 53). Lock-guarded for consistency with `upstreamHost`.
+    var upstreamPort: Int {
+        get { lock.withLock { _upstreamPort } }
+        set { lock.withLock { _upstreamPort = newValue } }
+    }
 
     func register(hostname: String, ip: String) {
         register(hostname: hostname, ips: [ip])
@@ -416,7 +422,8 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var upstream = sockaddr_in()
         upstream.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         upstream.sin_family = sa_family_t(AF_INET)
-        upstream.sin_port = UInt16(upstreamPort).bigEndian
+        guard let port = UInt16(exactly: upstreamPort) else { return nil }
+        upstream.sin_port = port.bigEndian
         guard inet_pton(AF_INET, upstreamHost, &upstream.sin_addr) == 1 else { return nil }
 
         let connected = withUnsafePointer(to: &upstream) {
