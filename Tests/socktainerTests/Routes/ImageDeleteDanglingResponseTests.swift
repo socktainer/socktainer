@@ -108,6 +108,9 @@ private struct FixedResultImageMock: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
     }
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }

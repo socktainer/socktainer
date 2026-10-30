@@ -22,6 +22,8 @@
   - [Quick Start ⚡](#quick-start)
     - [Launch socktainer 🏁](#launch-socktainer-🏁)
     - [Using Docker CLI 🐳](#using-docker-cli-🐳)
+    - [Using Podman CLI 🦭](#using-podman-cli-🦭)
+    - [Socket Symlinks 🔗](#socket-symlinks-🔗)
   - [Key Features ✨](#key-features)
   - [Requirements 📋](#requirements-📋)
   - [Installation 🛠️](#installation-🛠️)
@@ -151,6 +153,137 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ```
 
 </details>
+
+### Using Podman CLI 🦭
+
+Podman connects to socktainer via `CONTAINER_HOST` or socket symlink:
+
+```bash
+export CONTAINER_HOST=unix://$HOME/.socktainer/container.sock
+podman version   # Check connection
+podman ps        # List running containers
+podman images    # List available images
+```
+
+> [!NOTE]
+> Podman uses its own API endpoints (`/libpod/*`), not Docker-compatible ones.
+> Socktainer implements a subset of the libpod API — see [#201](https://github.com/socktainer/socktainer/issues/201) for progress.
+> To opt out of Podman support entirely, start socktainer with `SOCKTAINER_DISABLE_LIBPOD=1`:
+> no `/libpod/*` routes are registered and `/_ping` stops advertising `Libpod-API-Version`.
+
+> [!TIP]
+> Already have Podman Desktop (or `podman machine`) set up, with
+> `/var/run/docker.sock` symlinked to its own Docker-compat socket? `CONTAINER_HOST`
+> above talks to socktainer **without touching that link at all** — nothing else
+> that depends on it (Podman Desktop itself, other tools) is affected. This is
+> the reason to prefer the env var over the symlink approach below whenever an
+> existing setup like that is already in place.
+
+### Socket Symlinks 🔗
+
+Instead of setting environment variables, you can symlink socktainer's socket to the default locations that Docker and Podman expect.
+
+> [!WARNING]
+> `/var/run/docker.sock` is often already a symlink to something else — most
+> commonly Podman Desktop's own Docker-compat socket (`podman machine`'s
+> `podman.sock`), which is what makes plain `docker` commands work against
+> Podman in the first place. Overwriting it with `ln -sf` **replaces that link
+> silently**, so back up the existing target first if you want to switch back
+> later without reinstalling anything.
+
+**Docker** (requires `sudo`):
+
+```bash
+if [ -e /var/run/docker.sock ] && [ ! -L /var/run/docker.sock ]; then
+  echo "warning: /var/run/docker.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  # Back up whatever /var/run/docker.sock currently points to (if it's a symlink, and not
+  # already socktainer's own link — e.g. re-running setup without an intervening undo) —
+  # e.g. Podman Desktop's own Docker-compat link — so it can be restored later.
+  if [ -L /var/run/docker.sock ] && [ ! -f "$HOME/.socktainer-docker-sock-backup" ] \
+     && [ "$(readlink /var/run/docker.sock)" != "$HOME/.socktainer/container.sock" ]; then
+    readlink /var/run/docker.sock > "$HOME/.socktainer-docker-sock-backup"
+  fi
+  sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+fi
+```
+
+**Podman** (no `sudo` needed):
+
+```bash
+# Podman looks for its socket at $TMPDIR/storage-run-$UID/podman/podman.sock
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+if [ -e "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -L "$PODMAN_SOCK_DIR/podman.sock" ]; then
+  echo "warning: $PODMAN_SOCK_DIR/podman.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -f "$HOME/.socktainer-podman-sock-backup" ] \
+     && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" != "$HOME/.socktainer/container.sock" ]; then
+    readlink "$PODMAN_SOCK_DIR/podman.sock" > "$HOME/.socktainer-podman-sock-backup"
+  fi
+  ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+fi
+```
+
+**Both at once:**
+
+```bash
+# Docker
+if [ -e /var/run/docker.sock ] && [ ! -L /var/run/docker.sock ]; then
+  echo "warning: /var/run/docker.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L /var/run/docker.sock ] && [ ! -f "$HOME/.socktainer-docker-sock-backup" ] \
+     && [ "$(readlink /var/run/docker.sock)" != "$HOME/.socktainer/container.sock" ]; then
+    readlink /var/run/docker.sock > "$HOME/.socktainer-docker-sock-backup"
+  fi
+  sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+fi
+
+# Podman
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+if [ -e "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -L "$PODMAN_SOCK_DIR/podman.sock" ]; then
+  echo "warning: $PODMAN_SOCK_DIR/podman.sock exists and is not a symlink — leaving it in place, not overwriting" >&2
+else
+  if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ ! -f "$HOME/.socktainer-podman-sock-backup" ] \
+     && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" != "$HOME/.socktainer/container.sock" ]; then
+    readlink "$PODMAN_SOCK_DIR/podman.sock" > "$HOME/.socktainer-podman-sock-backup"
+  fi
+  ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+fi
+```
+
+To undo — restores whatever was linked before (e.g. Podman Desktop's socket), or just removes the link if there was nothing to restore. A path that no longer links to socktainer (another tool changed it since) is left alone, along with its backup:
+
+```bash
+# Docker
+if [ -L /var/run/docker.sock ] && [ "$(readlink /var/run/docker.sock)" = "$HOME/.socktainer/container.sock" ]; then
+  if [ -f "$HOME/.socktainer-docker-sock-backup" ]; then
+    sudo ln -sf "$(cat "$HOME/.socktainer-docker-sock-backup")" /var/run/docker.sock
+    rm -f "$HOME/.socktainer-docker-sock-backup"
+  else
+    sudo rm -f /var/run/docker.sock
+  fi
+else
+  echo "skipped: /var/run/docker.sock does not link to socktainer — leaving it (and any backup) in place" >&2
+fi
+
+# Podman
+PODMAN_SOCK_DIR="${TMPDIR:-/tmp}"
+PODMAN_SOCK_DIR="${PODMAN_SOCK_DIR%/}/storage-run-$(id -u)/podman"
+if [ -L "$PODMAN_SOCK_DIR/podman.sock" ] && [ "$(readlink "$PODMAN_SOCK_DIR/podman.sock")" = "$HOME/.socktainer/container.sock" ]; then
+  if [ -f "$HOME/.socktainer-podman-sock-backup" ]; then
+    ln -sf "$(cat "$HOME/.socktainer-podman-sock-backup")" "$PODMAN_SOCK_DIR/podman.sock"
+    rm -f "$HOME/.socktainer-podman-sock-backup"
+  else
+    rm -f "$PODMAN_SOCK_DIR/podman.sock"
+  fi
+else
+  echo "skipped: $PODMAN_SOCK_DIR/podman.sock does not link to socktainer — leaving it (and any backup) in place" >&2
+fi
+```
 
 ---
 
@@ -416,7 +549,7 @@ Ownership rules:
 
 - `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
 - `docker load` accepts tarballs from real Docker (plain, gzip or zstd compressed). Index entries whose blobs are not in the tarball are dropped on load — `docker save` on real Docker ships only the pulling platform's blobs while keeping the full multi-platform index, so only that platform is imported.
-- `docker save` works for images that were loaded from a tarball, and the `docker save | docker load` round-trip is supported. It fails with `ContentStore missing blob data` for **registry-pulled** images: Apple's Containerization pull stores the image's full multi-platform index but downloads only the local platform's blobs, and save exports the whole index ([platform limitation](https://github.com/apple/containerization)).
+- `docker save` writes the platforms whose content is in the local store: a registry pull downloads only the platform it resolved, so that is what a pulled image saves. The tarball carries one image per tag (the requested `--platform`, else the host's), and the `docker save | docker load` round-trip is supported. Saving a platform the image has no local content for returns `404`.
 - `docker rename` works only for containers that have **never been started**, which covers Compose recreation (it renames its new replacement before starting it). Apple Container has no rename and names a container by its id, so socktainer recreates the container under the new name, keeping its Docker ID. A container that has run keeps a writable root filesystem that recreating would lose, so renaming it returns `409 Conflict`.
 - `docker pause` / `docker unpause` are **not supported** — there is no freezer/checkpoint equivalent for Apple Container VMs.
 - `docker network connect` / `disconnect` are accepted as **no-ops**: Virtualization.framework offers no NIC hotplug and Apple Container has no post-create attach API, so network membership is fixed at container create. Containers on user-created networks reach each other by name through socktainer's DNS, which covers the common Compose use.

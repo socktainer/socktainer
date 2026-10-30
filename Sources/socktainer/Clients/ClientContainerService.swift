@@ -458,8 +458,14 @@ struct ClientContainerService: ClientContainerProtocol {
 
     private func stopInternal(container: ContainerSnapshot, signal: String?, timeout: Int?) async throws {
         let signal = signal ?? "SIGTERM"
-        let options = ContainerStopOptions(timeoutInSeconds: Int32(timeout ?? 5), signal: signal)
+        let options = ContainerStopOptions(timeoutInSeconds: Self.stopTimeoutSeconds(timeout), signal: signal)
         try await containerClient.withClient { try await $0.stop(id: container.id, opts: options) }
+    }
+
+    /// The grace period in the width Apple's stop options take. Clamped rather than converted:
+    /// podman sends its "wait forever" `-1` as the unsigned 4294967295, which `Int32(_:)` traps on.
+    static func stopTimeoutSeconds(_ timeout: Int?) -> Int32 {
+        Int32(clamping: timeout ?? 5)
     }
 
     func kill(id: String, signal: String?) async throws {
