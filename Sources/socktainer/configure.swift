@@ -268,11 +268,17 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
             // gateway already looked up above (or the built-in default if it could not be read).
             logger.error(
                 "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
-            dnsServer.setUpstream(host: gateway ?? SocktainerDNSServer.defaultUpstreamHost, port: DNSUpstream.defaultPort)
-            if gateway == nil {
-                logger.warning("Could not read default network gateway — DNS upstream falls back to \(dnsServer.upstreamHost)")
+            // The gateway fallback can itself be this server (listener on port 53 and the gateway is
+            // a host address); use the built-in default then rather than SERVFAIL every query.
+            let gatewayFallback = gateway.map { DNSUpstream(host: $0, port: DNSUpstream.defaultPort) }
+            if let gatewayFallback, !gatewayFallback.pointsAtSelf(dnsPort: resolvedDNSPort, localAddresses: localAddresses) {
+                dnsServer.setUpstream(host: gatewayFallback.host, port: gatewayFallback.port)
+                logger.notice("DNS upstream: \(gatewayFallback.host)")
             } else {
-                logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+                dnsServer.setUpstream(host: SocktainerDNSServer.defaultUpstreamHost, port: DNSUpstream.defaultPort)
+                logger.warning(
+                    "Default network gateway \(gateway == nil ? "could not be read" : "also points at socktainer's own DNS server") — DNS upstream falls back to \(SocktainerDNSServer.defaultUpstreamHost)"
+                )
             }
         } else {
             logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
