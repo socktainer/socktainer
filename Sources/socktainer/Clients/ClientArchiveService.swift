@@ -1126,7 +1126,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     func guestStatScript(path: String) -> String {
         let quoted = shellSingleQuoted(path)
         return "p=\(quoted); if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then exit 40; fi; "
-            + "stat -c '%f %s %Y' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\"; fi"
+            + "stat -c '%f %s %Y %u %g' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\"; fi"
     }
 
     func guestProbeStatus(exitCode: Int32) -> GuestProbeStatus {
@@ -1144,15 +1144,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard let first = lines.first else { return nil }
         let fields = first.split(separator: " ")
-        guard fields.count >= 3,
+        guard fields.count >= 5,
             let rawMode = UInt32(fields[0], radix: 16),
             let size = UInt64(fields[1]),
-            let mtime = Int64(fields[2])
+            let mtime = Int64(fields[2]),
+            let uid = UInt32(fields[3]),
+            let gid = UInt32(fields[4])
         else {
             return nil
         }
         let linkTarget = lines.count > 1 ? lines[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-        return GuestPathProbe(rawMode: rawMode, size: size, mtime: mtime, uid: 0, gid: 0, linkTarget: linkTarget)
+        return GuestPathProbe(rawMode: rawMode, size: size, mtime: mtime, uid: uid, gid: gid, linkTarget: linkTarget)
     }
 
     func guestReadKind(rawMode: UInt32) -> GuestReadKind {

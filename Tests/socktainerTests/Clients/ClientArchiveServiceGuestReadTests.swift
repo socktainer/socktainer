@@ -99,6 +99,28 @@ struct ClientArchiveServiceGuestReadTests {
             "distroless and scratch images have no /bin/sh; before the guest fallback these paths returned 404")
     }
 
+    @Test("the probe asks stat for the owner")
+    func probeAsksForOwner() {
+        #expect(
+            service.guestStatScript(path: "/data/f").contains("stat -c '%f %s %Y %u %g'"),
+            "without %u %g every file read through the guest is archived as root-owned")
+    }
+
+    @Test("the parsed probe keeps the file's owner and group")
+    func parsedProbeKeepsOwner() throws {
+        let probe = try #require(service.parseGuestStat("81a4 5 1700000000 1000 1001\n"))
+        #expect(probe.uid == 1000, "docker cp -a must keep the owner")
+        #expect(probe.gid == 1001)
+        #expect(probe.size == 5)
+        #expect(probe.rawMode == 0x81a4)
+    }
+
+    @Test("a symlink probe keeps its target after the stat line")
+    func parsedSymlinkProbe() throws {
+        let probe = try #require(service.parseGuestStat("a1ff 7 1700000000 0 0\n/target\n"))
+        #expect(probe.linkTarget == "/target")
+    }
+
     @Test("the probe's own exit codes keep their meaning")
     func probeExitCodes() {
         #expect(service.guestProbeStatus(exitCode: 0) == .found)
