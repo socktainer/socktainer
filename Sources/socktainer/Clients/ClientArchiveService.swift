@@ -1194,6 +1194,13 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
+    /// The guest command that reads a regular file for GET /archive, bounded
+    /// by the size the probe reported: a file that grows while it is read (a
+    /// log being written) must not stream past the size in the tar header.
+    func guestRegularFileReadCommand(path: String, size: UInt64) -> String {
+        "head -c \(size) \(shellSingleQuoted(path))"
+    }
+
     /// The guest command that archives a directory for GET /archive: entries
     /// are prefixed with the directory's own name, as the rootfs reader's
     /// (`extractPathToDirectory`) and Docker's are; the root is archived as `.`.
@@ -1380,7 +1387,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
         case .regular, .directory:
             entry.fileType = .regular
-            let (exitCode, stdout, stderr) = try await runGuestCommandOrFail(container: container, shellCommand: "cat \(shellSingleQuoted(path))")
+            let (exitCode, stdout, stderr) = try await runGuestCommandOrFail(container: container, shellCommand: guestRegularFileReadCommand(path: path, size: probe.size))
             guard exitCode == 0 else {
                 let detail = stderr.isEmpty ? "" : ": \(stderr)"
                 throw ClientArchiveError.operationFailed(message: "guest read of \(path) failed (exit \(exitCode))\(detail)")

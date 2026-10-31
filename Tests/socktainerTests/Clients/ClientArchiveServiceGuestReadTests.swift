@@ -73,6 +73,16 @@ struct ClientArchiveServiceGuestReadTests {
         #expect(service.guestReadKind(rawMode: 0xa1ff) == .symlink)
     }
 
+    // MARK: - Regular file reads
+
+    @Test("a regular file is read no further than the size the probe reported")
+    func regularFileReadIsBounded() {
+        let command = service.guestRegularFileReadCommand(path: "/var/log/app.log", size: 4096)
+        #expect(
+            command == "head -c 4096 '/var/log/app.log'",
+            "a file still being written must not stream past the size in the tar header: \(command)")
+    }
+
     // MARK: - Directory archives
 
     @Test("a mounted directory is archived under its own name, like the rootfs reader and Docker do")
