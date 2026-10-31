@@ -189,8 +189,8 @@ extension ImageListRoute {
         }
     }
 
-    /// Applies the `dangling` and `reference` image-ls filters. Different keys
-    /// AND together, matching moby.
+    /// Applies the `dangling`, `reference` and `label` image-ls filters. Different
+    /// keys AND together, matching moby.
     static func applyFilters(_ summaries: [RESTImageSummary], filters: [String: [String]]) throws -> [RESTImageSummary] {
         var result = summaries
         // A present (even empty) `dangling` key is validated, unlike `reference`
@@ -219,6 +219,20 @@ extension ImageListRoute {
         // image, which is exactly that "matches nothing" behavior.
         if let patterns = filters["reference"] {
             result = result.filter { ImageListFilter.referenceMatches(patterns: patterns, repoTags: $0.RepoTags) }
+        }
+        // Like moby's MatchKVList: `key` requires the label, `key=value` its value
+        // (split at the first `=`), and every label filter must match.
+        if let labelFilters = filters["label"] {
+            result = result.filter { image in
+                labelFilters.allSatisfy { labelFilter in
+                    guard let eqIdx = labelFilter.firstIndex(of: "=") else {
+                        return image.Labels[labelFilter] != nil
+                    }
+                    let key = String(labelFilter[..<eqIdx])
+                    let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
+                    return image.Labels[key] == value
+                }
+            }
         }
         return result
     }
