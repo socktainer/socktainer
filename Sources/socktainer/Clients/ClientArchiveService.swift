@@ -1100,8 +1100,20 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Whether a stat or archive read of `path` goes through a guest exec
     /// rather than the rootfs reader.
+    /// A path at or under a mount point always goes to the guest: the rootfs
+    /// only has the (usually empty) mount-point directory, and anything it
+    /// holds beneath the mount is hidden from the container.
     func readsThroughGuest(path: String, isRunning: Bool, mountDestinations: [String], existsInRootfs: Bool) -> Bool {
-        isRunning && !existsInRootfs
+        guard isRunning else { return false }
+        return !existsInRootfs || mountDestinations.contains { isPath(path, atOrUnder: $0) }
+    }
+
+    /// Component-wise prefix test: `/data` covers `/data` and `/data/x`, not `/database`.
+    func isPath(_ path: String, atOrUnder mountPoint: String) -> Bool {
+        let mount = mountPoint.split(separator: "/")
+        guard !mount.isEmpty else { return false }
+        let components = path.split(separator: "/")
+        return components.count >= mount.count && Array(components.prefix(mount.count)) == mount
     }
 
     /// The probe script: exit 40 when the path does not exist, otherwise one
