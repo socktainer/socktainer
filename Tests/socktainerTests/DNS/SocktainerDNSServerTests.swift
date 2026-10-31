@@ -405,6 +405,35 @@ struct SocktainerDNSQueryTests {
         #expect(server.upstreamPort == 5353)
     }
 
+    @Test("Concurrent setUpstream never exposes a mixed host/port pair")
+    func setUpstreamConcurrentSnapshotsAreConsistent() {
+        let server = SocktainerDNSServer()
+        let pairA = (host: "10.0.0.1", port: 1111)
+        let pairB = (host: "10.0.0.2", port: 2222)
+        server.setUpstream(host: pairA.host, port: pairA.port)
+        final class Counter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _mixed = 0
+            func recordMixed() { lock.withLock { _mixed += 1 } }
+            var mixed: Int { lock.withLock { _mixed } }
+        }
+        let counter = Counter()
+        // Even iterations write alternating pairs; odd iterations read and check the snapshot.
+        DispatchQueue.concurrentPerform(iterations: 20_000) { i in
+            if i.isMultiple(of: 2) {
+                let pair = (i / 2).isMultiple(of: 2) ? pairA : pairB
+                server.setUpstream(host: pair.host, port: pair.port)
+            } else {
+                let snapshot = server.upstreamSnapshot()
+                let consistent =
+                    (snapshot.host == pairA.host && snapshot.port == pairA.port)
+                    || (snapshot.host == pairB.host && snapshot.port == pairB.port)
+                if !consistent { counter.recordMixed() }
+            }
+        }
+        #expect(counter.mixed == 0, "every snapshot must be one complete pair")
+    }
+
     @Test("Upstream that points back at the server answers SERVFAIL instead of looping")
     func selfReferencingUpstreamAnswersServfail() throws {
         let server = SocktainerDNSServer()
