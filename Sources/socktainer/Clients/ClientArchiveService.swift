@@ -1132,7 +1132,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
     func guestProbeStatus(exitCode: Int32) -> GuestProbeStatus {
         switch exitCode {
         case 0: return .found
-        case 40: return .missing
+        // 126/127: the shell could not run the probe (no /bin/sh or no stat in a
+        // distroless or scratch image) — report what the rootfs reader would.
+        case 40, 126, 127: return .missing
         default: return .failed
         }
     }
@@ -1172,6 +1174,24 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Run `/bin/sh -c <command>` in the RUNNING container as root, capturing
     /// stdout in full and stderr capped at 16 KiB.
+    /// The exec in `runGuestCommand` could not be created or started.
+    private struct GuestExecLaunchFailure: Error {
+        let message: String
+    }
+
+    /// `runGuestCommand` for reads that must succeed: a launch failure is an
+    /// operation failure.
+    private func runGuestCommandOrFail(
+        container: ContainerSnapshot,
+        shellCommand: String
+    ) async throws -> (exitCode: Int32, stdout: Data, stderr: String) {
+        do {
+            return try await runGuestCommand(container: container, shellCommand: shellCommand)
+        } catch let failure as GuestExecLaunchFailure {
+            throw ClientArchiveError.operationFailed(message: failure.message)
+        }
+    }
+
     private func runGuestCommand(
         container: ContainerSnapshot,
         shellCommand: String
@@ -1197,13 +1217,13 @@ struct ClientArchiveService: ClientArchiveProtocol {
             )
         } catch {
             pipes.closeAll()
-            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+            throw GuestExecLaunchFailure(message: "Failed to exec into running container: \(error.localizedDescription)")
         }
         do {
             try await process.start()
         } catch {
             pipes.closeAfterHandoff()
-            throw ClientArchiveError.operationFailed(message: "Failed to exec into running container: \(error.localizedDescription)")
+            throw GuestExecLaunchFailure(message: "Failed to exec into running container: \(error.localizedDescription)")
         }
 
         let stdoutReader = pipes.stdout!.read
@@ -1242,7 +1262,15 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Stat a path inside the running container's mount namespace.
     private func probeGuestPath(container: ContainerSnapshot, path: String) async throws -> GuestPathProbe {
-        let (exitCode, stdout, stderr) = try await runGuestCommand(container: container, shellCommand: guestStatScript(path: path))
+        let result: (exitCode: Int32, stdout: Data, stderr: String)
+        do {
+            result = try await runGuestCommand(container: container, shellCommand: guestStatScript(path: path))
+        } catch is GuestExecLaunchFailure {
+            // The exec could not start (an image without /bin/sh fails here
+            // rather than with exit 127): the path cannot be shown to exist.
+            throw ClientArchiveError.pathNotFound(path: path)
+        }
+        let (exitCode, stdout, stderr) = result
         switch guestProbeStatus(exitCode: exitCode) {
         case .missing:
             throw ClientArchiveError.pathNotFound(path: path)
@@ -1280,7 +1308,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let kind = guestReadKind(rawMode: probe.rawMode)
 
         if kind == .directory {
-            let (exitCode, stdout, stderr) = try await runGuestCommand(
+            let (exitCode, stdout, stderr) = try await runGuestCommandOrFail(
                 container: container,
                 shellCommand: guestDirectoryArchiveCommand(path: path))
             if exitCode == 42 {
@@ -1317,7 +1345,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
         case .regular, .directory:
             entry.fileType = .regular
-            let (exitCode, stdout, stderr) = try await runGuestCommand(container: container, shellCommand: "cat \(shellSingleQuoted(path))")
+            let (exitCode, stdout, stderr) = try await runGuestCommandOrFail(container: container, shellCommand: "cat \(shellSingleQuoted(path))")
             guard exitCode == 0 else {
                 let detail = stderr.isEmpty ? "" : ": \(stderr)"
                 throw ClientArchiveError.operationFailed(message: "guest read of \(path) failed (exit \(exitCode))\(detail)")

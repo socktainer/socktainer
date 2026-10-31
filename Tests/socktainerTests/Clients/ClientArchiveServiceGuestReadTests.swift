@@ -73,6 +73,24 @@ struct ClientArchiveServiceGuestReadTests {
         #expect(service.guestReadKind(rawMode: 0xa1ff) == .symlink)
     }
 
+    // MARK: - The stat probe
+
+    @Test(
+        "an image whose shell cannot run the probe reports the path as missing, not as a server error",
+        arguments: [Int32(126), Int32(127)])
+    func probeThatCannotRunIsMissing(exitCode: Int32) {
+        #expect(
+            service.guestProbeStatus(exitCode: exitCode) == .missing,
+            "distroless and scratch images have no /bin/sh; before the guest fallback these paths returned 404")
+    }
+
+    @Test("the probe's own exit codes keep their meaning")
+    func probeExitCodes() {
+        #expect(service.guestProbeStatus(exitCode: 0) == .found)
+        #expect(service.guestProbeStatus(exitCode: 40) == .missing)
+        #expect(service.guestProbeStatus(exitCode: 41) == .failed)
+    }
+
     @Test("a path on the rootfs and outside mounts stays on the rootfs reader")
     func plainRootfsPath() {
         #expect(
