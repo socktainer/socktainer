@@ -1089,6 +1089,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         case directory
         case symlink
         case regular
+        /// Device, FIFO or socket: archived as a header-only entry, its
+        /// contents never read (`cat /dev/zero` never ends, a FIFO blocks).
+        case special(URLFileResourceType)
     }
 
     /// What the guest `stat` probe's exit status says about the path.
@@ -1154,6 +1157,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         switch rawMode & 0xF000 {
         case 0x4000: return .directory
         case 0xA000: return .symlink
+        case 0x2000: return .special(.characterSpecial)
+        case 0x6000: return .special(.blockSpecial)
+        case 0x1000: return .special(.namedPipe)
+        case 0xC000: return .special(.socket)
         default: return .regular
         }
     }
@@ -1303,6 +1310,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         case .symlink:
             entry.fileType = .symbolicLink
             entry.symlinkTarget = probe.linkTarget
+            try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
+        case .special(let fileType):
+            entry.fileType = fileType
+            entry.size = 0
             try writer.writeEntry(entry: entry, data: nil as UnsafeRawBufferPointer?)
         case .regular, .directory:
             entry.fileType = .regular

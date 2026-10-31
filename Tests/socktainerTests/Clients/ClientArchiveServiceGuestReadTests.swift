@@ -49,6 +49,30 @@ struct ClientArchiveServiceGuestReadTests {
             service.readsThroughGuest(path: "/dev/null", isRunning: true, mountDestinations: [], existsInRootfs: false))
     }
 
+    // MARK: - How a guest path is read
+
+    /// st_mode values as `stat -c %f` prints them (type bits + permissions).
+    private static let characterDevice: UInt32 = 0x21b6  // /dev/zero, crw-rw-rw-
+    private static let blockDevice: UInt32 = 0x61b0
+    private static let fifo: UInt32 = 0x11a4
+    private static let socket: UInt32 = 0xc1ed
+
+    @Test(
+        "a device, FIFO or socket is never read for its contents",
+        arguments: [characterDevice, blockDevice, fifo, socket])
+    func specialFilesAreNotRead(rawMode: UInt32) {
+        #expect(
+            service.guestReadKind(rawMode: rawMode) != .regular,
+            "cat on /dev/zero never ends and cat on a FIFO blocks; Docker archives these as header-only entries")
+    }
+
+    @Test("regular files, directories and symlinks keep their read kinds")
+    func ordinaryKinds() {
+        #expect(service.guestReadKind(rawMode: 0x81a4) == .regular)
+        #expect(service.guestReadKind(rawMode: 0x41ed) == .directory)
+        #expect(service.guestReadKind(rawMode: 0xa1ff) == .symlink)
+    }
+
     @Test("a path on the rootfs and outside mounts stays on the rootfs reader")
     func plainRootfsPath() {
         #expect(
