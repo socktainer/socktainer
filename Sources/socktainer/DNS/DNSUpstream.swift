@@ -86,6 +86,34 @@ struct DNSUpstream: Equatable {
         return localAddresses.contains(host)
     }
 
+    /// The upstream to use once a configured override has been checked against the running server.
+    enum Selection: Equatable {
+        /// The override is usable as configured.
+        case configured(DNSUpstream)
+        /// The override points at this server; use the default network's gateway instead.
+        case gatewayFallback(DNSUpstream)
+        /// The override points at this server and the gateway is unknown or points at it too;
+        /// use the built-in default.
+        case builtInFallback(gatewayPointsAtSelf: Bool)
+    }
+
+    /// Chooses between a configured override and its fallbacks. `gateway` is the default network's
+    /// gateway (nil if it could not be read); it is treated as a host address in addition to
+    /// `localAddresses`, since its vmnet bridge may not exist yet.
+    static func select(override: DNSUpstream, gateway: String?, dnsPort: Int, localAddresses: Set<String>) -> Selection {
+        var local = localAddresses
+        if let gateway {
+            local.insert(gateway)
+        }
+        guard override.pointsAtSelf(dnsPort: dnsPort, localAddresses: local) else { return .configured(override) }
+        guard let gateway else { return .builtInFallback(gatewayPointsAtSelf: false) }
+        let fallback = DNSUpstream(host: gateway, port: defaultPort)
+        if fallback.pointsAtSelf(dnsPort: dnsPort, localAddresses: local) {
+            return .builtInFallback(gatewayPointsAtSelf: true)
+        }
+        return .gatewayFallback(fallback)
+    }
+
     /// IPv4 addresses currently assigned to this host's interfaces, in canonical dotted-quad form.
     static func localIPv4Addresses() -> Set<String> {
         var result: Set<String> = []

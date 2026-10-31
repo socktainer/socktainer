@@ -108,6 +108,44 @@ struct DNSUpstreamTests {
         #expect(DNSUpstream.localIPv4Addresses().contains("127.0.0.1"))
     }
 
+    // MARK: - Fallback selection
+
+    @Test("Usable override is selected as configured")
+    func selectConfigured() {
+        let override = DNSUpstream(host: "127.0.0.1", port: 53)
+        let selection = DNSUpstream.select(override: override, gateway: "192.168.64.1", dnsPort: 2054, localAddresses: ["127.0.0.1"])
+        #expect(selection == .configured(override))
+    }
+
+    @Test("Self-referencing override falls back to a usable gateway on port 53")
+    func selectGatewayFallback() {
+        let selection = DNSUpstream.select(
+            override: DNSUpstream(host: "127.0.0.1", port: 2054), gateway: "192.168.64.1", dnsPort: 2054, localAddresses: [])
+        #expect(selection == .gatewayFallback(DNSUpstream(host: "192.168.64.1", port: 53)))
+    }
+
+    @Test("Override on the gateway address itself is self-referencing even before its bridge exists")
+    func selectGatewayAddressOverride() {
+        let selection = DNSUpstream.select(
+            override: DNSUpstream(host: "192.168.64.1", port: 2054), gateway: "192.168.64.1", dnsPort: 2054, localAddresses: [])
+        #expect(selection == .gatewayFallback(DNSUpstream(host: "192.168.64.1", port: 53)))
+    }
+
+    @Test("Gateway that also points at the server falls back to the built-in default")
+    func selectSelfReferentialGateway() {
+        // Listener on port 53: the gateway fallback (gateway:53) would be this server too.
+        let selection = DNSUpstream.select(
+            override: DNSUpstream(host: "127.0.0.1", port: 53), gateway: "192.168.64.1", dnsPort: 53, localAddresses: [])
+        #expect(selection == .builtInFallback(gatewayPointsAtSelf: true))
+    }
+
+    @Test("Missing gateway falls back to the built-in default")
+    func selectMissingGateway() {
+        let selection = DNSUpstream.select(
+            override: DNSUpstream(host: "127.0.0.1", port: 2054), gateway: nil, dnsPort: 2054, localAddresses: [])
+        #expect(selection == .builtInFallback(gatewayPointsAtSelf: false))
+    }
+
     // MARK: - Precedence
 
     @Test("Neither set resolves to auto-detection")
