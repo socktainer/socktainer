@@ -781,10 +781,35 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Send the file at `source` to a guest process's stdin and close it.
-    static func streamFileToStdin(writer: FileHandle, source: URL) async throws {
-        let data = try Data(contentsOf: source)
-        feedStdin(writer: writer, data: data)
+    /// Stream the file at `source` to a guest process's stdin in 64 KiB chunks
+    /// and close it. Throws when a read or a write fails, so a short write is
+    /// never reported as a complete copy. stdin is closed on every path: the
+    /// guest `cat` then sees EOF instead of waiting forever.
+    static func streamFileToStdin(writer: FileHandle, source: URL, queue: DispatchQueue = stdinFeedQueue) async throws {
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let reader: FileHandle
+        do {
+            reader = try FileHandle(forReadingFrom: source)
+        } catch {
+            try? writer.close()
+            throw error
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                defer {
+                    try? reader.close()
+                    try? writer.close()
+                }
+                do {
+                    while let chunk = try reader.read(upToCount: 1 << 16), !chunk.isEmpty {
+                        try writer.write(contentsOf: chunk)
+                    }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     /// Parse the uploaded tar into a copy plan.
