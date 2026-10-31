@@ -79,6 +79,7 @@ extension ImageListRoute {
             let includeManifests = query.manifests ?? false
             let includeDigests = query.digests ?? false
             var imagesSummaries: [RESTImageSummary] = []
+            var configLabelsByDigest: [String: [[String: String]]] = [:]
 
             for image in images {
                 let imageIndex = try await image.index()
@@ -87,6 +88,7 @@ extension ImageListRoute {
                 var created = 0
                 var size: Int64 = 0
                 var labels: [String: String] = [:]
+                var configLabels: [[String: String]] = []
                 var foundUsableManifest = false
 
                 for descriptor in manifests {
@@ -154,6 +156,9 @@ extension ImageListRoute {
                         )
                     }
 
+                    if let config, available {
+                        configLabels.append(config.config?.labels ?? [:])
+                    }
                     if !foundUsableManifest, let config, available {
                         created = Int(AppleContainerTimestampResolver.unixTimestampSeconds(config.created))
                         size = totalSize
@@ -183,15 +188,24 @@ extension ImageListRoute {
                 )
 
                 imagesSummaries.append(summary)
+                configLabelsByDigest[image.digest] = configLabels
             }
 
-            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters)
+            return try ImageListRoute.applyFilters(imagesSummaries, filters: filters) {
+                configLabelsByDigest[$0.Id] ?? []
+            }
         }
     }
 
     /// Applies the `dangling`, `reference` and `label` image-ls filters. Different
-    /// keys AND together, matching moby.
-    static func applyFilters(_ summaries: [RESTImageSummary], filters: [String: [String]]) throws -> [RESTImageSummary] {
+    /// keys AND together, matching moby. `configLabels` gives the labels of each
+    /// usable platform config of an image; `label` matches if any one of them
+    /// satisfies every label filter.
+    static func applyFilters(
+        _ summaries: [RESTImageSummary],
+        filters: [String: [String]],
+        configLabels: (RESTImageSummary) -> [[String: String]] = { [$0.Labels] }
+    ) throws -> [RESTImageSummary] {
         var result = summaries
         // A present (even empty) `dangling` key is validated, unlike `reference`
         // (where a present-but-empty filter matches nothing): real Docker 400s
@@ -220,17 +234,20 @@ extension ImageListRoute {
         if let patterns = filters["reference"] {
             result = result.filter { ImageListFilter.referenceMatches(patterns: patterns, repoTags: $0.RepoTags) }
         }
-        // Like moby's MatchKVList: `key` requires the label, `key=value` its value
-        // (split at the first `=`), and every label filter must match.
+        // Like moby's containerd image store: `key` requires the label, `key=value`
+        // its value (split at the first `=`), and one config must match every
+        // label filter; matches from different configs don't combine.
         if let labelFilters = filters["label"] {
             result = result.filter { image in
-                labelFilters.allSatisfy { labelFilter in
-                    guard let eqIdx = labelFilter.firstIndex(of: "=") else {
-                        return image.Labels[labelFilter] != nil
+                configLabels(image).contains { labels in
+                    labelFilters.allSatisfy { labelFilter in
+                        guard let eqIdx = labelFilter.firstIndex(of: "=") else {
+                            return labels[labelFilter] != nil
+                        }
+                        let key = String(labelFilter[..<eqIdx])
+                        let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
+                        return labels[key] == value
                     }
-                    let key = String(labelFilter[..<eqIdx])
-                    let value = String(labelFilter[labelFilter.index(after: eqIdx)...])
-                    return image.Labels[key] == value
                 }
             }
         }

@@ -215,6 +215,31 @@ struct ImageListFilterTests {
         #expect(kept.count == 1)
     }
 
+    @Test("A label on any usable platform config matches, even when the displayed labels lack it")
+    func applyLabelAnyPlatformConfig() throws {
+        let image = Self.summary(repoTags: ["multi:latest"], labels: ["arch": "amd64"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["arch=arm64"]]) { _ in
+            [["arch": "amd64"], ["arch": "arm64"]]
+        }
+        #expect(kept.count == 1)
+    }
+
+    @Test("Label filters must all match the same platform config")
+    func applyLabelNoCrossConfigCombination() throws {
+        let image = Self.summary(repoTags: ["multi:latest"], labels: ["a": "1"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["a=1", "b=2"]]) { _ in
+            [["a": "1"], ["b": "2"]]
+        }
+        #expect(kept.isEmpty)
+    }
+
+    @Test("An image with no usable platform config matches no label filter")
+    func applyLabelNoUsableConfig() throws {
+        let image = Self.summary(repoTags: ["broken:latest"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["a"]]) { _ in [] }
+        #expect(kept.isEmpty)
+    }
+
     @Test("label and reference AND together")
     func labelAndReferenceAnd() throws {
         let alpine = Self.summary(repoTags: ["docker.io/library/alpine:latest"], labels: ["a": "1"])
