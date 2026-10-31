@@ -1167,9 +1167,17 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// The guest command that archives a directory for GET /archive.
+    /// The guest command that archives a directory for GET /archive: entries
+    /// are prefixed with the directory's own name, as the rootfs reader's
+    /// (`extractPathToDirectory`) and Docker's are; the root is archived as `.`.
     func guestDirectoryArchiveCommand(path: String) -> String {
-        "command -v tar >/dev/null 2>&1 || exit 42; tar -cf - -C \(shellSingleQuoted(path)) ."
+        let check = "command -v tar >/dev/null 2>&1 || exit 42; "
+        let name = (path as NSString).lastPathComponent
+        guard path != "/", !name.isEmpty, name != "/" else {
+            return check + "tar -cf - -C '/' ."
+        }
+        let parent = (path as NSString).deletingLastPathComponent
+        return check + "tar -cf - -C \(shellSingleQuoted(parent.isEmpty ? "/" : parent)) \(shellSingleQuoted(name))"
     }
 
     /// Run `/bin/sh -c <command>` in the RUNNING container as root, capturing

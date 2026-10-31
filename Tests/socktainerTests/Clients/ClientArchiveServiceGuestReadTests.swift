@@ -73,6 +73,21 @@ struct ClientArchiveServiceGuestReadTests {
         #expect(service.guestReadKind(rawMode: 0xa1ff) == .symlink)
     }
 
+    // MARK: - Directory archives
+
+    @Test("a mounted directory is archived under its own name, like the rootfs reader and Docker do")
+    func directoryArchiveKeepsItsBasename() {
+        let command = service.guestDirectoryArchiveCommand(path: "/var/run/act/workflow")
+        #expect(
+            command.hasSuffix("tar -cf - -C '/var/run/act' 'workflow'"),
+            "docker cp rebases entries on the source basename; `-C <dir> .` drops it: \(command)")
+    }
+
+    @Test("the root directory is archived as `.`")
+    func rootDirectoryArchive() {
+        #expect(service.guestDirectoryArchiveCommand(path: "/").hasSuffix("tar -cf - -C '/' ."))
+    }
+
     // MARK: - The stat probe
 
     @Test(
