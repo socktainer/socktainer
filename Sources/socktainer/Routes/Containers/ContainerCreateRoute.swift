@@ -779,6 +779,9 @@ extension ContainerCreateRoute {
                         ExtraHostsFile.remove(labels: containerConfiguration.labels)
                         throw error
                     }
+                    // A container reusing a deleted one's name gets its native id, so drop
+                    // that run's exit code before /wait or inspect can report it.
+                    await ContainerExitCodeStore.shared.remove(id: containerConfiguration.id)
                     container = try await containerClient.get(id: containerConfiguration.id)
                     req.logger.debug("Container created successfully with ID: \(container.id)")
                     ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
