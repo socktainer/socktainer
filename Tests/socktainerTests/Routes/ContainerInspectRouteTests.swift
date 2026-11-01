@@ -535,3 +535,48 @@ struct ContainerInspectRoutePortBindingsTests {
         #expect(inspect.HostConfig.PortBindings == nil)
     }
 }
+
+@Suite("ContainerInspectRoute — State.ExitCode")
+struct ContainerInspectRouteExitCodeTests {
+
+    private func inspectExitCode(id: String, status: RuntimeStatus) async throws -> Int {
+        let container = makeSnapshot(id: id, status: status, configuredNetworks: [], liveNetworks: [])
+        var exitCode: Int?
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: MockContainerClient(containers: [container])))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(id)/json") { res async throws in
+                exitCode = try res.content.decode(RESTContainerInspect.self).State.ExitCode
+            }
+        }
+        return try #require(exitCode)
+    }
+
+    @Test("A stopped container reports the exit code its init process recorded")
+    func stoppedContainerReportsRecordedExitCode() async throws {
+        let id = "inspect-exit-code-stopped"
+        await ContainerExitCodeStore.shared.set(id: id, code: 5)
+        let exitCode = try await inspectExitCode(id: id, status: .stopped)
+        await ContainerExitCodeStore.shared.remove(id: id)
+
+        #expect(exitCode == 5)
+    }
+
+    @Test("A stopped container with no recorded exit reports 0")
+    func stoppedContainerWithoutRecordReportsZero() async throws {
+        #expect(try await inspectExitCode(id: "inspect-exit-code-never-ran", status: .stopped) == 0)
+    }
+
+    @Test("A running container reports 0, even with an earlier run's code still recorded")
+    func runningContainerReportsZero() async throws {
+        let id = "inspect-exit-code-running"
+        await ContainerExitCodeStore.shared.set(id: id, code: 5)
+        let exitCode = try await inspectExitCode(id: id, status: .running)
+        await ContainerExitCodeStore.shared.remove(id: id)
+
+        #expect(exitCode == 0)
+    }
+}

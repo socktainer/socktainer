@@ -191,6 +191,10 @@ extension ContainerInspectRoute {
             // True during the backoff window between a crash and its automatic restart.
             let isPendingRestart = await ContainerRestartState.shared.isPendingRestart(id: container.id)
 
+            // Recorded when the init process exits; absent for a container that never ran
+            // under this daemon, which Docker reports as 0.
+            let exitCode = container.status == .stopped ? Int(await ContainerExitCodeStore.shared.get(id: container.id) ?? 0) : 0
+
             let containerState: ContainerState = ContainerState(
                 Status: isPendingRestart ? "restarting" : container.status.mobyState,
                 Running: container.status == .running,
@@ -199,7 +203,7 @@ extension ContainerInspectRoute {
                 OOMKilled: false,
                 Dead: container.status == .stopped && !isPendingRestart,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
-                ExitCode: container.status == .stopped ? 0 : 0,
+                ExitCode: exitCode,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
                 FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
