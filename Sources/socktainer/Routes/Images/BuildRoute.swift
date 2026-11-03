@@ -239,11 +239,63 @@ extension BuildRoute {
     /// docker-py's `images.build()` takes the image ID from `Successfully built <id>`
     /// (or a `sha256:<id>` stream) and the Docker CLI from `aux.ID`; without a hex ID
     /// docker-py raises `BuildError` even though the build succeeded (#414).
-    static func completionEvents(imageID: String?, tag: String?) -> [[String: Any]] {
+    ///
+    /// A quiet build (`q`) closes with nothing but the full image ID, as moby does: the
+    /// Docker CLI prints the stream as it comes, so `docker build -q` outputs just the ID.
+    static func completionEvents(imageID: String?, tag: String?, quiet: Bool = false) -> [[String: Any]] {
+        if quiet {
+            return imageID.map { [["stream": "\($0)\n"]] } ?? []
+        }
         let tagged: [[String: Any]] = tag.map { [["stream": "Successfully tagged \($0)\n"]] } ?? []
         guard let imageID else { return tagged }
         let shortID = String(imageID.dropFirst("sha256:".count).prefix(12))
         return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"]] + tagged
+    }
+
+    /// The builder's configuration for a build. It is never quiet, whatever the request's
+    /// `q`: in quiet mode apple/container's `BuildStdio` drops the builder's output without
+    /// answering it, and the builder waits for that answer, so any build that produces
+    /// output (a `RUN` step) hangs (apple/container#2387). The builder's output goes to the
+    /// daemon's stderr either way (no terminal), never to the client.
+    static func buildConfig(
+        buildID: String,
+        buildArgs: [String],
+        contextDir: String,
+        dockerfile: Data,
+        labels: [String],
+        noCache: Bool,
+        platforms: [Platform],
+        tag: String,
+        target: String,
+        exports: [Builder.BuildExport],
+        pull: Bool,
+        systemConfig: ContainerSystemConfig
+    ) -> ContainerBuild.Builder.BuildConfig {
+        ContainerBuild.Builder.BuildConfig(
+            buildID: buildID,
+            contentStore: RemoteContentStoreClient(),
+            buildArgs: buildArgs,
+            // TODO: Implement secrets once integration with buildkit materializes
+            secrets: [:],
+            // Same as secrets: the Docker API's SSH forwarding for builds is not
+            // wired through yet, so nothing is offered to the builder.
+            ssh: "",
+            contextDir: contextDir,
+            dockerfile: dockerfile,
+            dockerignore: nil,
+            labels: labels,
+            noCache: noCache,
+            platforms: platforms,
+            terminal: nil,  // No terminal for API
+            tags: [tag],
+            target: target,
+            quiet: false,
+            exports: exports,
+            cacheIn: [],
+            cacheOut: [],
+            pull: pull,
+            containerSystemConfig: systemConfig
+        )
     }
 
     static func errorMessage(for error: Error) -> String {
@@ -397,6 +449,8 @@ extension BuildRoute {
 
         // Helper function to send Docker API compliant streaming messages
         @Sendable func sendStreamMessage(_ message: String) {
+            // A quiet build sends no progress, only the image ID at the end.
+            guard !quiet else { return }
             // Preserve the original message with its formatting
             sendEvent(["stream": message + "\n"])
         }
@@ -492,31 +546,19 @@ extension BuildRoute {
             return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
         }()
 
-        // Build configuration
-        let config = ContainerBuild.Builder.BuildConfig(
+        let config = buildConfig(
             buildID: buildID,
-            contentStore: RemoteContentStoreClient(),
             buildArgs: buildArgs,
-            // TODO: Implement secrets once integration with buildkit materializes
-            secrets: [:],
-            // Same as secrets: the Docker API's SSH forwarding for builds is not
-            // wired through yet, so nothing is offered to the builder.
-            ssh: "",
             contextDir: contextDir,
             dockerfile: dockerfileData,
-            dockerignore: nil,
             labels: labels,
             noCache: noCache,
             platforms: [Platform](platforms),
-            terminal: nil,  // No terminal for API
-            tags: [buildName],
+            tag: buildName,
             target: target,
-            quiet: quiet,
             exports: exports,
-            cacheIn: [],
-            cacheOut: [],
             pull: pull,
-            containerSystemConfig: systemConfig
+            systemConfig: systemConfig
         )
 
         sendStreamMessage(" ---> Starting build process")
@@ -569,7 +611,7 @@ extension BuildRoute {
         if imageID == nil {
             logger.warning("BuildRoute: could not determine the image ID of \(imageName ?? "untagged build")")
         }
-        for event in completionEvents(imageID: imageID, tag: imageName) {
+        for event in completionEvents(imageID: imageID, tag: imageName, quiet: quiet) {
             sendEvent(event)
         }
 

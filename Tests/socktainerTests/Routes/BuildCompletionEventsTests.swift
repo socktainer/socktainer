@@ -41,6 +41,23 @@ struct BuildCompletionEventsTests {
         #expect(Self.dockerPyImageID(events[0]) == nil)
     }
 
+    /// moby answers `q=1` with only the image ID, which the Docker CLI prints as it is,
+    /// so `docker build -q` outputs just the ID.
+    @Test("a quiet build yields only the full image ID")
+    func quietBuild() {
+        let events = BuildRoute.completionEvents(imageID: Self.imageID, tag: "probe:1", quiet: true)
+
+        #expect(events.count == 1)
+        #expect(events[0]["stream"] as? String == "\(Self.imageID)\n")
+        #expect(events[0]["aux"] == nil)
+        #expect(Self.dockerPyImageID(events[0]) == String(Self.imageID.dropFirst("sha256:".count)))
+    }
+
+    @Test("a quiet build with an unknown ID yields nothing")
+    func quietBuildWithoutImageID() {
+        #expect(BuildRoute.completionEvents(imageID: nil, tag: "probe:1", quiet: true).isEmpty)
+    }
+
     @Test("an untagged build yields no Successfully tagged event")
     func untaggedBuild() {
         let events = BuildRoute.completionEvents(imageID: Self.imageID, tag: nil)
