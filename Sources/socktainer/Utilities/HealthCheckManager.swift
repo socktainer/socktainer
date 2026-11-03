@@ -241,9 +241,10 @@ actor HealthCheckManager {
         let value = Mutex<Int32>(1)
     }
 
-    /// Containers with a probe still running. A timed-out probe's kill can fail
-    /// (apple/container#1941), so a later probe for that container fails at once rather
-    /// than start another process beside it, until the first one exits.
+    /// Containers with a probe still running. A timed-out probe can outlive its kill (it
+    /// may ignore SIGTERM, or the kill may not return within `probeKillTimeout`), so a
+    /// later probe for that container fails at once rather than start another process
+    /// beside it, until the first one exits.
     final class ProbesInFlight: Sendable {
         private let ids = Mutex<Set<String>>([])
         func begin(_ id: String) -> Bool { ids.withLock { $0.insert(id).inserted } }
