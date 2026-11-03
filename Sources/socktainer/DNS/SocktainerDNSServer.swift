@@ -8,8 +8,9 @@ struct SocktainerDNSServerKey: StorageKey {
 }
 
 /// UDP DNS server that resolves container service names and forwards unknown queries to
-/// `upstreamHost` — the vmnet gateway resolver in production, so names resolve as on the host
-/// (VPN split DNS, `/etc/resolver/*`); 1.1.1.1 only when no gateway is known.
+/// `upstreamHost` — the vmnet gateway resolver in production (so names resolve as on the host:
+/// VPN split DNS, `/etc/resolver/*`) or the configured `--dns-upstream` /
+/// `SOCKTAINER_DNS_UPSTREAM` override; 1.1.1.1 only when no upstream is known.
 ///
 /// Runs on 0.0.0.0:2054 (covers all interfaces including vmnet gateways).
 /// Port 2053 is reserved by Apple Container's own DNS handler.
@@ -36,15 +37,37 @@ final class SocktainerDNSServer: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: [AddressEntry]] = [:]  // normalized hostname → addresses, first-registered first
     private var log = Logger(label: "socktainer.dns")
-    private var _upstreamHost = "1.1.1.1"
-    /// Upstream for non-container names. Lock-guarded: startup may set it after the
+    /// Upstream used until (or unless) the gateway or a configured override is known.
+    static let defaultUpstreamHost = "1.1.1.1"
+    private var _upstreamHost = SocktainerDNSServer.defaultUpstreamHost
+    /// Upstream for non-container names: the vmnet gateway or the configured
+    /// `--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM` override. Lock-guarded: startup may set it after the
     /// server is already answering queries.
     var upstreamHost: String {
         get { lock.withLock { _upstreamHost } }
         set { lock.withLock { _upstreamHost = newValue } }
     }
-    /// Upstream port; only overridden by tests, before `start(...)`.
-    var upstreamPort = 53
+    private var _upstreamPort = 53
+    private var _listeningPort: Int?
+    private var selfForwardReported = false
+    /// Sets host and port as one atomic pair, so a concurrent forward never sees a mixed upstream.
+    func setUpstream(host: String, port: Int) {
+        lock.withLock {
+            _upstreamHost = host
+            _upstreamPort = port
+        }
+    }
+    /// Host and port read as one consistent pair.
+    func upstreamSnapshot() -> (host: String, port: Int) {
+        lock.withLock { (host: _upstreamHost, port: _upstreamPort) }
+    }
+    /// Port the server is bound to, once `start(...)` succeeds.
+    var listeningPort: Int? { lock.withLock { _listeningPort } }
+    /// Upstream port (default 53). Lock-guarded for consistency with `upstreamHost`.
+    var upstreamPort: Int {
+        get { lock.withLock { _upstreamPort } }
+        set { lock.withLock { _upstreamPort = newValue } }
+    }
 
     func register(hostname: String, ip: String) {
         register(hostname: hostname, ips: [ip])
@@ -130,6 +153,7 @@ final class SocktainerDNSServer: @unchecked Sendable {
         for offset in 0..<maxAttempts {
             let port = preferredPort + offset
             if canBind(port: port) {
+                lock.withLock { _listeningPort = port }
                 Thread.detachNewThread { self.serverLoop(port: port) }
                 return port
             }
@@ -406,6 +430,27 @@ final class SocktainerDNSServer: @unchecked Sendable {
     }
 
     private func forwardToUpstream(_ packet: [UInt8]) -> [UInt8]? {
+        let (host, upstreamPortValue) = upstreamSnapshot()
+        // A host address that appears after startup (e.g. a named-network gateway) can make the
+        // upstream point back at this server. Answer SERVFAIL rather than forward in a loop.
+        if let ownPort = listeningPort, upstreamPortValue == ownPort,
+            DNSUpstream(host: host, port: upstreamPortValue)
+                .pointsAtSelf(dnsPort: ownPort, localAddresses: DNSUpstream.localIPv4Addresses())
+        {
+            let firstReport = lock.withLock { () -> Bool in
+                defer { selfForwardReported = true }
+                return !selfForwardReported
+            }
+            if firstReport {
+                log.error("[dns] upstream \(host):\(upstreamPortValue) points at this DNS server — answering SERVFAIL instead of forwarding")
+            }
+            guard packet.count >= 4 else { return nil }
+            var response = packet
+            response[2] |= 0x80  // QR=1
+            response[3] = (response[3] & 0xF0) | 0x02  // RCODE=2 (SERVFAIL)
+            return response
+        }
+
         let sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard sockfd >= 0 else { return nil }
         defer { Darwin.close(sockfd) }
@@ -416,8 +461,9 @@ final class SocktainerDNSServer: @unchecked Sendable {
         var upstream = sockaddr_in()
         upstream.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         upstream.sin_family = sa_family_t(AF_INET)
-        upstream.sin_port = UInt16(upstreamPort).bigEndian
-        guard inet_pton(AF_INET, upstreamHost, &upstream.sin_addr) == 1 else { return nil }
+        guard let port = UInt16(exactly: upstreamPortValue) else { return nil }
+        upstream.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, host, &upstream.sin_addr) == 1 else { return nil }
 
         let connected = withUnsafePointer(to: &upstream) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

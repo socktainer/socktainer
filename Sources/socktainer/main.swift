@@ -24,6 +24,24 @@ struct CLIOptions: ParsableArguments {
             "Sync mode for named volumes: nosync (default, ~1.5x faster for write-heavy workloads), fsync (honors guest fsyncs for durability), full (fully synchronous writes). Override per-volume with: docker volume create -o sync=fsync <name>"
     )
     var volumeSync: String = "nosync"
+
+    @ArgumentParser.Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Upstream DNS server for non-container names, as an IPv4 address with optional port (<ipv4[:port]>, port defaults to 53). Overrides SOCKTAINER_DNS_UPSTREAM. Default: the 'default' network's vmnet gateway.",
+            valueName: "ipv4[:port]")
+    )
+    var dnsUpstream: String?
+
+    mutating func validate() throws {
+        if let dnsUpstream {
+            do {
+                _ = try DNSUpstream.parse(dnsUpstream)
+            } catch {
+                throw ArgumentParser.ValidationError("Invalid --dns-upstream: \(error)")
+            }
+        }
+    }
 }
 
 // Parse CLI before starting the app
@@ -61,7 +79,7 @@ if options.dockerContext,
     DockerContextSetup.install(homeDirectory: homeDir)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
-try await configure(app)
+try await configure(app, dnsUpstreamCLI: options.dnsUpstream)
 
 // Start the app
 try await app.startup()
