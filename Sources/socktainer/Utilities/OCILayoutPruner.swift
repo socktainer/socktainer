@@ -29,13 +29,77 @@ enum OCILayoutPruner {
         let originalDigests = index.manifests.map(\.digest)
 
         let cache = PruneCache()
-        index.manifests = try index.manifests.compactMap { try prunedDescriptor($0, in: layout, cache: cache, logger: logger) }
+        let blobs = BlobLocations(source: layout, destination: layout)
+        index.manifests = try index.manifests.compactMap { try prunedDescriptor($0, in: blobs, cache: cache, logger: logger) }
 
         guard !index.manifests.isEmpty else {
             throw PruneError.nothingLoadable
         }
         if index.manifests.map(\.digest) != originalDigests {
             try JSONEncoder().encode(index).write(to: indexURL)
+        }
+    }
+
+    /// `docker save` / `podman save`: Apple's `ImageStore.save` walks every manifest an
+    /// image's index lists, but a pull only fetches the blobs of the platform it resolved
+    /// (and none of the attestation manifests), so saving a pulled multi-platform image
+    /// fails on the first absent blob. Copies `descriptor` from the image store's content
+    /// directory `source` into the OCI layout at `destination`, keeping only manifests whose
+    /// manifest, config and layer blobs are all present and that match `platform` when one
+    /// is requested. Returns the descriptor to list in the layout's `index.json` (a
+    /// rewritten index when anything was dropped), or nil when nothing is exportable.
+    ///
+    /// `source` is never written to: a rewritten index blob lands only in `destination`.
+    static func exportComplete(
+        _ descriptor: Descriptor,
+        from source: URL,
+        to destination: URL,
+        platform: Platform?,
+        logger: Logger
+    ) throws -> Descriptor? {
+        let blobs = BlobLocations(source: source, destination: destination)
+        let matcher = platform.map { createPlatformMatcher(for: $0) }
+        guard
+            let kept = try prunedDescriptor(descriptor, in: blobs, platformMatcher: matcher, cache: PruneCache(), logger: logger)
+        else {
+            return nil
+        }
+        try copyTree(kept, blobs: blobs)
+        return kept
+    }
+
+    /// Copies every blob reachable from `descriptor` (already pruned) into the destination
+    /// layout. A rewritten index already lives in the destination; everything else is read
+    /// from the source.
+    private static func copyTree(_ descriptor: Descriptor, blobs: BlobLocations, depth: Int = 0) throws {
+        guard depth <= maxIndexNestingDepth else { throw PruneError.indexNestingTooDeep }
+        try blobs.copyToDestination(descriptor.digest)
+        let data = try Data(contentsOf: blobURL(descriptor.digest, in: blobs.destination))
+        if isIndex(descriptor.mediaType) {
+            for child in try decodeIndex(from: data).manifests {
+                try copyTree(child, blobs: blobs, depth: depth + 1)
+            }
+        } else if isManifest(descriptor.mediaType) {
+            let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+            try blobs.copyToDestination(manifest.config.digest)
+            for layer in manifest.layers {
+                try blobs.copyToDestination(layer.digest)
+            }
+        }
+    }
+
+    /// Where blobs are read from and where rewritten index blobs are written. Loading
+    /// prunes a layout in place (both the same); saving reads the image store's content
+    /// directory and writes a fresh layout.
+    private struct BlobLocations {
+        let source: URL
+        let destination: URL
+
+        func copyToDestination(_ digest: String) throws {
+            let target = blobURL(digest, in: destination)
+            guard !FileManager.default.fileExists(atPath: target.path) else { return }
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: blobURL(digest, in: source), to: target)
         }
     }
 
@@ -54,9 +118,16 @@ enum OCILayoutPruner {
     /// Blob content is never re-hashed against its digest, so a crafted tarball can make
     /// an index reference itself (a cycle) or fan out to the same sub-index exponentially.
     /// The path guard cuts cycles; the cache collapses repeated sub-indexes to one visit.
-    private static func prunedDescriptor(_ descriptor: Descriptor, in layout: URL, depth: Int = 0, visiting: Set<String> = [], cache: PruneCache, logger: Logger) throws
-        -> Descriptor?
-    {
+    private static func prunedDescriptor(
+        _ descriptor: Descriptor,
+        in blobs: BlobLocations,
+        platformMatcher: ((Platform) -> Bool)? = nil,
+        depth: Int = 0,
+        visiting: Set<String> = [],
+        cache: PruneCache,
+        logger: Logger
+    ) throws -> Descriptor? {
+        let layout = blobs.source
         guard depth <= maxIndexNestingDepth else { throw PruneError.indexNestingTooDeep }
         if isIndex(descriptor.mediaType), visiting.contains(descriptor.digest) {
             return nil
@@ -66,6 +137,9 @@ enum OCILayoutPruner {
         return try cache.result(of: descriptor.digest, as: descriptor.mediaType) {
             guard blobExists(descriptor.digest, in: layout) else { return nil }
             if isManifest(descriptor.mediaType) {
+                if let platformMatcher, let platform = descriptor.platform, !platformMatcher(platform) {
+                    return nil
+                }
                 let manifest: Manifest
                 do {
                     manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout)))
@@ -86,12 +160,14 @@ enum OCILayoutPruner {
                     return nil
                 }
                 let pruned = try childIndex.manifests.compactMap {
-                    try prunedDescriptor($0, in: layout, depth: depth + 1, visiting: visiting.union([descriptor.digest]), cache: cache, logger: logger)
+                    try prunedDescriptor(
+                        $0, in: blobs, platformMatcher: platformMatcher, depth: depth + 1, visiting: visiting.union([descriptor.digest]),
+                        cache: cache, logger: logger)
                 }
                 guard !pruned.isEmpty else { return nil }
                 guard pruned.map(\.digest) != childIndex.manifests.map(\.digest) else { return descriptor }
                 childIndex.manifests = pruned
-                return try rewrittenIndex(childIndex, keeping: descriptor, in: layout, logger: logger)
+                return try rewrittenIndex(childIndex, keeping: descriptor, in: blobs.destination, logger: logger)
             }
             return descriptor
         }
@@ -100,7 +176,9 @@ enum OCILayoutPruner {
     private static func rewrittenIndex(_ childIndex: Index, keeping original: Descriptor, in layout: URL, logger: Logger) throws -> Descriptor {
         let data = try JSONEncoder().encode(childIndex)
         let digest = "sha256:" + data.sha256Hex()
-        try data.write(to: blobURL(digest, in: layout))
+        let url = blobURL(digest, in: layout)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url)
         logger.info("pruned index \(original.digest) -> \(digest): kept \(childIndex.manifests.count) manifest(s)")
         return Descriptor(
             mediaType: original.mediaType,

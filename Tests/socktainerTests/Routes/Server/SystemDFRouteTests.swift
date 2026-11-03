@@ -18,6 +18,9 @@ private struct EmptyImageClient: ClientImageProtocol {
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
     }
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64) {
         ([], 0)
     }
@@ -39,8 +42,8 @@ private struct EmptyVolumeClient: ClientVolumeProtocol {
 }
 
 private struct EmptyBuilderClient: ClientBuilderProtocol {
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {}
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws {}
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder {
         fatalError("not exercised when the default (includeAll) query builds an empty BuildCache")
     }
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {

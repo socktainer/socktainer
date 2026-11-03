@@ -166,11 +166,11 @@ extension ImageCreateRoute {
     /// Import bodies are single-layer tarballs and can legitimately be several
     /// GB; this bounds them well above any real use while still rejecting a
     /// runaway or malicious upload before it fills disk.
-    private static let maxImportBodySize = 8 * 1024 * 1024 * 1024
+    static let maxImportBodySize = 8 * 1024 * 1024 * 1024
 
     /// Streams the request body to disk in chunks rather than buffering the
     /// whole tarball in memory first, enforcing `maxImportBodySize` as it goes.
-    private static func writeBodyToFile(_ body: Request.Body, at destination: URL) async throws {
+    static func writeBodyToFile(_ body: Request.Body, at destination: URL) async throws {
         guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
             throw Abort(.internalServerError, reason: "failed to create temporary file for import")
         }

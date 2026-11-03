@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerPersistence
 import Containerization
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import Logging
@@ -25,6 +26,13 @@ protocol ClientImageProtocol: Sendable {
         PullProgress, Error
     >
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    >
+    /// Pushes the full manifest list/index for `reference`, unconditionally — unlike `push`,
+    /// never narrows to a single platform. `podman manifest push` means "push the whole list";
+    /// `resolvedPushPlatform`'s single-available-platform narrowing (meant for `docker push`'s
+    /// different "push what's actually here" semantics) would silently defeat that intent.
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     >
     func prune(filters: [String: [String]], logger: Logger) async throws -> (results: [ImageDeletionResult], spaceReclaimed: Int64)
@@ -197,7 +205,11 @@ struct ClientImageService: ClientImageProtocol {
             let ref = img.reference.trimmingCharacters(in: .whitespacesAndNewlines)
             let isDigest = ref.contains("@sha256:")
             let isInfra = Utility.isInfraImage(name: ref, builderImage: containerSystemConfig.build.image, initImage: containerSystemConfig.vminit.image)
-            return isDigest || !isInfra
+            // A split build's scratch tags (`BuildRoute.performBuild`) are deleted once
+            // merged into the requested tag — this only hides one that's still around
+            // because the process crashed mid-build before that cleanup ran.
+            let isBuildSplitScratchTag = ref.contains(BuildRoute.scratchTagPrefix)
+            return !isBuildSplitScratchTag && (isDigest || !isInfra)
         }
         return filteredImages
     }
@@ -357,34 +369,62 @@ struct ClientImageService: ClientImageProtocol {
         }
     }
 
+    /// Shared by `push`/`pushManifestList`: normalizes `reference` (for logging/pushStream)
+    /// and resolves the actual stored image, mapping a lookup failure to
+    /// `ClientImageError.notFound`.
+    private func resolveForPush(reference: String, notFoundContext: String, logger: Logger) async throws -> (
+        normalizedReference: String, image: ClientImage
+    ) {
+        let normalizedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
+        let image: ClientImage
+        do {
+            // `ClientImage.get` (via `_search`) already tries both `reference` as given and its
+            // normalized form against each stored image's reference — passing only the
+            // normalized form here collapses both attempts into the same string, missing
+            // images tagged verbatim without a registry/library prefix (e.g. anything from
+            // `podman build`, which `ClientImage.load` tags as `<name>:latest`, not
+            // `docker.io/library/<name>:latest`).
+            image = try await ClientImage.get(reference: reference, containerSystemConfig: containerSystemConfig)
+        } catch let error as ContainerizationError where error.code == .notFound {
+            logger.error("\(notFoundContext) not found: \(normalizedReference)")
+            throw ClientImageError.notFound(id: normalizedReference)
+        }
+        return (normalizedReference, image)
+    }
+
     func push(reference: String, platform: Platform?, logger: Logger) async throws -> AsyncThrowingStream<
         String, Error
     > {
-        let normalizedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
-
-        logger.info("Pushing image reference: \(normalizedReference)")
-
-        let image: ClientImage
-        do {
-            image = try await ClientImage.get(reference: normalizedReference, containerSystemConfig: containerSystemConfig)
-        } catch {
-            logger.error("Image not found: \(normalizedReference)")
-            throw ClientImageError.notFound(id: normalizedReference)
-        }
+        logger.info("Pushing image reference: \(reference)")
+        let (normalizedReference, image) = try await resolveForPush(reference: reference, notFoundContext: "Image", logger: logger)
 
         logger.debug("Image reference from ClientImage: \(image.reference)")
 
         let effectivePlatform = try await resolvedPushPlatform(for: image, requestedPlatform: platform, logger: logger)
+        return Self.pushStream(normalizedReference: normalizedReference, image: image, platform: effectivePlatform, containerSystemConfig: containerSystemConfig, logger: logger)
+    }
 
-        return AsyncThrowingStream { continuation in
-            let platformDesc = effectivePlatform?.description ?? "default"
+    func pushManifestList(reference: String, logger: Logger) async throws -> AsyncThrowingStream<
+        String, Error
+    > {
+        logger.info("Pushing manifest list: \(reference)")
+        let (normalizedReference, image) = try await resolveForPush(reference: reference, notFoundContext: "Manifest list", logger: logger)
+
+        return Self.pushStream(normalizedReference: normalizedReference, image: image, platform: nil, containerSystemConfig: containerSystemConfig, logger: logger)
+    }
+
+    private static func pushStream(
+        normalizedReference: String, image: ClientImage, platform: Platform?, containerSystemConfig: ContainerSystemConfig, logger: Logger
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let platformDesc = platform?.description ?? "default"
             logger.info("Starting to push image \(normalizedReference) for platform \(platformDesc)")
             logger.info("Retrieved image object with reference: \(image.reference)")
             continuation.yield("Trying to push \(normalizedReference)")
             Task {
                 do {
                     try await image.push(
-                        platform: effectivePlatform,
+                        platform: platform,
                         scheme: RegistryScheme.scheme(forReference: normalizedReference, internalDnsDomain: containerSystemConfig.dns.domain),
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
@@ -618,7 +658,7 @@ struct ClientImageService: ClientImageProtocol {
         let extractedPath = tempDir.appendingPathComponent("extracted")
         try FileManager.default.createDirectory(at: extractedPath, withIntermediateDirectories: true)
 
-        try ArchiveUtility.extract(tarPath: tarballPath, to: extractedPath)
+        try ArchiveUtility.extract(tarPath: tarballPath, to: extractedPath, logger: logger)
 
         // `docker buildx build --load`, the containerd "docker" exporter, and
         // `docker save` on modern Docker emit a tarball that is already a valid
@@ -709,22 +749,20 @@ struct ClientImageService: ClientImageProtocol {
         let exportPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
 
+        // Not `imageStore.save`: it exports every platform the index lists and fails on
+        // the first blob a single-platform pull never fetched ("content with digest ...
+        // not found"). See `OCILayoutPruner.exportComplete`.
         do {
-            try await imageStore.save(
+            try await Self.writeOCILayout(
                 references: resolvedReferences,
-                out: exportPath,
-                platform: platform
+                imageStore: imageStore,
+                contentRoot: appleContainerAppSupportUrl.appendingPathComponent("content"),
+                to: exportPath,
+                platform: platform,
+                logger: logger
             )
         } catch {
-            let errorDescription = String(describing: error)
-            logger.error("Failed to export images: \(errorDescription)")
-
-            if errorDescription.contains("notFound") && errorDescription.localizedCaseInsensitiveContains("content with digest") {
-                let detailedMessage =
-                    "Export failed: ContentStore missing blob data. This is a limitation of Apple's Containerization framework. The image metadata exists but the underlying content blobs are not available."
-                logger.error("\(detailedMessage)")
-                throw ClientImageError.notFound(id: detailedMessage)
-            }
+            try? FileManager.default.removeItem(at: tempDir)
             throw error
         }
 
@@ -735,6 +773,7 @@ struct ClientImageService: ClientImageProtocol {
             ociLayoutPath: exportPath,
             dockerFormatPath: dockerFormatPath,
             resolvedRefs: resolvedReferences,
+            preferredPlatform: platform ?? .current,
             logger: logger
         )
 
@@ -748,6 +787,40 @@ struct ClientImageService: ClientImageProtocol {
         logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
         return tarballPath
+    }
+
+    /// Writes an OCI image layout holding `references`, each limited to the manifests whose
+    /// content is fully present in the store (and matching `platform` when given).
+    static func writeOCILayout(
+        references: [String],
+        imageStore: ImageStore,
+        contentRoot: URL,
+        to out: URL,
+        platform: Platform?,
+        logger: Logger
+    ) async throws {
+        var saved: [Descriptor] = []
+        for reference in references {
+            let image = try await imageStore.get(reference: reference)
+            guard
+                var descriptor = try OCILayoutPruner.exportComplete(
+                    image.descriptor, from: contentRoot, to: out, platform: platform, logger: logger)
+            else {
+                let scope = platform.map { " for platform \($0.description)" } ?? ""
+                throw ClientImageError.notFound(id: "\(reference) has no locally available content\(scope)")
+            }
+            var annotations = descriptor.annotations ?? [:]
+            annotations[AnnotationKeys.containerizationImageName] = reference
+            annotations[AnnotationKeys.containerdImageName] = reference
+            annotations[AnnotationKeys.openContainersImageName] = reference
+            descriptor.annotations = annotations
+            saved.append(descriptor)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        try encoder.encode(["imageLayoutVersion": "1.0.0"]).write(to: out.appendingPathComponent("oci-layout"))
+        try encoder.encode(Index(schemaVersion: 2, manifests: saved)).write(to: out.appendingPathComponent("index.json"))
     }
 
     /// `docker import`: synthesizes a single-layer OCI image from `tarPath` (the
