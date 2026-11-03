@@ -542,52 +542,45 @@ extension ContainerCreateRoute {
 
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
-            // must create missing directories BEFORE parsing, not after.
-            // Socket files (.sock) are skipped: Apple Container uses virtiofs which shares
-            // directories, not individual files or Unix domain sockets. Mounting a socket
-            // would cause "operation not supported" at bootstrap time. Compared
-            // case-insensitively: macOS's default APFS volume is case-insensitive.
-            let isSocketPath: (String) -> Bool = {
-                let lowercased = $0.lowercased()
-                return lowercased.hasSuffix(".sock") || lowercased.hasSuffix(".socket")
+            // must create missing directories BEFORE parsing, not after. Sources are
+            // classified by bindSource(for:): an existing socket is relayed by Apple Container
+            // and passes through, a missing socket path is skipped rather than created.
+            let bindSourceSkipped: (String) -> Void = { source in
+                req.logger.warning("bind mount '\(source)' looks like a Unix socket but no socket exists there — skipped")
             }
-            if let binds = hostBinds {
-                for bind in binds {
-                    let parts = bind.split(separator: ":").map(String.init)
-                    if let source = parts.first, source.hasPrefix("/"), !isSocketPath(source) {
+
+            // Process bind mounts from HostConfig.Binds
+            var filteredBinds: [String] = []
+            var socketBinds: [VolumeOrFilesystem] = []
+            for bind in hostBinds ?? [] {
+                let source = bind.split(separator: ":", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+                switch ContainerCreateRoute.bindSource(for: source) {
+                case .socket(let resolvedPath):
+                    socketBinds.append(try ContainerCreateRoute.socketBind(bind, resolvedSource: resolvedPath))
+                case .missingSocket:
+                    bindSourceSkipped(source)
+                case .other:
+                    if source.hasPrefix("/") {
                         try? FileManager.default.createDirectory(
                             atPath: source, withIntermediateDirectories: true)
                     }
+                    filteredBinds.append(bind)
                 }
-            }
-            if let mounts = hostMounts {
-                for mount in mounts where mount.MountType.lowercased() == "bind" && !mount.Source.isEmpty && !isSocketPath(mount.Source) {
-                    try? FileManager.default.createDirectory(
-                        atPath: mount.Source, withIntermediateDirectories: true)
-                }
-            }
-
-            // Process bind mounts from HostConfig.Binds — filter out socket files which
-            // cannot be shared via virtiofs (Apple Container is VM-based).
-            let filteredBinds = (hostBinds ?? []).filter { bind in
-                let source = bind.split(separator: ":").first.map(String.init) ?? ""
-                if isSocketPath(source) {
-                    req.logger.warning("bind mount '\(source)' is a Unix socket — skipped (not supported in Apple Container VMs)")
-                    return false
-                }
-                return true
             }
             var volumesOrFs: [VolumeOrFilesystem] = []
             if !filteredBinds.isEmpty {
                 volumesOrFs = try Parser.volumes(filteredBinds)
             }
+            volumesOrFs.append(contentsOf: socketBinds)
 
             // Process mounts from HostConfig.Mounts
             var mountsOrFs: [VolumeOrFilesystem] = []
             if let mounts = hostMounts, !mounts.isEmpty {
                 // Separate volume mounts from other mount types
                 let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
-                let otherMounts = mounts.filter { $0.MountType.lowercased() != "volume" && !isSocketPath($0.Source) }
+                let (otherMounts, socketMounts) = try ContainerCreateRoute.splitMounts(
+                    mounts.filter { $0.MountType.lowercased() != "volume" }, skipped: bindSourceSkipped)
+                mountsOrFs.append(contentsOf: socketMounts)
 
                 // Handle volume mounts using the volume format (source:destination)
                 // A volume mount without a source is anonymous (compose `- /data`).
@@ -1009,6 +1002,78 @@ extension ContainerCreateRoute {
         return ParsedVolume(
             name: VolumeStorage.generateAnonymousVolumeName(), destination: mount.Target,
             options: mount.ReadOnly == true ? ["ro"] : [], isAnonymous: true)
+    }
+
+    enum BindSource: Equatable {
+        /// An existing Unix socket, which Apple Container relays into the guest over vsock.
+        /// Carries the path with symlinks resolved: a symlink as the source hangs container start.
+        case socket(resolvedPath: String)
+        /// Named like a socket but not one: skipped, and never auto-created as a directory.
+        case missingSocket
+        case other
+    }
+
+    /// Classifies a bind-mount host source by file type, falling back to the name
+    /// (case-insensitively, as macOS's default APFS volume is) only when nothing exists there.
+    static func bindSource(for source: String) -> BindSource {
+        var status = stat()
+        if source.hasPrefix("/"), stat(source, &status) == 0, (status.st_mode & S_IFMT) == S_IFSOCK,
+            let resolved = realpath(source, nil)
+        {
+            defer { free(resolved) }
+            return .socket(resolvedPath: String(cString: resolved))
+        }
+        let lowercased = source.lowercased()
+        if (lowercased.hasSuffix(".sock") || lowercased.hasSuffix(".socket")) && !FileManager.default.fileExists(atPath: source) {
+            return .missingSocket
+        }
+        return .other
+    }
+
+    /// Splits non-volume `HostConfig.Mounts` into socket binds, already converted, and the
+    /// rest, for `Parser.mounts`, which rejects a bind source that isn't a directory.
+    /// Creates missing bind source directories, as Docker does.
+    static func splitMounts(
+        _ mounts: [Mount], skipped: (String) -> Void
+    ) throws -> (other: [Mount], sockets: [VolumeOrFilesystem]) {
+        var other: [Mount] = []
+        var sockets: [VolumeOrFilesystem] = []
+        for mount in mounts {
+            guard mount.MountType.lowercased() == "bind", !mount.Source.isEmpty else {
+                other.append(mount)
+                continue
+            }
+            switch bindSource(for: mount.Source) {
+            case .socket(let resolvedPath):
+                sockets.append(
+                    try socketBindMount(source: resolvedPath, target: mount.Target, options: mount.ReadOnly == true ? ["ro"] : []))
+            case .missingSocket:
+                skipped(mount.Source)
+            case .other:
+                if mount.Source.hasPrefix("/") {
+                    try? FileManager.default.createDirectory(atPath: mount.Source, withIntermediateDirectories: true)
+                }
+                other.append(mount)
+            }
+        }
+        return (other, sockets)
+    }
+
+    /// Converts a `HostConfig.Binds` entry whose source is a socket. The resolved path is
+    /// used as given, since rejoining it into the bind string would split a `:` in it.
+    static func socketBind(_ bind: String, resolvedSource: String) throws -> VolumeOrFilesystem {
+        guard case .filesystem(let parsed) = try Parser.volumes([bind]).first else {
+            throw Abort(.badRequest, reason: "Invalid bind mount for socket: \(bind)")
+        }
+        return try socketBindMount(source: resolvedSource, target: parsed.destination, options: parsed.options)
+    }
+
+    /// Built from fields rather than a `source:target` string, which a `:` in either would break.
+    static func socketBindMount(source: String, target: String, options: [String]) throws -> VolumeOrFilesystem {
+        guard !target.isEmpty else {
+            throw Abort(.badRequest, reason: "Invalid bind mount for socket \(source): no target")
+        }
+        return .filesystem(.virtiofs(source: source, destination: target, options: options))
     }
 
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {

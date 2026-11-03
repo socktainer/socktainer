@@ -868,3 +868,145 @@ struct ContainerCreateRouteNameConflictTests {
         #expect(!reason.contains("exists:"))
     }
 }
+
+@Suite("ContainerCreateRoute — bind sources that are Unix sockets (#495)")
+struct ContainerCreateBindSourceTests {
+    /// Binds a real Unix socket named `name` so `stat` reports S_IFSOCK. The directory
+    /// name stays short: sun_path is limited to 104 bytes on Darwin.
+    private func makeUnixSocket(named name: String) throws -> (dir: String, path: String, cleanup: () -> Void) {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("sk-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent(name)
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        #expect(fd >= 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            path.utf8CString.withUnsafeBytes { src in
+                raw.copyMemory(from: UnsafeRawBufferPointer(rebasing: src.prefix(raw.count - 1)))
+            }
+        }
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(bindResult == 0)
+        return (
+            dir, path,
+            {
+                close(fd)
+                try? FileManager.default.removeItem(atPath: dir)
+            }
+        )
+    }
+
+    private func realPath(_ path: String) -> String {
+        guard let resolved = realpath(path, nil) else { return path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    @Test("an existing socket named *.sock passes through instead of being dropped by name")
+    func socketNamedSockPassesThrough() throws {
+        let (_, path, cleanup) = try makeUnixSocket(named: "agent.sock")
+        defer { cleanup() }
+        #expect(ContainerCreateRoute.bindSource(for: path) == .socket(resolvedPath: realPath(path)))
+    }
+
+    @Test("an existing socket without a socket-like name passes through")
+    func socketWithPlainNamePassesThrough() throws {
+        let (_, path, cleanup) = try makeUnixSocket(named: "echo")
+        defer { cleanup() }
+        #expect(ContainerCreateRoute.bindSource(for: path) == .socket(resolvedPath: realPath(path)))
+    }
+
+    @Test("a symlink to a socket is mounted by its resolved target, never as the symlink")
+    func symlinkToSocketIsResolved() throws {
+        let (dir, path, cleanup) = try makeUnixSocket(named: "agent.sock")
+        defer { cleanup() }
+        let link = (dir as NSString).appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
+        #expect(ContainerCreateRoute.bindSource(for: link) == .socket(resolvedPath: realPath(path)))
+    }
+
+    private func virtiofs(_ mount: VolumeOrFilesystem?) -> Filesystem? {
+        guard case .filesystem(let fs) = mount else { return nil }
+        return fs
+    }
+
+    @Test("a socket in HostConfig.Mounts becomes a read-only virtiofs bind, kept away from Parser.mounts")
+    func socketInMountsIsAccepted() throws {
+        let (_, path, cleanup) = try makeUnixSocket(named: "agent.sock")
+        defer { cleanup() }
+        #expect(throws: (any Error).self) { try Parser.mounts(["type=bind,source=\(path),destination=/ssh-agent"]) }
+        let json =
+            #"[{"Type":"bind","Source":"\#(path)","Target":"/ssh-agent","ReadOnly":true},"#
+            + #"{"Type":"tmpfs","Source":"","Target":"/scratch"}]"#
+        let mounts = try JSONDecoder().decode([Mount].self, from: Data(json.utf8))
+        let (other, sockets) = try ContainerCreateRoute.splitMounts(mounts, skipped: { _ in })
+        #expect(other.map(\.Target) == ["/scratch"])
+        #expect(sockets.count == 1)
+        let fs = try #require(virtiofs(sockets.first))
+        #expect(fs.source == realPath(path))
+        #expect(fs.destination == "/ssh-agent")
+        #expect(fs.options == ["ro"])
+    }
+
+    @Test("a socket bind keeps a resolved path containing ':' intact")
+    func socketBindWithColonInResolvedPath() throws {
+        let (dir, path, cleanup) = try makeUnixSocket(named: "a:b")
+        defer { cleanup() }
+        let link = (dir as NSString).appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
+        guard case .socket(let resolved) = ContainerCreateRoute.bindSource(for: link) else {
+            Issue.record("expected \(link) to classify as a socket")
+            return
+        }
+        let fs = try #require(virtiofs(try ContainerCreateRoute.socketBind("\(link):/ssh-agent:ro", resolvedSource: resolved)))
+        #expect(fs.source == realPath(path))
+        #expect(fs.destination == "/ssh-agent")
+        #expect(fs.options == ["ro"])
+    }
+
+    @Test("a socket mount without a target is rejected")
+    func socketMountWithoutTargetIsRejected() {
+        #expect(throws: (any Error).self) {
+            try ContainerCreateRoute.socketBindMount(source: "/tmp/agent.sock", target: "", options: ["ro"])
+        }
+    }
+
+    @Test("a missing *.sock or *.socket source is skipped, so it is never created as a directory")
+    func missingSocketPathIsSkipped() {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("sk-\(UUID().uuidString)")
+        #expect(ContainerCreateRoute.bindSource(for: "\(dir)/agent.sock") == .missingSocket)
+        #expect(ContainerCreateRoute.bindSource(for: "\(dir)/Agent.SOCKET") == .missingSocket)
+    }
+
+    @Test("an existing directory named *.sock is an ordinary bind source")
+    func existingDirectoryNamedSockIsOrdinary() throws {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("sk-\(UUID().uuidString.prefix(8)).sock")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        #expect(ContainerCreateRoute.bindSource(for: dir) == .other)
+    }
+
+    @Test("a missing relative bind source in Mounts is left for the parser, not created")
+    func relativeMountSourceIsNotCreated() throws {
+        let name = "sk-rel-\(UUID().uuidString.prefix(8))"
+        let json = #"[{"Type":"bind","Source":"\#(name)","Target":"/data"}]"#
+        let mounts = try JSONDecoder().decode([Mount].self, from: Data(json.utf8))
+        let (other, sockets) = try ContainerCreateRoute.splitMounts(mounts, skipped: { _ in })
+        #expect(other.map(\.Source) == [name])
+        #expect(sockets.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: name))
+    }
+
+    @Test("ordinary sources, existing or missing, and named volumes are unaffected")
+    func ordinarySourcesAreUnaffected() {
+        #expect(ContainerCreateRoute.bindSource(for: NSTemporaryDirectory()) == .other)
+        #expect(ContainerCreateRoute.bindSource(for: "/nonexistent-\(UUID().uuidString)/data") == .other)
+        #expect(ContainerCreateRoute.bindSource(for: "myvolume") == .other)
+    }
+}
