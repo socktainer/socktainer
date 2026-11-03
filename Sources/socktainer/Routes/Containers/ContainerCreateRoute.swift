@@ -578,23 +578,25 @@ extension ContainerCreateRoute {
             if let mounts = hostMounts, !mounts.isEmpty {
                 // Separate volume mounts from other mount types
                 let volumeMounts = mounts.filter { $0.MountType.lowercased() == "volume" }
-                var otherMounts: [(mount: Mount, source: String)] = []
+                var otherMounts: [Mount] = []
+                var socketMounts: [(source: String, target: String, readOnly: Bool)] = []
                 for mount in mounts where mount.MountType.lowercased() != "volume" {
                     guard mount.MountType.lowercased() == "bind", !mount.Source.isEmpty else {
-                        otherMounts.append((mount, mount.Source))
+                        otherMounts.append(mount)
                         continue
                     }
                     switch ContainerCreateRoute.bindSource(for: mount.Source) {
                     case .socket(let resolvedPath):
-                        otherMounts.append((mount, resolvedPath))
+                        socketMounts.append((resolvedPath, mount.Target, mount.ReadOnly == true))
                     case .missingSocket:
                         bindSourceSkipped(mount.Source)
                     case .other:
                         try? FileManager.default.createDirectory(
                             atPath: mount.Source, withIntermediateDirectories: true)
-                        otherMounts.append((mount, mount.Source))
+                        otherMounts.append(mount)
                     }
                 }
+                mountsOrFs.append(contentsOf: try ContainerCreateRoute.socketBindMounts(socketMounts))
 
                 // Handle volume mounts using the volume format (source:destination)
                 // A volume mount without a source is anonymous (compose `- /data`).
@@ -620,7 +622,7 @@ extension ContainerCreateRoute {
 
                 // Handle other mount types (bind, tmpfs, etc.)
                 if !otherMounts.isEmpty {
-                    let mountStrings = otherMounts.map { mount, source in
+                    let mountStrings = otherMounts.map { mount in
                         var components: [String] = []
 
                         // Convert Docker mount type to Parser-supported type
@@ -628,8 +630,8 @@ extension ContainerCreateRoute {
                         components.append("type=\(mountType)")
 
                         // Add source if specified
-                        if !source.isEmpty {
-                            components.append("source=\(source)")
+                        if !mount.Source.isEmpty {
+                            components.append("source=\(mount.Source)")
                         }
 
                         // Add destination/target
@@ -1039,6 +1041,14 @@ extension ContainerCreateRoute {
             return .missingSocket
         }
         return .other
+    }
+
+    /// Parses socket bind mounts from `HostConfig.Mounts` the way `HostConfig.Binds` are
+    /// parsed: `Parser.mounts` rejects a bind source that isn't a directory, while
+    /// `Parser.volumes` only requires that it exists.
+    static func socketBindMounts(_ sockets: [(source: String, target: String, readOnly: Bool)]) throws -> [VolumeOrFilesystem] {
+        guard !sockets.isEmpty else { return [] }
+        return try Parser.volumes(sockets.map { "\($0.source):\($0.target)" + ($0.readOnly ? ":ro" : "") })
     }
 
     static func validateCpuLimits(hostConfig: HostConfig?) -> String? {

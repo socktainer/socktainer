@@ -931,6 +931,22 @@ struct ContainerCreateBindSourceTests {
         #expect(ContainerCreateRoute.bindSource(for: link) == .socket(resolvedPath: realPath(path)))
     }
 
+    @Test("a socket source in HostConfig.Mounts parses as a virtiofs bind, which Parser.mounts would reject")
+    func socketInMountsIsAccepted() throws {
+        let (_, path, cleanup) = try makeUnixSocket(named: "agent.sock")
+        defer { cleanup() }
+        #expect(throws: (any Error).self) { try Parser.mounts(["type=bind,source=\(path),destination=/ssh-agent"]) }
+        let parsed = try ContainerCreateRoute.socketBindMounts([(path, "/ssh-agent", true)])
+        #expect(parsed.count == 1)
+        guard case .filesystem(let fs) = parsed.first else {
+            Issue.record("expected a filesystem mount, got \(parsed)")
+            return
+        }
+        #expect(fs.source == path)
+        #expect(fs.destination == "/ssh-agent")
+        #expect(fs.options.contains("ro"))
+    }
+
     @Test("a missing *.sock or *.socket source is skipped, so it is never created as a directory")
     func missingSocketPathIsSkipped() {
         let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("sk-\(UUID().uuidString)")
