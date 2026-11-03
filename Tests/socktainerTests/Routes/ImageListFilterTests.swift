@@ -5,10 +5,11 @@ import Vapor
 
 @testable import socktainer
 
-/// GET /images/json must honor moby's `reference` and `dangling` filters.
+/// GET /images/json must honor moby's `reference`, `dangling` and `label` filters.
 /// `reference` matches repo tags in familiar form with path.Match globbing;
-/// `dangling` selects images with no repo tags. Different keys AND together.
-@Suite("ImageListRoute — reference and dangling filters")
+/// `dangling` selects images with no repo tags; `label` selects images carrying
+/// a label (`key`) or a label value (`key=value`). Different keys AND together.
+@Suite("ImageListRoute — reference, dangling and label filters")
 struct ImageListFilterTests {
 
     // MARK: - dangling
@@ -171,6 +172,82 @@ struct ImageListFilterTests {
         #expect(kept.isEmpty)
     }
 
+    // MARK: - label
+
+    @Test("label=key=value keeps only images with that label value")
+    func applyLabelKeyValue() throws {
+        let web = Self.summary(repoTags: ["web:latest"], labels: ["com.example.project": "a"])
+        let other = Self.summary(repoTags: ["other:latest"], labels: ["com.example.project": "b"])
+        let unlabeled = Self.summary(repoTags: ["alpine:latest"])
+        let kept = try ImageListRoute.applyFilters([web, other, unlabeled], filters: ["label": ["com.example.project=a"]])
+        #expect(kept.map(\.RepoTags) == [["web:latest"]])
+    }
+
+    @Test("label=key keeps images that have the label, whatever its value")
+    func applyLabelKeyOnly() throws {
+        let a = Self.summary(repoTags: ["a:latest"], labels: ["com.example.project": "a"])
+        let empty = Self.summary(repoTags: ["e:latest"], labels: ["com.example.project": ""])
+        let unlabeled = Self.summary(repoTags: ["alpine:latest"])
+        let kept = try ImageListRoute.applyFilters([a, empty, unlabeled], filters: ["label": ["com.example.project"]])
+        #expect(kept.map(\.RepoTags) == [["a:latest"], ["e:latest"]])
+    }
+
+    @Test("A label filter that matches no image returns nothing")
+    func applyLabelNoMatch() throws {
+        let labeled = Self.summary(repoTags: ["web:latest"], labels: ["com.example.project": "a"])
+        let unlabeled = Self.summary(repoTags: ["alpine:latest"])
+        let kept = try ImageListRoute.applyFilters([labeled, unlabeled], filters: ["label": ["repro.none=1"]])
+        #expect(kept.isEmpty)
+    }
+
+    @Test("Multiple label filters AND together")
+    func applyLabelMultipleAnd() throws {
+        let both = Self.summary(repoTags: ["both:latest"], labels: ["a": "1", "b": "2"])
+        let onlyA = Self.summary(repoTags: ["onlya:latest"], labels: ["a": "1"])
+        let kept = try ImageListRoute.applyFilters([both, onlyA], filters: ["label": ["a=1", "b"]])
+        #expect(kept.map(\.RepoTags) == [["both:latest"]])
+    }
+
+    @Test("A label value may itself contain '='")
+    func applyLabelValueWithEquals() throws {
+        let image = Self.summary(repoTags: ["x:latest"], labels: ["opts": "k=v"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["opts=k=v"]])
+        #expect(kept.count == 1)
+    }
+
+    @Test("A label on any usable platform config matches, even when the displayed labels lack it")
+    func applyLabelAnyPlatformConfig() throws {
+        let image = Self.summary(repoTags: ["multi:latest"], labels: ["arch": "amd64"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["arch=arm64"]]) { _ in
+            [["arch": "amd64"], ["arch": "arm64"]]
+        }
+        #expect(kept.count == 1)
+    }
+
+    @Test("Label filters must all match the same platform config")
+    func applyLabelNoCrossConfigCombination() throws {
+        let image = Self.summary(repoTags: ["multi:latest"], labels: ["a": "1"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["a=1", "b=2"]]) { _ in
+            [["a": "1"], ["b": "2"]]
+        }
+        #expect(kept.isEmpty)
+    }
+
+    @Test("An image with no usable platform config matches no label filter")
+    func applyLabelNoUsableConfig() throws {
+        let image = Self.summary(repoTags: ["broken:latest"])
+        let kept = try ImageListRoute.applyFilters([image], filters: ["label": ["a"]]) { _ in [] }
+        #expect(kept.isEmpty)
+    }
+
+    @Test("label and reference AND together")
+    func labelAndReferenceAnd() throws {
+        let alpine = Self.summary(repoTags: ["docker.io/library/alpine:latest"], labels: ["a": "1"])
+        let redis = Self.summary(repoTags: ["docker.io/library/redis:7"], labels: ["a": "1"])
+        let kept = try ImageListRoute.applyFilters([alpine, redis], filters: ["label": ["a=1"], "reference": ["redis"]])
+        #expect(kept.map(\.RepoTags) == [["docker.io/library/redis:7"]])
+    }
+
     @Test("No filters returns everything unchanged")
     func noFilters() throws {
         let a = Self.summary(repoTags: ["docker.io/library/alpine:latest"])
@@ -238,7 +315,7 @@ struct ImageListFilterTests {
 
     // MARK: - Helpers
 
-    private static func summary(repoTags: [String]) -> RESTImageSummary {
+    private static func summary(repoTags: [String], labels: [String: String] = [:]) -> RESTImageSummary {
         RESTImageSummary(
             Id: "sha256:\(repoTags.first ?? "none")",
             ParentId: "",
@@ -247,7 +324,7 @@ struct ImageListFilterTests {
             Created: 0,
             Size: 0,
             SharedSize: -1,
-            Labels: [:],
+            Labels: labels,
             Containers: 0,
             Manifests: nil,
             Descriptor: nil)
