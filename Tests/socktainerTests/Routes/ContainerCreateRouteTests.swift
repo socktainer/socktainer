@@ -931,20 +931,50 @@ struct ContainerCreateBindSourceTests {
         #expect(ContainerCreateRoute.bindSource(for: link) == .socket(resolvedPath: realPath(path)))
     }
 
-    @Test("a socket source in HostConfig.Mounts parses as a virtiofs bind, which Parser.mounts would reject")
+    private func virtiofs(_ mount: VolumeOrFilesystem?) -> Filesystem? {
+        guard case .filesystem(let fs) = mount else { return nil }
+        return fs
+    }
+
+    @Test("a socket in HostConfig.Mounts becomes a read-only virtiofs bind, kept away from Parser.mounts")
     func socketInMountsIsAccepted() throws {
         let (_, path, cleanup) = try makeUnixSocket(named: "agent.sock")
         defer { cleanup() }
         #expect(throws: (any Error).self) { try Parser.mounts(["type=bind,source=\(path),destination=/ssh-agent"]) }
-        let parsed = try ContainerCreateRoute.socketBindMounts([(path, "/ssh-agent", true)])
-        #expect(parsed.count == 1)
-        guard case .filesystem(let fs) = parsed.first else {
-            Issue.record("expected a filesystem mount, got \(parsed)")
+        let json =
+            #"[{"Type":"bind","Source":"\#(path)","Target":"/ssh-agent","ReadOnly":true},"#
+            + #"{"Type":"tmpfs","Source":"","Target":"/scratch"}]"#
+        let mounts = try JSONDecoder().decode([Mount].self, from: Data(json.utf8))
+        let (other, sockets) = try ContainerCreateRoute.splitMounts(mounts, skipped: { _ in })
+        #expect(other.map(\.Target) == ["/scratch"])
+        #expect(sockets.count == 1)
+        let fs = try #require(virtiofs(sockets.first))
+        #expect(fs.source == realPath(path))
+        #expect(fs.destination == "/ssh-agent")
+        #expect(fs.options == ["ro"])
+    }
+
+    @Test("a socket bind keeps a resolved path containing ':' intact")
+    func socketBindWithColonInResolvedPath() throws {
+        let (dir, path, cleanup) = try makeUnixSocket(named: "a:b")
+        defer { cleanup() }
+        let link = (dir as NSString).appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
+        guard case .socket(let resolved) = ContainerCreateRoute.bindSource(for: link) else {
+            Issue.record("expected \(link) to classify as a socket")
             return
         }
-        #expect(fs.source == path)
+        let fs = try #require(virtiofs(try ContainerCreateRoute.socketBind("\(link):/ssh-agent:ro", resolvedSource: resolved)))
+        #expect(fs.source == realPath(path))
         #expect(fs.destination == "/ssh-agent")
-        #expect(fs.options.contains("ro"))
+        #expect(fs.options == ["ro"])
+    }
+
+    @Test("a socket mount without a target is rejected")
+    func socketMountWithoutTargetIsRejected() {
+        #expect(throws: (any Error).self) {
+            try ContainerCreateRoute.socketBindMount(source: "/tmp/agent.sock", target: "", options: ["ro"])
+        }
     }
 
     @Test("a missing *.sock or *.socket source is skipped, so it is never created as a directory")
