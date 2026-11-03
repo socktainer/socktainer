@@ -10,6 +10,22 @@ import Logging
 import Vapor
 
 struct ContainerCreateRoute: RouteCollection {
+    /// Docker Engine's message for a duplicate container name. Testcontainers only switches to reuse
+    /// when the error matches `[Tt]he container name .* is already in use by .*`.
+    static func nameConflictReason(name: String, existingId: String) -> String {
+        "Conflict. The container name \"/\(name)\" is already in use by container \"\(existingId)\". "
+            + "You have to remove (or rename) that container to be able to reuse that name."
+    }
+
+    /// Whether a create error means the requested name is taken
+    /// (Apple Container: `ContainerizationError(.exists, "container already exists: <id>")`).
+    static func isNameConflict(_ error: Error) -> Bool {
+        if let error = error as? ContainerizationError {
+            return error.code == .exists
+        }
+        return String(describing: error).lowercased().hasPrefix("exists:")
+    }
+
     let client: ClientContainerProtocol
     let systemConfig: ContainerSystemConfig
 
@@ -784,6 +800,18 @@ extension ContainerCreateRoute {
                     ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
                 } catch {
                     req.logger.error("Failed to create container: \(error)")
+                    // Docker Engine answers a duplicate name with 409 Conflict. Clients such as Testcontainers
+                    // (WithReuseByName) treat 409 as "reuse the existing container"; a 500 aborts them instead.
+                    if ContainerCreateRoute.isNameConflict(error) {
+                        // Docker's wording, including `by container "<id>"`: Testcontainers matches
+                        // `the container name .* is already in use by .*` before it switches to reuse.
+                        let existingId =
+                            (try? await ContainerClient().get(id: containerConfiguration.id))
+                            .map { DockerContainerID.hexId(for: $0) } ?? containerConfiguration.id
+                        throw Abort(
+                            .conflict,
+                            reason: ContainerCreateRoute.nameConflictReason(name: containerConfiguration.id, existingId: existingId))
+                    }
                     throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
                 }
 

@@ -830,3 +830,41 @@ struct ContainerCreateAnonymousMountTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute — duplicate name")
+struct ContainerCreateRouteNameConflictTests {
+    struct RuntimeError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    @Test("a ContainerizationError with code .exists is a name conflict")
+    func typedExistsIsConflict() {
+        #expect(ContainerCreateRoute.isNameConflict(ContainerizationError(.exists, message: "container already exists: pg")))
+        #expect(!ContainerCreateRoute.isNameConflict(ContainerizationError(.notFound, message: "image not found")))
+        #expect(!ContainerCreateRoute.isNameConflict(ContainerizationError(.internalError, message: "volume already exists")))
+    }
+
+    @Test("an untyped 'exists:' error is classified as a name conflict")
+    func existsIsConflict() {
+        #expect(ContainerCreateRoute.isNameConflict(RuntimeError(description: "exists: \"container already exists: pg\"")))
+    }
+
+    @Test("the conflict reason matches the pattern Testcontainers uses to switch to reuse")
+    func reasonMatchesTestcontainers() throws {
+        let reason = ContainerCreateRoute.nameConflictReason(name: "pg", existingId: "abc123")
+        #expect(reason.range(of: "[Tt]he container name .* is already in use by .*", options: .regularExpression) != nil)
+    }
+
+    @Test("other create-time runtime errors are not classified as a name conflict")
+    func otherErrorsAreNot() {
+        #expect(!ContainerCreateRoute.isNameConflict(RuntimeError(description: "interrupted: XPC connection error")))
+        #expect(!ContainerCreateRoute.isNameConflict(RuntimeError(description: "internalError: failed to bootstrap container")))
+    }
+
+    @Test("the conflict reason is Docker's wording only, without the runtime error text")
+    func reasonHasNoRuntimeText() {
+        let reason = ContainerCreateRoute.nameConflictReason(name: "pg", existingId: "abc123")
+        #expect(reason.hasPrefix("Conflict. The container name \"/pg\" is already in use by container \"abc123\"."))
+        #expect(!reason.contains("exists:"))
+    }
+}
