@@ -984,6 +984,25 @@ struct ContainerCreateBindSourceTests {
         #expect(ContainerCreateRoute.bindSource(for: "\(dir)/Agent.SOCKET") == .missingSocket)
     }
 
+    @Test("an existing directory named *.sock is an ordinary bind source")
+    func existingDirectoryNamedSockIsOrdinary() throws {
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("sk-\(UUID().uuidString.prefix(8)).sock")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        #expect(ContainerCreateRoute.bindSource(for: dir) == .other)
+    }
+
+    @Test("a missing relative bind source in Mounts is left for the parser, not created")
+    func relativeMountSourceIsNotCreated() throws {
+        let name = "sk-rel-\(UUID().uuidString.prefix(8))"
+        let json = #"[{"Type":"bind","Source":"\#(name)","Target":"/data"}]"#
+        let mounts = try JSONDecoder().decode([Mount].self, from: Data(json.utf8))
+        let (other, sockets) = try ContainerCreateRoute.splitMounts(mounts, skipped: { _ in })
+        #expect(other.map(\.Source) == [name])
+        #expect(sockets.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: name))
+    }
+
     @Test("ordinary sources, existing or missing, and named volumes are unaffected")
     func ordinarySourcesAreUnaffected() {
         #expect(ContainerCreateRoute.bindSource(for: NSTemporaryDirectory()) == .other)

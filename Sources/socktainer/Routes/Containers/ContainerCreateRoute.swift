@@ -1011,7 +1011,7 @@ extension ContainerCreateRoute {
     }
 
     /// Classifies a bind-mount host source by file type, falling back to the name
-    /// (case-insensitively, as macOS's default APFS volume is) only when no socket exists.
+    /// (case-insensitively, as macOS's default APFS volume is) only when nothing exists there.
     static func bindSource(for source: String) -> BindSource {
         var status = stat()
         if source.hasPrefix("/"), stat(source, &status) == 0, (status.st_mode & S_IFMT) == S_IFSOCK,
@@ -1021,7 +1021,7 @@ extension ContainerCreateRoute {
             return .socket(resolvedPath: String(cString: resolved))
         }
         let lowercased = source.lowercased()
-        if lowercased.hasSuffix(".sock") || lowercased.hasSuffix(".socket") {
+        if (lowercased.hasSuffix(".sock") || lowercased.hasSuffix(".socket")) && !FileManager.default.fileExists(atPath: source) {
             return .missingSocket
         }
         return .other
@@ -1047,7 +1047,9 @@ extension ContainerCreateRoute {
             case .missingSocket:
                 skipped(mount.Source)
             case .other:
-                try? FileManager.default.createDirectory(atPath: mount.Source, withIntermediateDirectories: true)
+                if mount.Source.hasPrefix("/") {
+                    try? FileManager.default.createDirectory(atPath: mount.Source, withIntermediateDirectories: true)
+                }
                 other.append(mount)
             }
         }
