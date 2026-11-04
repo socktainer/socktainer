@@ -61,6 +61,21 @@ final class SocktainerDNSServer: @unchecked Sendable {
     func upstreamSnapshot() -> (host: String, port: Int) {
         lock.withLock { (host: _upstreamHost, port: _upstreamPort) }
     }
+    private var _systemResolvers: [DNSUpstream] = []
+    /// Host resolvers followed in `auto` mode, tried in order (empty: use `upstreamHost`/`upstreamPort`).
+    /// Lock-guarded: the system DNS watcher replaces it live.
+    var systemResolvers: [DNSUpstream] {
+        get { lock.withLock { _systemResolvers } }
+        set { lock.withLock { _systemResolvers = newValue } }
+    }
+    private var _hasConfiguredUpstream = false
+    /// True when `--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM` is in effect (an address or `auto`).
+    /// Container creation uses it to give `default`-network containers the DNS sidecar and to keep
+    /// an explicit `HostConfig.Dns`, since those only help when the server can reach a working upstream.
+    var hasConfiguredUpstream: Bool {
+        get { lock.withLock { _hasConfiguredUpstream } }
+        set { lock.withLock { _hasConfiguredUpstream = newValue } }
+    }
     /// Port the server is bound to, once `start(...)` succeeds.
     var listeningPort: Int? { lock.withLock { _listeningPort } }
     /// Upstream port (default 53). Lock-guarded for consistency with `upstreamHost`.
@@ -430,7 +445,33 @@ final class SocktainerDNSServer: @unchecked Sendable {
     }
 
     private func forwardToUpstream(_ packet: [UInt8]) -> [UInt8]? {
-        let (host, upstreamPortValue) = upstreamSnapshot()
+        let resolvers = systemResolvers
+        guard !resolvers.isEmpty else {
+            let (host, port) = upstreamSnapshot()
+            return forward(packet, to: DNSUpstream(host: host, port: port))
+        }
+        var fallback: [UInt8]?
+        for resolver in resolvers {
+            guard let response = forward(packet, to: resolver) else { continue }
+            if Self.shouldTryNextResolver(after: response) {
+                fallback = fallback ?? response
+                continue
+            }
+            return response
+        }
+        return fallback
+    }
+
+    /// SERVFAIL and REFUSED mean this resolver cannot answer; with several resolvers the next
+    /// one may. NXDOMAIN and NODATA are real answers and end the search.
+    static func shouldTryNextResolver(after response: [UInt8]) -> Bool {
+        guard response.count > 3 else { return false }
+        let rcode = response[3] & 0x0F
+        return rcode == 2 || rcode == 5
+    }
+
+    private func forward(_ packet: [UInt8], to target: DNSUpstream) -> [UInt8]? {
+        let (host, upstreamPortValue) = (target.host, target.port)
         // A host address that appears after startup (e.g. a named-network gateway) can make the
         // upstream point back at this server. Answer SERVFAIL rather than forward in a loop.
         if let ownPort = listeningPort, upstreamPortValue == ownPort,

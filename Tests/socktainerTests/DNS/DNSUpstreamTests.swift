@@ -191,4 +191,56 @@ struct DNSUpstreamTests {
         let result = DNSUpstream.resolve(cliValue: nil, environment: ["SOCKTAINER_DNS_UPSTREAM": "  "])
         #expect(result == DNSUpstream.Resolution(upstream: nil, warning: nil))
     }
+
+    // MARK: - auto
+
+    @Test("auto is recognised case-insensitively, ignoring whitespace")
+    func isAuto() {
+        #expect(DNSUpstream.isAuto("auto"))
+        #expect(DNSUpstream.isAuto("  AUTO\n"))
+        #expect(!DNSUpstream.isAuto("automatic"))
+        #expect(!DNSUpstream.isAuto("1.1.1.1"))
+        #expect(!DNSUpstream.isAuto(""))
+    }
+
+    @Test("auto is not an address")
+    func autoIsNotAnAddress() {
+        #expect(throws: DNSUpstream.ParseError.invalidHost("auto")) { try DNSUpstream.parse("auto") }
+    }
+
+    @Test("auto via environment variable")
+    func autoEnv() {
+        let result = DNSUpstream.resolve(cliValue: nil, environment: ["SOCKTAINER_DNS_UPSTREAM": "auto"])
+        #expect(result == DNSUpstream.Resolution(upstream: nil, warning: nil, followSystemResolvers: true))
+    }
+
+    @Test("auto via CLI flag")
+    func autoCLI() {
+        let result = DNSUpstream.resolve(cliValue: "Auto", environment: [:])
+        #expect(result == DNSUpstream.Resolution(upstream: nil, warning: nil, followSystemResolvers: true))
+    }
+
+    @Test("CLI auto wins over an environment address, and a CLI address wins over environment auto")
+    func autoPrecedence() {
+        let cliAuto = DNSUpstream.resolve(cliValue: "auto", environment: ["SOCKTAINER_DNS_UPSTREAM": "10.1.1.1"])
+        #expect(cliAuto.followSystemResolvers)
+        #expect(cliAuto.upstream == nil)
+
+        let cliAddress = DNSUpstream.resolve(cliValue: "10.1.1.1", environment: ["SOCKTAINER_DNS_UPSTREAM": "auto"])
+        #expect(!cliAddress.followSystemResolvers)
+        #expect(cliAddress.upstream == DNSUpstream(host: "10.1.1.1", port: 53))
+    }
+
+    @Test("Invalid CLI value falls through to environment auto, keeping the warning")
+    func invalidCLIThenAuto() {
+        let result = DNSUpstream.resolve(cliValue: "bogus", environment: ["SOCKTAINER_DNS_UPSTREAM": "auto"])
+        #expect(result.followSystemResolvers)
+        #expect(result.warning?.contains("--dns-upstream") == true)
+    }
+
+    @Test("Fixed values never follow system resolvers")
+    func fixedDoesNotFollow() {
+        #expect(!DNSUpstream.resolve(cliValue: nil, environment: ["SOCKTAINER_DNS_UPSTREAM": "10.1.1.1"]).followSystemResolvers)
+        #expect(!DNSUpstream.resolve(cliValue: nil, environment: [:]).followSystemResolvers)
+    }
 }
