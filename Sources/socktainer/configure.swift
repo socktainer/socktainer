@@ -249,8 +249,10 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         gateway = await defaultGatewayAddress()
         dnsServer.setUpstream(host: upstream.host, port: upstream.port)
     } else {
+        // Also the baseline for `auto`, used while the host reports no usable resolver.
         await useGatewayUpstream()
     }
+    dnsServer.hasConfiguredUpstream = upstreamResolution.upstream != nil || upstreamResolution.followSystemResolvers
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
         return
@@ -280,6 +282,20 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
                 "Default network gateway \(gatewayPointsAtSelf ? "also points at socktainer's own DNS server" : "could not be read") — DNS upstream falls back to \(SocktainerDNSServer.defaultUpstreamHost)"
             )
         }
+    }
+    if upstreamResolution.followSystemResolvers {
+        // Started only for `auto`, after the server is bound; stopped on application shutdown.
+        let watcher = SystemDNSResolverWatcher { resolvers in
+            dnsServer.systemResolvers = resolvers
+            if resolvers.isEmpty {
+                logger.warning("No usable system DNS resolver found — DNS upstream falls back to \(dnsServer.upstreamHost)")
+            } else {
+                logger.notice("DNS upstream (system resolvers): \(resolvers.map { "\($0.host):\($0.port)" }.joined(separator: ", "))")
+            }
+        }
+        watcher.start()
+        app.storage[SystemDNSResolverWatcherKey.self] = watcher
+        app.lifecycle.use(SystemDNSResolverWatcherLifecycle(watcher: watcher))
     }
     app.storage[SocktainerDNSServerKey.self] = dnsServer
 

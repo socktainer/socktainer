@@ -292,7 +292,7 @@ gateway cannot be read.
 On some managed Macs the vmnet gateway does not answer DNS queries, so containers on named
 networks cannot resolve external names. The override only affects the embedded server, so it
 applies to containers on named networks (including Docker Compose); containers on the
-`default` network still query the vmnet gateway directly.
+`default` network still query the vmnet gateway directly unless an upstream is configured (see below).
 
 Point it at a resolver that already runs on the host (macOS has none on `127.0.0.1:53` by
 default), for example a local DNS proxy installed by security or VPN software, or one you run
@@ -302,6 +302,23 @@ yourself. The address must be an IPv4 literal, with an optional port (default `5
 socktainer --dns-upstream 127.0.0.1
 SOCKTAINER_DNS_UPSTREAM=127.0.0.1:5353 socktainer
 ```
+
+Use `auto` to follow the Mac's own DNS resolvers instead of naming one. Socktainer then forwards
+to the global default resolvers (from SystemConfiguration, falling back to `/etc/resolv.conf`),
+tries them in order if one answers SERVFAIL or REFUSED, and picks up changes such as a VPN
+connecting or a network switch without a restart. Only IPv4 resolvers are used, and scoped or
+split DNS (`/etc/resolver/*`, per-domain VPN resolvers) is not consulted; with no usable resolver
+it uses the default described above.
+
+```bash
+socktainer --dns-upstream auto
+SOCKTAINER_DNS_UPSTREAM=auto socktainer
+```
+
+When an upstream is configured (an address or `auto`), containers on the `default` network get
+the embedded DNS server's forwarder as their nameserver too, so they use the same upstream, and
+an explicit `--dns` / `HostConfig.Dns` (for example Compose `dns:`) is kept instead of being
+replaced by the forwarder.
 
 Do not point it at socktainer's own DNS port; that configuration is ignored with an error.
 
