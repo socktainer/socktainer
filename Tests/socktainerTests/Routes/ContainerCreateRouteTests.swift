@@ -171,6 +171,17 @@ struct PeerHostnameRewriteTests {
         #expect(ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-peer-hostnames": "true"]))
     }
 
+    @Test("A matching URL is preserved without the label and rewritten with it (#479)")
+    func labelGatesRewrite() {
+        let env = ["DATABASE_URL=postgresql://user@db:5432/x", "PUBLIC_URL=https://supabase_db_supabase:8443"]
+        #expect(ContainerCreateRoute.peerRewrittenEnv(env, labels: nil, peers: peers) == env)
+        #expect(ContainerCreateRoute.peerRewrittenEnv(env, labels: ["app": "web"], peers: peers) == env)
+        #expect(
+            ContainerCreateRoute.peerRewrittenEnv(
+                env, labels: ["socktainer.rewrite-peer-hostnames": "true"], peers: peers)
+                == ["DATABASE_URL=postgresql://user@192.168.67.3:5432/x", "PUBLIC_URL=https://192.168.67.3:8443"])
+    }
+
     private let peers = ["supabase_db_supabase": "192.168.67.3", "db": "192.168.67.3"]
 
     @Test("@hostname:port form is rewritten")

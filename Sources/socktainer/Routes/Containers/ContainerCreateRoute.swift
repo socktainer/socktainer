@@ -272,17 +272,14 @@ extension ContainerCreateRoute {
             // rewrite: the DNS table spans every network, and URL-form values are often meant
             // for clients, not peers (#479). host-mode containers are excluded (they already
             // get loopback DNS for fast-fail).
-            if ContainerCreateRoute.shouldRewritePeerHostnames(labels: body.Labels),
-                !isHostMode, namedNet != nil,
+            if !isHostMode, namedNet != nil,
                 let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
             {
-                let peers = dnsServer.listEntries()
-                if !peers.isEmpty {
-                    let hostRewrote = ContainerCreateRoute.rewritePeerHostnames(finalEnv, peers: peers)
-                    if hostRewrote != finalEnv {
-                        req.logger.info("[network] rewrote peer hostnames→IPs in env vars")
-                        finalEnv = hostRewrote
-                    }
+                let hostRewrote = ContainerCreateRoute.peerRewrittenEnv(
+                    finalEnv, labels: body.Labels, peers: dnsServer.listEntries())
+                if hostRewrote != finalEnv {
+                    req.logger.info("[network] rewrote peer hostnames→IPs in env vars")
+                    finalEnv = hostRewrote
                 }
             }
 
@@ -910,6 +907,12 @@ extension ContainerCreateRoute {
 
     static func shouldRewritePeerHostnames(labels: [String: String]?) -> Bool {
         labels?[rewritePeerHostnamesLabel] == "true"
+    }
+
+    /// `envVars` with peer hostnames rewritten when `labels` opt in, else unchanged.
+    static func peerRewrittenEnv(_ envVars: [String], labels: [String: String]?, peers: [String: String]) -> [String] {
+        guard shouldRewritePeerHostnames(labels: labels), !peers.isEmpty else { return envVars }
+        return rewritePeerHostnames(envVars, peers: peers)
     }
 
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).
