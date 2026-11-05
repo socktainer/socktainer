@@ -268,8 +268,12 @@ extension ContainerCreateRoute {
             // under concurrent startup load the sidecar can drop responses causing auth/realtime/
             // storage to time out on DNS. Only @hostname:port and host=hostname DSN positions are
             // rewritten; IPs are a point-in-time snapshot so DNS remains the runtime path.
-            // host-mode containers are excluded (they already get loopback DNS for fast-fail).
-            if !isHostMode, namedNet != nil,
+            // Opt-in via the `socktainer.rewrite-peer-hostnames=true` label, like the loopback
+            // rewrite: the DNS table spans every network, and URL-form values are often meant
+            // for clients, not peers (#479). host-mode containers are excluded (they already
+            // get loopback DNS for fast-fail).
+            if ContainerCreateRoute.shouldRewritePeerHostnames(labels: body.Labels),
+                !isHostMode, namedNet != nil,
                 let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
             {
                 let peers = dnsServer.listEntries()
@@ -899,6 +903,13 @@ extension ContainerCreateRoute {
 
     static func shouldRewriteLoopback(labels: [String: String]?) -> Bool {
         labels?[rewriteLoopbackLabel] == "true"
+    }
+
+    /// Container label that opts in to `rewritePeerHostnames` on named networks.
+    static let rewritePeerHostnamesLabel = "socktainer.rewrite-peer-hostnames"
+
+    static func shouldRewritePeerHostnames(labels: [String: String]?) -> Bool {
+        labels?[rewritePeerHostnamesLabel] == "true"
     }
 
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).

@@ -162,6 +162,15 @@ struct LoopbackGatewayRewriteTests {
 @Suite("ContainerCreateRoute — peer hostname rewrite")
 struct PeerHostnameRewriteTests {
 
+    @Test("Rewrite is off by default so URLs naming another container's alias are preserved (#479)")
+    func rewriteIsOptIn() {
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: nil))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["app": "web"]))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-peer-hostnames": "false"]))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-loopback": "true"]))
+        #expect(ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-peer-hostnames": "true"]))
+    }
+
     private let peers = ["supabase_db_supabase": "192.168.67.3", "db": "192.168.67.3"]
 
     @Test("@hostname:port form is rewritten")
