@@ -1027,6 +1027,7 @@ struct ContainerCreateNetworkAliasAttachmentOptionsTests {
         requestedHostname: String? = nil,
         network: String,
         aliases: [String] = [],
+        labels: [String: String] = [:],
         warnings: WarningLog? = nil
     ) -> AttachmentOptions {
         ContainerCreateRoute.attachmentOptions(
@@ -1037,8 +1038,20 @@ struct ContainerCreateNetworkAliasAttachmentOptionsTests {
             requestedHostname: requestedHostname,
             network: network,
             aliases: aliases,
+            labels: labels,
             warn: { warnings?.messages.append($0) }
         )
+    }
+
+    private func composeLabels(number: String?) -> [String: String] {
+        var labels = [
+            "com.docker.compose.project": "myapp",
+            "com.docker.compose.service": "web",
+        ]
+        if let number {
+            labels["com.docker.compose.container-number"] = number
+        }
+        return labels
     }
 
     @Test("socktainer-dns mode keeps the plain hostname and registers no aliases")
@@ -1076,6 +1089,54 @@ struct ContainerCreateNetworkAliasAttachmentOptionsTests {
         )
         #expect(result.hostname == "web.myapp.test")
         #expect(result.aliases == ["abc123.myapp.test", "db.myapp.test"])
+    }
+
+    @Test("a non-primary compose replica gets the container-name hostname and no shared aliases")
+    func nonPrimaryComposeReplicaDropsSharedNames() {
+        // Compose sends every replica the same shared aliases.
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            requestedHostname: "web",
+            network: "myapp",
+            aliases: ["web", "abc123"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(result.hostname == "abc123.myapp.test")
+        #expect(result.aliases.isEmpty)
+    }
+
+    @Test("the shared-name drop rule needs both compose identity labels and number != 1")
+    func sharedNameDropRule() {
+        #expect(!ContainerCreateRoute.dropsSharedComposeNames(labels: [:]))
+        #expect(!ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: "1")))
+        #expect(ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: "2")))
+        #expect(ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: nil)))
+        #expect(
+            !ContainerCreateRoute.dropsSharedComposeNames(
+                labels: ["com.docker.compose.container-number": "2"]))
+    }
+
+    @Test("the compose drop rule does not leak past the mode and network guards")
+    func dropRuleDoesNotLeakPastGuards() {
+        let inSocktainerDNS = options(
+            dnsMode: .socktainerDNS,
+            dnsDomain: "test",
+            network: "myapp",
+            aliases: ["web"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(inSocktainerDNS.hostname == "web")
+        #expect(inSocktainerDNS.aliases.isEmpty)
+        let onReservedNetwork = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "default",
+            aliases: ["web"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(onReservedNetwork.hostname == "web")
+        #expect(onReservedNetwork.aliases.isEmpty)
     }
 
     @Test("an alias equal to the attachment hostname is excluded — the hostname serves the name")
