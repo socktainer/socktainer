@@ -110,6 +110,27 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["b"])
     }
 
+    @Test("status=created keeps a container that was never started, and not one that exited")
+    func statusCreated() throws {
+        let containers = [
+            try makeSnapshot(id: "filter-never-started-ctr", status: .stopped, startedDate: nil),
+            try makeSnapshot(id: "filter-exited-ctr", status: .stopped),
+            try makeSnapshot(id: "filter-running-ctr", status: .running),
+        ]
+        let result = ClientContainerService.applyFilters(containers, filters: ["status": ["created"]])
+        #expect(result.map(\.id) == ["filter-never-started-ctr"])
+    }
+
+    @Test("status=exited drops a container that was never started")
+    func statusExitedExcludesNeverStarted() throws {
+        let containers = [
+            try makeSnapshot(id: "filter-never-started-ctr", status: .stopped, startedDate: nil),
+            try makeSnapshot(id: "filter-exited-ctr", status: .stopped),
+        ]
+        let result = ClientContainerService.applyFilters(containers, filters: ["status": ["exited"]])
+        #expect(result.map(\.id) == ["filter-exited-ctr"])
+    }
+
     // MARK: - label
 
     @Test("label=key keeps containers that have the key")
@@ -217,6 +238,16 @@ struct ContainerFilterTests {
         let containers = [try makeSnapshot(id: "a", status: .stopped)]
         let result = ClientContainerService.applyFilters(containers, filters: ["exited": ["1"]])
         #expect(result.isEmpty)
+    }
+
+    @Test("exited=0 drops a container that was never started — it has no exit code")
+    func exitedKeyExcludesNeverStarted() throws {
+        let containers = [
+            try makeSnapshot(id: "filter-never-started-ctr", status: .stopped, startedDate: nil),
+            try makeSnapshot(id: "filter-exited-ctr", status: .stopped),
+        ]
+        let result = ClientContainerService.applyFilters(containers, filters: ["exited": ["0"]])
+        #expect(result.map(\.id) == ["filter-exited-ctr"])
     }
 
     // MARK: - id prefix match
@@ -338,12 +369,15 @@ struct ContainerFilterTests {
 
 // MARK: - Helpers
 
+/// `startedDate` defaults to a past date so a `.stopped` snapshot reads as a
+/// container that ran and exited. Pass `nil` for one that was never started.
 private func makeSnapshot(
     id: String,
     status: RuntimeStatus = .running,
     labels: [String: String] = [:],
     image: String = "alpine:latest",
-    networkNames: [String] = []
+    networkNames: [String] = [],
+    startedDate: Date? = Date(timeIntervalSinceNow: -30)
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
@@ -356,7 +390,7 @@ private func makeSnapshot(
     var config = ContainerConfiguration(id: id, image: img, process: proc)
     config.labels = labels
     let attachments = try networkNames.map { try makeAttachment(network: $0) }
-    return ContainerSnapshot(configuration: config, status: status, networks: attachments)
+    return ContainerSnapshot(configuration: config, status: status, networks: attachments, startedDate: startedDate)
 }
 
 private func makeAttachment(network: String) throws -> ContainerResource.Attachment {
