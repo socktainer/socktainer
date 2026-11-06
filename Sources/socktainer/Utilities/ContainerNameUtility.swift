@@ -12,4 +12,16 @@ enum ContainerNameUtility {
         let prefix = String(name.prefix(maxLength - suffix.count))
         return prefix + suffix
     }
+
+    /// `<first label of requested>.<random suffix>`. The guest hostname is the first label,
+    /// capped at 63 chars (Linux/VZ hostname limit; longer values fail start with EINVAL).
+    static func uniqueAttachmentHostname(requested: String) -> String {
+        let label = sanitize(guestHostname(requested))
+        return "\(label).\(UUID().uuidString.lowercased().prefix(12))"
+    }
+
+    /// The hostname Apple Container gives the guest for an attachment hostname.
+    static func guestHostname(_ attachmentHostname: String) -> String {
+        attachmentHostname.split(separator: ".", maxSplits: 1).first.map(String.init) ?? attachmentHostname
+    }
 }

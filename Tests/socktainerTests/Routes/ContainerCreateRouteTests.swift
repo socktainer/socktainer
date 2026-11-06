@@ -844,6 +844,18 @@ struct ContainerCreateRouteNameConflictTests {
         #expect(!ContainerCreateRoute.isNameConflict(ContainerizationError(.internalError, message: "volume already exists")))
     }
 
+    @Test("a taken hostname or alias is not a name conflict")
+    func hostnameExistsIsNotConflict() {
+        #expect(
+            !ContainerCreateRoute.isNameConflict(
+                ContainerizationError(.exists, message: "hostname(s) already exist: [\"probe-host\"]")))
+        #expect(
+            !ContainerCreateRoute.isNameConflict(ContainerizationError(.exists, message: "alias(es) already exist: [\"db\"]")))
+        #expect(
+            !ContainerCreateRoute.isNameConflict(
+                RuntimeError(description: "exists: \"hostname(s) already exist: [\\\"probe-host\\\"]\"")))
+    }
+
     @Test("an untyped 'exists:' error is classified as a name conflict")
     func existsIsConflict() {
         #expect(ContainerCreateRoute.isNameConflict(RuntimeError(description: "exists: \"container already exists: pg\"")))
