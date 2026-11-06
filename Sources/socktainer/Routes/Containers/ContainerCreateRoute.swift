@@ -384,6 +384,9 @@ extension ContainerCreateRoute {
 
             let dnsMode = req.application.dnsMode
             let dnsDomain = systemConfig.dns.domain
+            let dropsSharedNames =
+                dnsMode == .appleDNS
+                && ContainerCreateRoute.dropsSharedComposeNames(labels: body.Labels ?? [:])
             // Alias warnings, returned with the create response.
             var createWarnings: [String] = []
 
@@ -392,6 +395,7 @@ extension ContainerCreateRoute {
                     dnsMode: dnsMode, dnsDomain: dnsDomain, id: id, hostname: hostname,
                     requestedHostname: body.Hostname.flatMap { $0.isEmpty ? nil : $0 },
                     network: networkName, aliases: aliases,
+                    labels: body.Labels ?? [:],
                     warn: { message in
                         createWarnings.append(message)
                         req.logger.warning("\(message)")
@@ -447,6 +451,13 @@ extension ContainerCreateRoute {
             } else {
                 // Fall back to default network if no networking config provided
                 containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: attachmentOptions("default", []))]
+            }
+            if dropsSharedNames,
+                containerConfiguration.networks.contains(where: { !NetworkAliasDNS.isReservedNetwork($0.network) })
+            {
+                req.logger.warning(
+                    "apple-dns mode: compose replica \(id) keeps no shared aliases — they stay with the primary replica"
+                )
             }
 
             containerConfiguration.publishedPorts = publishedPorts
@@ -900,9 +911,21 @@ extension ContainerCreateRoute {
         return primaryNetwork == "default" ? "default" : nil
     }
 
+    /// True for a Compose replica that must not claim the service's shared names in
+    /// `apple-dns` mode: apple/container requires names to be globally unique. Marks
+    /// `container-number` present but not `1`, or absent (one-offs, hook runners);
+    /// both identity labels are required — `docker run` is unaffected.
+    static func dropsSharedComposeNames(labels: [String: String]) -> Bool {
+        guard let project = labels["com.docker.compose.project"], !project.isEmpty,
+            let service = labels["com.docker.compose.service"], !service.isEmpty
+        else { return false }
+        return labels["com.docker.compose.container-number"] != "1"
+    }
+
     /// Per-attachment options for one network: in `apple-dns` mode a non-reserved network
     /// gets the FQDN of the requested hostname — the container name when none was
-    /// requested — plus the qualified aliases; else the plain hostname and no aliases.
+    /// requested — plus the qualified aliases (none for a non-primary Compose replica,
+    /// see `dropsSharedComposeNames`); else the plain hostname and no aliases.
     static func attachmentOptions(
         dnsMode: DNSMode,
         dnsDomain: String?,
@@ -911,12 +934,17 @@ extension ContainerCreateRoute {
         requestedHostname: String?,
         network: String,
         aliases: [String],
+        labels: [String: String] = [:],
         warn: (String) -> Void = { _ in }
     ) -> AttachmentOptions {
         guard dnsMode == .appleDNS, let dnsDomain,
             !NetworkAliasDNS.isReservedNetwork(network)
         else {
             return AttachmentOptions(hostname: hostname)
+        }
+        guard !dropsSharedComposeNames(labels: labels) else {
+            return AttachmentOptions(
+                hostname: NetworkAliasDNS.qualify(id, network: network, dnsDomain: dnsDomain))
         }
         let base = ContainerNameUtility.sanitize(requestedHostname ?? id)
         let attachmentHostname = NetworkAliasDNS.qualify(base, network: network, dnsDomain: dnsDomain)
