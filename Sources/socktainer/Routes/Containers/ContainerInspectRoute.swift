@@ -196,12 +196,12 @@ extension ContainerInspectRoute {
             let exitCode = container.status == .stopped ? Int(await ContainerExitCodeStore.shared.get(id: container.id) ?? 0) : 0
 
             let containerState: ContainerState = ContainerState(
-                Status: isPendingRestart ? "restarting" : container.status.mobyState,
+                Status: isPendingRestart ? "restarting" : container.mobyState,
                 Running: container.status == .running,
                 Paused: false,  // Apple containers don't have a paused state like Docker
                 Restarting: isPendingRestart,
                 OOMKilled: false,
-                Dead: container.status == .stopped && !isPendingRestart,
+                Dead: container.status == .stopped && !isPendingRestart && !container.hasNeverStarted,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: exitCode,
                 Error: "",
