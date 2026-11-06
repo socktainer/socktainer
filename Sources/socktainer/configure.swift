@@ -35,6 +35,20 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         systemConfig = ContainerSystemConfig()
     }
 
+    // Refuse to start in `apple-dns` mode: the configured DNS domain must be one
+    // apple/container has registered in /etc/resolver.
+    if app.dnsMode == .appleDNS {
+        try app.dnsMode.validateStartup(
+            domain: systemConfig.dns.domain,
+            registeredDomains: HostDNSResolver().listDomains().map { $0.pqdn }
+        )
+    }
+
+    // The configured domain, used to report the aliases a client sent.
+    if let dnsDomain = systemConfig.dns.domain {
+        app.storage[DNSDomainKey.self] = dnsDomain
+    }
+
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
@@ -194,97 +208,107 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     Task { await externalEventWatcher.run() }
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
 
-    // Initialize inter-container DNS infrastructure.
-    // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
-    // is taken, Socktainer auto-increments until a free port is found.
-    let preferredDNSPort =
-        ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
-        .flatMap(Int.init) ?? 2054
-    let dnsServer = SocktainerDNSServer()
-    let logger = app.logger
-    // Upstream precedence: --dns-upstream > SOCKTAINER_DNS_UPSTREAM > default-network gateway.
-    let upstreamResolution = DNSUpstream.resolve(cliValue: dnsUpstreamCLI, environment: ProcessInfo.processInfo.environment)
-    if let warning = upstreamResolution.warning {
-        logger.warning("\(warning)")
-    }
-    // Forward non-container names to the vmnet gateway resolver (as `default`-network
-    // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
-    // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
-    func useGatewayUpstream() async {
-        let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
-            do {
-                dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
-                logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
-            } catch {
-                logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+    // Initialize inter-container DNS infrastructure (socktainer-dns mode only).
+    // `apple-dns` mode resolves through apple/container: no server is constructed
+    // (no port bind, no gateway lookup) and nothing is stored under its key, so every
+    // storage read below is nil there — no call site needs to gate on the mode.
+    let dnsManager: NetworkDNSManager?
+    if app.dnsMode == .socktainerDNS {
+        // Port is read from SOCKTAINER_DNS_PORT (default 2054). If the preferred port
+        // is taken, Socktainer auto-increments until a free port is found.
+        let preferredDNSPort =
+            ProcessInfo.processInfo.environment["SOCKTAINER_DNS_PORT"]
+            .flatMap(Int.init) ?? 2054
+        let dnsServer = SocktainerDNSServer()
+        let logger = app.logger
+        // Upstream precedence: --dns-upstream > SOCKTAINER_DNS_UPSTREAM > default-network gateway.
+        let upstreamResolution = DNSUpstream.resolve(cliValue: dnsUpstreamCLI, environment: ProcessInfo.processInfo.environment)
+        if let warning = upstreamResolution.warning {
+            logger.warning("\(warning)")
+        }
+        // Forward non-container names to the vmnet gateway resolver (as `default`-network
+        // containers do) so host-only names — VPN split DNS, /etc/resolver — resolve too.
+        // Bounded: a wedged XPC call must not keep the DNS server (and the API socket) from coming up.
+        func useGatewayUpstream() async {
+            let gatewayLookupFinished = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+                do {
+                    dnsServer.upstreamHost = try await NetworkClient().get(id: "default").status.ipv4Gateway.description
+                    logger.notice("DNS upstream: \(dnsServer.upstreamHost)")
+                } catch {
+                    logger.warning("Could not read default network gateway (\(error)) — DNS upstream falls back to \(dnsServer.upstreamHost)")
+                }
+            }
+            if !gatewayLookupFinished {
+                logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
             }
         }
-        if !gatewayLookupFinished {
-            logger.warning("Default network gateway lookup timed out — DNS upstream falls back to \(dnsServer.upstreamHost)")
-        }
-    }
-    // The default network's gateway is a host address too, but its vmnet bridge only exists while
-    // containers run, so it may be missing from the interface list at startup.
-    func defaultGatewayAddress() async -> String? {
-        final class Box: @unchecked Sendable {
-            private let lock = NSLock()
-            private var _value: String?
-            var value: String? {
-                get { lock.withLock { _value } }
-                set { lock.withLock { _value = newValue } }
+        // The default network's gateway is a host address too, but its vmnet bridge only exists while
+        // containers run, so it may be missing from the interface list at startup.
+        func defaultGatewayAddress() async -> String? {
+            final class Box: @unchecked Sendable {
+                private let lock = NSLock()
+                private var _value: String?
+                var value: String? {
+                    get { lock.withLock { _value } }
+                    set { lock.withLock { _value = newValue } }
+                }
             }
+            let box = Box()
+            _ = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
+                box.value = try? await NetworkClient().get(id: "default").status.ipv4Gateway.description
+            }
+            return box.value
         }
-        let box = Box()
-        _ = await StartupHousekeeping.runBounded(timeout: .seconds(5)) {
-            box.value = try? await NetworkClient().get(id: "default").status.ipv4Gateway.description
-        }
-        return box.value
-    }
-    // With an override, apply it before the server starts so no query is ever forwarded to the
-    // built-in default instead. A loop is not possible meanwhile: forwardToUpstream answers SERVFAIL
-    // while the upstream points at this server. The gateway (also the fallback) is looked up up
-    // front so the post-start check needs no await.
-    var gateway: String?
-    if let upstream = upstreamResolution.upstream {
-        gateway = await defaultGatewayAddress()
-        dnsServer.setUpstream(host: upstream.host, port: upstream.port)
-    } else {
-        await useGatewayUpstream()
-    }
-    guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
-        app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
-        return
-    }
-    app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
-    if let upstream = upstreamResolution.upstream {
-        // Read interface addresses only now, after every await, so an interface that appeared
-        // during the gateway lookup is still caught.
-        let selection = DNSUpstream.select(
-            override: upstream, gateway: gateway, dnsPort: resolvedDNSPort, localAddresses: DNSUpstream.localIPv4Addresses())
-        if case .configured = selection {
-            logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
+        // With an override, apply it before the server starts so no query is ever forwarded to the
+        // built-in default instead. A loop is not possible meanwhile: forwardToUpstream answers SERVFAIL
+        // while the upstream points at this server. The gateway (also the fallback) is looked up up
+        // front so the post-start check needs no await.
+        var gateway: String?
+        if let upstream = upstreamResolution.upstream {
+            gateway = await defaultGatewayAddress()
+            dnsServer.setUpstream(host: upstream.host, port: upstream.port)
         } else {
-            // Forwarding to ourselves would loop and amplify every query; switch synchronously.
-            logger.error(
-                "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
+            await useGatewayUpstream()
         }
-        switch selection {
-        case .configured:
-            break  // already applied before start()
-        case .gatewayFallback(let fallback):
-            dnsServer.setUpstream(host: fallback.host, port: fallback.port)
-            logger.notice("DNS upstream: \(fallback.host)")
-        case .builtInFallback(let gatewayPointsAtSelf):
-            dnsServer.setUpstream(host: SocktainerDNSServer.defaultUpstreamHost, port: DNSUpstream.defaultPort)
-            logger.warning(
-                "Default network gateway \(gatewayPointsAtSelf ? "also points at socktainer's own DNS server" : "could not be read") — DNS upstream falls back to \(SocktainerDNSServer.defaultUpstreamHost)"
-            )
+        guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
+            app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
+            return
         }
-    }
-    app.storage[SocktainerDNSServerKey.self] = dnsServer
+        app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
+        if let upstream = upstreamResolution.upstream {
+            // Read interface addresses only now, after every await, so an interface that appeared
+            // during the gateway lookup is still caught.
+            let selection = DNSUpstream.select(
+                override: upstream, gateway: gateway, dnsPort: resolvedDNSPort, localAddresses: DNSUpstream.localIPv4Addresses())
+            if case .configured = selection {
+                logger.notice("DNS upstream: \(upstream.host):\(upstream.port) (configured)")
+            } else {
+                // Forwarding to ourselves would loop and amplify every query; switch synchronously.
+                logger.error(
+                    "DNS upstream \(upstream.host):\(upstream.port) points at socktainer's own DNS server — ignoring it and using the default network gateway")
+            }
+            switch selection {
+            case .configured:
+                break  // already applied before start()
+            case .gatewayFallback(let fallback):
+                dnsServer.setUpstream(host: fallback.host, port: fallback.port)
+                logger.notice("DNS upstream: \(fallback.host)")
+            case .builtInFallback(let gatewayPointsAtSelf):
+                dnsServer.setUpstream(host: SocktainerDNSServer.defaultUpstreamHost, port: DNSUpstream.defaultPort)
+                logger.warning(
+                    "Default network gateway \(gatewayPointsAtSelf ? "also points at socktainer's own DNS server" : "could not be read") — DNS upstream falls back to \(SocktainerDNSServer.defaultUpstreamHost)"
+                )
+            }
+        }
+        app.storage[SocktainerDNSServerKey.self] = dnsServer
 
-    let dnsManager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
-    app.storage[NetworkDNSManagerKey.self] = dnsManager
+        let manager = NetworkDNSManager(appSupportURL: appleContainerAppSupportUrl, dnsPort: resolvedDNSPort, containerSystemConfig: systemConfig)
+        app.storage[NetworkDNSManagerKey.self] = manager
+        dnsManager = manager
+    } else {
+        app.logger.notice("DNS server: not started (apple-dns mode — apple/container serves names)")
+        dnsManager = nil
+    }
 
     // Healthcheck executor: runs `HEALTHCHECK` probes inside containers and
     // tracks status so `/containers/{id}/json` can return `.State.Health`.
@@ -302,7 +326,10 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
             guard !ClientContainerService.isDNSSidecar(container)
             else { continue }
 
-            ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            // apple-dns mode starts no DNS server, so there is nothing to re-register.
+            if let dnsServer = app.storage[SocktainerDNSServerKey.self] {
+                ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: app.logger)
+            }
 
             // Resume healthcheck loop if the container has one.
             guard let json = container.configuration.labels[HealthCheckManager.healthcheckLabel],
@@ -324,7 +351,10 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     // routing (EHOSTUNREACH).
     let housekeepingLogger = app.logger
     let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
-        await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        // No manager in apple-dns mode (sidecars never exist there) — nothing to adopt.
+        if let dnsManager {
+            await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
+        }
         await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
     }
     if !housekeepingFinished {
