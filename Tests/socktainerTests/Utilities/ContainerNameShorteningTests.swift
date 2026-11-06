@@ -66,3 +66,33 @@ struct ContainerNameShorteningTests {
         #expect(result.hasPrefix("act-my-workflow-job-name-"))
     }
 }
+
+@Suite("Unique attachment hostname")
+struct UniqueAttachmentHostnameTests {
+
+    @Test("Two containers asking for the same hostname get different attachment hostnames")
+    func uniquePerCall() {
+        let first = ContainerNameUtility.uniqueAttachmentHostname(requested: "probe-host")
+        let second = ContainerNameUtility.uniqueAttachmentHostname(requested: "probe-host")
+        #expect(first != second)
+    }
+
+    @Test("The guest hostname is the requested hostname")
+    func guestHostnameIsRequested() {
+        let attachment = ContainerNameUtility.uniqueAttachmentHostname(requested: "probe-host")
+        #expect(attachment.hasPrefix("probe-host."))
+        #expect(ContainerNameUtility.guestHostname(attachment) == "probe-host")
+    }
+
+    @Test("A requested FQDN keeps only its first label, as Apple Container does")
+    func fqdnKeepsFirstLabel() {
+        let attachment = ContainerNameUtility.uniqueAttachmentHostname(requested: "web.example.test")
+        #expect(ContainerNameUtility.guestHostname(attachment) == "web")
+    }
+
+    @Test("A long requested hostname is capped at 63 characters for the guest")
+    func longHostnameCapped() {
+        let attachment = ContainerNameUtility.uniqueAttachmentHostname(requested: String(repeating: "h", count: 80))
+        #expect(ContainerNameUtility.guestHostname(attachment).count == 63)
+    }
+}
