@@ -86,8 +86,15 @@ actor RestartPolicyOverrideStore {
             document = loaded
             configurationError = nil
         } catch {
-            configurationError = error
-            throw error
+            // A corrupted file, or one written by a newer schema version, must not
+            // stop the daemon from starting. Keep the bad file for inspection and
+            // start with an empty store; the next write recreates it.
+            log.error("could not load restart state from \(url.path): \(error) - starting with an empty store")
+            let backup = url.deletingLastPathComponent().appendingPathComponent(
+                "\(url.lastPathComponent).corrupt-\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: url, to: backup)
+            document = Document()
+            configurationError = nil
         }
     }
 
@@ -147,15 +154,6 @@ actor RestartPolicyOverrideStore {
         }
     }
 
-    /// Records that an automatic restart attempt is about to start for `id`.
-    func recordRestartIntent(id: String, attempt: Int) throws {
-        guard (0..<Int.max).contains(attempt) else { throw PersistenceError.invalidRestartAttempts }
-        try mutate { document in
-            document.lifecycles[id, default: RestartLifecycleRecord()].pendingAction = .start
-            document.lifecycles[id, default: RestartLifecycleRecord()].restartAttempts = attempt
-        }
-    }
-
     /// Records that automatic restart `attempt` completed for `id`.
     func recordRestarted(id: String, attempt: Int) throws {
         guard (0..<Int.max).contains(attempt) else { throw PersistenceError.invalidRestartAttempts }
@@ -186,11 +184,18 @@ actor RestartPolicyOverrideStore {
         }
     }
 
-    /// Records that a manual stop operation finished for `id`.
-    func recordStopped(id: String) throws {
+    /// Clears an in-flight lifecycle transition that never completed. A failed
+    /// stop, delete or prune must not leave a marker that recovery reads as a
+    /// pending manual stop or removal for every later run of this instance.
+    func clearPendingAction(id: String) throws {
         try mutate { document in
             document.lifecycles[id, default: RestartLifecycleRecord()].pendingAction = nil
         }
+    }
+
+    /// Records that a manual stop operation finished for `id`.
+    func recordStopped(id: String) throws {
+        try clearPendingAction(id: id)
     }
 
     /// Commits the container's real final exit code for the run that just ended.

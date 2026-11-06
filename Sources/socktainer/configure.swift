@@ -254,8 +254,15 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
     }
     guard let resolvedDNSPort = dnsServer.start(preferredPort: preferredDNSPort) else {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
-        await restoreContainerLifecycles(app, client: containerClient)
-        Task { await externalEventWatcher.run() }
+        // Recovery calls into the runtime over XPC, which can hang forever
+        // (apple/container#1884). Keep it off the startup path so a wedged
+        // runtime cannot delay binding the API socket. The watcher starts only
+        // after recovery reserved those runs, so its first snapshot cannot
+        // produce a second die for an exit recovery already claimed.
+        Task {
+            await restoreContainerLifecycles(app, client: containerClient)
+            Task { await externalEventWatcher.run() }
+        }
         return
     }
     app.logger.notice("DNS server listening on port \(resolvedDNSPort)")
@@ -331,10 +338,14 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         )
     }
 
-    await restoreContainerLifecycles(app, client: containerClient)
-    // Capture the poller's first running snapshot only after recovery reserved
-    // those runs, so a slow authoritative wait cannot produce a second die.
-    Task { await externalEventWatcher.run() }
+    // Recovery calls into the runtime over XPC, which can hang forever
+    // (apple/container#1884). Keep it off the startup path so a wedged runtime
+    // cannot delay binding the API socket. The watcher starts only after recovery
+    // reserved those runs, so its first snapshot cannot produce a second die.
+    Task {
+        await restoreContainerLifecycles(app, client: containerClient)
+        Task { await externalEventWatcher.run() }
+    }
 }
 
 private func restoreContainerLifecycles(_ app: Application, client: any ClientContainerProtocol) async {

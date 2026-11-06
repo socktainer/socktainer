@@ -245,7 +245,8 @@ struct ContainerRestartRecoveryTests {
             try await Task.sleep(for: .seconds(60))
             return 0
         }
-        await report.cancelWaiters()
+        for task in report.waitTasks { task.cancel() }
+        for task in report.waitTasks { await task.value }
         let code = await ContainerExitCodeStore.shared.get(id: snapshot.id)
         #expect(code == ContainerExitCodeStore.waitFailureSentinel)
         // The sentinel must resolve both already-suspended and not-yet-scheduled observers.
@@ -256,6 +257,22 @@ struct ContainerRestartRecoveryTests {
         // fabricate an exit: no die is broadcast and no restart is attempted.
         #expect(!(await broadcaster.emittedRecently(id: id, action: "die", within: 60)))
         #expect(await client.startCount == 0)
+        await cleanUpRecovery(snapshot)
+    }
+
+    @Test("A failed delete does not make recovery skip the container as removalPending")
+    func failedDeleteDoesNotBlockRecovery() async throws {
+        let snapshot = try recoverySnapshot(policy: "always")
+        let id = DockerContainerID.hexId(for: snapshot)
+        let store = RestartPolicyOverrideStore()
+        try await store.recordStarted(id: id)
+        // delete records .remove before the runtime call, which then throws.
+        try await store.recordRemoveIntent(id: id)
+        try await store.clearPendingAction(id: id)
+        let client = RecoveryClient(snapshot: snapshot)
+        let report = await recover(client: client, store: store)
+        #expect(!report.skipped.contains { $0.id == id && $0.reason == .removalPending })
+        #expect(report.started == [id])
         await cleanUpRecovery(snapshot)
     }
 

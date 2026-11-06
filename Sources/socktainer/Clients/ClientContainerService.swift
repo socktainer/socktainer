@@ -486,8 +486,16 @@ struct ClientContainerService: ClientContainerProtocol {
         try? await RestartPolicyOverrideStore.shared.recordStopIntent(
             id: hexId, hasStarted: container.status == .running || container.status == .stopping)
         await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
-        try await VMLifecycleAdmission.shared.withSlot {
-            try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+        do {
+            try await VMLifecycleAdmission.shared.withSlot {
+                try await self.stopInternal(container: container, signal: signal, timeout: timeout)
+            }
+        } catch {
+            // The stop did not finish; leave no in-flight marker for recovery to
+            // carry into every later run. The in-memory explicit-stop flag above
+            // still suppresses an auto-restart for this exit.
+            try? await RestartPolicyOverrideStore.shared.clearPendingAction(id: hexId)
+            throw error
         }
         try? await RestartPolicyOverrideStore.shared.recordStopped(id: hexId)
     }
@@ -508,11 +516,17 @@ struct ClientContainerService: ClientContainerProtocol {
         }
 
         let signal = signal ?? "SIGKILL"
+        let hexId = DockerContainerID.hexId(for: container)
 
-        try? await RestartPolicyOverrideStore.shared.recordStopIntent(
-            id: DockerContainerID.hexId(for: container), hasStarted: true)
+        try? await RestartPolicyOverrideStore.shared.recordStopIntent(id: hexId, hasStarted: true)
         await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
-        try await containerClient.withClient { try await $0.kill(id: container.id, signal: signal) }
+        do {
+            try await containerClient.withClient { try await $0.kill(id: container.id, signal: signal) }
+        } catch {
+            try? await RestartPolicyOverrideStore.shared.clearPendingAction(id: hexId)
+            throw error
+        }
+        try? await RestartPolicyOverrideStore.shared.recordStopped(id: hexId)
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
@@ -543,7 +557,14 @@ struct ClientContainerService: ClientContainerProtocol {
         // Intent precedes the external side effect: a daemon that dies mid-delete
         // must not let the next startup restore an instance the user asked to remove.
         try? await RestartPolicyOverrideStore.shared.recordRemoveIntent(id: hexContainerId)
-        try await containerClient.withClient { try await $0.delete(id: container.id) }
+        do {
+            try await containerClient.withClient { try await $0.delete(id: container.id) }
+        } catch {
+            // A failed delete must not leave .remove pending: recovery would skip
+            // this container permanently as removalPending.
+            try? await RestartPolicyOverrideStore.shared.clearPendingAction(id: hexContainerId)
+            throw error
+        }
         await RestartPolicyOverrideStore.shared.remove(id: hexContainerId)
         // After the delete, and by the native id: the reference a client holds may
         // be a derived Docker id, and a delete that failed leaves a container that
@@ -766,6 +787,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 ExtraHostsFile.remove(labels: container.configuration.labels)
                 deletedIds.append(container.id)
             } catch {
+                try? await RestartPolicyOverrideStore.shared.clearPendingAction(id: hexContainerId)
                 continue
             }
         }

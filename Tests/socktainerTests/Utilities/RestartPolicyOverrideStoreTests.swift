@@ -26,6 +26,28 @@ struct RestartPolicyOverrideStoreTests {
         #expect(await completed.lifecycle(id: "instance") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: true, pendingAction: nil))
     }
 
+    @Test("A completed kill leaves no stop marker for the next start")
+    func completedKillLeavesNoStopMarker() async throws {
+        let store = RestartPolicyOverrideStore()
+        try await store.recordStarted(id: "instance")
+        // kill records the intent and must finish it just as stop does.
+        try await store.recordStopIntent(id: "instance", hasStarted: true)
+        try await store.recordStopped(id: "instance")
+        try await store.recordStarted(id: "instance")
+        #expect(await store.lifecycle(id: "instance") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: false, pendingAction: nil))
+    }
+
+    @Test("A failed stop leaves no stop marker for the next start")
+    func failedStopLeavesNoStopMarker() async throws {
+        let store = RestartPolicyOverrideStore()
+        try await store.recordStarted(id: "instance")
+        try await store.recordStopIntent(id: "instance", hasStarted: true)
+        // The runtime call threw; the in-flight marker must be cleared.
+        try await store.clearPendingAction(id: "instance")
+        try await store.recordStarted(id: "instance")
+        #expect(await store.lifecycle(id: "instance") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: false, pendingAction: nil))
+    }
+
     @Test("A stop still in flight when a start completes survives it")
     func startDoesNotEraseInFlightStop() async throws {
         let directory = try makeStorageDirectory()
@@ -153,21 +175,20 @@ struct RestartPolicyOverrideStoreTests {
         #expect(await reloaded.lifecycle(id: "unknown") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: false, pendingAction: nil, restartAttempts: nil))
     }
 
-    @Test("Automatic restart reservations survive reload without resetting the retry budget")
+    @Test("A completed automatic restart keeps its retry budget across reload")
     func restartBudgetSurvivesReload() async throws {
         let directory = try makeStorageDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = RestartPolicyOverrideStore()
         try await store.configure(storageDirectory: directory)
         try await store.recordStarted(id: "instance")
-        try await store.recordRestartIntent(id: "instance", attempt: 2)
+        try await store.recordRestarted(id: "instance", attempt: 2)
         let reloaded = RestartPolicyOverrideStore()
         try await reloaded.configure(storageDirectory: directory)
         #expect(await reloaded.lifecycle(id: "instance")?.restartAttempts == 2)
-        #expect(await reloaded.lifecycle(id: "instance")?.pendingAction == .start)
+        #expect(await reloaded.lifecycle(id: "instance")?.pendingAction == nil)
         try await reloaded.recordObservedRunning(id: "instance")
         #expect(await reloaded.lifecycle(id: "instance")?.restartAttempts == 2)
-        #expect(await reloaded.lifecycle(id: "instance")?.pendingAction == nil)
         try await reloaded.recordStarted(id: "instance")
         #expect(await reloaded.lifecycle(id: "instance")?.restartAttempts == 0)
     }
@@ -202,34 +223,32 @@ struct RestartPolicyOverrideStoreTests {
     }
 
     @Test(
-        "Invalid files fail configuration and cannot be overwritten by subsequent mutations",
+        "A corrupt or newer-schema file is set aside so the daemon starts with an empty store",
         arguments: [
             "{broken-json",
             #"{"schemaVersion":2,"overrides":{},"lifecycles":{}}"#,
             #"{"schemaVersion":1,"overrides":{},"lifecycles":{"instance":{"hasStarted":true}}}"#,
         ]
     )
-    func protectsInvalidFile(contents: String) async throws {
+    func recoversFromInvalidFile(contents: String) async throws {
         let directory = try makeStorageDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let original = Data(contents.utf8)
-        try original.write(to: storageFile(in: directory))
+        let file = storageFile(in: directory)
+        try Data(contents.utf8).write(to: file)
         let store = RestartPolicyOverrideStore()
 
-        await #expect(throws: (any Error).self) {
-            try await store.configure(storageDirectory: directory)
-        }
-        // Policy overrides log-and-continue (their callers cannot react to a disk
-        // failure); lifecycle mutations still surface the error.
-        await store.set(id: "instance", policy: RestartPolicy(Name: "always", MaximumRetryCount: nil))
-        await #expect(throws: (any Error).self) {
-            try await store.recordStarted(id: "instance")
-        }
-        await store.remove(id: "instance")
-
+        // A bad file must not stop the daemon: it is moved aside and the store
+        // starts empty, so later writes are not blocked by a stale load error.
+        try await store.configure(storageDirectory: directory)
         #expect(await store.get(id: "instance") == nil)
         #expect(await store.lifecycle(id: "instance") == nil)
-        #expect(try Data(contentsOf: storageFile(in: directory)) == original)
+        let kept = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        #expect(kept.contains { $0.lastPathComponent.hasPrefix(file.lastPathComponent + ".corrupt-") })
+
+        try await store.recordStarted(id: "instance")
+        let reloaded = RestartPolicyOverrideStore()
+        try await reloaded.configure(storageDirectory: directory)
+        #expect(await reloaded.lifecycle(id: "instance")?.hasStarted == true)
     }
 
     @Test("Failed writes leave both the policy and lifecycle memory unchanged")

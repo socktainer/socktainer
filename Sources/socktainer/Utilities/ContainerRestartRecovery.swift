@@ -42,11 +42,6 @@ enum ContainerRestartRecovery {
         var skipped: [Skipped] = []
         var failed: [Failure] = []
         var waitTasks: [Task<Void, Never>] = []
-
-        func cancelWaiters() async {
-            for task in waitTasks { task.cancel() }
-            for task in waitTasks { await task.value }
-        }
     }
 
     static func recover(
