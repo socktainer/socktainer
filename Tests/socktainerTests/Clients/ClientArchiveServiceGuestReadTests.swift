@@ -138,6 +138,33 @@ struct ClientArchiveServiceGuestReadTests {
         #expect(service.guestProbeStatus(exitCode: 41) == .failed)
     }
 
+    @Test("an existing symlink whose target readlink cannot read is a probe failure, not a missing path")
+    func symlinkWithoutReadlinkFails() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("probe-\(UUID().uuidString)")
+        let bin = dir.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // An image with stat but no readlink: PATH holds a stand-in stat and nothing else.
+        let fakeStat = bin.appendingPathComponent("stat")
+        try "#!/bin/sh\necho 'a1ff 7 1700000000 0 0'\n".write(to: fakeStat, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeStat.path)
+        let link = dir.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/target")
+
+        let shell = Process()
+        shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+        shell.arguments = ["-c", service.guestStatScript(path: link.path)]
+        shell.environment = ["PATH": bin.path]
+        shell.standardOutput = FileHandle.nullDevice
+        shell.standardError = FileHandle.nullDevice
+        try shell.run()
+        shell.waitUntilExit()
+
+        #expect(
+            service.guestProbeStatus(exitCode: shell.terminationStatus) == .failed,
+            "the path exists; a 404 would tell the client it does not (exit \(shell.terminationStatus))")
+    }
+
     @Test("a path on the rootfs and outside mounts stays on the rootfs reader")
     func plainRootfsPath() {
         #expect(

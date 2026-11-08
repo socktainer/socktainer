@@ -1153,7 +1153,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     func guestStatScript(path: String) -> String {
         let quoted = shellSingleQuoted(path)
         return "p=\(quoted); if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then exit 40; fi; "
-            + "stat -c '%f %s %Y %u %g' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\"; fi"
+            + "stat -c '%f %s %Y %u %g' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\" || exit 41; fi"
     }
 
     /// Map the exit code of `guestStatScript` to found, missing or failed.
