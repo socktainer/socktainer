@@ -38,4 +38,21 @@ struct ClientArchiveServiceStdinFeedTests {
 
         #expect(await received.value == (try Data(contentsOf: source)), "EOF must follow the last byte")
     }
+
+    @Test("a guest's stderr is drained to EOF and kept only up to the cap")
+    func stderrIsDrainedAndCapped() async throws {
+        let pipe = Pipe()
+        let writer = pipe.fileHandleForWriting
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let chatter = Data(repeating: 0x61, count: 256 * 1024)
+        let collected = ClientArchiveService.drainCapped(pipe.fileHandleForReading, limit: 16 * 1024)
+
+        // A reader that stopped at the cap would close its end and fail this write.
+        try writer.write(contentsOf: chatter)
+        try writer.close()
+
+        let kept = await collected.value.count
+        #expect(kept >= 16 * 1024, "the first bytes up to the cap are kept")
+        #expect(kept < 16 * 1024 + 4096, "nothing past the cap's last read is kept, got \(kept)")
+    }
 }

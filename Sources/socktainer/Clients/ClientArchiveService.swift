@@ -400,6 +400,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         )
     }
 
+    /// Serve GET /containers/{id}/archive: a tar of `path` and its stat. The
+    /// path is read from the rootfs image, or through a guest exec when the
+    /// container is running and the path is under a mount or missing from the
+    /// rootfs (`readsThroughGuest`).
     func getArchive(container: ContainerSnapshot, path: String) async throws -> (tarData: Data, stat: PathStat) {
         await flushIfRunning(container)
         let rootfsPath = try resolveRootfsPath(container: container)
@@ -744,17 +748,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let stdinWriter = pipes.stdin!.write
         let feedTask = Task.detached { try await Self.streamFileToStdin(writer: stdinWriter, source: source) }
 
-        let stderrReader = pipes.stderr!.read
-        let stderrTask = Task.detached { () -> Data in
-            defer { try? stderrReader.close() }
-            var collected = Data()
-            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
-                if collected.count < 16 * 1024 {
-                    collected.append(chunk)
-                }
-            }
-            return collected
-        }
+        let stderrTask = Self.drainCapped(pipes.stderr!.read)
 
         let exitCode: Int32
         do {
@@ -778,6 +772,23 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } catch {
             throw ClientArchiveError.operationFailed(
                 message: "Failed to send \(guestPath) into running container: \(error.localizedDescription)")
+        }
+    }
+
+    /// Read `reader` to EOF on a detached task, keeping at most about `limit`
+    /// bytes, and close it when done. Draining to the end keeps a chatty guest
+    /// process from blocking on a full stderr pipe; the cap keeps its output
+    /// from growing daemon memory without bound.
+    static func drainCapped(_ reader: FileHandle, limit: Int = 16 * 1024) -> Task<Data, Never> {
+        Task.detached {
+            defer { try? reader.close() }
+            var collected = Data()
+            while let chunk = try? reader.read(upToCount: 4096), !chunk.isEmpty {
+                if collected.count < limit {
+                    collected.append(chunk)
+                }
+            }
+            return collected
         }
     }
 
@@ -988,17 +999,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Drain stderr concurrently (capped at 16 KiB) while waiting.
         // collectOutput() is not used here because it reads unboundedly via
         // readDataToEndOfFile(); this capped reader prevents runaway memory growth.
-        let stderrReader = pipes.stderr!.read
-        let stderrTask = Task.detached { () -> Data in
-            defer { try? stderrReader.close() }
-            var collected = Data()
-            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
-                if collected.count < 16 * 1024 {
-                    collected.append(chunk)
-                }
-            }
-            return collected
-        }
+        let stderrTask = Self.drainCapped(pipes.stderr!.read)
 
         let exitCode: Int32
         do {
@@ -1093,6 +1094,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return lines.joined(separator: "\n")
     }
 
+    /// Quote `value` as one POSIX shell word, safe for any content.
     private func shellSingleQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -1154,6 +1156,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             + "stat -c '%f %s %Y %u %g' \"$p\" || exit 41; if [ -L \"$p\" ]; then readlink \"$p\"; fi"
     }
 
+    /// Map the exit code of `guestStatScript` to found, missing or failed.
     func guestProbeStatus(exitCode: Int32) -> GuestProbeStatus {
         switch exitCode {
         case 0: return .found
@@ -1182,6 +1185,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return GuestPathProbe(rawMode: rawMode, size: size, mtime: mtime, uid: uid, gid: gid, linkTarget: linkTarget)
     }
 
+    /// How GET /archive reads a guest path, from the file type bits of its
+    /// `stat` mode: devices, FIFOs and sockets become header-only entries.
     func guestReadKind(rawMode: UInt32) -> GuestReadKind {
         switch rawMode & 0xF000 {
         case 0x4000: return .directory
@@ -1234,6 +1239,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
+    /// Run `shellCommand` with `/bin/sh -c` as root in the running container
+    /// and collect its exit code, stdout, and stderr (capped by `drainCapped`).
     private func runGuestCommand(
         container: ContainerSnapshot,
         shellCommand: String
@@ -1277,17 +1284,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
             return collected
         }
-        let stderrReader = pipes.stderr!.read
-        let stderrTask = Task.detached { () -> Data in
-            defer { try? stderrReader.close() }
-            var collected = Data()
-            while let chunk = try? stderrReader.read(upToCount: 4096), !chunk.isEmpty {
-                if collected.count < 16 * 1024 {
-                    collected.append(chunk)
-                }
-            }
-            return collected
-        }
+        let stderrTask = Self.drainCapped(pipes.stderr!.read)
 
         let exitCode: Int32
         do {
@@ -1327,6 +1324,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
+    /// The Docker path stat for a guest probe, in the shape the rootfs reader
+    /// reports.
     private func pathStat(from probe: GuestPathProbe, path: String) -> PathStat {
         PathStat(
             name: (path as NSString).lastPathComponent,
@@ -1337,6 +1336,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
         )
     }
 
+    /// Serve HEAD /containers/{id}/archive through a guest exec, for paths the
+    /// rootfs reader cannot see.
     private func statPathViaGuestShell(container: ContainerSnapshot, path: String) async throws -> PathStat {
         let probe = try await probeGuestPath(container: container, path: path)
         return pathStat(from: probe, path: path)
