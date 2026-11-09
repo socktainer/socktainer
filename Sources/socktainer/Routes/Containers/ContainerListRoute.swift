@@ -117,7 +117,7 @@ extension ContainerListRoute {
 
                 let createdTimestamp = AppleContainerTimestampResolver.unixTimestampSeconds(createdDate)
 
-                let mobyState = container.status.mobyState
+                let mobyState = container.mobyState
                 // Build human-readable status matching Docker's "Up X seconds/minutes/hours" format
                 let baseStatus: String
                 switch container.status {
@@ -128,7 +128,7 @@ extension ContainerListRoute {
                         baseStatus = "Up"
                     }
                 case .stopped:
-                    baseStatus = "Exited"
+                    baseStatus = mobyState == "created" ? "Created" : "Exited"
                 default:
                     baseStatus = mobyState
                 }
