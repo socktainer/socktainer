@@ -19,11 +19,13 @@ struct ContainerCreateRoute: RouteCollection {
 
     /// Whether a create error means the requested name is taken
     /// (Apple Container: `ContainerizationError(.exists, "container already exists: <id>")`).
+    /// A taken hostname or alias is also `.exists`, and keeps its own message.
     static func isNameConflict(_ error: Error) -> Bool {
         if let error = error as? ContainerizationError {
-            return error.code == .exists
+            return error.code == .exists && error.message.lowercased().contains("container already exists")
         }
-        return String(describing: error).lowercased().hasPrefix("exists:")
+        let description = String(describing: error).lowercased()
+        return description.hasPrefix("exists:") && description.contains("container already exists")
     }
 
     let client: ClientContainerProtocol
@@ -370,10 +372,15 @@ extension ContainerCreateRoute {
                 containerConfiguration.rosetta = true
             }
 
-            // Handle hostname from request - ensure uniqueness to avoid collision,
-            // capped at 64 chars (Linux/VZ hostname limit; longer values fail start with EINVAL)
-            let hostname = ContainerNameUtility.sanitize(
-                (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())")
+            // Apple Container requires attachment hostnames to be unique across all containers, and
+            // sets the guest hostname to the part before the first dot. A requested hostname gets a
+            // unique suffix, so Compose can create a replacement while the old container still exists.
+            let hostname: String
+            if let requested = body.Hostname, !requested.isEmpty {
+                hostname = ContainerNameUtility.uniqueAttachmentHostname(requested: requested)
+            } else {
+                hostname = ContainerNameUtility.sanitize("\(id)-\(UUID().uuidString.lowercased())")
+            }
 
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,

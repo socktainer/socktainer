@@ -27,6 +27,13 @@ struct ExtraHostsFileTests {
             ExtraHostsFile.invalidEntries(["ok:10.1.2.3", "foo:", "bad:nope", "gw:host-gateway"]) == ["foo:", "bad:nope"])
     }
 
+    @Test("Renders only the first label of a suffixed attachment hostname")
+    func rendersGuestHostname() {
+        let content = ExtraHostsFile.render(
+            extraHosts: ["foo:10.1.2.3"], ip: "192.168.64.5", hostname: "web.0123456789ab", gateway: nil)
+        #expect(content.hasSuffix("192.168.64.5\tweb\n"))
+    }
+
     @Test("Renders extra hosts and the container's own address")
     func rendersExtraHostsAndOwnAddress() {
         let content = ExtraHostsFile.render(
