@@ -513,11 +513,16 @@ extension ContainerCreateRoute {
                     searchDomains: existing?.searchDomains ?? [],
                     options: existing?.options ?? []
                 )
-            } else if let firstNetwork = firstNamedNetwork,
+            } else if let sidecarNetwork = ContainerCreateRoute.dnsSidecarNetwork(
+                explicitNameservers: nameservers,
+                firstNamedNetwork: firstNamedNetwork,
+                primaryNetwork: containerConfiguration.networks.first?.network,
+                hasConfiguredUpstream: req.application.storage[SocktainerDNSServerKey.self]?.hasConfiguredUpstream ?? false
+            ),
                 let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
             {
                 do {
-                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: sidecarNetwork)
                     let existing = containerConfiguration.dns
                     containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
                         nameservers: [dnsIP],
@@ -526,7 +531,7 @@ extension ContainerCreateRoute {
                         options: existing?.options ?? []
                     )
                 } catch {
-                    req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    req.logger.warning("Could not start DNS container for \(sidecarNetwork): \(error)")
                 }
             }
             var labelsWithTimestamp = containerLabels
@@ -835,6 +840,25 @@ extension ContainerCreateRoute {
             httpResponse.status = .created
             return httpResponse
         }
+    }
+
+    /// Network whose DNS forwarder sidecar becomes the container's nameserver, or `nil` to keep
+    /// the nameservers from the request.
+    ///
+    /// Without a configured upstream (`--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM`) only named
+    /// networks get a sidecar, as before. With one, a container on the `default` network also gets
+    /// one so it resolves outside names through the embedded server, and an explicit
+    /// `HostConfig.Dns` (e.g. Compose `dns:`) is left alone.
+    static func dnsSidecarNetwork(
+        explicitNameservers: [String],
+        firstNamedNetwork: String?,
+        primaryNetwork: String?,
+        hasConfiguredUpstream: Bool
+    ) -> String? {
+        guard hasConfiguredUpstream else { return firstNamedNetwork }
+        guard explicitNameservers.isEmpty else { return nil }
+        if let named = firstNamedNetwork { return named }
+        return primaryNetwork == "default" ? "default" : nil
     }
 
     /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
