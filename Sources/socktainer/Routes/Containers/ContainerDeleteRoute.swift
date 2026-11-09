@@ -93,6 +93,7 @@ extension ContainerDeleteRoute {
                         cachedIP: cached?.ip ?? containerIP,
                         dnsServer: dnsServer
                     )
+                    ConnectedNetworkAliases.shared.forget(nativeId: container.id)
                 }
 
                 if let container, container.status == .running {

@@ -457,6 +457,9 @@ extension ContainerStartRoute {
                         logger.info("[dns] registered compose alias '\(serviceName)' → \(addresses)")
                     }
                 }
+                for name in ConnectedNetworkAliases.shared.all(nativeId: snapshot.id) {
+                    dnsServer.register(hostname: name, ips: cidrs)
+                }
             }
         }
 

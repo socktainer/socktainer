@@ -1,8 +1,8 @@
 import Foundation
 
 /// Unregisters a container's DNS aliases (name, `socktainer.dns.names`, Compose
-/// service/project) — used by the `--rm` auto-remove paths, which never receive a
-/// DELETE for `ContainerDeleteRoute` to react to.
+/// service/project, network-connect aliases) — used by the `--rm` auto-remove
+/// paths, which never receive a DELETE for `ContainerDeleteRoute` to react to.
 ///
 /// `cachedIP` nil means ownership can't be confirmed, so nothing is touched: unregistering
 /// blind risks yanking a live peer's identically-named alias, worse than a stale leftover.
@@ -28,6 +28,9 @@ enum ContainerAliasCleanup {
             if let projectName = labels["com.docker.compose.project"], !projectName.isEmpty {
                 dnsServer.unregisterIfOwned(hostname: "\(serviceName).\(projectName)", expectedIP: cachedIP)
             }
+        }
+        for name in ConnectedNetworkAliases.shared.all(nativeId: nativeId) {
+            dnsServer.unregisterIfOwned(hostname: name, expectedIP: cachedIP)
         }
     }
 }
