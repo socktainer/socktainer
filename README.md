@@ -329,6 +329,16 @@ URL-form values (`scheme://127.0.0.1:PORT` or `user@127.0.0.1:PORT`) rewritten
 to the network gateway for a container on a named network, opt in with the
 `socktainer.rewrite-loopback=true` container label.
 
+### Peer hostnames in environment variables
+
+Container hostnames in environment values are also left unchanged and resolved
+through DNS at runtime. To have connection-string positions
+(`scheme://NAME:PORT`, `user@NAME:PORT` or `host=NAME`) rewritten to the
+current IP of the container that owns `NAME`, for a container on a named
+network, opt in with the `socktainer.rewrite-peer-hostnames=true` container
+label. The IP is captured when the container is created, so it goes stale if
+that peer is later re-created with a new address.
+
 ---
 
 ## Building from Source 🏗️
