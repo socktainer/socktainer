@@ -36,10 +36,10 @@ struct NetworkConnectRoute: RouteCollection {
 
             let aliases = (body.EndpointConfig?.Aliases ?? []).filter { !$0.isEmpty }
             let previous = ConnectedNetworkAliases.shared.set(nativeId: container.id, network: network, aliases: aliases)
+            ConnectedNetworkAliases.shared.setOwner(nativeId: container.id, ip: owner)
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                for name in previous {
-                    dnsServer.unregisterIfOwned(hostname: name, expectedIP: owner)
-                }
+                ContainerAliasCleanup.unregisterConnectedAliases(
+                    previous, nativeId: container.id, labels: container.configuration.labels, owner: owner, dnsServer: dnsServer)
                 // Registered on every attachment, primary first, as create-time aliases are,
                 // so the cleanup paths' ownership check by primary IP matches them.
                 for name in aliases {
