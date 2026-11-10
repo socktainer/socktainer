@@ -549,10 +549,10 @@ extension ContainerCreateRoute {
                     options: existing?.options ?? []
                 )
             } else if dnsMode == .appleDNS {
-                // Named networks in attachment order — the injected search domains follow it.
+                // Sorted so the injected search-domain order is deterministic.
                 let aliasSearchNetworks = containerConfiguration.networks.map(\.network).filter {
                     !NetworkAliasDNS.isReservedNetwork($0)
-                }
+                }.sorted()
                 let existing = containerConfiguration.dns
                 if let dnsConfiguration = ContainerCreateRoute.networkAliasDNS(
                     existing: existing, networks: aliasSearchNetworks, dnsDomain: dnsDomain
