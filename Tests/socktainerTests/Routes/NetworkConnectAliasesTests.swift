@@ -97,6 +97,7 @@ struct NetworkConnectAliasesTests {
         let snapshot = try makeContainerSnapshot(
             nativeId: "connect-cleanup", ip: "192.168.65.44", network: Self.network, labels: [:], status: .running)
         let dnsServer = SocktainerDNSServer()
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: "connect-cleanup") }
 
         try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: snapshot), dnsServer: dnsServer) { app in
             try await connect(app, container: "connect-cleanup", aliases: ["gone.example"])
@@ -105,7 +106,29 @@ struct NetworkConnectAliasesTests {
             nativeId: "connect-cleanup", labels: [:], cachedIP: "192.168.65.44", dnsServer: dnsServer)
 
         #expect(dnsServer.listEntries()["gone.example"] == nil)
-        ConnectedNetworkAliases.shared.forget(nativeId: "connect-cleanup")
+    }
+
+    @Test("Disconnect from one network keeps an alias another network still records")
+    func aliasOnTwoNetworksSurvivesOneDisconnect() async throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "connect-two-networks",
+            networks: [(network: Self.network, ip: "192.168.65.45"), (network: "other_net", ip: "192.168.66.45")],
+            labels: [:], status: .running)
+        let dnsServer = SocktainerDNSServer()
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: "connect-two-networks") }
+
+        try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: snapshot), dnsServer: dnsServer) { app in
+            try await connect(app, container: "connect-two-networks", aliases: ["shared.example"])
+            try await connect(app, container: "connect-two-networks", aliases: ["shared.example"], network: "other_net")
+            try await app.testing().test(
+                .POST, "/v1.51/networks/\(Self.network)/disconnect",
+                beforeRequest: { req in try req.content.encode(["Container": "connect-two-networks"], as: .json) }
+            ) { res async in
+                #expect(res.status == .ok)
+            }
+        }
+
+        #expect(dnsServer.listEntries()["shared.example"] == "192.168.65.45")
     }
 
     private func connect(_ app: Application, container: String, aliases: [String], network: String = NetworkConnectAliasesTests.network) async throws {

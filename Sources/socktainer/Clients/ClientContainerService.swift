@@ -504,6 +504,7 @@ struct ClientContainerService: ClientContainerProtocol {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.withClient { try await $0.delete(id: container.id) }
+        ConnectedNetworkAliases.shared.forget(nativeId: container.id)
         // After the delete, and by the native id: the reference a client holds may
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.

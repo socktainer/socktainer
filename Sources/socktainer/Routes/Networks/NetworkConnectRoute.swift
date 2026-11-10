@@ -37,7 +37,7 @@ struct NetworkConnectRoute: RouteCollection {
             let aliases = (body.EndpointConfig?.Aliases ?? []).filter { !$0.isEmpty }
             let previous = ConnectedNetworkAliases.shared.set(nativeId: container.id, network: network, aliases: aliases)
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self] {
-                for name in previous where !aliases.contains(name) {
+                for name in previous {
                     dnsServer.unregisterIfOwned(hostname: name, expectedIP: owner)
                 }
                 // Registered on every attachment, primary first, as create-time aliases are,
