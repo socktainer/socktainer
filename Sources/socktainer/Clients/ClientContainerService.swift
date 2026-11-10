@@ -503,13 +503,21 @@ struct ClientContainerService: ClientContainerProtocol {
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
-        try await containerClient.withClient { try await $0.delete(id: container.id) }
-        ConnectedNetworkAliases.shared.forget(nativeId: container.id)
+        try await Self.deleteNative(nativeId: container.id) {
+            try await containerClient.withClient { try await $0.delete(id: container.id) }
+        }
         // After the delete, and by the native id: the reference a client holds may
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.
         try await PreStartInjectionStore.shared.clear(containerId: container.id)
         ExtraHostsFile.remove(labels: container.configuration.labels)
+    }
+
+    /// Runs the native delete, then forgets the container's network-connect aliases,
+    /// before any later cleanup that can throw. A failed delete keeps them for the next start.
+    static func deleteNative(nativeId: String, _ nativeDelete: () async throws -> Void) async throws {
+        try await nativeDelete()
+        ConnectedNetworkAliases.shared.forget(nativeId: nativeId)
     }
 
     /// Apple Container has no rename and identifies containers by name, so a

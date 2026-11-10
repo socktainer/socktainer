@@ -131,6 +131,94 @@ struct NetworkConnectAliasesTests {
         #expect(dnsServer.listEntries()["shared.example"] == "192.168.65.45")
     }
 
+    @Test("Reconnect and disconnect keep a replaced alias that is also the Compose service name")
+    func configuredNameSurvivesReplaceAndDisconnect() async throws {
+        let labels = ["com.docker.compose.service": "web", "com.docker.compose.project": "myapp"]
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "connect-configured", ip: "192.168.65.46", network: Self.network, labels: labels, status: .running)
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: "web", ips: ["192.168.65.46/24"])
+        dnsServer.register(hostname: "web.myapp", ips: ["192.168.65.46/24"])
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: "connect-configured") }
+
+        try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: snapshot), dnsServer: dnsServer) { app in
+            try await connect(app, container: "connect-configured", aliases: ["WEB", "extra.example"])
+            try await connect(app, container: "connect-configured", aliases: ["extra.example"])
+            #expect(dnsServer.listEntries()["web"] == "192.168.65.46", "replacing the connect aliases must keep the service name")
+            try await connect(app, container: "connect-configured", aliases: ["web.myapp", "extra.example"])
+            try await disconnect(app, container: "connect-configured")
+        }
+
+        let entries = dnsServer.listEntries()
+        #expect(entries["web"] == "192.168.65.46")
+        #expect(entries["web.myapp"] == "192.168.65.46")
+        #expect(entries["extra.example"] == nil)
+    }
+
+    @Test("Disconnect after the live attachments are gone uses the owner recorded at connect")
+    func disconnectWithoutLiveAttachmentUsesRecordedOwner() async throws {
+        let running = try makeContainerSnapshot(
+            nativeId: "connect-stopped", ip: "192.168.65.47", network: Self.network, labels: [:], status: .running)
+        let stopped = try makeContainerSnapshot(nativeId: "connect-stopped", networks: [], labels: [:], status: .stopped)
+        let dnsServer = SocktainerDNSServer()
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: "connect-stopped") }
+
+        try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: running), dnsServer: dnsServer) { app in
+            try await connect(app, container: "connect-stopped", aliases: ["late.example"])
+        }
+        try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: stopped), dnsServer: dnsServer) { app in
+            try await disconnect(app, container: "connect-stopped")
+        }
+
+        #expect(dnsServer.listEntries()["late.example"] == nil)
+    }
+
+    @Test("Cleanup without a cached IP still drops connected aliases, by the owner recorded at connect")
+    func cleanupWithoutCachedIPUsesRecordedOwner() async throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "connect-no-cache", ip: "192.168.65.48", network: Self.network, labels: [:], status: .running)
+        let dnsServer = SocktainerDNSServer()
+        dnsServer.register(hostname: "peer.example", ips: ["192.168.66.99/24"])
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: "connect-no-cache") }
+
+        try await withNetworkRoutes(client: StaticSnapshotClientMock(snapshot: snapshot), dnsServer: dnsServer) { app in
+            try await connect(app, container: "connect-no-cache", aliases: ["mine.example", "peer.example"])
+        }
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: "connect-no-cache", labels: [:], cachedIP: nil, dnsServer: dnsServer)
+
+        let entries = dnsServer.listEntries()
+        #expect(entries["mine.example"] == nil)
+        #expect(entries["peer.example"] == "192.168.66.99", "a peer's registration of the same name must stay")
+    }
+
+    @Test("A failed native delete keeps connected aliases; a successful one forgets them")
+    func deleteForgetsOnlyAfterNativeDelete() async throws {
+        let nativeId = "connect-delete"
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: nativeId) }
+        ConnectedNetworkAliases.shared.set(nativeId: nativeId, network: Self.network, aliases: ["kept.example"])
+        ConnectedNetworkAliases.shared.setOwner(nativeId: nativeId, ip: "192.168.65.49")
+
+        await #expect(throws: DeleteFailed.self) {
+            try await ClientContainerService.deleteNative(nativeId: nativeId) { throw DeleteFailed() }
+        }
+        #expect(ConnectedNetworkAliases.shared.all(nativeId: nativeId) == ["kept.example"])
+        #expect(ConnectedNetworkAliases.shared.owner(nativeId: nativeId) == "192.168.65.49")
+
+        try await ClientContainerService.deleteNative(nativeId: nativeId) {}
+        #expect(ConnectedNetworkAliases.shared.all(nativeId: nativeId).isEmpty)
+        #expect(ConnectedNetworkAliases.shared.owner(nativeId: nativeId) == nil)
+    }
+
+    private func disconnect(_ app: Application, container: String, network: String = NetworkConnectAliasesTests.network) async throws {
+        try await app.testing().test(
+            .POST, "/v1.51/networks/\(network)/disconnect",
+            beforeRequest: { req in try req.content.encode(["Container": container], as: .json) }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+    }
+
     private func connect(_ app: Application, container: String, aliases: [String], network: String = NetworkConnectAliasesTests.network) async throws {
         let body = RESTNetworkConnect(
             Container: container,
@@ -180,3 +268,5 @@ private struct MissingContainerClient: ClientContainerProtocol {
         ([], 0)
     }
 }
+
+private struct DeleteFailed: Error {}

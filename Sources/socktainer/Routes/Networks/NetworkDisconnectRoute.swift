@@ -27,11 +27,11 @@ struct NetworkDisconnectRoute: RouteCollection {
 
             let removed = ConnectedNetworkAliases.shared.set(nativeId: container.id, network: network, aliases: [])
             if let dnsServer = req.application.storage[SocktainerDNSServerKey.self],
-                let owner = ContainerStartRoute.dnsAttachmentIP(in: container)
+                let owner = ConnectedNetworkAliases.shared.owner(nativeId: container.id)
+                    ?? ContainerStartRoute.dnsAttachmentIP(in: container)
             {
-                for name in removed {
-                    dnsServer.unregisterIfOwned(hostname: name, expectedIP: owner)
-                }
+                ContainerAliasCleanup.unregisterConnectedAliases(
+                    removed, nativeId: container.id, labels: container.configuration.labels, owner: owner, dnsServer: dnsServer)
             }
             return Response(status: .ok)
         }
