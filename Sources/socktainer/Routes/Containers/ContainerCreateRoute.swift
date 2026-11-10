@@ -549,10 +549,7 @@ extension ContainerCreateRoute {
                     options: existing?.options ?? []
                 )
             } else if dnsMode == .appleDNS {
-                // Named networks in attachment order — the injected search domains follow it.
-                let aliasSearchNetworks = containerConfiguration.networks.map(\.network).filter {
-                    !NetworkAliasDNS.isReservedNetwork($0)
-                }
+                let aliasSearchNetworks = ContainerCreateRoute.aliasSearchNetworks(containerConfiguration.networks)
                 let existing = containerConfiguration.dns
                 if let dnsConfiguration = ContainerCreateRoute.networkAliasDNS(
                     existing: existing, networks: aliasSearchNetworks, dnsDomain: dnsDomain
@@ -954,6 +951,12 @@ extension ContainerCreateRoute {
             warn: warn
         )
         return AttachmentOptions(hostname: attachmentHostname, aliases: qualified)
+    }
+
+    /// Named (non-reserved) networks for the injected search list, sorted so the
+    /// order is deterministic regardless of attachment order.
+    static func aliasSearchNetworks(_ attachments: [AttachmentConfiguration]) -> [String] {
+        attachments.map(\.network).filter { !NetworkAliasDNS.isReservedNetwork($0) }.sorted()
     }
 
     /// The resolv.conf for an `apple-dns` container on a named network: the zone search

@@ -1325,3 +1325,27 @@ struct ContainerCreateNetworkAliasDNSTests {
         #expect(dns == nil)
     }
 }
+
+@Suite("ContainerCreateRoute — apple-dns alias search networks")
+struct ContainerCreateAliasSearchNetworksTests {
+
+    private func attachments(_ networks: [String]) -> [AttachmentConfiguration] {
+        networks.map { AttachmentConfiguration(network: $0, options: AttachmentOptions(hostname: "x")) }
+    }
+
+    @Test("named networks are sorted; reserved ones are excluded")
+    func sortsNamedNetworksAndDropsReserved() {
+        let networks = ContainerCreateRoute.aliasSearchNetworks(
+            attachments(["zeta", "myapp_default", "alpha", "bridge", "host", "none"])
+        )
+        #expect(networks == ["alpha", "myapp_default", "zeta"])
+    }
+
+    @Test("only reserved networks means nothing to inject")
+    func onlyReservedNetworksYieldsEmptyList() {
+        let networks = ContainerCreateRoute.aliasSearchNetworks(
+            attachments(["bridge", "none"])
+        )
+        #expect(networks.isEmpty)
+    }
+}
