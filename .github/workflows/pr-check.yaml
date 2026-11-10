@@ -349,7 +349,7 @@ jobs:
 
       # The apple-dns mode needs the domain registered with apple/container —
       # that is what an /etc/resolver entry does.
-      - name: check apple-dns mode
+      - name: run socktainer in apple-dns mode
         # The daemon answers in seconds; this only guards against a hang.
         timeout-minutes: 5
         run: |
@@ -373,13 +373,20 @@ jobs:
 
           sudo -H env SOCKTAINER_DNS_MODE=apple-dns ./socktainer > daemon.log 2>&1 &
           DAEMON_PID=$!
-          sleep 5
-          if ! sudo curl -sf --unix-socket /var/root/.socktainer/container.sock http://localhost/_ping > /dev/null; then
+          UP=
+          for _ in $(seq 1 60); do
+            if sudo curl -sf --unix-socket /var/root/.socktainer/container.sock http://localhost/_ping > /dev/null; then
+              UP=1
+              break
+            fi
+            sleep 1
+          done
+          cat daemon.log
+          if [ -z "$UP" ]; then
             echo "Error: the daemon did not serve /_ping"
-            cat daemon.log
-            kill "$DAEMON_PID" 2>/dev/null || true
+            sudo kill "$DAEMON_PID" 2>/dev/null || true
             exit 1
           fi
-          kill "$DAEMON_PID" 2>/dev/null || true
+          sudo kill "$DAEMON_PID" 2>/dev/null || true
 
           sudo container system dns delete "$DOMAIN" || true
