@@ -266,9 +266,17 @@ struct ContainerRestartRecoveryTests {
         let id = DockerContainerID.hexId(for: snapshot)
         let store = RestartPolicyOverrideStore()
         try await store.recordStarted(id: id)
-        // delete records .remove before the runtime call, which then throws.
-        try await store.recordRemoveIntent(id: id)
-        try await store.clearPendingAction(id: id)
+        struct DeleteFailed: Error {}
+        // Exercise the production helper delete goes through, with the runtime
+        // call failing: the .remove intent must be cleared, not left pending.
+        await #expect(throws: DeleteFailed.self) {
+            try await LifecycleIntent.run(
+                hexId: id, store: store,
+                record: { try? await store.recordRemoveIntent(id: id) },
+                operation: { () async throws -> Void in throw DeleteFailed() },
+                complete: { await store.remove(id: id) }
+            )
+        }
         let client = RecoveryClient(snapshot: snapshot)
         let report = await recover(client: client, store: store)
         #expect(!report.skipped.contains { $0.id == id && $0.reason == .removalPending })

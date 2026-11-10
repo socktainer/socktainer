@@ -131,6 +131,18 @@ enum ContainerRestartRecovery {
                     continue
                 }
 
+                // The API is already serving while recovery runs, so a docker stop
+                // or rm can land after the record was read at the top of this loop.
+                // Re-read immediately before starting and honour the newer intent;
+                // the remaining window between this check and client.start is
+                // narrowed, not eliminated (the runtime call itself is not atomic).
+                let latestRecord = await store.lifecycle(id: hexId)
+                if let reason = stoppedSkipReason(status: container.status, record: latestRecord, policy: policy) {
+                    report.skipped.append(Skipped(id: hexId, reason: reason))
+                    logger.info("restart-recovery: skipped \(container.id): \(reason.rawValue) (intent changed during recovery)")
+                    continue
+                }
+
                 // Intent precedes the external side effect. If the daemon dies in
                 // this interval, the next recovery will not invent a completed start.
                 await ContainerRestartState.shared.reset(id: container.id)

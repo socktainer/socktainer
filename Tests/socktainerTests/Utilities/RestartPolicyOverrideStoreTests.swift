@@ -30,9 +30,14 @@ struct RestartPolicyOverrideStoreTests {
     func completedKillLeavesNoStopMarker() async throws {
         let store = RestartPolicyOverrideStore()
         try await store.recordStarted(id: "instance")
-        // kill records the intent and must finish it just as stop does.
-        try await store.recordStopIntent(id: "instance", hasStarted: true)
-        try await store.recordStopped(id: "instance")
+        // Exercise the production helper kill goes through: a successful runtime
+        // call must complete the intent, not leave it pending.
+        try await LifecycleIntent.run(
+            hexId: "instance", store: store,
+            record: { try? await store.recordStopIntent(id: "instance", hasStarted: true) },
+            operation: { () async throws -> Void in },
+            complete: { try? await store.recordStopped(id: "instance") }
+        )
         try await store.recordStarted(id: "instance")
         #expect(await store.lifecycle(id: "instance") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: false, pendingAction: nil))
     }
@@ -41,9 +46,15 @@ struct RestartPolicyOverrideStoreTests {
     func failedStopLeavesNoStopMarker() async throws {
         let store = RestartPolicyOverrideStore()
         try await store.recordStarted(id: "instance")
-        try await store.recordStopIntent(id: "instance", hasStarted: true)
-        // The runtime call threw; the in-flight marker must be cleared.
-        try await store.clearPendingAction(id: "instance")
+        struct StopFailed: Error {}
+        await #expect(throws: StopFailed.self) {
+            try await LifecycleIntent.run(
+                hexId: "instance", store: store,
+                record: { try? await store.recordStopIntent(id: "instance", hasStarted: true) },
+                operation: { () async throws -> Void in throw StopFailed() },
+                complete: { try? await store.recordStopped(id: "instance") }
+            )
+        }
         try await store.recordStarted(id: "instance")
         #expect(await store.lifecycle(id: "instance") == RestartLifecycleRecord(hasStarted: true, manuallyStopped: false, pendingAction: nil))
     }

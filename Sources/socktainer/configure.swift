@@ -256,11 +256,18 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
         app.logger.error("Could not bind DNS server on any port near \(preferredDNSPort) — inter-container DNS disabled")
         // Recovery calls into the runtime over XPC, which can hang forever
         // (apple/container#1884). Keep it off the startup path so a wedged
-        // runtime cannot delay binding the API socket. The watcher starts only
-        // after recovery reserved those runs, so its first snapshot cannot
-        // produce a second die for an exit recovery already claimed.
+        // runtime cannot delay binding the API socket, and bound it so a hung
+        // XPC call cannot hold the event watcher back either.
         Task {
-            await restoreContainerLifecycles(app, client: containerClient)
+            let recoveryFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+                await restoreContainerLifecycles(app, client: containerClient)
+            }
+            if !recoveryFinished {
+                app.logger.warning(
+                    "[startup] restart recovery did not finish within 30s - starting the event watcher anyway. The container runtime may be unhealthy (see apple/container#1884).")
+            }
+            // The API is already up; start the watcher whether recovery finished
+            // or was abandoned, otherwise native die/start events are dropped.
             Task { await externalEventWatcher.run() }
         }
         return
@@ -340,10 +347,18 @@ func configure(_ app: Application, dnsUpstreamCLI: String? = nil) async throws {
 
     // Recovery calls into the runtime over XPC, which can hang forever
     // (apple/container#1884). Keep it off the startup path so a wedged runtime
-    // cannot delay binding the API socket. The watcher starts only after recovery
-    // reserved those runs, so its first snapshot cannot produce a second die.
+    // cannot delay binding the API socket, and bound it so a hung XPC call
+    // cannot hold the event watcher back either.
     Task {
-        await restoreContainerLifecycles(app, client: containerClient)
+        let recoveryFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+            await restoreContainerLifecycles(app, client: containerClient)
+        }
+        if !recoveryFinished {
+            app.logger.warning(
+                "[startup] restart recovery did not finish within 30s - starting the event watcher anyway. The container runtime may be unhealthy (see apple/container#1884).")
+        }
+        // The API is already up; start the watcher whether recovery finished or
+        // was abandoned, otherwise native die/start events are dropped.
         Task { await externalEventWatcher.run() }
     }
 }
