@@ -601,6 +601,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 await RestartPolicyOverrideStore.shared.remove(id: hexContainerId)
             }
         )
+        ConnectedNetworkAliases.shared.forget(nativeId: container.id)
         // After the delete, and by the native id: the reference a client holds may
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.

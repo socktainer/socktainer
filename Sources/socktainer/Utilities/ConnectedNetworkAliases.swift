@@ -12,7 +12,8 @@ final class ConnectedNetworkAliases: @unchecked Sendable {
     private let lock = NSLock()
     private var aliases: [String: [String: [String]]] = [:]  // native ID → network → aliases
 
-    /// Replaces the aliases for `nativeId` on `network` and returns the ones replaced.
+    /// Replaces the aliases for `nativeId` on `network` and returns the replaced ones
+    /// that no network still records, which are the ones safe to unregister.
     @discardableResult
     func set(nativeId: String, network: String, aliases newAliases: [String]) -> [String] {
         lock.withLock {
@@ -20,7 +21,8 @@ final class ConnectedNetworkAliases: @unchecked Sendable {
             var byNetwork = aliases[nativeId] ?? [:]
             byNetwork[network] = newAliases.isEmpty ? nil : newAliases
             aliases[nativeId] = byNetwork.isEmpty ? nil : byNetwork
-            return previous
+            let stillRecorded = Set(byNetwork.values.flatMap { $0 })
+            return previous.filter { !stillRecorded.contains($0) }
         }
     }
 
