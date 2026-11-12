@@ -457,6 +457,13 @@ extension ContainerStartRoute {
                         logger.info("[dns] registered compose alias '\(serviceName)' → \(addresses)")
                     }
                 }
+                let connected = ConnectedNetworkAliases.shared.all(nativeId: snapshot.id)
+                if !connected.isEmpty, let primary = ContainerStartRoute.dnsAttachmentIP(in: snapshot) {
+                    ConnectedNetworkAliases.shared.setOwner(nativeId: snapshot.id, ip: primary)
+                }
+                for name in connected {
+                    dnsServer.register(hostname: name, ips: cidrs)
+                }
             }
         }
 

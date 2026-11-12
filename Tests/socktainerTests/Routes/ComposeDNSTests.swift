@@ -333,13 +333,17 @@ struct ComposeDNSTests {
 
     @Test("POST /networks/{id}/connect returns 200")
     func networkConnectReturns200() async throws {
+        let snapshot = try makeSnapshot(nativeId: "net-connect", ip: "192.168.65.50", labels: [:])
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: NetworkConnectRoute())
+            try app.register(collection: NetworkConnectRoute(client: ComposeMock(snapshot: snapshot)))
 
-            try await app.testing().test(.POST, "/v1.51/networks/myapp_default/connect") { res async in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/myapp_default/connect",
+                beforeRequest: { req in try req.content.encode(["Container": "net-connect"], as: .json) }
+            ) { res async in
                 #expect(res.status == .ok)
             }
         }
@@ -347,13 +351,17 @@ struct ComposeDNSTests {
 
     @Test("POST /networks/{id}/disconnect returns 200")
     func networkDisconnectReturns200() async throws {
+        let snapshot = try makeSnapshot(nativeId: "net-disconnect", ip: "192.168.65.51", labels: [:])
         try await withApp(configure: { _ in }) { app in
             let regexRouter = app.regexRouter(with: app.logger)
             app.setRegexRouter(regexRouter)
             regexRouter.installMiddleware(on: app)
-            try app.register(collection: NetworkDisconnectRoute())
+            try app.register(collection: NetworkDisconnectRoute(client: ComposeMock(snapshot: snapshot)))
 
-            try await app.testing().test(.POST, "/v1.51/networks/myapp_default/disconnect") { res async in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/myapp_default/disconnect",
+                beforeRequest: { req in try req.content.encode(["Container": "net-disconnect"], as: .json) }
+            ) { res async in
                 #expect(res.status == .ok)
             }
         }
