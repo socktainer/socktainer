@@ -1042,3 +1042,284 @@ struct ContainerCreateBindSourceTests {
         #expect(ContainerCreateRoute.bindSource(for: "myvolume") == .other)
     }
 }
+
+@Suite("ContainerCreateRoute — apple-dns attachment options")
+struct ContainerCreateNetworkAliasAttachmentOptionsTests {
+
+    /// Collects `warn` messages without capturing a `var` in the closure.
+    private final class WarningLog {
+        var messages: [String] = []
+    }
+
+    private func options(
+        dnsMode: DNSMode,
+        dnsDomain: String?,
+        id: String = "abc123",
+        hostname: String = "web",
+        requestedHostname: String? = nil,
+        network: String,
+        aliases: [String] = [],
+        labels: [String: String] = [:],
+        warnings: WarningLog? = nil
+    ) -> AttachmentOptions {
+        ContainerCreateRoute.attachmentOptions(
+            dnsMode: dnsMode,
+            dnsDomain: dnsDomain,
+            id: id,
+            hostname: hostname,
+            requestedHostname: requestedHostname,
+            network: network,
+            aliases: aliases,
+            labels: labels,
+            warn: { warnings?.messages.append($0) }
+        )
+    }
+
+    private func composeLabels(number: String?) -> [String: String] {
+        var labels = [
+            "com.docker.compose.project": "myapp",
+            "com.docker.compose.service": "web",
+        ]
+        if let number {
+            labels["com.docker.compose.container-number"] = number
+        }
+        return labels
+    }
+
+    @Test("socktainer-dns mode keeps the plain hostname and registers no aliases")
+    func socktainerDNSModeKeepsPlainHostname() {
+        let result = options(
+            dnsMode: .socktainerDNS,
+            dnsDomain: "test",
+            network: "myapp_default",
+            aliases: ["web"]
+        )
+        #expect(result.hostname == "web")
+        #expect(result.aliases.isEmpty)
+    }
+
+    @Test("apple-dns mode uses the FQDN attachment hostname and zone-qualifies aliases")
+    func networkAliasQualifiesAliases() {
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "myapp",
+            aliases: ["web"]
+        )
+        #expect(result.hostname == "abc123.myapp.test")
+        #expect(result.aliases == ["web.myapp.test"])
+    }
+
+    @Test("the explicitly requested hostname preferred, the id stays reachable as an alias")
+    func requestedHostnamePreferred() {
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            requestedHostname: "web",
+            network: "myapp",
+            aliases: ["db"]
+        )
+        #expect(result.hostname == "web.myapp.test")
+        #expect(result.aliases == ["abc123.myapp.test", "db.myapp.test"])
+    }
+
+    @Test("a non-primary compose replica gets the container-name hostname and no shared aliases")
+    func nonPrimaryComposeReplicaDropsSharedNames() {
+        // Compose sends every replica the same shared aliases.
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            requestedHostname: "web",
+            network: "myapp",
+            aliases: ["web", "abc123"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(result.hostname == "abc123.myapp.test")
+        #expect(result.aliases.isEmpty)
+    }
+
+    @Test("the shared-name drop rule needs both compose identity labels and number != 1")
+    func sharedNameDropRule() {
+        #expect(!ContainerCreateRoute.dropsSharedComposeNames(labels: [:]))
+        #expect(!ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: "1")))
+        #expect(ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: "2")))
+        #expect(ContainerCreateRoute.dropsSharedComposeNames(labels: composeLabels(number: nil)))
+        #expect(
+            !ContainerCreateRoute.dropsSharedComposeNames(
+                labels: ["com.docker.compose.container-number": "2"]))
+    }
+
+    @Test("the compose drop rule does not leak past the mode and network guards")
+    func dropRuleDoesNotLeakPastGuards() {
+        let inSocktainerDNS = options(
+            dnsMode: .socktainerDNS,
+            dnsDomain: "test",
+            network: "myapp",
+            aliases: ["web"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(inSocktainerDNS.hostname == "web")
+        #expect(inSocktainerDNS.aliases.isEmpty)
+        let onReservedNetwork = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "default",
+            aliases: ["web"],
+            labels: composeLabels(number: "2")
+        )
+        #expect(onReservedNetwork.hostname == "web")
+        #expect(onReservedNetwork.aliases.isEmpty)
+    }
+
+    @Test("an alias equal to the attachment hostname is excluded — the hostname serves the name")
+    func aliasEqualToHostnameIsExcluded() {
+        // "abc123" is the fixture container id/name — sent as an alias, as Compose does.
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "myapp",
+            aliases: ["web", "abc123"]
+        )
+        #expect(result.hostname == "abc123.myapp.test")
+        #expect(result.aliases == ["web.myapp.test"])
+    }
+
+    @Test("an alias the guest resolver may not expand warns")
+    func unexpandedAliasWarns() {
+        let warnings = WarningLog()
+        _ = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "myapp",
+            aliases: ["db.example.com"],
+            warnings: warnings
+        )
+        #expect(warnings.messages.count == 1)
+        #expect(warnings.messages.first?.contains("db.example.com.myapp.test") == true)
+    }
+
+    @Test("a hostname longer than 63 chars is truncated, keeping it a valid DNS label")
+    func longHostnameIsTruncated() {
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            requestedHostname: String(repeating: "w", count: 65),
+            network: "myapp"
+        )
+        #expect(
+            result.hostname
+                == "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-1e3258f8a1ed.myapp.test"
+        )
+    }
+
+    @Test("a reserved network keeps the plain hostname and registers no aliases")
+    func reservedNetworkKeepsPlainHostname() {
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: "test",
+            network: "default",
+            aliases: ["web"]
+        )
+        #expect(result.hostname == "web")
+        #expect(result.aliases.isEmpty)
+    }
+
+    @Test("a missing DNS domain keeps the plain hostname and registers no aliases")
+    func missingDNSDomainKeepsPlainHostname() {
+        let result = options(
+            dnsMode: .appleDNS,
+            dnsDomain: nil,
+            network: "myapp_default",
+            aliases: ["web"]
+        )
+        #expect(result.hostname == "web")
+        #expect(result.aliases.isEmpty)
+    }
+}
+
+@Suite("ContainerCreateRoute — apple-dns resolv.conf injection")
+struct ContainerCreateNetworkAliasDNSTests {
+
+    @Test("the nameserver is left to apple")
+    func nameserverIsLeftToApple() throws {
+        let dns = try #require(
+            ContainerCreateRoute.networkAliasDNS(
+                existing: ContainerConfiguration.DNSConfiguration(
+                    nameservers: ["1.1.1.1"],
+                    domain: nil,
+                    searchDomains: [],
+                    options: []
+                ),
+                networks: ["net1"],
+                dnsDomain: "test"
+            )
+        )
+        #expect(dns.nameservers.isEmpty)
+    }
+
+    @Test("per-network and bare search domains are merged, and ndots defaults to 2")
+    func mergesSearchDomainsAndNDots() throws {
+        let dns = try #require(
+            ContainerCreateRoute.networkAliasDNS(
+                existing: ContainerConfiguration.DNSConfiguration(
+                    nameservers: [],
+                    domain: "example.test",
+                    searchDomains: ["corp.example.test"],
+                    options: []
+                ),
+                networks: ["net1"],
+                dnsDomain: "test"
+            )
+        )
+        #expect(dns.nameservers.isEmpty)
+        #expect(dns.searchDomains == ["corp.example.test", "net1.test", "test"])
+        #expect(dns.options == ["ndots:2"])
+    }
+
+    @Test("the user's ndots entry is replaced by the computed one, other options are kept")
+    func replacesUserNDots() throws {
+        let dns = try #require(
+            ContainerCreateRoute.networkAliasDNS(
+                existing: ContainerConfiguration.DNSConfiguration(
+                    nameservers: [],
+                    domain: "example.test",
+                    searchDomains: [],
+                    options: ["timeout:1", "ndots:1"]
+                ),
+                networks: ["net1"],
+                dnsDomain: "test"
+            )
+        )
+        #expect(dns.options == ["timeout:1", "ndots:2"])
+    }
+
+    @Test("no named network means nothing to inject")
+    func noNetworksDisablesInjection() {
+        let dns = ContainerCreateRoute.networkAliasDNS(
+            existing: ContainerConfiguration.DNSConfiguration(
+                nameservers: [],
+                domain: "example.test",
+                searchDomains: ["corp.example.test"],
+                options: []
+            ),
+            networks: [],
+            dnsDomain: "test"
+        )
+        #expect(dns == nil)
+    }
+
+    @Test("no DNS domain means nothing to inject")
+    func noDNSDomainDisablesInjection() {
+        let dns = ContainerCreateRoute.networkAliasDNS(
+            existing: ContainerConfiguration.DNSConfiguration(
+                nameservers: [],
+                domain: "example.test",
+                searchDomains: ["corp.example.test"],
+                options: []
+            ),
+            networks: ["net1"],
+            dnsDomain: nil
+        )
+        #expect(dns == nil)
+    }
+}

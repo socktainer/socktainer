@@ -382,14 +382,35 @@ extension ContainerCreateRoute {
                 hostname = ContainerNameUtility.sanitize("\(id)-\(UUID().uuidString.lowercased())")
             }
 
+            let dnsMode = req.application.dnsMode
+            let dnsDomain = systemConfig.dns.domain
+            let dropsSharedNames =
+                dnsMode == .appleDNS
+                && ContainerCreateRoute.dropsSharedComposeNames(labels: body.Labels ?? [:])
+            // Alias warnings, returned with the create response.
+            var createWarnings: [String] = []
+
+            let attachmentOptions: (String, [String]) -> AttachmentOptions = { networkName, aliases in
+                ContainerCreateRoute.attachmentOptions(
+                    dnsMode: dnsMode, dnsDomain: dnsDomain, id: id, hostname: hostname,
+                    requestedHostname: body.Hostname.flatMap { $0.isEmpty ? nil : $0 },
+                    network: networkName, aliases: aliases,
+                    labels: body.Labels ?? [:],
+                    warn: { message in
+                        createWarnings.append(message)
+                        req.logger.warning("\(message)")
+                    }
+                )
+            }
+
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,
                 let endpointsConfig = networkingConfig.EndpointsConfig,
                 !endpointsConfig.isEmpty
             {
                 // Use networking config from request if provided
-                containerConfiguration.networks = endpointsConfig.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
+                containerConfiguration.networks = endpointsConfig.map { (networkName, settings) in
+                    let options = attachmentOptions(networkName, settings.Aliases ?? [])
                     return AttachmentConfiguration(network: networkName, options: options)
                 }
             } else if let networkingConfig = body.NetworkingConfig,
@@ -397,8 +418,8 @@ extension ContainerCreateRoute {
                 !networks.isEmpty
             {
                 // Fallback to Networks field for backward compatibility
-                containerConfiguration.networks = networks.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
+                containerConfiguration.networks = networks.map { (networkName, settings) in
+                    let options = attachmentOptions(networkName, settings.Aliases ?? [])
                     return AttachmentConfiguration(network: networkName, options: options)
                 }
             } else if let hostConfig = body.HostConfig,
@@ -425,11 +446,18 @@ extension ContainerCreateRoute {
                     resolvedMode = networkMode
                 }
                 containerConfiguration.networks = [
-                    AttachmentConfiguration(network: resolvedMode, options: AttachmentOptions(hostname: hostname))
+                    AttachmentConfiguration(network: resolvedMode, options: attachmentOptions(resolvedMode, []))
                 ]
             } else {
                 // Fall back to default network if no networking config provided
-                containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
+                containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: attachmentOptions("default", []))]
+            }
+            if dropsSharedNames,
+                containerConfiguration.networks.contains(where: { !NetworkAliasDNS.isReservedNetwork($0.network) })
+            {
+                req.logger.warning(
+                    "apple-dns mode: compose replica \(id) keeps no shared aliases — they stay with the primary replica"
+                )
             }
 
             containerConfiguration.publishedPorts = publishedPorts
@@ -520,6 +548,17 @@ extension ContainerCreateRoute {
                     searchDomains: existing?.searchDomains ?? [],
                     options: existing?.options ?? []
                 )
+            } else if dnsMode == .appleDNS {
+                // Sorted so the injected search-domain order is deterministic.
+                let aliasSearchNetworks = containerConfiguration.networks.map(\.network).filter {
+                    !NetworkAliasDNS.isReservedNetwork($0)
+                }.sorted()
+                let existing = containerConfiguration.dns
+                if let dnsConfiguration = ContainerCreateRoute.networkAliasDNS(
+                    existing: existing, networks: aliasSearchNetworks, dnsDomain: dnsDomain
+                ) {
+                    containerConfiguration.dns = dnsConfiguration
+                }
             } else if let sidecarNetwork = ContainerCreateRoute.dnsSidecarNetwork(
                 explicitNameservers: nameservers,
                 firstNamedNetwork: firstNamedNetwork,
@@ -842,7 +881,11 @@ extension ContainerCreateRoute {
                 await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
             }
             // Docker Engine API: POST /containers/create returns 201 Created.
-            let createResponse = RESTContainerCreate(Id: hexId, Warnings: [])
+            var seenWarnings = Set<String>()
+            let createResponse = RESTContainerCreate(
+                Id: hexId,
+                Warnings: createWarnings.filter { seenWarnings.insert($0).inserted }
+            )
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
@@ -866,6 +909,69 @@ extension ContainerCreateRoute {
         guard explicitNameservers.isEmpty else { return nil }
         if let named = firstNamedNetwork { return named }
         return primaryNetwork == "default" ? "default" : nil
+    }
+
+    /// True for a Compose replica that must not claim the service's shared names in
+    /// `apple-dns` mode: apple/container requires names to be globally unique. Marks
+    /// `container-number` present but not `1`, or absent (one-offs, hook runners);
+    /// both identity labels are required — `docker run` is unaffected.
+    static func dropsSharedComposeNames(labels: [String: String]) -> Bool {
+        guard let project = labels["com.docker.compose.project"], !project.isEmpty,
+            let service = labels["com.docker.compose.service"], !service.isEmpty
+        else { return false }
+        return labels["com.docker.compose.container-number"] != "1"
+    }
+
+    /// Per-attachment options for one network: in `apple-dns` mode a non-reserved network
+    /// gets the FQDN of the requested hostname — the container name when none was
+    /// requested — plus the qualified aliases (none for a non-primary Compose replica,
+    /// see `dropsSharedComposeNames`); else the plain hostname and no aliases.
+    static func attachmentOptions(
+        dnsMode: DNSMode,
+        dnsDomain: String?,
+        id: String,
+        hostname: String,
+        requestedHostname: String?,
+        network: String,
+        aliases: [String],
+        labels: [String: String] = [:],
+        warn: (String) -> Void = { _ in }
+    ) -> AttachmentOptions {
+        guard dnsMode == .appleDNS, let dnsDomain,
+            !NetworkAliasDNS.isReservedNetwork(network)
+        else {
+            return AttachmentOptions(hostname: hostname)
+        }
+        guard !dropsSharedComposeNames(labels: labels) else {
+            return AttachmentOptions(
+                hostname: NetworkAliasDNS.qualify(id, network: network, dnsDomain: dnsDomain))
+        }
+        let base = ContainerNameUtility.sanitize(requestedHostname ?? id)
+        let attachmentHostname = NetworkAliasDNS.qualify(base, network: network, dnsDomain: dnsDomain)
+        // Container id/name stays reachable as an alias.
+        let qualified = NetworkAliasDNS.qualifiedAliases(
+            [id] + aliases, network: network, dnsDomain: dnsDomain, hostname: attachmentHostname,
+            warn: warn
+        )
+        return AttachmentOptions(hostname: attachmentHostname, aliases: qualified)
+    }
+
+    /// The resolv.conf for an `apple-dns` container on a named network: the zone search
+    /// domains are added, and the nameserver is left to apple, which substitutes the vmnet
+    /// gateway — the one that reaches apple's DNS through the host resolver.
+    static func networkAliasDNS(
+        existing: ContainerConfiguration.DNSConfiguration?,
+        networks: [String],
+        dnsDomain: String?
+    ) -> ContainerConfiguration.DNSConfiguration? {
+        guard let existing, let dnsDomain, !networks.isEmpty else { return nil }
+        let userOptions = existing.options.filter { !$0.lowercased().hasPrefix("ndots:") }
+        return ContainerConfiguration.DNSConfiguration(
+            nameservers: [],
+            domain: existing.domain,
+            searchDomains: NetworkAliasDNS.searchDomains(existing.searchDomains, networks: networks, dnsDomain: dnsDomain),
+            options: userOptions + [NetworkAliasDNS.ndots(from: existing.options)]
+        )
     }
 
     /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the

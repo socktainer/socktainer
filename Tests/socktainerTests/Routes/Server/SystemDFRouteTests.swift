@@ -105,6 +105,28 @@ struct SystemDFRouteNetworkSettingsTests {
         }
     }
 
+    @Test("Container summaries carry the aliases from the configured attachment")
+    func configuredAliasesSurface() async throws {
+        var container = try makeContainerSnapshot(
+            nativeId: "c1",
+            networks: [(network: "mynet", ip: "192.168.64.5")],
+            labels: [:],
+            status: .running
+        )
+        container.configuration.networks = [
+            AttachmentConfiguration(
+                network: "mynet",
+                options: AttachmentOptions(hostname: "c1", aliases: ["api.test"])
+            )
+        ]
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/system/df") { res async throws in
+                let body = try res.content.decode(SystemDFResponse.self)
+                #expect(body.Containers?.first?.NetworkSettings.Networks?["mynet"]?.Aliases == ["api.test"])
+            }
+        }
+    }
+
     @Test("Container Id is the canonical hex digest, matching /containers/json and /containers/{id}/json")
     func containerIdIsCanonicalHexDigest() async throws {
         let container = try makeContainerSnapshot(nativeId: "my-native-container", ip: "192.168.64.5", network: "mynet", labels: [:], status: .running)

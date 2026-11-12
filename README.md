@@ -512,6 +512,35 @@ services:
 > (e.g. both have a `db` service) will share the short-form alias — last
 > started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
 
+### DNS modes
+
+Socktainer resolves container names in one of two modes, selected at daemon start:
+
+| Mode | Flag | How it works |
+|---|---|---|
+| `socktainer-dns` (default) | `--dns-mode socktainer-dns` | One DNS forwarder container per named network; names are served by socktainer's in-process DNS server. |
+| `apple-dns` | `--dns-mode apple-dns` | No sidecars: names are registered as network aliases on each attachment and served by Apple Container's built-in DNS. |
+
+The mode can also be set via the `SOCKTAINER_DNS_MODE` environment variable
+(the flag takes precedence). `apple-dns` needs setup on the apple/container
+side; the daemon refuses to start until it is done. See apple/container's
+[networking guide](https://github.com/apple/container/blob/main/docs/networking.md)
+for the steps.
+
+In `apple-dns` mode:
+
+- A container's hostname, name and aliases on a named network become
+  `<label>.<network>.<domain>` unless they already end in a dot or the configured
+  `<domain>`. Search domains let containers reach each other by short name.
+- **Scaled Compose services**: the service name resolves to replica 1 only;
+  replicas ≥2 are reachable by their container name alone and never take over
+  the service name, even after replica 1 stops.
+- **`--internal` (host-only) networks get no DNS at all**: neither external nor
+  container names resolve. Use `--dns-mode socktainer-dns` (the default) when containers
+  on internal networks need name resolution.
+- **Unregistered short names can leak to your upstream DNS**: `socktainer-dns` mode
+  answers them locally; `apple-dns` mode forwards them to your normal resolver.
+
 ### Container-to-container connections fail with `EHOSTUNREACH`
 
 If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
