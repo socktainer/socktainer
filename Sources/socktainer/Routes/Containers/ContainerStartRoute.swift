@@ -17,6 +17,10 @@ struct ContainerStartQuery: Content {
 }
 
 extension ContainerStartRoute {
+    /// How many consecutive `getContainer` failures the unknown-exit observer tolerates
+    /// before it stops polling (100ms apart) and leaves cleanup to the next lifecycle.
+    static let unknownExitProbeFailureLimit = 50
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
 
@@ -159,6 +163,21 @@ extension ContainerStartRoute {
         }
     }
 
+    /// Decides whether the restart policy wants this exit restarted.
+    ///
+    /// `on-failure` is the only policy that reasons about *how* the process ended, so it is
+    /// the only one that needs a real exit code: an unknown status (`waitFailureSentinel`)
+    /// is not evidence of failure and must not be read as one. `always` and
+    /// `unless-stopped` restart on an exit regardless of the code, so an unknown code does
+    /// not change their outcome and they keep evaluating normally.
+    static func restartDecision(
+        policy: RestartPolicy, exitCode: Int32, exitCodeKnown: Bool, attempt: Int, hasBeenManuallyStopped: Bool
+    ) -> Bool {
+        if policy.Name == "on-failure" && !exitCodeKnown { return false }
+        return RestartPolicyManager.shouldRestart(
+            policy: policy, exitCode: exitCode, attempt: attempt, hasBeenManuallyStopped: hasBeenManuallyStopped)
+    }
+
     /// Awaits the container's init process exit, fires the "die" event, and — unless it was
     /// created with `--rm` — honors `HostConfig.RestartPolicy` by restarting it and re-arming
     /// this observer for the next lifecycle. Runs as a detached background task.
@@ -196,13 +215,79 @@ extension ContainerStartRoute {
                 return
             }
 
-            let executionDuration = Date().timeIntervalSince(startedAt)
+            // The authoritative wait failed, so the exit code is unknown. The sentinel
+            // standing in for it has to be non-zero to stay distinguishable from a genuine
+            // exit 0, so `on-failure` must not read it as a crash and restart an instance
+            // that may never have failed. The `die` event still carries the sentinel as its
+            // `exitCode`: moby always includes the attribute, and Compose (and CI jobs using
+            // --abort-on-container-exit / --exit-code-from) read a missing one as exit 0.
+            // Exit cleanup waits for a confirmed stop (or an already-reaped `--rm` container)
+            // so a still-running container keeps its mounts, cache entry, and DNS aliases.
+            let exitCodeKnown = code != ContainerExitCodeStore.waitFailureSentinel
 
             // moby unmounts the container's volumes during exit cleanup, before logging
             // "die" (daemon/monitor.go → daemon.Cleanup → container.UnmountVolumes). The
             // snapshot is re-fetched here; a --rm container already reaped by Apple
             // Container resolves to nil and skips its unmount events.
-            let exitSnapshot = try? await client.getContainer(id: nativeId)
+            // `try?` would collapse a thrown probe error and a genuinely missing container
+            // into the same `nil`. With a known exit code that is harmless: the container has
+            // already exited and a `--rm` one is expected to be gone. On the unknown-exit path
+            // a failed probe is not evidence of a stop, so it must not be read as one — doing
+            // so skipped the polling loop and tore down a live run's mounts, cache entry, and
+            // DNS aliases.
+            var exitSnapshot: ContainerSnapshot?
+            var initialProbeFailed = false
+            do {
+                exitSnapshot = try await client.getContainer(id: nativeId)
+            } catch {
+                initialProbeFailed = true
+            }
+            var confirmedStopped = !initialProbeFailed && (exitSnapshot == nil || exitSnapshot?.status == .stopped)
+
+            if !exitCodeKnown {
+                logger.error("restart-policy: exit status unavailable for \(nativeId); waiting for a confirmed stop, on-failure will not restart")
+                // The authoritative wait can fail before the init process has actually
+                // exited. Returning here would leave this run with no observer at all: the
+                // attach monitor defers ownership to us via `reserveForStart`, so nothing
+                // else would broadcast its unmounts, unregister its DNS aliases, or run the
+                // `--rm` cleanup. Keep watching this run until a later status confirms the
+                // stop, re-checking the generation each time so a newer lifecycle can take
+                // over without this observer fighting it. A probe that keeps erroring is
+                // not a stopped container, so an unreachable client eventually gives up
+                // rather than polling forever.
+                // A live container whose exit wait failed is probed every 100ms for as long
+                // as the run lasts. This is a rare fallback, but each tick is an XPC
+                // round-trip to the same daemon that just failed the wait, so the loop is
+                // bounded by the failure limit below instead of running indefinitely.
+                var consecutiveProbeFailures = 0
+                while !confirmedStopped, consecutiveProbeFailures < Self.unknownExitProbeFailureLimit {
+                    guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard await ContainerRestartState.shared.isCurrent(id: nativeId, generation: generation) else {
+                        return
+                    }
+                    do {
+                        exitSnapshot = try await client.getContainer(id: nativeId)
+                        confirmedStopped = exitSnapshot == nil || exitSnapshot?.status == .stopped
+                        consecutiveProbeFailures = 0
+                    } catch {
+                        consecutiveProbeFailures += 1
+                    }
+                }
+                guard confirmedStopped else {
+                    logger.error(
+                        "restart-policy: container \(nativeId) still has an unknown exit status and could not be probed; leaving its cleanup to the next lifecycle")
+                    return
+                }
+            }
+
+            // The run can keep going past the failed wait while the observer polls for a
+            // confirmed stop. Measure only now so `die`'s execDuration covers the whole run
+            // and the backoff decision sees the real uptime instead of a near-zero value.
+            let executionDuration = Date().timeIntervalSince(startedAt)
+
             if let exitSnapshot {
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
@@ -213,13 +298,20 @@ extension ContainerStartRoute {
             // `docker compose up` runs a service. Claiming twice would double every exit.
             let ownsExit = await DieEventOwnership.shared.claimForStart(id: nativeId, epoch: runEpoch, generation: generation)
             if ownsExit {
-                var attrs = labels
-                attrs["exitCode"] = String(code)
-                // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
-                attrs["execDuration"] = String(Int(executionDuration))
+                // The container exited, so `die` is reported even when the status could not be
+                // observed: withholding it would leave `docker events`, `docker wait`, and
+                // Compose's --abort-on-container-exit with no stop signal at all. moby always
+                // includes `exitCode`, so an unobserved status publishes the -1 sentinel rather
+                // than omitting the attribute — a missing code reads as a successful exit 0 to
+                // Compose, while the sentinel stays distinguishable from a genuine exit 0.
+                let extraAttributes = [
+                    // moby's die event carries the run duration in whole seconds (daemon/monitor.go).
+                    "execDuration": String(Int(executionDuration)),
+                    "exitCode": String(code)
+                ]
                 let dieEvent = DockerEvent.simpleEvent(
                     id: eventId, type: "container", status: "die",
-                    image: image, name: name, labels: attrs
+                    image: image, name: name, labels: labels, extraAttributes: extraAttributes
                 )
                 await broadcaster.broadcast(dieEvent)
             }
@@ -249,8 +341,9 @@ extension ContainerStartRoute {
             let effectivePolicy = await RestartPolicyOverrideStore.shared.get(id: eventId) ?? restartPolicy
             let willRestart =
                 effectivePolicy.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown,
+                        attempt: nextAttemptNumber, hasBeenManuallyStopped: explicitlyStopped)
                 } ?? false
 
             // Staying stopped: moby tears down a container's network sandbox (and its DNS
@@ -286,8 +379,8 @@ extension ContainerStartRoute {
             let stoppedDuringBackoff = await ContainerRestartState.shared.consumeExplicitlyStopped(id: nativeId)
             let stillWantsRestart =
                 policyAfterBackoff.map {
-                    RestartPolicyManager.shouldRestart(
-                        policy: $0, exitCode: code, attempt: nextAttemptNumber,
+                    restartDecision(
+                        policy: $0, exitCode: code, exitCodeKnown: exitCodeKnown, attempt: nextAttemptNumber,
                         hasBeenManuallyStopped: explicitlyStopped || stoppedDuringBackoff)
                 } ?? false
             guard stillWantsRestart else {
