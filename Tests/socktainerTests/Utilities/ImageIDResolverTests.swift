@@ -67,4 +67,77 @@ struct ImageIDResolverTests {
     func noMatch() {
         #expect(ImageIDResolver.uniqueMatch("dddd11110000", in: [Self.image]) == nil)
     }
+
+    // MARK: - repo@sha256:<digest> references
+
+    static let indexHex = String(repeating: "ab", count: 32)
+
+    @Test("parses repo@sha256:<digest> references")
+    func parsesDigestReferences() {
+        let parsed = ImageIDResolver.parseDigestReference("example/tool@sha256:\(Self.indexHex)")
+        #expect(parsed?.repository == "example/tool")
+        #expect(parsed?.digest == "sha256:\(Self.indexHex)")
+        #expect(ImageIDResolver.parseDigestReference("docker.io/library/busybox@sha256:\(Self.indexHex)")?.repository == "docker.io/library/busybox")
+    }
+
+    @Test("rejects plain references, tags and malformed digests")
+    func rejectsNonDigestReferences() {
+        #expect(ImageIDResolver.parseDigestReference("busybox:1.37") == nil)
+        #expect(ImageIDResolver.parseDigestReference("busybox") == nil)
+        #expect(ImageIDResolver.parseDigestReference("sha256:\(Self.indexHex)") == nil)
+        #expect(ImageIDResolver.parseDigestReference("busybox@sha256:abc") == nil)
+        #expect(ImageIDResolver.parseDigestReference("busybox@md5:\(Self.indexHex)") == nil)
+        #expect(ImageIDResolver.parseDigestReference("@sha256:\(Self.indexHex)") == nil)
+    }
+
+    @Test("repository comparison ignores the docker.io and library/ defaults, tags and digests")
+    func repositoryMatching() {
+        #expect(ImageIDResolver.repositoryMatches("busybox", "docker.io/library/busybox:1.37"))
+        #expect(ImageIDResolver.repositoryMatches("library/busybox", "busybox"))
+        #expect(ImageIDResolver.repositoryMatches("example/tool", "docker.io/example/tool:arm64-v1"))
+        #expect(ImageIDResolver.repositoryMatches("ghcr.io/apple/container", "ghcr.io/apple/container:latest"))
+        #expect(ImageIDResolver.repositoryMatches("localhost:5000/app", "localhost:5000/app:dev"))
+        #expect(!ImageIDResolver.repositoryMatches("busybox", "docker.io/library/alpine:3"))
+        #expect(!ImageIDResolver.repositoryMatches("ghcr.io/apple/container", "docker.io/apple/container:latest"))
+    }
+
+    static let manifestHex = String(repeating: "12", count: 32)
+    @Test("a digest equal to the index digest matches the index")
+    func digestMatchesIndex() {
+        let match = ImageIDResolver.digestMatch(
+            "sha256:\(Self.indexHex)", indexDigest: "sha256:\(Self.indexHex)",
+            manifests: [(digest: "sha256:\(Self.manifestHex)", platform: Self.arm64)])
+        #expect(match == .index)
+    }
+
+    @Test("a per-platform manifest digest matches and carries that platform")
+    func digestMatchesManifest() {
+        // RepoDigests reports the selected platform's manifest digest, which is what clients send back.
+        let match = ImageIDResolver.digestMatch(
+            "sha256:\(Self.manifestHex)", indexDigest: "sha256:\(Self.indexHex)",
+            manifests: [
+                (digest: "sha256:" + String(repeating: "34", count: 32), platform: Self.amd64),
+                (digest: "sha256:\(Self.manifestHex)", platform: Self.arm64),
+            ])
+        #expect(match == .manifest(Self.arm64))
+    }
+
+    @Test("an unknown digest matches nothing")
+    func digestMatchesNothing() {
+        let other = "sha256:" + String(repeating: "ef", count: 32)
+        let match = ImageIDResolver.digestMatch(
+            other, indexDigest: "sha256:\(Self.indexHex)",
+            manifests: [(digest: "sha256:\(Self.manifestHex)", platform: Self.arm64)])
+        #expect(match == nil)
+    }
+
+    @Test("a repository qualified with a private default registry only matches that registry")
+    func repositoryWithPrivateDefaultRegistry() {
+        // resolve() qualifies the requested repository with the configured default registry
+        // before comparing, so an image that shares the digest under Docker Hub is not picked.
+        #expect(ImageIDResolver.repositoryMatches("registry.example.com/team/app", "registry.example.com/team/app:latest"))
+        #expect(!ImageIDResolver.repositoryMatches("registry.example.com/team/app", "docker.io/team/app:latest"))
+        #expect(!ImageIDResolver.repositoryMatches("docker.io/team/app", "registry.example.com/team/app:latest"))
+        #expect(ImageIDResolver.repositoryMatches("docker.io/team/app", "team/app:latest"))
+    }
 }
