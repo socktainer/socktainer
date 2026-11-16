@@ -1,3 +1,4 @@
+import ContainerPersistence
 import ContainerizationOCI
 import Testing
 
@@ -131,10 +132,26 @@ struct ImageIDResolverTests {
         #expect(match == nil)
     }
 
-    @Test("a repository qualified with a private default registry only matches that registry")
-    func repositoryWithPrivateDefaultRegistry() {
-        // resolve() qualifies the requested repository with the configured default registry
-        // before comparing, so an image that shares the digest under Docker Hub is not picked.
+    @Test("the requested repository is qualified with the configured default registry")
+    func qualifiesWithConfiguredDefaultRegistry() {
+        let hub = ContainerSystemConfig()
+        let ghcr = ContainerSystemConfig(registry: .init(domain: "ghcr.io"))
+        #expect(ImageIDResolver.qualifiedRepository("team/app", containerSystemConfig: ghcr) == "ghcr.io/team/app")
+        // A repository that already names a registry keeps it.
+        #expect(ImageIDResolver.qualifiedRepository("docker.io/team/app", containerSystemConfig: ghcr) == "docker.io/team/app")
+        #expect(ImageIDResolver.qualifiedRepository("team/app", containerSystemConfig: hub) == "docker.io/team/app")
+    }
+
+    @Test("with a private default registry, a digest in another registry's copy of the repository does not match")
+    func privateDefaultRegistryIgnoresMirror() {
+        let ghcr = ContainerSystemConfig(registry: .init(domain: "ghcr.io"))
+        let requested = ImageIDResolver.qualifiedRepository("team/app", containerSystemConfig: ghcr)
+        let stored = ["docker.io/team/app:latest", "ghcr.io/team/app:latest"]
+        #expect(stored.filter { ImageIDResolver.repositoryMatches(requested, $0) } == ["ghcr.io/team/app:latest"])
+    }
+
+    @Test("repository comparison keeps registries apart")
+    func repositoryComparisonKeepsRegistriesApart() {
         #expect(ImageIDResolver.repositoryMatches("registry.example.com/team/app", "registry.example.com/team/app:latest"))
         #expect(!ImageIDResolver.repositoryMatches("registry.example.com/team/app", "docker.io/team/app:latest"))
         #expect(!ImageIDResolver.repositoryMatches("docker.io/team/app", "registry.example.com/team/app:latest"))

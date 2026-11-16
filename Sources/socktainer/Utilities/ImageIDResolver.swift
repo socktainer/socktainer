@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerPersistence
 import ContainerizationOCI
+import Logging
 
 /// Resolves an image the way Docker does: by reference, by `repository@sha256:<digest>`, or by (short) image ID.
 ///
@@ -8,6 +9,8 @@ import ContainerizationOCI
 /// short hex ID, as reported by `GET /images/json` (index digest) or
 /// `GET /images/{name}/json` (config digest), would never match.
 enum ImageIDResolver {
+    private static let log = Logger(label: "socktainer.imageid")
+
     /// The bare lowercase hex of `value` if it looks like an image ID
     /// (`sha256:` optional, 12–64 hex chars), otherwise nil.
     static func candidateID(_ value: String) -> String? {
@@ -34,13 +37,19 @@ enum ImageIDResolver {
         return (repository, digest)
     }
 
-    /// The repository part of a reference, normalized the way Docker does for comparison:
-    /// no tag, no digest, and without the implicit `docker.io/` and `library/` defaults.
-    static func normalizedRepository(_ reference: String) -> String {
+    /// `reference` without its digest and tag.
+    static func repositoryWithoutTag(_ reference: String) -> String {
         var name = reference
         if let at = name.firstIndex(of: "@") { name = String(name[..<at]) }
         // A ':' after the last '/' is a tag; one before it is a registry port.
         if let colon = name.lastIndex(of: ":"), !(name[colon...].contains("/")) { name = String(name[..<colon]) }
+        return name
+    }
+
+    /// The repository part of a reference, normalized the way Docker does for comparison:
+    /// no tag, no digest, and without the implicit `docker.io/` and `library/` defaults.
+    static func normalizedRepository(_ reference: String) -> String {
+        var name = repositoryWithoutTag(reference)
         for prefix in ["index.docker.io/", "registry-1.docker.io/", "docker.io/"] where name.hasPrefix(prefix) {
             name = String(name.dropFirst(prefix.count))
             break
@@ -51,6 +60,14 @@ enum ImageIDResolver {
 
     static func repositoryMatches(_ lhs: String, _ rhs: String) -> Bool {
         normalizedRepository(lhs) == normalizedRepository(rhs)
+    }
+
+    /// The repository of a `repository@sha256:<digest>` reference, qualified the way
+    /// `ClientImage.get` qualifies a reference: with the configured default registry unless it
+    /// already names one. Falls back to the repository as given when it cannot be normalized.
+    static func qualifiedRepository(_ repository: String, containerSystemConfig: ContainerSystemConfig) -> String {
+        // normalizeReference also appends the default tag, which is not part of the repository.
+        repositoryWithoutTag((try? ClientImage.normalizeReference(repository, containerSystemConfig: containerSystemConfig)) ?? repository)
     }
 
     enum DigestMatch: Equatable {
@@ -123,13 +140,19 @@ enum ImageIDResolver {
             if let parsed = parseDigestReference(refOrId) {
                 // Qualify the repository the way ClientImage.get does, so the configured default
                 // registry applies and the same digest under another registry never matches.
-                let repository = (try? ClientImage.normalizeReference(parsed.repository, containerSystemConfig: containerSystemConfig)) ?? parsed.repository
+                let repository = qualifiedRepository(parsed.repository, containerSystemConfig: containerSystemConfig)
                 for image in try await ClientImage.list() where repositoryMatches(repository, image.reference) {
                     // Only images of the requested repository get their index read.
                     if image.digest == parsed.digest {
                         return Resolved(image: image, platform: nil, byID: true)
                     }
-                    let manifests = ((try? await image.index().manifests) ?? []).map { (digest: $0.digest, platform: $0.platform) }
+                    var manifests: [(digest: String, platform: Platform?)] = []
+                    do {
+                        manifests = try await image.index().manifests.map { (digest: $0.digest, platform: $0.platform) }
+                    } catch {
+                        // Skipped rather than failed: the caller still gets the original "not found".
+                        log.debug("could not read the index of \(image.reference) while resolving \(refOrId): \(error)")
+                    }
                     switch digestMatch(parsed.digest, indexDigest: image.digest, manifests: manifests) {
                     case .manifest(let platform)?:
                         return Resolved(image: image, platform: platform, byID: true)
