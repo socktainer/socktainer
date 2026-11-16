@@ -535,6 +535,10 @@ In `apple-dns` mode:
 - **Scaled Compose services**: the service name resolves to replica 1 only;
   replicas ≥2 are reachable by their container name alone and never take over
   the service name, even after replica 1 stops.
+- **Compose recreation fails**: any attempt by `docker compose up` to recreate a
+  container attached to a user-defined network will be rejected with a `409 Conflict`
+  "name already in use" error, even if the old container is stopped. Recreate via
+  `docker compose down && docker compose up`.
 - **`--internal` (host-only) networks get no DNS at all**: neither external nor
   container names resolve. Use `--dns-mode socktainer-dns` (the default) when containers
   on internal networks need name resolution.
