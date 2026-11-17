@@ -859,6 +859,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
                     message: "unsupported archive entry type for copy into a running container: \(relativePath)")
             }
         }
+        // A corrupt or truncated stream ends the iteration without throwing:
+        // refuse it rather than copy the entries that happened to decode.
+        try archiveReader.throwIfStreamFailed()
         return plan
     }
 
@@ -1525,7 +1528,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
                     message: "Refusing to overwrite \(existingIsDirectory ? "directory" : "non-directory") at \(fullPath)"
                 )
             }
-        }
+        }  // A corrupt or truncated stream ends the iteration without throwing:
+        // refuse it before the rootfs is rebuilt from a partial archive.
+        try archiveReader.throwIfStreamFailed()
     }
 
     /// Extract a path from the ext4 filesystem to a local directory.
