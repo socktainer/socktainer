@@ -173,6 +173,8 @@ struct ContainerArchiveRoute: RouteCollection {
                     throw Abort(.notFound, reason: error.localizedDescription)
                 case .invalidPath:
                     throw Abort(.badRequest, reason: error.localizedDescription)
+                case .invalidArchive:
+                    throw Abort(.badRequest, reason: error.localizedDescription)
                 default:
                     throw Abort(.internalServerError, reason: error.localizedDescription)
                 }
