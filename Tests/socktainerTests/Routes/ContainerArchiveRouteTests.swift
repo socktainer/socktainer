@@ -100,6 +100,23 @@ struct ContainerArchiveRouteTests {
             }
         }
     }
+
+    @Test("a corrupt uploaded archive maps to 400")
+    func corruptUpload() async throws {
+        let archive = FakeArchiveClient(
+            getResult: .failure(.operationFailed(message: "not under test")),
+            putError: .invalidArchive(reason: "truncated gzip input"))
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+
+        try await withArchiveApp(snapshot: snapshot, archive: archive) { app in
+            try await app.testing().test(
+                .PUT, "/v1.51/containers/web/archive?path=/tmp",
+                beforeRequest: { req in req.body = ByteBuffer(bytes: [0x1f, 0x8b, 0x08, 0x00]) }
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -122,6 +139,7 @@ private func withArchiveApp(
 
 private struct FakeArchiveClient: ClientArchiveProtocol {
     var getResult: Result<(tarData: Data, stat: PathStat), ClientArchiveError>
+    var putError: ClientArchiveError? = nil
 
     func getRootfsPath(containerId: String) -> URL {
         URL(fileURLWithPath: "/nonexistent/rootfs.ext4")
@@ -139,7 +157,9 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
         throw ClientArchiveError.operationFailed(message: "unreachable")
     }
 
-    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {}
+    func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
+        if let putError { throw putError }
+    }
 
     func exportRootfs(containerId: String) async throws -> URL {
         throw ClientArchiveError.operationFailed(message: "not under test")

@@ -59,9 +59,12 @@ struct ArchiveUtility {
         // not enough: `BZh-notes.txt` is a valid first member. Match as much of
         // each signature as the format fixes.
         if magic.starts(with: [0x1f, 0x8b, 0x08]) { return .gzip }
-        // "BZh", a block size of '1'...'9', then the block header magic.
+        // "BZh", a block size of '1'...'9', then either the block header
+        // magic or, for a stream that opens with an empty member, the
+        // end-of-stream magic.
         if magic.count >= 10, magic.starts(with: [0x42, 0x5a, 0x68]), (0x31...0x39).contains(magic[3]),
             magic[4...9].elementsEqual([0x31, 0x41, 0x59, 0x26, 0x53, 0x59])
+                || magic[4...9].elementsEqual([0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
         {
             return .bzip2
         }

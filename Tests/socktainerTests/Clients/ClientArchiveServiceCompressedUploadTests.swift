@@ -107,9 +107,39 @@ struct ClientArchiveServiceCompressedUploadTests {
 
         let service = ClientArchiveService(appSupportPath: dir, flushGuest: { _ in })
         #expect(try service.parseArchiveEntries(tarPath: whole, destinationPath: "/tmp").count == 2)
-        #expect(throws: (any Error).self) {
+        do {
             _ = try service.parseArchiveEntries(tarPath: truncated, destinationPath: "/tmp")
+            Issue.record("expected invalidArchive")
+        } catch let error as ClientArchiveError {
+            // invalidArchive is what the route maps to 400.
+            guard case .invalidArchive = error else {
+                Issue.record("expected invalidArchive, got \(error)")
+                return
+            }
         }
+    }
+
+    @Test("a bzip2 stream that opens with an empty member is detected and decoded")
+    func bzip2EmptyFirstMemberIsDecoded() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("put-compressed-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        try Data("notes\n".utf8).write(to: dir.appendingPathComponent("notes.txt"))
+        let member = dir.appendingPathComponent("member.tar.bz2")
+        try runTar(["-cjf", member.path, "-C", dir.path, "notes.txt"])
+
+        // bzip2 of empty input: "BZh9", the end-of-stream magic, a zero CRC.
+        // Concatenated members decompress to their combined contents.
+        let emptyMember = Data([0x42, 0x5a, 0x68, 0x39, 0x17, 0x72, 0x45, 0x38, 0x50, 0x90, 0x00, 0x00, 0x00, 0x00])
+        let archive = dir.appendingPathComponent("upload")
+        try (emptyMember + Data(contentsOf: member)).write(to: archive)
+
+        #expect(ArchiveUtility.compressionFilter(of: archive) == .bzip2)
+
+        let service = ClientArchiveService(appSupportPath: dir, flushGuest: { _ in })
+        let plan = try service.parseArchiveEntries(tarPath: archive, destinationPath: "/tmp")
+        #expect(plan.map(\.guestPath) == ["/tmp/notes.txt"])
     }
 
     private func runTar(_ arguments: [String]) throws {

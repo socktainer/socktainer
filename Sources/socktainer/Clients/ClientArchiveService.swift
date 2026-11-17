@@ -51,6 +51,8 @@ enum ClientArchiveError: Error, LocalizedError {
     case rootfsNotFound(id: String)
     case invalidPath(path: String)
     case notADirectory(path: String)
+    /// The uploaded archive is corrupt or truncated: the client's fault.
+    case invalidArchive(reason: String)
     case operationFailed(message: String)
 
     var errorDescription: String? {
@@ -65,6 +67,8 @@ enum ClientArchiveError: Error, LocalizedError {
             return "Invalid path: \(path)"
         case .notADirectory(let path):
             return "Extraction point is not a directory: \(path)"
+        case .invalidArchive(let reason):
+            return "Invalid archive: \(reason)"
         case .operationFailed(let message):
             return "Archive operation failed: \(message)"
         }
@@ -823,6 +827,16 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
+    /// Refuse an uploaded archive whose stream failed while it was read, as
+    /// `invalidArchive`, so the route answers 400 rather than 500.
+    static func throwIfCorrupt(_ reader: ArchiveReader) throws {
+        do {
+            try reader.throwIfStreamFailed()
+        } catch {
+            throw ClientArchiveError.invalidArchive(reason: "\(error)")
+        }
+    }
+
     /// Parse the uploaded tar into a copy plan. The upload may be compressed.
     func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
         let archiveReader = try ArchiveReader(
@@ -861,7 +875,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
         // A corrupt or truncated stream ends the iteration without throwing:
         // refuse it rather than copy the entries that happened to decode.
-        try archiveReader.throwIfStreamFailed()
+        try Self.throwIfCorrupt(archiveReader)
         return plan
     }
 
@@ -1530,7 +1544,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
         }  // A corrupt or truncated stream ends the iteration without throwing:
         // refuse it before the rootfs is rebuilt from a partial archive.
-        try archiveReader.throwIfStreamFailed()
+        try Self.throwIfCorrupt(archiveReader)
     }
 
     /// Extract a path from the ext4 filesystem to a local directory.
