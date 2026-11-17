@@ -823,11 +823,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Parse the uploaded tar into a copy plan.
-    private func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
+    /// Parse the uploaded tar into a copy plan. The upload may be compressed.
+    func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: ArchiveUtility.compressionFilter(of: tarPath),
             file: tarPath
         )
 
@@ -1503,7 +1503,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     ) throws {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: ArchiveUtility.compressionFilter(of: tarPath),
             file: tarPath
         )
 
