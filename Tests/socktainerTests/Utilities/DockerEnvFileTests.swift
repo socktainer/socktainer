@@ -63,6 +63,31 @@ struct DockerEnvFileTests {
         #expect(!FileManager.default.fileExists(atPath: root.path))
     }
 
+    @Test("Honours a client /.dockerenv written with . and .. components")
+    func clientMountWithDotComponentsWins() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for destination in ["/var/../.dockerenv", "//.dockerenv", "/./.dockerenv", "/../.dockerenv", "/a/./b/../../.dockerenv"] {
+            let own = Filesystem.virtiofs(source: "/tmp/my-dockerenv", destination: destination, options: [])
+            #expect(try DockerEnvFile.mount(existing: [own], readOnlyRootfs: false, root: root) == nil, "\(destination)")
+        }
+    }
+
+    @Test("Normalizes guest paths without following host symlinks")
+    func normalizesLexically() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // On the host, `link/..` resolves through the symlink to `real`; lexically it is `root`.
+        let real = root.appendingPathComponent("real/deep")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("link"), withDestinationURL: real)
+        try Data().write(to: root.appendingPathComponent("real/file"))
+
+        #expect(DockerEnvFile.normalized(root.path + "/link/../file") == root.path + "/file")
+    }
+
     @Test("Skips the marker for a read-only root filesystem")
     func skipsReadOnlyRootfs() throws {
         let root = temporaryRoot()

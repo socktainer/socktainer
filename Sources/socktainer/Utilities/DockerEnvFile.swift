@@ -60,8 +60,21 @@ enum DockerEnvFile {
         mounts.filter { !isMarker($0) }
     }
 
-    private static func normalized(_ path: String) -> String {
-        let standardized = (path as NSString).standardizingPath
-        return standardized.isEmpty ? path : standardized
+    /// Collapses `.`, `..` and repeated or trailing slashes in a guest path. This is purely
+    /// lexical: `NSString.standardizingPath` would resolve `..` through the host's
+    /// symlinks, which say nothing about the guest's filesystem.
+    static func normalized(_ path: String) -> String {
+        var components: [Substring] = []
+        for component in path.split(separator: "/") {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                _ = components.popLast()
+            default:
+                components.append(component)
+            }
+        }
+        return "/" + components.joined(separator: "/")
     }
 }
