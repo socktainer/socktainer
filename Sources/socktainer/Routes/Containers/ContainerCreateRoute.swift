@@ -19,11 +19,13 @@ struct ContainerCreateRoute: RouteCollection {
 
     /// Whether a create error means the requested name is taken
     /// (Apple Container: `ContainerizationError(.exists, "container already exists: <id>")`).
+    /// A taken hostname or alias is also `.exists`, and keeps its own message.
     static func isNameConflict(_ error: Error) -> Bool {
         if let error = error as? ContainerizationError {
-            return error.code == .exists
+            return error.code == .exists && error.message.lowercased().contains("container already exists")
         }
-        return String(describing: error).lowercased().hasPrefix("exists:")
+        let description = String(describing: error).lowercased()
+        return description.hasPrefix("exists:") && description.contains("container already exists")
     }
 
     let client: ClientContainerProtocol
@@ -268,17 +270,18 @@ extension ContainerCreateRoute {
             // under concurrent startup load the sidecar can drop responses causing auth/realtime/
             // storage to time out on DNS. Only @hostname:port and host=hostname DSN positions are
             // rewritten; IPs are a point-in-time snapshot so DNS remains the runtime path.
-            // host-mode containers are excluded (they already get loopback DNS for fast-fail).
+            // Opt-in via the `socktainer.rewrite-peer-hostnames=true` label, like the loopback
+            // rewrite: the DNS table spans every network, and URL-form values are often meant
+            // for clients, not peers (#479). host-mode containers are excluded (they already
+            // get loopback DNS for fast-fail).
             if !isHostMode, namedNet != nil,
                 let dnsServer = req.application.storage[SocktainerDNSServerKey.self]
             {
-                let peers = dnsServer.listEntries()
-                if !peers.isEmpty {
-                    let hostRewrote = ContainerCreateRoute.rewritePeerHostnames(finalEnv, peers: peers)
-                    if hostRewrote != finalEnv {
-                        req.logger.info("[network] rewrote peer hostnames→IPs in env vars")
-                        finalEnv = hostRewrote
-                    }
+                let hostRewrote = ContainerCreateRoute.peerRewrittenEnv(
+                    finalEnv, labels: body.Labels, peers: dnsServer.listEntries())
+                if hostRewrote != finalEnv {
+                    req.logger.info("[network] rewrote peer hostnames→IPs in env vars")
+                    finalEnv = hostRewrote
                 }
             }
 
@@ -369,10 +372,15 @@ extension ContainerCreateRoute {
                 containerConfiguration.rosetta = true
             }
 
-            // Handle hostname from request - ensure uniqueness to avoid collision,
-            // capped at 64 chars (Linux/VZ hostname limit; longer values fail start with EINVAL)
-            let hostname = ContainerNameUtility.sanitize(
-                (body.Hostname?.isEmpty == false) ? body.Hostname! : "\(id)-\(UUID().uuidString.lowercased())")
+            // Apple Container requires attachment hostnames to be unique across all containers, and
+            // sets the guest hostname to the part before the first dot. A requested hostname gets a
+            // unique suffix, so Compose can create a replacement while the old container still exists.
+            let hostname: String
+            if let requested = body.Hostname, !requested.isEmpty {
+                hostname = ContainerNameUtility.uniqueAttachmentHostname(requested: requested)
+            } else {
+                hostname = ContainerNameUtility.sanitize("\(id)-\(UUID().uuidString.lowercased())")
+            }
 
             // Handle networking configuration from request
             if let networkingConfig = body.NetworkingConfig,
@@ -512,11 +520,16 @@ extension ContainerCreateRoute {
                     searchDomains: existing?.searchDomains ?? [],
                     options: existing?.options ?? []
                 )
-            } else if let firstNetwork = firstNamedNetwork,
+            } else if let sidecarNetwork = ContainerCreateRoute.dnsSidecarNetwork(
+                explicitNameservers: nameservers,
+                firstNamedNetwork: firstNamedNetwork,
+                primaryNetwork: containerConfiguration.networks.first?.network,
+                hasConfiguredUpstream: req.application.storage[SocktainerDNSServerKey.self]?.hasConfiguredUpstream ?? false
+            ),
                 let dnsManager = req.application.storage[NetworkDNSManagerKey.self]
             {
                 do {
-                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: firstNetwork)
+                    let dnsIP = try await dnsManager.ensureDNSContainer(networkId: sidecarNetwork)
                     let existing = containerConfiguration.dns
                     containerConfiguration.dns = ContainerConfiguration.DNSConfiguration(
                         nameservers: [dnsIP],
@@ -525,7 +538,7 @@ extension ContainerCreateRoute {
                         options: existing?.options ?? []
                     )
                 } catch {
-                    req.logger.warning("Could not start DNS container for \(firstNetwork): \(error)")
+                    req.logger.warning("Could not start DNS container for \(sidecarNetwork): \(error)")
                 }
             }
             var labelsWithTimestamp = containerLabels
@@ -844,6 +857,25 @@ extension ContainerCreateRoute {
         }
     }
 
+    /// Network whose DNS forwarder sidecar becomes the container's nameserver, or `nil` to keep
+    /// the nameservers from the request.
+    ///
+    /// Without a configured upstream (`--dns-upstream` / `SOCKTAINER_DNS_UPSTREAM`) only named
+    /// networks get a sidecar, as before. With one, a container on the `default` network also gets
+    /// one so it resolves outside names through the embedded server, and an explicit
+    /// `HostConfig.Dns` (e.g. Compose `dns:`) is left alone.
+    static func dnsSidecarNetwork(
+        explicitNameservers: [String],
+        firstNamedNetwork: String?,
+        primaryNetwork: String?,
+        hasConfiguredUpstream: Bool
+    ) -> String? {
+        guard hasConfiguredUpstream else { return firstNamedNetwork }
+        guard explicitNameservers.isEmpty else { return nil }
+        if let named = firstNamedNetwork { return named }
+        return primaryNetwork == "default" ? "default" : nil
+    }
+
     /// Returns the network name that should receive a DNS forwarder sidecar, or `nil` if the
     /// container uses the default (non-named) network and no DNS setup is needed.
     ///
@@ -907,6 +939,19 @@ extension ContainerCreateRoute {
 
     static func shouldRewriteLoopback(labels: [String: String]?) -> Bool {
         labels?[rewriteLoopbackLabel] == "true"
+    }
+
+    /// Container label that opts in to `rewritePeerHostnames` on named networks.
+    static let rewritePeerHostnamesLabel = "socktainer.rewrite-peer-hostnames"
+
+    static func shouldRewritePeerHostnames(labels: [String: String]?) -> Bool {
+        labels?[rewritePeerHostnamesLabel] == "true"
+    }
+
+    /// `envVars` with peer hostnames rewritten when `labels` opt in, else unchanged.
+    static func peerRewrittenEnv(_ envVars: [String], labels: [String: String]?, peers: [String: String]) -> [String] {
+        guard shouldRewritePeerHostnames(labels: labels), !peers.isEmpty else { return envVars }
+        return rewritePeerHostnames(envVars, peers: peers)
     }
 
     /// Rewrite `127.0.0.1:PORT` → `gatewayIP:PORT` in URL-form env vars (`@` or `://` prefix).

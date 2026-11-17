@@ -2,7 +2,7 @@ import Foundation
 
 /// An IPv4 DNS upstream (host and UDP port) that the embedded DNS server forwards
 /// non-container names to.
-struct DNSUpstream: Equatable {
+struct DNSUpstream: Hashable {
     let host: String
     let port: Int
 
@@ -17,9 +17,9 @@ struct DNSUpstream: Equatable {
         var description: String {
             switch self {
             case .empty:
-                return "value is empty; expected <ipv4>[:port]"
+                return "value is empty; expected <ipv4>[:port] or 'auto'"
             case .invalidHost(let host):
-                return "'\(host)' is not an IPv4 address (hostnames and IPv6 are not supported); expected <ipv4>[:port]"
+                return "'\(host)' is not an IPv4 address (hostnames and IPv6 are not supported); expected <ipv4>[:port] or 'auto'"
             case .unusableAddress(let host):
                 return "'\(host)' cannot be used as a DNS upstream (unspecified or broadcast address)"
             case .invalidPort(let port):
@@ -34,9 +34,25 @@ struct DNSUpstream: Equatable {
         let upstream: DNSUpstream?
         /// A message to log when an ignored value was found.
         let warning: String?
+        /// `auto` was configured: follow the host's resolvers instead of a fixed `upstream`.
+        let followSystemResolvers: Bool
+
+        init(upstream: DNSUpstream?, warning: String?, followSystemResolvers: Bool = false) {
+            self.upstream = upstream
+            self.warning = warning
+            self.followSystemResolvers = followSystemResolvers
+        }
     }
 
     static let environmentKey = "SOCKTAINER_DNS_UPSTREAM"
+
+    /// The value that selects the host's own resolvers instead of an address.
+    static let autoValue = "auto"
+
+    /// Whether `value` is the `auto` keyword (case-insensitive, surrounding whitespace ignored).
+    static func isAuto(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == autoValue
+    }
 
     /// Parses `host` or `host:port`, where `host` is an IPv4 literal and `port` is 1-65535.
     static func parse(_ value: String) throws -> DNSUpstream {
@@ -131,12 +147,16 @@ struct DNSUpstream: Equatable {
         return result
     }
 
-    /// Applies precedence: CLI value > environment variable > `nil` (auto-detect).
+    /// Applies precedence: CLI value > environment variable > `nil` (gateway auto-detection).
+    /// Either value may be `auto` (follow the host's resolvers).
     /// An invalid CLI value is expected to be rejected at startup; if one reaches here
     /// it is ignored with a warning like an invalid environment value.
     static func resolve(cliValue: String?, environment: [String: String]) -> Resolution {
         var warning: String?
         if let cliValue {
+            if isAuto(cliValue) {
+                return Resolution(upstream: nil, warning: nil, followSystemResolvers: true)
+            }
             do {
                 return Resolution(upstream: try parse(cliValue), warning: nil)
             } catch {
@@ -146,6 +166,9 @@ struct DNSUpstream: Equatable {
         if let raw = environment[environmentKey],
             !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
+            if isAuto(raw) {
+                return Resolution(upstream: nil, warning: warning, followSystemResolvers: true)
+            }
             do {
                 return Resolution(upstream: try parse(raw), warning: warning)
             } catch {

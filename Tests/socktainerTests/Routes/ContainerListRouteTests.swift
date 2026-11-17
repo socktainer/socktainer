@@ -50,23 +50,41 @@ private func makeRunningSnapshot(id: String, networks: [ContainerResource.Attach
     )
 }
 
+/// Pass `startedDate: nil` for a container that was created but never booted.
+private func makeStoppedSnapshot(id: String, startedDate: Date?) -> ContainerSnapshot {
+    let processConfig = ProcessConfiguration(
+        executable: "/bin/sh",
+        arguments: [],
+        environment: [],
+        workingDirectory: "/",
+        terminal: false,
+        user: .id(uid: 0, gid: 0)
+    )
+    let imageDesc = ImageDescription(
+        reference: "alpine:latest",
+        descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+    )
+    let config = ContainerConfiguration(id: id, image: imageDesc, process: processConfig)
+    return ContainerSnapshot(configuration: config, status: .stopped, networks: [], startedDate: startedDate)
+}
+
+private func withRoute(
+    container: ContainerSnapshot,
+    test: @escaping (Application) async throws -> Void
+) async throws {
+    try await withApp(configure: { _ in }) { app in
+        let regexRouter = app.regexRouter(with: app.logger)
+        app.setRegexRouter(regexRouter)
+        regexRouter.installMiddleware(on: app)
+
+        let client = MockContainerClient(containers: [container])
+        try app.register(collection: ContainerListRoute(client: client))
+        try await test(app)
+    }
+}
+
 @Suite("ContainerListRoute network settings")
 struct ContainerListRouteNetworkSettingsTests {
-
-    private func withRoute(
-        container: ContainerSnapshot,
-        test: @escaping (Application) async throws -> Void
-    ) async throws {
-        try await withApp(configure: { _ in }) { app in
-            let regexRouter = app.regexRouter(with: app.logger)
-            app.setRegexRouter(regexRouter)
-            regexRouter.installMiddleware(on: app)
-
-            let client = MockContainerClient(containers: [container])
-            try app.register(collection: ContainerListRoute(client: client))
-            try await test(app)
-        }
-    }
 
     @Test("A running container with an IPv6 attachment lists GlobalIPv6Address and prefix length")
     func listReportsIPv6Attachment() async throws {
@@ -128,6 +146,37 @@ struct ContainerListRouteNetworkSettingsTests {
             try await app.testing().test(.GET, "/v1.51/containers/json") { res async throws in
                 let summaries = try res.content.decode([RESTContainerSummary].self)
                 #expect(summaries.first?.NetworkSettings.Networks?.keys.contains("dup") == true)
+            }
+        }
+    }
+}
+
+/// Apple reports a container as `.stopped` from creation onwards, so one that
+/// was never started used to list as `exited`. Docker lists it as `created`,
+/// and Compose's `pre_start` hook lookup depends on that.
+@Suite("ContainerListRoute created state")
+struct ContainerListCreatedStateTests {
+
+    @Test("A container that was never started lists as created / Created")
+    func neverStartedListsAsCreated() async throws {
+        let container = makeStoppedSnapshot(id: "list-never-started-ctr", startedDate: nil)
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=1") { res async throws in
+                let summaries = try res.content.decode([RESTContainerSummary].self)
+                #expect(summaries.first?.State == "created")
+                #expect(summaries.first?.Status == "Created")
+            }
+        }
+    }
+
+    @Test("A container that ran and stopped still lists as exited / Exited")
+    func stoppedAfterRunningListsAsExited() async throws {
+        let container = makeStoppedSnapshot(id: "list-ran-then-stopped-ctr", startedDate: Date(timeIntervalSinceNow: -30))
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/json?all=1") { res async throws in
+                let summaries = try res.content.decode([RESTContainerSummary].self)
+                #expect(summaries.first?.State == "exited")
+                #expect(summaries.first?.Status == "Exited")
             }
         }
     }

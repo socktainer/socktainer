@@ -28,13 +28,13 @@ struct CLIOptions: ParsableArguments {
     @ArgumentParser.Option(
         name: .long,
         help: ArgumentHelp(
-            "Upstream DNS server for non-container names, as an IPv4 address with optional port (<ipv4[:port]>, port defaults to 53). Overrides SOCKTAINER_DNS_UPSTREAM. Default: the 'default' network's vmnet gateway.",
-            valueName: "ipv4[:port]")
+            "Upstream DNS server for non-container names, as an IPv4 address with optional port (<ipv4[:port]>, port defaults to 53), or 'auto' to follow the host's DNS resolvers as they change. Overrides SOCKTAINER_DNS_UPSTREAM. Default: the 'default' network's vmnet gateway.",
+            valueName: "ipv4[:port]|auto")
     )
     var dnsUpstream: String?
 
     mutating func validate() throws {
-        if let dnsUpstream {
+        if let dnsUpstream, !DNSUpstream.isAuto(dnsUpstream) {
             do {
                 _ = try DNSUpstream.parse(dnsUpstream)
             } catch {

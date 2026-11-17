@@ -240,7 +240,13 @@ struct ContainerInspectRouteRestartPolicyTests {
 
     // MARK: - Helpers
 
-    private func makeSnapshot(nativeId: String, restartPolicyLabel: String? = nil) -> ContainerSnapshot {
+    /// `startedDate` defaults to a past date so the `.stopped` snapshot reads as
+    /// a container that ran and exited. Pass `nil` for one that was never started.
+    private func makeSnapshot(
+        nativeId: String,
+        restartPolicyLabel: String? = nil,
+        startedDate: Date? = Date(timeIntervalSinceNow: -30)
+    ) -> ContainerSnapshot {
         let proc = ProcessConfiguration(
             executable: "/bin/sh",
             arguments: [],
@@ -261,7 +267,7 @@ struct ContainerInspectRouteRestartPolicyTests {
         if let restartPolicyLabel {
             containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
         }
-        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [], startedDate: startedDate)
     }
 
     private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {
@@ -376,6 +382,47 @@ struct ContainerInspectRouteRestartPolicyTests {
                 let inspect = try res.content.decode(RESTContainerInspect.self)
                 #expect(inspect.State.Restarting == false)
                 #expect(inspect.State.Status == "exited")
+            }
+        }
+    }
+
+    @Test("A container that was never started reports created, not exited")
+    func neverStartedReportsCreated() async throws {
+        let nativeId = "inspect-never-started-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId, startedDate: nil)
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Status == "created")
+                #expect(inspect.State.Running == false)
+                #expect(inspect.State.Dead == false, "a container that never ran is not dead")
+            }
+        }
+    }
+
+    @Test("A container that ran and stopped still reports exited and Dead")
+    func stoppedAfterRunningReportsExited() async throws {
+        let nativeId = "inspect-ran-then-stopped-ctr"
+        let snapshot = makeSnapshot(nativeId: nativeId)
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Status == "exited")
+                #expect(inspect.State.Dead == true)
             }
         }
     }

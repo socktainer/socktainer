@@ -162,6 +162,26 @@ struct LoopbackGatewayRewriteTests {
 @Suite("ContainerCreateRoute — peer hostname rewrite")
 struct PeerHostnameRewriteTests {
 
+    @Test("Rewrite is off by default so URLs naming another container's alias are preserved (#479)")
+    func rewriteIsOptIn() {
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: nil))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["app": "web"]))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-peer-hostnames": "false"]))
+        #expect(!ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-loopback": "true"]))
+        #expect(ContainerCreateRoute.shouldRewritePeerHostnames(labels: ["socktainer.rewrite-peer-hostnames": "true"]))
+    }
+
+    @Test("A matching URL is preserved without the label and rewritten with it (#479)")
+    func labelGatesRewrite() {
+        let env = ["DATABASE_URL=postgresql://user@db:5432/x", "PUBLIC_URL=https://supabase_db_supabase:8443"]
+        #expect(ContainerCreateRoute.peerRewrittenEnv(env, labels: nil, peers: peers) == env)
+        #expect(ContainerCreateRoute.peerRewrittenEnv(env, labels: ["app": "web"], peers: peers) == env)
+        #expect(
+            ContainerCreateRoute.peerRewrittenEnv(
+                env, labels: ["socktainer.rewrite-peer-hostnames": "true"], peers: peers)
+                == ["DATABASE_URL=postgresql://user@192.168.67.3:5432/x", "PUBLIC_URL=https://192.168.67.3:8443"])
+    }
+
     private let peers = ["supabase_db_supabase": "192.168.67.3", "db": "192.168.67.3"]
 
     @Test("@hostname:port form is rewritten")
@@ -842,6 +862,18 @@ struct ContainerCreateRouteNameConflictTests {
         #expect(ContainerCreateRoute.isNameConflict(ContainerizationError(.exists, message: "container already exists: pg")))
         #expect(!ContainerCreateRoute.isNameConflict(ContainerizationError(.notFound, message: "image not found")))
         #expect(!ContainerCreateRoute.isNameConflict(ContainerizationError(.internalError, message: "volume already exists")))
+    }
+
+    @Test("a taken hostname or alias is not a name conflict")
+    func hostnameExistsIsNotConflict() {
+        #expect(
+            !ContainerCreateRoute.isNameConflict(
+                ContainerizationError(.exists, message: "hostname(s) already exist: [\"probe-host\"]")))
+        #expect(
+            !ContainerCreateRoute.isNameConflict(ContainerizationError(.exists, message: "alias(es) already exist: [\"db\"]")))
+        #expect(
+            !ContainerCreateRoute.isNameConflict(
+                RuntimeError(description: "exists: \"hostname(s) already exist: [\\\"probe-host\\\"]\"")))
     }
 
     @Test("an untyped 'exists:' error is classified as a name conflict")

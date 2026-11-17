@@ -67,7 +67,7 @@ enum ExtraHostsFile {
             }
         }
         if let ip {
-            lines.append("\(ip)\t\(hostname)")
+            lines.append("\(ip)\t\(ContainerNameUtility.guestHostname(hostname))")
         }
         return lines.joined(separator: "\n") + "\n"
     }
