@@ -732,6 +732,14 @@ extension ContainerCreateRoute {
                 containerConfiguration.labels[ExtraHostsFile.label] = nil
 
                 containerConfiguration.mounts = resolvedMounts
+                // A container without the marker still works, so a failure here only warns.
+                do {
+                    if let marker = try DockerEnvFile.mount(existing: resolvedMounts, readOnlyRootfs: containerConfiguration.readOnly) {
+                        containerConfiguration.mounts.append(marker)
+                    }
+                } catch {
+                    req.logger.warning("could not create \(DockerEnvFile.guestPath) marker: \(error)")
+                }
                 // Always overwrite client-supplied metadata, including an empty list.
                 containerConfiguration.labels[ContainerAnonymousVolumes.label] =
                     try ContainerAnonymousVolumes.encode(createdAnonymousVolumes)

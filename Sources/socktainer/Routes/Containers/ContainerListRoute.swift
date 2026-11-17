@@ -76,7 +76,7 @@ extension ContainerListRoute {
                     uniquingKeysWith: { first, _ in first }
                 )
 
-                let mounts = container.configuration.mounts.map { mount in
+                let mounts = DockerEnvFile.reported(container.configuration.mounts).map { mount in
                     let mountType: String
                     let mountName: String?
                     let driver: String?
