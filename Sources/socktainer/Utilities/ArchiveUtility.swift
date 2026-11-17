@@ -43,6 +43,25 @@ struct ArchiveUtility {
         }
     }
 
+    /// The compression wrapped around an uploaded archive, read from its magic
+    /// bytes.
+    ///
+    /// `PUT /containers/{id}/archive` accepts a tar compressed with gzip, bzip2,
+    /// xz or zstd as well as a plain one: moby runs every upload through
+    /// `DecompressStream`. A reader pinned to `filter: .none` yields no entries
+    /// for a compressed body and reports no error, so the copy would succeed
+    /// while writing nothing. testcontainers-go always uploads gzip.
+    static func compressionFilter(of tarPath: URL) -> Filter {
+        guard let handle = try? FileHandle(forReadingFrom: tarPath) else { return .none }
+        defer { try? handle.close() }
+        let magic = (try? handle.read(upToCount: 6)) ?? Data()
+        if magic.starts(with: [0x1f, 0x8b]) { return .gzip }
+        if magic.starts(with: [0x42, 0x5a, 0x68]) { return .bzip2 }
+        if magic.starts(with: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) { return .xz }
+        if magic.starts(with: [0x28, 0xb5, 0x2f, 0xfd]) { return .zstd }
+        return .none
+    }
+
     static func create(tarPath: URL, from source: URL) throws {
         let fileManager = FileManager.default
 
@@ -98,7 +117,7 @@ struct ArchiveUtility {
     ) throws {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: compressionFilter(of: tarPath),
             file: tarPath
         )
 
