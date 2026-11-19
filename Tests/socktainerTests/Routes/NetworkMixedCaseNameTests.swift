@@ -46,6 +46,34 @@ struct NetworkMixedCaseNameTests {
         #expect(client.deletedIds == ["mixed-case.test"])
     }
 
+    @Test("inspect by the original name reports the original name and the stored id")
+    func inspectReportsOriginalName() async throws {
+        let client = LookupNetworkClient(networks: [
+            ("mixed-case.test", [NetworkNameNormalization.originalNameLabel: "Mixed-Case.Test"])
+        ])
+        try await withNetworkApp(client: client) { app in
+            try await app.testing().test(.GET, "/v1.51/networks/Mixed-Case.Test") { res async throws in
+                #expect(res.status == .ok)
+                let network = try res.content.decode(RESTNetworkSummary.self)
+                #expect(network.Name == "Mixed-Case.Test")
+                #expect(network.Id == "mixed-case.test")
+            }
+        }
+    }
+
+    @Test("delete by an over-long original name deletes the shortened stored network")
+    func deleteByLongOriginalName() async throws {
+        let long = "aspire-session-network-ghfpwpdj-Contoso.Enterprise.Inventory.Management.Web.Frontend"
+        let stored = NetworkNameNormalization.normalize(long)
+        let client = LookupNetworkClient(networks: [(stored, [NetworkNameNormalization.originalNameLabel: long])])
+        try await withNetworkApp(client: client) { app in
+            try await app.testing().test(.DELETE, "/v1.51/networks/\(long)") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+        #expect(client.deletedIds == [stored])
+    }
+
     @Test("container attachments from EndpointsConfig keys are lowercased")
     func endpointsConfigKeysLowercased() {
         let networks = ContainerCreateRoute.attachmentNetworks(
@@ -115,13 +143,15 @@ private func withNetworkApp(
 /// Holds a fixed set of stored (lowercase) networks and resolves lookups the same
 /// way `ClientNetworkService.getNetwork` does.
 private final class LookupNetworkClient: ClientNetworkProtocol, @unchecked Sendable {
-    private let names: [String]
+    private let networks: [(name: String, labels: [String: String])]
     private(set) var deletedIds: [String] = []
 
-    init(names: [String]) { self.names = names }
+    init(names: [String]) { self.networks = names.map { ($0, [:]) } }
+
+    init(networks: [(name: String, labels: [String: String])]) { self.networks = networks }
 
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] {
-        try names.map { try makeSummary($0) }
+        try networks.map { try makeSummary($0.name, labels: $0.labels) }
     }
 
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {

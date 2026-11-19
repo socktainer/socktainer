@@ -29,7 +29,11 @@ struct NetworkCreateRoute: RouteCollection {
     func handler(_ req: Request) async throws -> Response {
         let logger = req.logger
         let query = try req.content.decode(NetworksCreateQuery.self)
-        // Apple Container rejects uppercase network names; store and report the lowercase form.
+        guard !query.Name.isEmpty else {
+            throw Abort(.badRequest, reason: "network name is required")
+        }
+        // Apple Container only accepts lowercase names of up to 63 characters from [a-z0-9._-];
+        // store the normalized name and record the client's original name in a label when they differ.
         let name = NetworkNameNormalization.normalize(query.Name)
         let mode: NetworkMode = query.Internal == true ? .hostOnly : .nat
         let originalLabels = query.Labels ?? [:]
@@ -37,8 +41,14 @@ struct NetworkCreateRoute: RouteCollection {
             throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
         }
         var labels = LabelNormalization.sanitize(originalLabels)
+        guard labels[NetworkNameNormalization.originalNameLabel] == nil else {
+            throw Abort(.badRequest, reason: "Label key '\(NetworkNameNormalization.originalNameLabel)' is reserved for internal use")
+        }
         if let mapping = LabelNormalization.buildMapping(originalLabels) {
             labels[LabelNormalization.mappingKey] = mapping
+        }
+        if name != query.Name {
+            labels[NetworkNameNormalization.originalNameLabel] = query.Name
         }
         let response: RESTNetworkCreate
         do {
@@ -50,11 +60,11 @@ struct NetworkCreateRoute: RouteCollection {
                 await broadcaster.broadcast(
                     DockerEvent.make(
                         type: "network", action: "create", actorID: response.Id,
-                        attributes: ["name": name, "type": "nat"]))
+                        attributes: ["name": query.Name, "type": "nat"]))
             }
         } catch {
-            // A name that is still invalid after lowercasing (too long, or characters
-            // outside [a-z0-9._-]) — report Apple's message as a 400 instead of a bare 500.
+            // Apple rejected the configuration (for example an oversized label) — report its
+            // message as a 400 instead of a bare 500.
             if let containerError = error as? ContainerizationError, containerError.code == .invalidArgument {
                 throw Abort(.badRequest, reason: containerError.message)
             }
