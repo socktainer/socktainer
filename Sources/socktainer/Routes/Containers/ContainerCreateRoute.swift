@@ -1201,7 +1201,11 @@ extension ContainerCreateRoute {
             let options = tmpfs[path] ?? ""
             return options.isEmpty ? path : "\(path):\(options)"
         }
-        return try Parser.tmpfsMounts(specs).map { .filesystem($0) }
+        do {
+            return try Parser.tmpfsMounts(specs).map { .filesystem($0) }
+        } catch {
+            throw Abort(.badRequest, reason: "Invalid tmpfs mount: \(error)")
+        }
     }
 
     /// Splits non-volume `HostConfig.Mounts` into socket binds, already converted, and the

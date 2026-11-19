@@ -360,9 +360,11 @@ struct TmpfsMountsTests {
         #expect(try filesystems([:]).isEmpty)
     }
 
-    @Test("A relative path is rejected")
+    /// Parser's error is not an `Abort`, so without the mapping the client gets a 500.
+    @Test("A relative path is rejected with 400")
     func relativePathRejected() {
-        #expect(throws: (any Error).self) { try filesystems(["data": ""]) }
+        let error = #expect(throws: Abort.self) { try filesystems(["data": ""]) }
+        #expect(error?.status == .badRequest)
     }
 }
 
