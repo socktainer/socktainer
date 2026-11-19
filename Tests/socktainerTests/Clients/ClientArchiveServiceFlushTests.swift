@@ -8,6 +8,13 @@ import Testing
 
 @testable import socktainer
 
+/// Backs up tests whose flush never returns: it fires only if the code under test waits
+/// on that flush, which a correct read never does. Correct code finishes in
+/// milliseconds, so this is generous on purpose. A loaded CI runner can stop scheduling
+/// the test process for 10 s or more; a watchdog near that races the very deadline it
+/// is backing up, and fails tests whose code did nothing wrong.
+private let watchdog: Duration = .seconds(60)
+
 /// A running guest buffers writes in its page cache, so `rootfs.ext4` read from the
 /// host lags behind. The service must flush the guest before reading a running
 /// container, and must leave stopped containers alone (no guest to flush).
@@ -69,11 +76,13 @@ struct ClientArchiveServiceFlushTests {
         try fixture.writeRootfs(containerId: "web", files: ["/hello.txt": "hi\n"])
         let stuck = StuckWait()
         defer { stuck.release() }
-        let service = fixture.service(flushTimeout: .milliseconds(100)) { _ in await stuck.wait() }
+        // The cap fires once the flush has started, not after a wall-clock delay that a
+        // starved runner can stretch until it loses the race with the watchdog.
+        let service = fixture.wedgedService(stuck: stuck)
         let running = fixture.makeContainer(id: "web", status: .running)
 
         let reads = ReadResults()
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(10)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             reads.archive = try? await service.getArchive(container: running, path: "/hello.txt").stat
             reads.stat = try? await service.statPath(container: running, path: "/hello.txt")
         }
@@ -107,18 +116,29 @@ struct ClientArchiveServiceBoundedFlushTests {
         let stuck = StuckWait()
         defer { stuck.release() }
         let result = OutcomeBox()
-        let clock = ContinuousClock()
-        let start = clock.now
+        let entered = EntryGate()
+        let deadlines = DurationLog()
 
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(10)) {
-            result.outcome = await ClientArchiveService.boundedFlush(timeout: .milliseconds(100)) {
+        // The deadline's wait is injected: it records the bound it was asked to wait
+        // and ends once the flush has started. Measuring wall-clock time instead fails
+        // when a starved runner delays a 100 ms timer by 10 s or more.
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
+            result.outcome = await ClientArchiveService.boundedFlush(
+                timeout: .milliseconds(100),
+                sleep: { bound in
+                    deadlines.record(bound)
+                    await entered.waitForEntry()
+                }
+            ) {
+                entered.enter()
                 await stuck.wait()
             }
         }
 
+        // A boundedFlush that waited on the parked flush would never return.
         #expect(finished, "boundedFlush waited on a flush that never returns")
-        // Far below the 10 s watchdog: it did not wait on the parked flush.
-        #expect(clock.now - start < .seconds(8))
+        // Its deadline is the bound it was given, not some longer wait.
+        #expect(deadlines.values == [.milliseconds(100)])
         guard case .timedOut = result.outcome else {
             Issue.record("expected .timedOut, got \(String(describing: result.outcome))")
             return
@@ -158,19 +178,15 @@ struct ClientArchiveServiceFlushBreakerTests {
         let service = fixture.wedgedService(stuck: stuck)
         let running = fixture.makeContainer(id: "web", status: .running)
 
-        let slowest = DurationBox()
         let sizes = SizeLog()
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(20)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             @Sendable func read(_ index: Int) async {
-                let clock = ContinuousClock()
-                let start = clock.now
                 let size: Int64?
                 if index.isMultiple(of: 2) {
                     size = try? await service.statPath(container: running, path: "/hello.txt").size
                 } else {
                     size = try? await service.getArchive(container: running, path: "/hello.txt").stat.size
                 }
-                slowest.record(clock.now - start)
                 sizes.record(size)
             }
             // The first read times out and trips the breaker; the rest arrive while the
@@ -181,12 +197,13 @@ struct ClientArchiveServiceFlushBreakerTests {
             }
         }
 
+        // No read waited on the parked flush: one that did would never return. That is
+        // judged by every read finishing, not by timing each one, which a starved runner
+        // stretches whatever the code does.
         #expect(finished, "the reads waited on a flush that never returns")
         #expect(calls.count == 1)
         #expect(sizes.values.count == 50)
         #expect(sizes.values.allSatisfy { $0 == 3 })
-        // Far below the 20 s watchdog: no read waited on the parked flush.
-        #expect(slowest.value < .seconds(10))
     }
 
     @Test("once the abandoned flush returns, the next read flushes again")
@@ -201,7 +218,7 @@ struct ClientArchiveServiceFlushBreakerTests {
         let service = fixture.wedgedService(stuck: stuck, breaker: breaker)
         let running = fixture.makeContainer(id: "web", status: .running)
 
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(10)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             _ = try? await service.statPath(container: running, path: "/hello.txt")
             _ = try? await service.getArchive(container: running, path: "/hello.txt")
         }
@@ -241,7 +258,7 @@ struct ClientArchiveServiceFlushBreakerTests {
         let web = fixture.makeContainer(id: "web", status: .running)
         let api = fixture.makeContainer(id: "api", status: .running)
 
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             for _ in 0..<3 {
                 _ = try? await wedged.statPath(container: web, path: "/hello.txt")
                 _ = try? await healthy.getArchive(container: api, path: "/hello.txt")
@@ -269,7 +286,7 @@ struct ClientArchiveServiceFlushBreakerTests {
         let running = fixture.makeContainer(id: "web", status: .running)
         let counts = CountLog()
 
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             // Trips, then skips while the trip is fresh.
             _ = try? await service.statPath(container: running, path: "/hello.txt")
             _ = try? await service.getArchive(container: running, path: "/hello.txt")
@@ -331,7 +348,7 @@ struct ClientArchiveServiceFlushBreakerTests {
         let service = fixture.wedgedService(stuck: stuck)
         let stopped = fixture.makeContainer(id: "web", status: .stopped)
 
-        let finished = await StartupHousekeeping.runBounded(timeout: .seconds(10)) {
+        let finished = await StartupHousekeeping.runBounded(timeout: watchdog) {
             _ = try? await service.statPath(container: stopped, path: "/hello.txt")
             _ = try? await service.statPath(
                 container: fixture.makeContainer(id: "web", status: .running), path: "/hello.txt")
@@ -451,15 +468,15 @@ struct ClientArchiveServiceFlushBreakerTests {
     }
 }
 
-private final class DurationBox: @unchecked Sendable {
+private final class DurationLog: @unchecked Sendable {
     private let lock = NSLock()
-    private var longest: Duration = .zero
+    private var durations: [Duration] = []
 
     func record(_ duration: Duration) {
-        lock.withLock { longest = max(longest, duration) }
+        lock.withLock { durations.append(duration) }
     }
 
-    var value: Duration { lock.withLock { longest } }
+    var values: [Duration] { lock.withLock { durations } }
 }
 
 private final class SizeLog: @unchecked Sendable {
