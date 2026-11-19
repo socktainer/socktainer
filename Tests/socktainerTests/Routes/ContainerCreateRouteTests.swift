@@ -333,6 +333,41 @@ struct ShmSizeBytesTests {
     }
 }
 
+/// Docker distinguishes an absent list (runtime defaults) from an empty one (no
+/// paths). Collapsing `[]` to nil re-applies the default /proc masks, which makes
+/// a nested `bwrap --proc /proc` fail with EPERM inside the container.
+@Suite("ContainerCreateRoute.requestedPathOverrides")
+struct RequestedPathOverridesTests {
+
+    private func overrides(_ json: String?) throws -> (masked: [String]?, readonly: [String]?) {
+        let hostConfig = try json.map { try JSONDecoder().decode(HostConfig.self, from: Data($0.utf8)) }
+        return ContainerCreateRoute.requestedPathOverrides(hostConfig: hostConfig)
+    }
+
+    @Test("No HostConfig or absent lists stay nil so the runtime defaults apply")
+    func absentKeepsDefaults() throws {
+        for json in [nil, #"{}"#] {
+            let paths = try overrides(json)
+            #expect(paths.masked == nil)
+            #expect(paths.readonly == nil)
+        }
+    }
+
+    @Test("Empty lists stay empty so no path is masked or read-only")
+    func emptyClearsDefaults() throws {
+        let paths = try overrides(#"{"MaskedPaths":[],"ReadonlyPaths":[]}"#)
+        #expect(paths.masked == [])
+        #expect(paths.readonly == [])
+    }
+
+    @Test("Custom lists are kept verbatim")
+    func customListsKept() throws {
+        let paths = try overrides(#"{"MaskedPaths":["/proc/kcore"],"ReadonlyPaths":["/proc/sys"]}"#)
+        #expect(paths.masked == ["/proc/kcore"])
+        #expect(paths.readonly == ["/proc/sys"])
+    }
+}
+
 @Suite("ContainerCreateRoute.resolveUser")
 struct ResolveUserTests {
 
