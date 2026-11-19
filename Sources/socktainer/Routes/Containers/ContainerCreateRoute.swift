@@ -364,6 +364,8 @@ extension ContainerCreateRoute {
             containerConfiguration.capAdd = normalizedCapabilities.capAdd
             containerConfiguration.capDrop = normalizedCapabilities.capDrop
             containerConfiguration.readOnly = body.HostConfig?.ReadonlyRootfs ?? false
+            (containerConfiguration.maskedPaths, containerConfiguration.readonlyPaths) =
+                ContainerCreateRoute.requestedPathOverrides(hostConfig: body.HostConfig)
             containerConfiguration.useInit = body.HostConfig?.Init ?? false
             containerConfiguration.sysctls = body.HostConfig?.Sysctls ?? [:]
 
@@ -1130,6 +1132,13 @@ extension ContainerCreateRoute {
             name: container.id,
             labels: LabelNormalization.restore(container.configuration.labels)
         )
+    }
+
+    /// `HostConfig.MaskedPaths` and `ReadonlyPaths` for Apple Container, which shares
+    /// Docker's contract: nil keeps the runtime defaults, `[]` clears them, a list
+    /// replaces them. `--security-opt systempaths=unconfined` sends both as `[]`.
+    static func requestedPathOverrides(hostConfig: HostConfig?) -> (masked: [String]?, readonly: [String]?) {
+        (hostConfig?.MaskedPaths, hostConfig?.ReadonlyPaths)
     }
 
     /// Docker's `--privileged` has no direct Apple Containerization equivalent; granting
