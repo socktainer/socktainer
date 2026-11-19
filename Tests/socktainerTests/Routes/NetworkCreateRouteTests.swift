@@ -1,4 +1,5 @@
 import ContainerResource
+import ContainerizationError
 import ContainerizationExtras
 import Foundation
 import Testing
@@ -83,6 +84,60 @@ struct NetworkCreateRouteTests {
         }
         #expect(client.createCalls == 2, "both creates reach the backend")
         #expect(client.getNetworkCalls == 1, "the conflict is resolved by looking up the existing network")
+    }
+
+    @Test("a mixed-case name is created and reported in lowercase")
+    func mixedCaseNameIsLowercased() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"aspire-session-network-ghfpwpdj-MyApp.Web"}"#)
+            ) { res async throws in
+                #expect(res.status == .created)
+                let created = try res.content.decode(RESTNetworkCreate.self)
+                #expect(created.Id == "aspire-session-network-ghfpwpdj-myapp.web")
+            }
+        }
+        #expect(client.createdNames == ["aspire-session-network-ghfpwpdj-myapp.web"])
+    }
+
+    @Test("re-creating with different casing takes the idempotent \"already exists\" path")
+    func recreateWithDifferentCasingIsIdempotent() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            for name in ["Foo-Bar.Web", "foo-bar.web", "FOO-BAR.WEB"] {
+                try await app.testing().test(
+                    .POST, "/v1.51/networks/create",
+                    headers: ["Content-Type": "application/json"],
+                    body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+                ) { res async throws in
+                    #expect(res.status == .created)
+                    let body = try res.content.decode(RESTNetworkCreate.self)
+                    #expect(body.Id == "foo-bar.web")
+                }
+            }
+        }
+        #expect(client.createdNames == ["foo-bar.web", "foo-bar.web", "foo-bar.web"])
+        #expect(client.getNetworkCalls == 2, "the second and third creates resolve the existing network")
+    }
+
+    @Test("an invalidArgument error from the backend returns 400 with its message")
+    func invalidArgumentReturns400() async throws {
+        let client = FakeNetworkClient()
+        client.createThrowsInvalidArgument = true
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"bad name!"}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("invalid network name: bad name!"))
+            }
+        }
+        #expect(client.getNetworkCalls == 0)
     }
 
     @Test("a non-\"already exists\" create failure still propagates (not swallowed)")
@@ -316,6 +371,10 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     var getNetworkReturnsNil = false
     /// When true, `create` fails with a non-"already exists" error.
     var createThrowsOther = false
+    /// When true, `create` fails the way Apple's `NetworkConfiguration` rejects an invalid name.
+    var createThrowsInvalidArgument = false
+    /// Every name passed to `create`, in order.
+    private(set) var createdNames: [String] = []
     /// Number of leading `create` calls with a pinned subnet that fail with a subnet-conflict error.
     var subnetConflictsBeforeSuccess = 0
     /// When true, every `create` with a non-nil subnet fails with a subnet-conflict error.
@@ -340,7 +399,11 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
         triedModes.append(mode)
         lastSubnet = ipv4Subnet
         triedSubnets.append(ipv4Subnet)
+        createdNames.append(name)
         if createThrowsOther { throw OtherError() }
+        if createThrowsInvalidArgument {
+            throw ContainerizationError(.invalidArgument, message: "invalid network name: \(name)")
+        }
         if ipv4Subnet != nil {
             if conflictAllPinned { throw SubnetConflictError() }
             if subnetConflictsBeforeSuccess > 0 {

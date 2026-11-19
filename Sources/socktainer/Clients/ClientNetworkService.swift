@@ -150,7 +150,18 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
         let networks = try await list(logger: logger)
-        return networks.first { $0.Id == id || $0.Name == id }
+        return Self.findNetwork(in: networks, reference: id)
+    }
+
+    /// Resolves a client-supplied network id or name. An exact match wins; otherwise
+    /// the normalized (lowercase) name is matched, so a network created as `Foo-Bar.Web`
+    /// (stored as `foo-bar.web`) is still found by its original name.
+    static func findNetwork(in networks: [RESTNetworkSummary], reference: String) -> RESTNetworkSummary? {
+        if let exact = networks.first(where: { $0.Id == reference || $0.Name == reference }) {
+            return exact
+        }
+        let normalized = NetworkNameNormalization.normalize(reference)
+        return networks.first { $0.Id == normalized || $0.Name == normalized }
     }
 
     func delete(id: String, logger: Logger) async throws {
@@ -161,7 +172,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
     func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         let pinnedSubnet = try ipv4Subnet.map { try CIDRv4($0) }
         let configuration = try NetworkConfiguration(
-            name: name,
+            name: NetworkNameNormalization.normalize(name),
             mode: mode,
             ipv4Subnet: pinnedSubnet,
             labels: ResourceLabels(labels),

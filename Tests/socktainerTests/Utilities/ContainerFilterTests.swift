@@ -221,6 +221,17 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
+    @Test("network filter matches a mixed-case name against the stored lowercase network")
+    func networkFilterMixedCase() throws {
+        let containers = [
+            try makeSnapshot(id: "a", networkNames: ["mixed-case.test"]),
+            try makeSnapshot(id: "b", networkNames: ["other"]),
+        ]
+        let result = ClientContainerService.applyFilters(
+            containers, filters: ["network": ["Mixed-Case.Test"]])
+        #expect(result.map(\.id) == ["a"])
+    }
+
     // MARK: - exited key filter (distinct from status=exited)
 
     @Test("exited=0 filter keeps stopped containers (exit code 0 is the only tracked state)")

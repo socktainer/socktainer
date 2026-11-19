@@ -256,7 +256,9 @@ struct ClientContainerService: ClientContainerProtocol {
             case "network":
                 result = result.filter { container in
                     let networkNames = container.networks.map { $0.network }
-                    return values.allSatisfy { networkNames.contains($0) }
+                    return values.allSatisfy {
+                        networkNames.contains($0) || networkNames.contains(NetworkNameNormalization.normalize($0))
+                    }
                 }
             case "publish":
                 result = result.filter { container in
