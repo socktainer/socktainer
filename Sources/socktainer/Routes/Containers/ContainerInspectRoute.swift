@@ -214,8 +214,12 @@ extension ContainerInspectRoute {
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: exitCode,
                 Error: "",
-                StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                // Unset timestamps use Docker's zero time, never "": Go clients fail to parse "".
+                // Apple Container does not record when a container finished, so FinishedAt is
+                // always reported as unset.
+                StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) }
+                    ?? AppleContainerTimestampResolver.dockerZeroTime,
+                FinishedAt: AppleContainerTimestampResolver.dockerZeroTime,
                 Health: health
             )
 

@@ -350,6 +350,7 @@ struct ContainerInspectRouteRestartPolicyTests {
     private func makeSnapshot(
         nativeId: String,
         restartPolicyLabel: String? = nil,
+        status: RuntimeStatus = .stopped,
         startedDate: Date? = Date(timeIntervalSinceNow: -30)
     ) -> ContainerSnapshot {
         let proc = ProcessConfiguration(
@@ -372,7 +373,7 @@ struct ContainerInspectRouteRestartPolicyTests {
         if let restartPolicyLabel {
             containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
         }
-        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [], startedDate: startedDate)
+        return ContainerSnapshot(configuration: containerConfig, status: status, networks: [], startedDate: startedDate)
     }
 
     private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {
@@ -530,6 +531,51 @@ struct ContainerInspectRouteRestartPolicyTests {
                 #expect(inspect.State.Dead == true)
             }
         }
+    }
+
+    // MARK: - StartedAt / FinishedAt (#529)
+
+    /// Docker reports an unset timestamp as Go's zero time; Go clients (e.g. the .NET Aspire
+    /// orchestrator DCP) decode these fields into `time.Time` and fail on an empty string.
+    private func inspectState(_ snapshot: ContainerSnapshot) async throws -> socktainer.ContainerState {
+        let mock = InspectMock(snapshot: snapshot)
+        var state: socktainer.ContainerState?
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(snapshot.id)/json") { res async throws in
+                #expect(res.status == .ok)
+                state = try res.content.decode(RESTContainerInspect.self).State
+            }
+        }
+        return try #require(state)
+    }
+
+    @Test("A never-started container reports Docker's zero time for StartedAt and FinishedAt")
+    func neverStartedReportsZeroTimes() async throws {
+        let state = try await inspectState(makeSnapshot(nativeId: "inspect-zero-time-created", startedDate: nil))
+        #expect(state.StartedAt == "0001-01-01T00:00:00Z")
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
+    }
+
+    @Test("A running container reports its start time and Docker's zero time for FinishedAt")
+    func runningReportsZeroFinishedAt() async throws {
+        let startedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let state = try await inspectState(
+            makeSnapshot(nativeId: "inspect-zero-time-running", status: .running, startedDate: startedDate))
+        #expect(state.StartedAt == AppleContainerTimestampResolver.iso8601Timestamp(startedDate))
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
+    }
+
+    @Test("A stopped container reports its start time and Docker's zero time for the unknown FinishedAt")
+    func stoppedReportsZeroFinishedAt() async throws {
+        let startedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let state = try await inspectState(makeSnapshot(nativeId: "inspect-zero-time-stopped", startedDate: startedDate))
+        #expect(state.StartedAt == AppleContainerTimestampResolver.iso8601Timestamp(startedDate))
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
     }
 }
 
