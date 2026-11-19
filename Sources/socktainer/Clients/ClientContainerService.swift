@@ -586,28 +586,39 @@ struct ClientContainerService: ClientContainerProtocol {
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
-        let hexContainerId = DockerContainerID.hexId(for: container)
-        // Intent precedes the external side effect: a daemon that dies mid-delete
-        // must not let the next startup restore an instance the user asked to remove.
-        try await LifecycleIntent.run(
-            hexId: hexContainerId,
-            record: {
-                try? await RestartPolicyOverrideStore.shared.recordRemoveIntent(id: hexContainerId)
-            },
-            operation: {
-                try await Self.deleteNative(nativeId: container.id) {
-                    try await containerClient.withClient { try await $0.delete(id: container.id) }
-                }
-            },
-            complete: {
-                await RestartPolicyOverrideStore.shared.remove(id: hexContainerId)
-            }
-        )
+        try await Self.removeInstance(hexId: DockerContainerID.hexId(for: container), nativeId: container.id) {
+            try await containerClient.withClient { try await $0.delete(id: container.id) }
+        }
         // After the delete, and by the native id: the reference a client holds may
         // be a derived Docker id, and a delete that failed leaves a container that
         // still needs its uploads.
         try await PreStartInjectionStore.shared.clear(containerId: container.id)
         ExtraHostsFile.remove(labels: container.configuration.labels)
+    }
+
+    /// Removes a container the way `delete(id:)` and `prune(filters:)` both must: the
+    /// remove intent precedes the native delete, so a daemon that dies mid-delete can't
+    /// let the next startup restore an instance the user asked to remove, and a
+    /// successful delete forgets the container's network-connect aliases.
+    static func removeInstance(
+        hexId: String,
+        nativeId: String,
+        store: RestartPolicyOverrideStore = .shared,
+        _ nativeDelete: () async throws -> Void
+    ) async throws {
+        try await LifecycleIntent.run(
+            hexId: hexId,
+            store: store,
+            record: {
+                try? await store.recordRemoveIntent(id: hexId)
+            },
+            operation: {
+                try await deleteNative(nativeId: nativeId, nativeDelete)
+            },
+            complete: {
+                await store.remove(id: hexId)
+            }
+        )
     }
 
     /// Runs the native delete, then forgets the container's network-connect aliases,
@@ -817,22 +828,10 @@ struct ClientContainerService: ClientContainerProtocol {
         var deletedIds: [String] = []
 
         for container in containersToDelete {
-            let hexContainerId = DockerContainerID.hexId(for: container)
             do {
-                // Intent precedes the external side effect: a daemon that dies
-                // mid-prune must not let the next startup restore a pruned instance.
-                try await LifecycleIntent.run(
-                    hexId: hexContainerId,
-                    record: {
-                        try? await RestartPolicyOverrideStore.shared.recordRemoveIntent(id: hexContainerId)
-                    },
-                    operation: {
-                        try await containerClient.withClient { try await $0.delete(id: container.id) }
-                    },
-                    complete: {
-                        await RestartPolicyOverrideStore.shared.remove(id: hexContainerId)
-                    }
-                )
+                try await Self.removeInstance(hexId: DockerContainerID.hexId(for: container), nativeId: container.id) {
+                    try await containerClient.withClient { try await $0.delete(id: container.id) }
+                }
                 // Pruning reclaims a container, so it reclaims what was staged for
                 // it too: those files are whatever a client uploaded, secrets
                 // included.

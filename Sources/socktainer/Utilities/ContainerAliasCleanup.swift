@@ -6,7 +6,7 @@ import Foundation
 ///
 /// `cachedIP` nil means ownership can't be confirmed, so nothing is touched: unregistering
 /// blind risks yanking a live peer's identically-named alias, worse than a stale leftover.
-/// Network-connect aliases fall back to the owner recorded when they were registered.
+/// Network-connect aliases use the owner recorded when they were registered, falling back to `cachedIP`.
 enum ContainerAliasCleanup {
     static func unregisterAllAliases(
         nativeId: String,
@@ -14,7 +14,9 @@ enum ContainerAliasCleanup {
         cachedIP: String?,
         dnsServer: SocktainerDNSServer
     ) {
-        if let connectedOwner = cachedIP ?? ConnectedNetworkAliases.shared.owner(nativeId: nativeId) {
+        // Connected aliases are registered under the owner recorded at connect or start,
+        // which a start records before it refreshes the cached IP, so prefer it.
+        if let connectedOwner = ConnectedNetworkAliases.shared.owner(nativeId: nativeId) ?? cachedIP {
             for name in ConnectedNetworkAliases.shared.all(nativeId: nativeId) {
                 dnsServer.unregisterIfOwned(hostname: name, expectedIP: connectedOwner)
             }
