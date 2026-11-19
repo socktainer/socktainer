@@ -9,6 +9,10 @@ enum AppleContainerTimestampResolver {
     )
     private static let epoch = Date(timeIntervalSince1970: 0)
 
+    /// Docker's representation of a timestamp that was never set (Go's zero `time.Time`).
+    /// Go clients decode container state timestamps into `time.Time` and cannot parse "".
+    static let dockerZeroTime = "0001-01-01T00:00:00Z"
+
     static func containerCreationDate(_ container: ContainerSnapshot) -> Date? {
         // The label first: the Docker-facing id is derived from this date, and
         // a container rebuilt in place (see PreStartInjectionStore) gets a new
