@@ -192,6 +192,42 @@ struct NetworkConnectAliasesTests {
         #expect(entries["peer.example"] == "192.168.66.99", "a peer's registration of the same name must stay")
     }
 
+    @Test("Cleanup prefers the recorded owner to a cached IP a start hasn't refreshed yet")
+    func cleanupPrefersRecordedOwnerToStaleCachedIP() async throws {
+        let nativeId = "connect-stale-cache"
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: nativeId) }
+        let dnsServer = SocktainerDNSServer()
+        // A start recorded the new primary IP and registered the alias under it,
+        // but hasn't refreshed the cached IP, which still holds the old one.
+        ConnectedNetworkAliases.shared.set(nativeId: nativeId, network: Self.network, aliases: ["moved.example"])
+        ConnectedNetworkAliases.shared.setOwner(nativeId: nativeId, ip: "192.168.65.51")
+        dnsServer.register(hostname: "moved.example", ips: ["192.168.65.51/24"])
+
+        ContainerAliasCleanup.unregisterAllAliases(
+            nativeId: nativeId, labels: [:], cachedIP: "192.168.65.50", dnsServer: dnsServer)
+
+        #expect(dnsServer.listEntries()["moved.example"] == nil)
+    }
+
+    @Test("Removing an instance, as delete and prune do, forgets connected aliases only after a successful delete")
+    func removeInstanceForgetsOnlyAfterNativeDelete() async throws {
+        let nativeId = "connect-remove-instance"
+        let hexId = "0123456789abcdef"
+        defer { ConnectedNetworkAliases.shared.forget(nativeId: nativeId) }
+        let store = RestartPolicyOverrideStore()
+        ConnectedNetworkAliases.shared.set(nativeId: nativeId, network: Self.network, aliases: ["pruned.example"])
+        ConnectedNetworkAliases.shared.setOwner(nativeId: nativeId, ip: "192.168.65.52")
+
+        await #expect(throws: DeleteFailed.self) {
+            try await ClientContainerService.removeInstance(hexId: hexId, nativeId: nativeId, store: store) { throw DeleteFailed() }
+        }
+        #expect(ConnectedNetworkAliases.shared.all(nativeId: nativeId) == ["pruned.example"])
+
+        try await ClientContainerService.removeInstance(hexId: hexId, nativeId: nativeId, store: store) {}
+        #expect(ConnectedNetworkAliases.shared.all(nativeId: nativeId).isEmpty)
+        #expect(ConnectedNetworkAliases.shared.owner(nativeId: nativeId) == nil)
+    }
+
     @Test("A failed native delete keeps connected aliases; a successful one forgets them")
     func deleteForgetsOnlyAfterNativeDelete() async throws {
         let nativeId = "connect-delete"
