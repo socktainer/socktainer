@@ -171,7 +171,8 @@ extension ContainerInspectRoute {
             )
 
             // Enhanced network settings with proper port mapping
-            let networkEndpoints = Self.networkEndpoints(for: container)
+            let networkEndpoints = NetworkNameNormalization.displayKeyed(
+                Self.networkEndpoints(for: container), containerLabels: container.configuration.labels)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,

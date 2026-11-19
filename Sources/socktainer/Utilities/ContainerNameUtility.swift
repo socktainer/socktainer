@@ -6,11 +6,16 @@ enum ContainerNameUtility {
 
     static func sanitize(_ name: String) -> String {
         guard name.count > maxLength else { return name }
-        let digest = SHA256.hash(data: Data(name.utf8))
-        let hashHex = digest.compactMap { String(format: "%02x", $0) }.joined()
-        let suffix = "-" + hashHex.prefix(12)
+        let suffix = "-" + hashSuffix(name)
         let prefix = String(name.prefix(maxLength - suffix.count))
         return prefix + suffix
+    }
+
+    /// The first `length` lowercase hex characters of the SHA-256 of `input`.
+    static func hashSuffix(_ input: String, length: Int = 12) -> String {
+        let digest = SHA256.hash(data: Data(input.utf8))
+        let hashHex = digest.compactMap { String(format: "%02x", $0) }.joined()
+        return String(hashHex.prefix(length))
     }
 
     /// `<first label of requested>.<random suffix>`. The guest hostname is the first label,

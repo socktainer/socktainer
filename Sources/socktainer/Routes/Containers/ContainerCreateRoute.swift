@@ -383,54 +383,21 @@ extension ContainerCreateRoute {
             }
 
             // Handle networking configuration from request
-            if let networkingConfig = body.NetworkingConfig,
-                let endpointsConfig = networkingConfig.EndpointsConfig,
-                !endpointsConfig.isEmpty
+            if let networkMode = body.HostConfig?.NetworkMode, networkMode == "host" || networkMode == "none",
+                body.NetworkingConfig?.EndpointsConfig?.isEmpty ?? true,
+                body.NetworkingConfig?.Networks?.isEmpty ?? true
             {
-                // Use networking config from request if provided
-                containerConfiguration.networks = endpointsConfig.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
-                    return AttachmentConfiguration(network: networkName, options: options)
-                }
-            } else if let networkingConfig = body.NetworkingConfig,
-                let networks = networkingConfig.Networks,
-                !networks.isEmpty
-            {
-                // Fallback to Networks field for backward compatibility
-                containerConfiguration.networks = networks.map { (networkName, _) in
-                    let options = AttachmentOptions(hostname: hostname)
-                    return AttachmentConfiguration(network: networkName, options: options)
-                }
-            } else if let hostConfig = body.HostConfig,
-                let networkMode = hostConfig.NetworkMode,
-                !networkMode.isEmpty
-            {
-                // Apple Container is VM-based and does not support Linux-only network modes.
-                // "host" and "none" have no equivalent; "bridge" is Docker's default bridge
-                // which maps to Apple Container's "default". All three are silently remapped
-                // to "default" so containers start instead of failing with "no network for id".
-                let resolvedMode: String
-                switch networkMode {
-                case "host", "none", "bridge":
-                    // Apple Container is VM-based: host/none/bridge have no equivalent.
-                    // All remap to "default". host-mode containers rely on fast DNS failure
-                    // (127.0.0.1 nameserver, see below) to avoid hanging on package downloads.
-                    if networkMode != "bridge" {
-                        req.logger.warning(
-                            "network_mode '\(networkMode)' is not supported by Apple Container — remapping to 'default'"
-                        )
-                    }
-                    resolvedMode = "default"
-                default:
-                    resolvedMode = networkMode
-                }
-                containerConfiguration.networks = [
-                    AttachmentConfiguration(network: resolvedMode, options: AttachmentOptions(hostname: hostname))
-                ]
-            } else {
-                // Fall back to default network if no networking config provided
-                containerConfiguration.networks = [AttachmentConfiguration(network: "default", options: AttachmentOptions(hostname: hostname))]
+                // host-mode containers rely on fast DNS failure (127.0.0.1 nameserver,
+                // see below) to avoid hanging on package downloads.
+                req.logger.warning(
+                    "network_mode '\(networkMode)' is not supported by Apple Container — remapping to 'default'"
+                )
             }
+            containerConfiguration.networks = ContainerCreateRoute.attachmentNetworks(
+                endpointsConfigKeys: body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? [],
+                legacyNetworkKeys: body.NetworkingConfig?.Networks.map { Array($0.keys) } ?? [],
+                networkMode: body.HostConfig?.NetworkMode
+            ).map { AttachmentConfiguration(network: $0, options: AttachmentOptions(hostname: hostname)) }
 
             containerConfiguration.publishedPorts = publishedPorts
 
@@ -491,6 +458,23 @@ extension ContainerCreateRoute {
             // inspect can report HostConfig.PortBindings as sent, unset HostIp/HostPort included.
             if let portBindingsLabel = ContainerCreateRoute.portBindingsLabelValue(for: body.HostConfig?.PortBindings, logger: req.logger) {
                 containerLabels[ContainerCreateRoute.portBindingsLabel] = portBindingsLabel
+            }
+
+            // Record the client-facing names of networks whose stored name differs, so
+            // inspect/list report the name the client used (or the name the network was created with).
+            containerLabels.removeValue(forKey: NetworkNameNormalization.containerNetworkNamesLabel)
+            let requestedNetworkNames =
+                (body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? [])
+                + (body.NetworkingConfig?.Networks.map { Array($0.keys) } ?? [])
+                + [body.HostConfig?.NetworkMode].compactMap { $0 }
+            if let networkNamesLabel = await NetworkNameNormalization.containerNetworkNamesLabelValue(
+                requestedNames: requestedNetworkNames,
+                storedNames: containerConfiguration.networks.map(\.network),
+                originalName: { stored in
+                    (try? await NetworkClient().get(id: stored))?.configuration.labels.dictionary[NetworkNameNormalization.originalNameLabel]
+                }
+            ) {
+                containerLabels[NetworkNameNormalization.containerNetworkNamesLabel] = networkNamesLabel
             }
 
             if !dnsNames.isEmpty {
@@ -880,11 +864,44 @@ extension ContainerCreateRoute {
     /// the full handler, which drives Apple Container APIs.
     ///
     /// Pass `endpointsConfigKeys` as `Array(body.NetworkingConfig?.EndpointsConfig?.keys ?? [])`.
+    ///
+    /// The returned name is normalized (lowercase) so it matches the `attachment.network`
+    /// values built by `attachmentNetworks` and the network names Apple Container stores.
     static func firstNamedNetwork(endpointsConfigKeys: [String], networkMode: String?) -> String? {
         let reservedModes: Set<String> = ["default", "bridge", "host", "none"]
-        if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
-        if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
+        if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) {
+            return NetworkNameNormalization.normalize(net)
+        }
+        if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) {
+            return NetworkNameNormalization.normalize(mode)
+        }
         return nil
+    }
+
+    /// The Apple Container network names a new container attaches to, in priority order:
+    /// `NetworkingConfig.EndpointsConfig` keys, the legacy `NetworkingConfig.Networks` keys,
+    /// then `HostConfig.NetworkMode`, falling back to `default`.
+    ///
+    /// Apple Container is VM-based and does not support Linux-only network modes: "host"
+    /// and "none" have no equivalent and "bridge" is Docker's default bridge, so all three
+    /// map to "default" so containers start instead of failing with "no network for id".
+    /// Every other name is normalized (lowercase) to match the stored network name.
+    static func attachmentNetworks(endpointsConfigKeys: [String], legacyNetworkKeys: [String], networkMode: String?) -> [String] {
+        if !endpointsConfigKeys.isEmpty {
+            return endpointsConfigKeys.map(NetworkNameNormalization.normalize)
+        }
+        if !legacyNetworkKeys.isEmpty {
+            return legacyNetworkKeys.map(NetworkNameNormalization.normalize)
+        }
+        if let networkMode, !networkMode.isEmpty {
+            switch networkMode {
+            case "host", "none", "bridge":
+                return ["default"]
+            default:
+                return [NetworkNameNormalization.normalize(networkMode)]
+            }
+        }
+        return ["default"]
     }
 
     /// Maps an error from the pre-flight image existence check to a client-facing error.
