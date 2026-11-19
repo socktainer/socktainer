@@ -101,11 +101,9 @@ struct SystemResolverFailoverTests {
     @Test("A refusing or unreachable resolver falls through to the next one")
     func failover() throws {
         let refusing = try startStub(rcode: 5)
+        defer { refusing.stop() }
         let good = try startStub(rcode: 3)  // NXDOMAIN counts as a real answer
-        defer {
-            refusing.stop()
-            good.stop()
-        }
+        defer { good.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [
             DNSUpstream(host: "127.0.0.1", port: 1),  // nothing listens: times out or is refused
@@ -122,11 +120,9 @@ struct SystemResolverFailoverTests {
     @Test("The resolver list can be replaced while the server runs")
     func liveUpdate() throws {
         let first = try startStub(rcode: 5)
+        defer { first.stop() }
         let second = try startStub(rcode: 3)
-        defer {
-            first.stop()
-            second.stop()
-        }
+        defer { second.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [DNSUpstream(host: "127.0.0.1", port: first.port)]
         guard let port = server.start(preferredPort: 19840, maxAttempts: 5) else {
@@ -154,11 +150,9 @@ struct SystemResolverFailoverTests {
     @Test("When every resolver fails the first failure answer is returned")
     func allFail() throws {
         let first = try startStub(rcode: 5)
+        defer { first.stop() }
         let second = try startStub(rcode: 2)
-        defer {
-            first.stop()
-            second.stop()
-        }
+        defer { second.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [
             DNSUpstream(host: "127.0.0.1", port: first.port), DNSUpstream(host: "127.0.0.1", port: second.port),
