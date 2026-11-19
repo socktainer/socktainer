@@ -1,4 +1,5 @@
 import ContainerResource
+import ContainerizationError
 import ContainerizationExtras
 import Vapor
 
@@ -28,6 +29,8 @@ struct NetworkCreateRoute: RouteCollection {
     func handler(_ req: Request) async throws -> Response {
         let logger = req.logger
         let query = try req.content.decode(NetworksCreateQuery.self)
+        // Apple Container rejects uppercase network names; store and report the lowercase form.
+        let name = NetworkNameNormalization.normalize(query.Name)
         let mode: NetworkMode = query.Internal == true ? .hostOnly : .nat
         let originalLabels = query.Labels ?? [:]
         guard !LabelNormalization.containsReservedKey(originalLabels) else {
@@ -40,16 +43,21 @@ struct NetworkCreateRoute: RouteCollection {
         let response: RESTNetworkCreate
         do {
             response = try await NetworkCreateRoute.createPinned(
-                client: client, name: query.Name, labels: labels, ipam: query.IPAM, mode: mode, logger: logger)
+                client: client, name: name, labels: labels, ipam: query.IPAM, mode: mode, logger: logger)
             // moby network events carry {name, type} where type is the driver.
             // Only broadcast on actual creation — not on the idempotent "already exists" path.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
                 await broadcaster.broadcast(
                     DockerEvent.make(
                         type: "network", action: "create", actorID: response.Id,
-                        attributes: ["name": query.Name, "type": "nat"]))
+                        attributes: ["name": name, "type": "nat"]))
             }
         } catch {
+            // A name that is still invalid after lowercasing (too long, or characters
+            // outside [a-z0-9._-]) — report Apple's message as a 400 instead of a bare 500.
+            if let containerError = error as? ContainerizationError, containerError.code == .invalidArgument {
+                throw Abort(.badRequest, reason: containerError.message)
+            }
             // Docker's `network create` is effectively create-to-ensure for tools
             // (e.g. the Supabase CLI) that may issue it more than once during a
             // single bring-up; socktainer's create throws "already exists", which
@@ -58,9 +66,9 @@ struct NetworkCreateRoute: RouteCollection {
             // existing network; any other failure is a real error and propagates.
             // (Mirrors VolumeCreateRoute's idempotent create.)
             guard "\(error)".lowercased().contains("already exists") else { throw error }
-            guard let existing = try await client.getNetwork(id: query.Name, logger: logger) else { throw error }
+            guard let existing = try await client.getNetwork(id: name, logger: logger) else { throw error }
             guard existing.Internal == (query.Internal ?? false) else {
-                throw Abort(.conflict, reason: "Network '\(query.Name)' already exists with a different Internal setting")
+                throw Abort(.conflict, reason: "Network '\(name)' already exists with a different Internal setting")
             }
             response = RESTNetworkCreate(Id: existing.Id, Warning: "")
         }
