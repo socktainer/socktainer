@@ -31,6 +31,7 @@ enum ContainerAutoRemoveCleanup {
                 cachedIP: cached?.ip,
                 dnsServer: dnsServer
             )
+            ConnectedNetworkAliases.shared.forget(nativeId: nativeId)
         }
         if let broadcaster {
             await broadcaster.broadcast(

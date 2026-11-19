@@ -595,7 +595,9 @@ struct ClientContainerService: ClientContainerProtocol {
                 try? await RestartPolicyOverrideStore.shared.recordRemoveIntent(id: hexContainerId)
             },
             operation: {
-                try await containerClient.withClient { try await $0.delete(id: container.id) }
+                try await Self.deleteNative(nativeId: container.id) {
+                    try await containerClient.withClient { try await $0.delete(id: container.id) }
+                }
             },
             complete: {
                 await RestartPolicyOverrideStore.shared.remove(id: hexContainerId)
@@ -606,6 +608,13 @@ struct ClientContainerService: ClientContainerProtocol {
         // still needs its uploads.
         try await PreStartInjectionStore.shared.clear(containerId: container.id)
         ExtraHostsFile.remove(labels: container.configuration.labels)
+    }
+
+    /// Runs the native delete, then forgets the container's network-connect aliases,
+    /// before any later cleanup that can throw. A failed delete keeps them for the next start.
+    static func deleteNative(nativeId: String, _ nativeDelete: () async throws -> Void) async throws {
+        try await nativeDelete()
+        ConnectedNetworkAliases.shared.forget(nativeId: nativeId)
     }
 
     /// Apple Container has no rename and identifies containers by name, so a
