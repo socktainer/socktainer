@@ -196,6 +196,17 @@ extension ContainerStartRoute {
                 return
             }
 
+            // The authoritative wait failed, so the real exit code is unknown. A
+            // fabricated one must not drive the restart decision: the sentinel is
+            // non-zero and would otherwise restart an `on-failure` instance on a
+            // crash that may never have happened. Leave the run unclaimed — no `die`
+            // is broadcast here, and the external event watcher's poll still reports
+            // the state transition (without an exit code).
+            guard code != ContainerExitCodeStore.waitFailureSentinel else {
+                logger.error("restart-policy: exit status unavailable for \(nativeId); automatic restart was not attempted")
+                return
+            }
+
             let executionDuration = Date().timeIntervalSince(startedAt)
 
             // moby unmounts the container's volumes during exit cleanup, before logging
