@@ -50,6 +50,7 @@ struct NetworkCreateRoute: RouteCollection {
         if name != query.Name {
             labels[NetworkNameNormalization.originalNameLabel] = query.Name
         }
+        try Self.validateLabels(labels, originalName: query.Name)
         let response: RESTNetworkCreate
         do {
             response = try await NetworkCreateRoute.createPinned(
@@ -121,6 +122,26 @@ struct NetworkCreateRoute: RouteCollection {
         }
         logger.warning("[networks] no free pinnable subnet for \(name); creating without a pinned subnet")
         return try await client.create(name: name, labels: labels, ipv4Subnet: nil, mode: mode, logger: logger)
+    }
+
+    /// Validates labels the way Apple Container will, so an invalid label is a descriptive 400
+    /// before any backend call rather than a `ResourceLabels.LabelError` that surfaces as a 500.
+    /// The original-name label is checked first: a name whose label cannot fit Apple's
+    /// `key=value` limit is reported as a too-long network name.
+    static func validateLabels(_ labels: [String: String], originalName: String) throws {
+        if let recorded = labels[NetworkNameNormalization.originalNameLabel],
+            (try? ResourceLabels.validateLabel(key: NetworkNameNormalization.originalNameLabel, value: recorded)) == nil
+        {
+            let maxLength = ResourceLabels.labelLengthMax - NetworkNameNormalization.originalNameLabel.count - 1
+            throw Abort(
+                .badRequest,
+                reason: "network name is too long: \(originalName.count) characters, the maximum is \(maxLength)")
+        }
+        do {
+            _ = try ResourceLabels(labels)
+        } catch let error as ResourceLabels.LabelError {
+            throw Abort(.badRequest, reason: "invalid network label: \(error.code.rawValue)")
+        }
     }
 
     static let maxSubnetConflictRetries = 5

@@ -192,6 +192,60 @@ struct NetworkCreateRouteTests {
         #expect(client.createdLabels.first?[NetworkNameNormalization.originalNameLabel] == long)
     }
 
+    /// The longest original name whose `socktainer.network-original-name=<name>` label fits
+    /// Apple's 4096-character label limit.
+    static let maxOriginalNameLength = ResourceLabels.labelLengthMax - NetworkNameNormalization.originalNameLabel.count - 1
+
+    @Test("a name too long for the original-name label returns a descriptive 400, not a 500")
+    func originalNameTooLongForLabelReturns400() async throws {
+        let client = FakeNetworkClient()
+        let name = "Net-" + String(repeating: "a", count: Self.maxOriginalNameLength - 3)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("network name is too long"))
+            }
+        }
+        #expect(client.createCalls == 0, "an unstorable name must be rejected before reaching the backend")
+    }
+
+    @Test("an oversized client label returns a 400 instead of a 500")
+    func oversizedClientLabelReturns400() async throws {
+        let client = FakeNetworkClient()
+        let value = String(repeating: "v", count: ResourceLabels.labelLengthMax)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a","Labels":{"app":"\#(value)"}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("invalid network label"))
+            }
+        }
+        #expect(client.createCalls == 0)
+    }
+
+    @Test("the longest name whose original-name label fits is created")
+    func longestStorableNameIsCreated() async throws {
+        let client = FakeNetworkClient()
+        let name = "Net-" + String(repeating: "a", count: Self.maxOriginalNameLength - 4)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(client.createdLabels.first?[NetworkNameNormalization.originalNameLabel] == name)
+    }
+
     @Test("an invalidArgument error from the backend returns 400 with its message")
     func invalidArgumentReturns400() async throws {
         let client = FakeNetworkClient()
