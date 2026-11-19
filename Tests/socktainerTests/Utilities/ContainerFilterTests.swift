@@ -232,6 +232,19 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
+    @Test("network filter matches the recorded display name of a shortened network")
+    func networkFilterDisplayName() throws {
+        let long = "Contoso.Enterprise.Inventory.Management.Web.Frontend.Service.Network"
+        let stored = NetworkNameNormalization.normalize(long)
+        let labels = [NetworkNameNormalization.containerNetworkNamesLabel: #"{"\#(stored)":"\#(long)"}"#]
+        let containers = [
+            try makeSnapshot(id: "a", labels: labels, networkNames: [stored]),
+            try makeSnapshot(id: "b", networkNames: ["other"]),
+        ]
+        #expect(ClientContainerService.applyFilters(containers, filters: ["network": [long]]).map(\.id) == ["a"])
+        #expect(ClientContainerService.applyFilters(containers, filters: ["network": [stored]]).map(\.id) == ["a"])
+    }
+
     // MARK: - exited key filter (distinct from status=exited)
 
     @Test("exited=0 filter keeps stopped containers (exit code 0 is the only tracked state)")

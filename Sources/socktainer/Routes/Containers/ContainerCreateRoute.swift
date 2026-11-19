@@ -496,6 +496,23 @@ extension ContainerCreateRoute {
                 containerLabels[ContainerCreateRoute.portBindingsLabel] = portBindingsLabel
             }
 
+            // Record the client-facing names of networks whose stored name differs, so
+            // inspect/list report the name the client used (or the name the network was created with).
+            containerLabels.removeValue(forKey: NetworkNameNormalization.containerNetworkNamesLabel)
+            let requestedNetworkNames =
+                (body.NetworkingConfig?.EndpointsConfig.map { Array($0.keys) } ?? [])
+                + (body.NetworkingConfig?.Networks.map { Array($0.keys) } ?? [])
+                + [body.HostConfig?.NetworkMode].compactMap { $0 }
+            if let networkNamesLabel = await NetworkNameNormalization.containerNetworkNamesLabelValue(
+                requestedNames: requestedNetworkNames,
+                storedNames: containerConfiguration.networks.map(\.network),
+                originalName: { stored in
+                    (try? await NetworkClient().get(id: stored))?.configuration.labels.dictionary[NetworkNameNormalization.originalNameLabel]
+                }
+            ) {
+                containerLabels[NetworkNameNormalization.containerNetworkNamesLabel] = networkNamesLabel
+            }
+
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
             }

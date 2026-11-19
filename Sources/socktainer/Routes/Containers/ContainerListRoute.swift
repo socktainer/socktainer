@@ -67,14 +67,18 @@ extension ContainerListRoute {
                     )
                 }
 
-                let networkMode = container.networks.first?.network ?? "default"
+                let networkMode = NetworkNameNormalization.displayName(
+                    storedName: container.networks.first?.network ?? "default", containerLabels: container.configuration.labels)
 
                 let aliasesByNetwork = container.configuration.endpointAliasesByNetwork(dnsDomain: req.application.dnsDomain)
-                let networkSettings = Dictionary(
-                    container.networks.map { attachment in
-                        (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))
-                    },
-                    uniquingKeysWith: { first, _ in first }
+                let networkSettings = NetworkNameNormalization.displayKeyed(
+                    Dictionary(
+                        container.networks.map { attachment in
+                            (attachment.network, ContainerEndpointSettings.live(attachment, aliases: aliasesByNetwork[attachment.network]))
+                        },
+                        uniquingKeysWith: { first, _ in first }
+                    ),
+                    containerLabels: container.configuration.labels
                 )
 
                 let mounts = container.configuration.mounts.map { mount in
