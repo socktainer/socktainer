@@ -45,7 +45,9 @@ struct ExecExitCodeWaitTests {
             await ExecManager.shared.setExitCode(id: execId, code: 42)
         }
 
-        let code = await ExecManager.shared.waitForExitCode(id: execId)
+        // Well past the 12 s default: a starved CI runner can hold back the 100 ms
+        // writer that long, and this checks the wait outlasts pipe EOF, not its length.
+        let code = await ExecManager.shared.waitForExitCode(id: execId, timeoutNanoseconds: 120_000_000_000)
 
         #expect(code == 42)
         await ExecManager.shared.remove(id: execId)

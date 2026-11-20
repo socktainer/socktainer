@@ -68,15 +68,20 @@ struct ContainerWaitStoppedTests {
             runningPolls: 1
         )
 
+        let storeTimeoutNs: UInt64 = 30_000_000_000
         let started = Date()
         let result = await ContainerWaitRoute.resolveNotRunning(
             containerId: identifier,
             client: client,
-            storeTimeoutNs: 30_000_000_000
+            storeTimeoutNs: storeTimeoutNs
         )
 
         #expect(result.StatusCode == 0)
-        #expect(Date().timeIntervalSince(started) < 15, "must not wait out the 30s store poll")
+        // A store poll that ran out its budget sleeps the whole 30 s, so anything shorter
+        // means it was cut short. Bounded by the poll itself, not a tighter guess, so a
+        // starved CI runner that pauses the test for 10 s or more cannot fail it.
+        let storeTimeout = TimeInterval(storeTimeoutNs) / 1_000_000_000
+        #expect(Date().timeIntervalSince(started) < storeTimeout, "must not wait out the 30s store poll")
     }
 
     @Test("a recorded exit code is reported instead of a clean exit")

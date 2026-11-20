@@ -87,15 +87,18 @@ struct AppleContainerBootstrapWaitForExitTests {
         process.arguments = ["30"]
         try! process.run()
 
-        let start = ContinuousClock.now
         let result = await AppleContainerBootstrap.waitForExit(of: process, timeout: .milliseconds(200))
-        let elapsed = start.duration(to: .now)
 
         #expect(result == false)
-        // The whole point of the fix: this returns near the (short) timeout, not after the
-        // process's own 30-second runtime — proving the caller isn't blocked indefinitely.
-        #expect(elapsed < .seconds(10))
         #expect(!process.isRunning)
+        // The whole point of the fix: this returns because the deadline killed the
+        // process, not because the process ran out its own 30-second sleep — proving
+        // the caller isn't blocked indefinitely. Judged by how the process ended rather
+        // than by elapsed time, which a starved CI runner stretches past any fixed bound:
+        // a `sleep` left to finish exits 0, while one ended by the deadline dies of SIGTERM.
+        await waitUntilReaped(process)
+        #expect(process.terminationReason == .uncaughtSignal)
+        #expect(process.terminationStatus == SIGTERM)
     }
 
     @Test("a process that ignores SIGTERM is force-killed instead of blocking past the deadline")
@@ -104,21 +107,41 @@ struct AppleContainerBootstrapWaitForExitTests {
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         // Traps and discards SIGTERM, so only SIGKILL can end this — reproduces the gap
         // CodeRabbit's follow-up review found: terminate() alone doesn't bound the wait.
-        process.arguments = ["-c", "trap '' TERM; exec sleep 30"]
+        // Creates the file named by $0 once the trap is in place.
+        let trapped = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("socktainer-sigterm-trapped-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: trapped) }
+        process.arguments = ["-c", "trap '' TERM; : > \"$0\"; exec sleep 30", trapped.path]
         try! process.run()
+        // Until the shell runs `trap`, SIGTERM alone would end it. A loaded runner can
+        // take longer than the 200 ms deadline to get there, so wait for the shell.
+        while process.isRunning && !FileManager.default.fileExists(atPath: trapped.path) {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
 
-        let start = ContinuousClock.now
         let result = await AppleContainerBootstrap.waitForExit(
             of: process,
             timeout: .milliseconds(200),
             killGracePeriod: .milliseconds(200)
         )
-        let elapsed = start.duration(to: .now)
 
         #expect(result == false)
-        // Bounded by timeout + killGracePeriod, not the process's own 30-second sleep.
-        #expect(elapsed < .seconds(10))
-        #expect(!process.isRunning)
+        // Bounded by timeout + killGracePeriod, not the process's own 30-second sleep:
+        // a `sleep` left to finish exits 0, and SIGTERM is ignored, so only the
+        // deadline's SIGKILL ends it early. Judged by how it ended rather than by elapsed
+        // time, which a starved CI runner stretches past any fixed bound.
+        await waitUntilReaped(process)
+        #expect(process.terminationReason == .uncaughtSignal)
+        #expect(process.terminationStatus == SIGKILL)
+    }
+
+    /// `terminationReason` and `terminationStatus` are only valid once the process has
+    /// been reaped. Polls rather than calling `waitUntilExit()`, which would hold a
+    /// cooperative-pool thread. Never waits past the children's own 30-second runtime.
+    private func waitUntilReaped(_ process: Process) async {
+        while process.isRunning {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 }
 
