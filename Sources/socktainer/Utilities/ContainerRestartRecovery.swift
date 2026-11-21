@@ -126,6 +126,7 @@ enum ContainerRestartRecovery {
                 }
 
                 if let reason = stoppedSkipReason(status: container.status, record: record, policy: policy) {
+                    await restoreStoppedExitCode(container: container, record: record)
                     report.skipped.append(Skipped(id: hexId, reason: reason))
                     logger.debug("restart-recovery: skipped \(container.id): \(reason.rawValue)")
                     continue
@@ -138,6 +139,7 @@ enum ContainerRestartRecovery {
                 // narrowed, not eliminated (the runtime call itself is not atomic).
                 let latestRecord = await store.lifecycle(id: hexId)
                 if let reason = stoppedSkipReason(status: container.status, record: latestRecord, policy: policy) {
+                    await restoreStoppedExitCode(container: container, record: latestRecord)
                     report.skipped.append(Skipped(id: hexId, reason: reason))
                     logger.info("restart-recovery: skipped \(container.id): \(reason.rawValue) (intent changed during recovery)")
                     continue
@@ -146,8 +148,13 @@ enum ContainerRestartRecovery {
                 // Intent precedes the external side effect. If the daemon dies in
                 // this interval, the next recovery will not invent a completed start.
                 await ContainerRestartState.shared.reset(id: container.id)
-                try await store.recordStartIntent(id: hexId)
-                try await client.start(id: hexId, detachKeys: nil)
+                do {
+                    try await store.recordStartIntent(id: hexId)
+                    try await client.start(id: hexId, detachKeys: nil)
+                } catch {
+                    await restoreStoppedExitCode(container: container, record: latestRecord)
+                    throw error
+                }
                 // The start is durable evidence now: a fresh run clears the manual-stop
                 // mark and the previous run's exit code. (A production client records
                 // the same fact itself; recording it here keeps the store correct for
@@ -191,6 +198,14 @@ enum ContainerRestartRecovery {
     private enum RecoveryError: Error {
         case instanceReplaced
         case invalidExitCode
+    }
+
+    /// Repopulates `ContainerExitCodeStore` for a stopped container that recovery leaves
+    /// down, so `docker inspect` (`ContainerInspectRoute`) and `docker wait` report the
+    /// persisted exit code instead of `0`. Unknown sentinel codes (`< 0`) stay absent.
+    private static func restoreStoppedExitCode(container: ContainerSnapshot, record: RestartLifecycleRecord?) async {
+        guard container.status == .stopped, let exitCode = record?.lastExitCode, exitCode >= 0 else { return }
+        await ContainerExitCodeStore.shared.set(id: container.id, code: exitCode)
     }
 
     private static func stoppedSkipReason(
