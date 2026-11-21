@@ -13,6 +13,7 @@ actor ContainerExitCodeStore {
 
     private var codes: [String: Int32] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
+    private var timedWaiters: [String: [UUID: CheckedContinuation<Int32?, Never>]] = [:]
     private var generations: [String: Int] = [:]
 
     /// Returns the current exit-code generation token for `id`.
@@ -35,6 +36,9 @@ actor ContainerExitCodeStore {
         if let pending = waiters.removeValue(forKey: id) {
             for continuation in pending { continuation.resume(returning: code) }
         }
+        if let pending = timedWaiters.removeValue(forKey: id) {
+            for continuation in pending.values { continuation.resume(returning: code) }
+        }
     }
 
     func get(id: String) -> Int32? {
@@ -55,6 +59,34 @@ actor ContainerExitCodeStore {
         return await withCheckedContinuation { continuation in
             waiters[id, default: []].append(continuation)
         }
+    }
+
+    /// Like `waitForCode(id:)`, but gives up after `timeout` and returns nil.
+    ///
+    /// Resumes the moment `set(id:)` records a code, so callers that previously
+    /// slept in fixed steps waiting for a late recorder no longer pay a full step.
+    /// The waiter is dropped on timeout, so abandoned waits don't accumulate.
+    func waitForCode(id: String, timeout: Duration) async -> Int32? {
+        if let code = codes[id] { return code }
+        let token = UUID()
+        return await withCheckedContinuation { continuation in
+            timedWaiters[id, default: [:]][token] = continuation
+            Task {
+                try? await Task.sleep(for: timeout)
+                self.expireWaiter(id: id, token: token)
+            }
+        }
+    }
+
+    private func expireWaiter(id: String, token: UUID) {
+        guard let continuation = timedWaiters[id]?.removeValue(forKey: token) else { return }
+        if timedWaiters[id]?.isEmpty == true { timedWaiters.removeValue(forKey: id) }
+        continuation.resume(returning: nil)
+    }
+
+    /// Number of timed waiters still pending for `id` (for tests).
+    func pendingTimedWaiters(id: String) -> Int {
+        timedWaiters[id]?.count ?? 0
     }
 
     /// Sentinel recorded when the init process's exit code could not be obtained after retries.
@@ -722,26 +754,27 @@ struct ClientContainerService: ClientContainerProtocol {
         case .notRunning, .nextExit, .removed:
             // Wait until the init process exits and its code is recorded. For
             // `--rm` the container can be deleted the instant it exits (racing
-            // the recorder), so also stop once it's gone, then grace-poll the
-            // store below.
-            while await ContainerExitCodeStore.shared.get(id: id) == nil {
+            // the recorder), so also stop once it's gone and wait briefly for the
+            // store to receive the code. Checks back off from 10ms to the old
+            // fixed intervals so short-lived containers are noticed promptly.
+            try await WaitPolling.poll(cap: WaitPolling.exitDelayCap) {
+                if await ContainerExitCodeStore.shared.get(id: id) != nil { return true }
                 let current = try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first
                 if current == nil {
-                    var graceTries = 0
-                    while await ContainerExitCodeStore.shared.get(id: id) == nil && graceTries < 30 {
-                        try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-                        graceTries += 1
-                    }
-                    break
+                    // Auto-remove can delete the container before the recorder (start()'s
+                    // background waiter or the attach stream) stores the exit code. Wait for
+                    // the store to signal it rather than sleeping in fixed steps.
+                    _ = await ContainerExitCodeStore.shared.waitForCode(id: id, timeout: .seconds(3))
+                    return true
                 }
-                try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                return false
             }
 
             // `removed` must block until the container is actually gone, not just
             // exited — otherwise the requested condition was never satisfied.
             if condition == .removed {
-                while (try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first) != nil {
-                    try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+                try await WaitPolling.poll(cap: WaitPolling.removalDelayCap) {
+                    (try await containerClient.withClient { try await $0.list() }.filter { $0.id == id }.first) == nil
                 }
             }
         }
