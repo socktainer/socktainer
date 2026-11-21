@@ -114,4 +114,43 @@ struct DockerEnvFileTests {
             destination: DockerEnvFile.guestPath, options: ["ro"])
         #expect(DockerEnvFile.reported([data, markerAtDefaultRoot, own]).map(\.source) == ["/tmp/host-dir", "/tmp/my-dockerenv"])
     }
+
+    private var markerAtDefaultRoot: Filesystem {
+        .virtiofs(
+            source: DockerEnvFile.root.appendingPathComponent(DockerEnvFile.fileName).path,
+            destination: DockerEnvFile.guestPath, options: ["ro"])
+    }
+
+    @Test("A file copied to /.dockerenv before start replaces the marker")
+    func stagedFileReplacesMarker() throws {
+        let data = Filesystem.virtiofs(source: "/tmp/host-dir", destination: "/mnt/host", options: [])
+        let stagedMarker = Filesystem.virtiofs(source: "/tmp/staged/.dockerenv", destination: "/.dockerenv", options: [])
+        let stagedOther = Filesystem.virtiofs(source: "/tmp/staged/etc/app.conf", destination: "/etc/app.conf", options: [])
+
+        let mounts = try #require(
+            ClientContainerService.mountsWithPreStartInjections(
+                [data, markerAtDefaultRoot], staged: [stagedMarker, stagedOther]))
+
+        #expect(mounts.map(\.source) == ["/tmp/host-dir", "/tmp/staged/.dockerenv", "/tmp/staged/etc/app.conf"])
+        #expect(!mounts.contains(where: { DockerEnvFile.isMarker($0) }))
+    }
+
+    @Test("The marker stays when no staged file targets /.dockerenv")
+    func markerKeptForUnrelatedStagedFiles() throws {
+        let stagedOther = Filesystem.virtiofs(source: "/tmp/staged/etc/app.conf", destination: "/etc/app.conf", options: [])
+
+        let mounts = try #require(
+            ClientContainerService.mountsWithPreStartInjections([markerAtDefaultRoot], staged: [stagedOther]))
+
+        #expect(mounts.map(\.destination) == ["/.dockerenv", "/etc/app.conf"])
+        #expect(DockerEnvFile.isMarker(mounts[0]))
+    }
+
+    @Test("A client mount at /.dockerenv still wins over a staged file")
+    func clientMountBeatsStagedFile() {
+        let own = Filesystem.virtiofs(source: "/tmp/my-dockerenv", destination: "/.dockerenv", options: [])
+        let stagedMarker = Filesystem.virtiofs(source: "/tmp/staged/.dockerenv", destination: "/.dockerenv", options: [])
+
+        #expect(ClientContainerService.mountsWithPreStartInjections([own], staged: [stagedMarker]) == nil)
+    }
 }

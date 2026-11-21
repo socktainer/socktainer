@@ -60,6 +60,14 @@ enum DockerEnvFile {
         mounts.filter { !isMarker($0) }
     }
 
+    /// `mounts` without the marker when one of `staged`, the files copied in before the
+    /// first start, targets `/.dockerenv`. In Docker the copy lands in the container's
+    /// own layer, above the marker, so the copied file is what the container sees.
+    static func yielding(_ mounts: [Filesystem], to staged: [Filesystem]) -> [Filesystem] {
+        guard staged.contains(where: { normalized($0.destination) == guestPath }) else { return mounts }
+        return mounts.filter { !isMarker($0) }
+    }
+
     /// Collapses `.`, `..` and repeated or trailing slashes in a guest path. This is purely
     /// lexical: `NSString.standardizingPath` would resolve `..` through the host's
     /// symlinks, which say nothing about the guest's filesystem.
