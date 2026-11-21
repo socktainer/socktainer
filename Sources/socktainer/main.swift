@@ -42,6 +42,13 @@ struct CLIOptions: ParsableArguments {
             }
         }
     }
+
+    @ArgumentParser.Option(
+        name: .long,
+        help:
+            "DNS resolution mode: socktainer-dns (default) or apple-dns (resolve via apple/container's built-in DNS). Also settable via SOCKTAINER_DNS_MODE."
+    )
+    var dnsMode: String?
 }
 
 // Parse CLI before starting the app
@@ -50,6 +57,14 @@ let options = CLIOptions.parseOrExit()
 if options.version {
     print("socktainer: \(getBuildVersion()) (git commit: \(getBuildGitCommit()))")
     exit(0)
+}
+
+let dnsMode: DNSMode
+do {
+    dnsMode = try DNSMode.resolve(flag: options.dnsMode)
+} catch {
+    FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+    exit(64)  // EX_USAGE
 }
 
 if options.autoStart {
@@ -79,7 +94,15 @@ if options.dockerContext,
     DockerContextSetup.install(homeDirectory: homeDir)
 }
 app.storage[VolumeSyncModeKey.self] = Filesystem.SyncMode.resolve(from: options.volumeSync)
-try await configure(app, dnsUpstreamCLI: options.dnsUpstream)
+app.storage[DNSModeKey.self] = dnsMode
+do {
+    try await configure(app, dnsUpstreamCLI: options.dnsUpstream)
+} catch {
+    // Report the reason and exit; an error thrown from top level would
+    // otherwise abort the process with a Swift runtime trap.
+    FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+    exit(78)  // EX_CONFIG
+}
 
 // Start the app
 try await app.startup()

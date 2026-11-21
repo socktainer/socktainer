@@ -102,6 +102,8 @@ struct HostConfig: Content {
     let PidMode: String?
     let Isolation: String?
     let SecurityOpt: [String]?
+    let MaskedPaths: [String]?
+    let ReadonlyPaths: [String]?
     let StorageOpt: [String]?
     let CgroupParent: String?
     let VolumeDriver: String?
@@ -173,6 +175,8 @@ struct HostConfig: Content {
         self.PidMode = nil
         self.Isolation = nil
         self.SecurityOpt = nil
+        self.MaskedPaths = nil
+        self.ReadonlyPaths = nil
         self.StorageOpt = nil
         self.CgroupParent = nil
         self.VolumeDriver = nil

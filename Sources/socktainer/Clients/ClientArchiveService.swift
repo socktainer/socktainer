@@ -637,6 +637,10 @@ struct ClientArchiveService: ClientArchiveProtocol {
         let guestPath: String
         let kind: Kind
         let mode: UInt32
+        // Owner and mtime recorded in the tar, applied as Docker Engine does.
+        var uid: UInt32? = nil
+        var gid: UInt32? = nil
+        var mtime: Int64? = nil
     }
 
     /// Inject the archive into a RUNNING container.
@@ -649,8 +653,8 @@ struct ClientArchiveService: ClientArchiveProtocol {
     ///  1. runs ONE `/bin/sh` exec in the guest that validates the destination
     ///     (404/400/conflict semantics that copyIn cannot express) and creates
     ///     missing directories and symlinks (`mkdir` skips existing dirs), then
-    ///  2. streams each regular file individually over vsock via the daemon's
-    ///     copyIn API with the mode recorded in the tar.
+    ///  2. writes each regular file through its own exec (`fileWriteCommand`)
+    ///     with the owner, mode and mtime recorded in the tar.
     private func putArchiveViaCopyIn(
         container: ContainerSnapshot,
         destinationPath: String,
@@ -692,29 +696,41 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
             try await writeFileViaGuestShell(
                 container: container,
-                guestPath: file.guestPath,
-                mode: file.mode,
+                file: file,
                 source: stagedURL
             )
         }
     }
 
+    /// The guest shell command that writes one regular file from stdin and
+    /// applies the tar entry's owner, mode and mtime. `chown` runs before
+    /// `chmod` because it clears setuid/setgid bits.
+    func fileWriteCommand(for file: ArchiveEntryPlan) -> String {
+        let quoted = shellSingleQuoted(file.guestPath)
+        var steps = ["cat > \(quoted)"]
+        if let uid = file.uid, let gid = file.gid {
+            steps.append("chown \(uid):\(gid) \(quoted)")
+        }
+        steps.append("chmod \(String(format: "%04o", file.mode & 0o7777)) \(quoted)")
+        if let mtime = file.mtime {
+            steps.append("touch -c -d @\(mtime) \(quoted)")
+        }
+        return steps.joined(separator: " && ")
+    }
+
     /// Write one regular file into the RUNNING container by exec-ing
-    /// `sh -c 'cat > file && chmod mode file'` and feeding `source` over
-    /// stdin. Runs in the container's mount namespace (unlike copyIn), so
-    /// destinations under volume/bind mounts receive the file.
+    /// `fileWriteCommand` and feeding `source` over stdin. Runs in the
+    /// container's mount namespace (unlike copyIn), so destinations under
+    /// volume/bind mounts receive the file.
     private func writeFileViaGuestShell(
         container: ContainerSnapshot,
-        guestPath: String,
-        mode: UInt32,
+        file: ArchiveEntryPlan,
         source: URL
     ) async throws {
-        let quoted = shellSingleQuoted(guestPath)
-        let octal = String(format: "%04o", mode & 0o7777)
-
+        let guestPath = file.guestPath
         var processConfig = container.configuration.initProcess
         processConfig.executable = "/bin/sh"
-        processConfig.arguments = ["-c", "cat > \(quoted) && chmod \(octal) \(quoted)"]
+        processConfig.arguments = ["-c", fileWriteCommand(for: file)]
         processConfig.terminal = false
         // Write as root so restrictive permissions on parent directories
         // cannot mask the copy (matches Docker's daemon-side extraction).
@@ -824,7 +840,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Parse the uploaded tar into a copy plan.
-    private func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
+    func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
             filter: .none,
@@ -846,18 +862,26 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
 
             let mode = UInt32(entry.permissions) & 0o7777
+            let uid = entry.owner.map { UInt32($0) }
+            let gid = entry.group.map { UInt32($0) }
+            let mtime = entry.modificationDate.map { Int64($0.timeIntervalSince1970.rounded(.down)) }
+            let kind: ArchiveEntryPlan.Kind
             switch entry.fileType {
             case .directory:
-                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .directory, mode: mode))
+                kind = .directory
             case .regular:
-                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .file, mode: mode))
+                kind = .file
             case .symbolicLink:
                 guard let target = entry.symlinkTarget else { continue }
-                plan.append(.init(relativePath: relativePath, guestPath: guestPath, kind: .symlink(target: target), mode: mode))
+                kind = .symlink(target: target)
             default:
                 throw ClientArchiveError.operationFailed(
                     message: "unsupported archive entry type for copy into a running container: \(relativePath)")
             }
+            plan.append(
+                .init(
+                    relativePath: relativePath, guestPath: guestPath, kind: kind, mode: mode,
+                    uid: uid, gid: gid, mtime: mtime))
         }
         return plan
     }
@@ -1054,20 +1078,24 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
 
         // Explicit directory entries: create missing ones with the archived
-        // mode (parents first); never touch directories that already exist.
+        // mode and owner (parents first); never touch directories that already exist.
         let directories =
             entries
-            .compactMap { entry -> (path: String, mode: UInt32)? in
-                guard case .directory = entry.kind else { return nil }
-                return (entry.guestPath, entry.mode)
+            .filter {
+                guard case .directory = $0.kind else { return false }
+                return true
             }
-            .sorted { $0.path.count < $1.path.count }
+            .sorted { $0.guestPath.count < $1.guestPath.count }
         for directory in directories {
-            let quoted = shellSingleQuoted(directory.path)
-            let parent = shellSingleQuoted((directory.path as NSString).deletingLastPathComponent)
+            let quoted = shellSingleQuoted(directory.guestPath)
+            let parent = shellSingleQuoted((directory.guestPath as NSString).deletingLastPathComponent)
             let octal = String(directory.mode, radix: 8)
+            var create = "mkdir -p \(parent) && mkdir -m \(octal) \(quoted)"
+            if let uid = directory.uid, let gid = directory.gid {
+                create += " && chown \(uid):\(gid) \(quoted)"
+            }
             lines.append(
-                "if [ ! -d \(quoted) ]; then mkdir -p \(parent) && mkdir -m \(octal) \(quoted) || { echo \"failed to create directory \(directory.path)\" >&2; exit 44; }; fi")
+                "if [ ! -d \(quoted) ]; then \(create) || { echo \"failed to create directory \(directory.guestPath)\" >&2; exit 44; }; fi")
         }
 
         // Implicit parents of file/symlink entries (mkdir -p is a no-op on

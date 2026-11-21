@@ -30,6 +30,11 @@ actor ContainerRestartState {
         attempts[id] ?? 0
     }
 
+    /// Restores the in-memory restart attempt counter from persisted lifecycle state.
+    func restoreAttempts(id: String, count: Int) {
+        attempts[id] = count
+    }
+
     func markPendingRestart(id: String) {
         pendingRestart.insert(id)
     }

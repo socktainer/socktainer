@@ -96,6 +96,111 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("A running container reports the aliases from its configured attachment")
+    func runningContainerReportsConfiguredAliases() async throws {
+        // The live attachment carries no aliases; only the persisted configuration does.
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [
+                AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1", aliases: ["api.test", "db.test"]))
+            ],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                let endpoint = inspect.NetworkSettings.Networks?["mynet"]
+                #expect(endpoint?.IPAddress == "192.168.64.5")
+                #expect(endpoint?.Aliases == ["api.test", "db.test"])
+            }
+        }
+    }
+
+    @Test("A zone-qualified alias is reported as the client sent it")
+    func zoneQualifiedAliasIsShortened() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [
+                AttachmentConfiguration(
+                    network: "mynet",
+                    options: AttachmentOptions(hostname: "c1", aliases: ["api.mynet.test"])
+                )
+            ],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            app.storage[DNSDomainKey.self] = "test"
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?["mynet"]?.Aliases == ["api"])
+            }
+        }
+    }
+
+    @Test("A stopped container reports the aliases from its configured attachment")
+    func stoppedContainerReportsConfiguredAliases() async throws {
+        let container = makeSnapshot(
+            id: "c1",
+            status: .stopped,
+            configuredNetworks: [
+                AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1", aliases: ["api.test"]))
+            ],
+            liveNetworks: []
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.NetworkSettings.Networks?["mynet"]?.Aliases == ["api.test"])
+            }
+        }
+    }
+
+    @Test("A network without aliases reports no Aliases key at all")
+    func networkWithoutAliasesReportsNoAliases() async throws {
+        let attachment = try ContainerResource.Attachment(
+            network: "mynet",
+            hostname: "c1",
+            ipv4Address: CIDRv4("192.168.64.5/24"),
+            ipv4Gateway: IPv4Address("192.168.64.1"),
+            ipv6Address: nil,
+            macAddress: nil
+        )
+        let container = makeSnapshot(
+            id: "c1",
+            status: .running,
+            configuredNetworks: [AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "c1"))],
+            liveNetworks: [attachment]
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c1/json") { res async throws in
+                let body = try #require(JSONSerialization.jsonObject(with: Data(buffer: res.body)) as? [String: Any])
+                let networkSettings = try #require(body["NetworkSettings"] as? [String: Any])
+                let networks = try #require(networkSettings["Networks"] as? [String: Any])
+                let endpoint = try #require(networks["mynet"] as? [String: Any])
+                // Aliases must be absent, never an empty list.
+                #expect(endpoint["Aliases"] == nil)
+            }
+        }
+    }
+
     @Test("A running container reports its live network attachment with IP info")
     func runningContainerReportsLiveNetwork() async throws {
         let attachment = try ContainerResource.Attachment(
@@ -245,6 +350,7 @@ struct ContainerInspectRouteRestartPolicyTests {
     private func makeSnapshot(
         nativeId: String,
         restartPolicyLabel: String? = nil,
+        status: RuntimeStatus = .stopped,
         startedDate: Date? = Date(timeIntervalSinceNow: -30)
     ) -> ContainerSnapshot {
         let proc = ProcessConfiguration(
@@ -267,7 +373,7 @@ struct ContainerInspectRouteRestartPolicyTests {
         if let restartPolicyLabel {
             containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
         }
-        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [], startedDate: startedDate)
+        return ContainerSnapshot(configuration: containerConfig, status: status, networks: [], startedDate: startedDate)
     }
 
     private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {
@@ -425,6 +531,51 @@ struct ContainerInspectRouteRestartPolicyTests {
                 #expect(inspect.State.Dead == true)
             }
         }
+    }
+
+    // MARK: - StartedAt / FinishedAt (#529)
+
+    /// Docker reports an unset timestamp as Go's zero time; Go clients (e.g. the .NET Aspire
+    /// orchestrator DCP) decode these fields into `time.Time` and fail on an empty string.
+    private func inspectState(_ snapshot: ContainerSnapshot) async throws -> socktainer.ContainerState {
+        let mock = InspectMock(snapshot: snapshot)
+        var state: socktainer.ContainerState?
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(snapshot.id)/json") { res async throws in
+                #expect(res.status == .ok)
+                state = try res.content.decode(RESTContainerInspect.self).State
+            }
+        }
+        return try #require(state)
+    }
+
+    @Test("A never-started container reports Docker's zero time for StartedAt and FinishedAt")
+    func neverStartedReportsZeroTimes() async throws {
+        let state = try await inspectState(makeSnapshot(nativeId: "inspect-zero-time-created", startedDate: nil))
+        #expect(state.StartedAt == "0001-01-01T00:00:00Z")
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
+    }
+
+    @Test("A running container reports its start time and Docker's zero time for FinishedAt")
+    func runningReportsZeroFinishedAt() async throws {
+        let startedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let state = try await inspectState(
+            makeSnapshot(nativeId: "inspect-zero-time-running", status: .running, startedDate: startedDate))
+        #expect(state.StartedAt == AppleContainerTimestampResolver.iso8601Timestamp(startedDate))
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
+    }
+
+    @Test("A stopped container reports its start time and Docker's zero time for the unknown FinishedAt")
+    func stoppedReportsZeroFinishedAt() async throws {
+        let startedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let state = try await inspectState(makeSnapshot(nativeId: "inspect-zero-time-stopped", startedDate: startedDate))
+        #expect(state.StartedAt == AppleContainerTimestampResolver.iso8601Timestamp(startedDate))
+        #expect(state.FinishedAt == "0001-01-01T00:00:00Z")
     }
 }
 

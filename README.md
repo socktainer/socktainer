@@ -469,10 +469,10 @@ Ownership rules:
 - `docker export` streams the container's root filesystem; exporting a running container yields a volatile snapshot, same as Docker. One visible difference: the tar contains **no `/.dockerenv`** — Docker's daemon fabricates that file inside every container at start, Apple Container does not. Tools that probe `/.dockerenv` to detect "am I inside a container" won't find it in filesystems exported from socktainer.
 - `docker run --restart` is honored (`no`, `always`, `unless-stopped`, `on-failure[:max-retries]`), matching moby's restart-manager behavior closely, including its quirks:
   - Backoff between restart attempts doubles on rapid successive crashes (100ms → up to 1 minute), but resets back to 100ms once the container has managed to stay up for at least 10 seconds.
-  - An explicit `docker stop` / `docker kill` only suppresses the next auto-restart for `unless-stopped`. `always` restarts the container anyway, and `on-failure` restarts whenever the exit code is non-zero — regardless of whether a human or a crash caused the exit. Use `unless-stopped` if you don't want a manual stop to be overridden.
-  - **Caveat:** the policy is enforced only by the running `socktainer` process — it does not survive a `socktainer` restart or host reboot, unlike real Docker's daemon-level reconciliation. `always`/`unless-stopped` containers are not automatically resumed on `socktainer` startup.
+  - A manual stop or kill suppresses every policy for the current run. After a daemon restart, `always` restores a previously started instance, `unless-stopped` preserves a manual stop, and stopped `on-failure` instances are restored when a durable nonzero exit code and retry allowance remain (including after a manual stop); instances stay stopped when the exit code or bounded retry budget is unavailable.
+  - Startup recovery uses durable instance identity and start evidence: running managed instances are adopted without another bootstrap, while stopped legacy instances lacking start evidence require an explicit start.
 
-- `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
+- `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably and, like create-time policies, are honored by startup recovery after a daemon restart.
 - `docker load` accepts tarballs from real Docker (plain, gzip or zstd compressed). Index entries whose blobs are not in the tarball are dropped on load — `docker save` on real Docker ships only the pulling platform's blobs while keeping the full multi-platform index, so only that platform is imported.
 - `docker save` works for images that were loaded from a tarball, and the `docker save | docker load` round-trip is supported. It fails with `ContentStore missing blob data` for **registry-pulled** images: Apple's Containerization pull stores the image's full multi-platform index but downloads only the local platform's blobs, and save exports the whole index ([platform limitation](https://github.com/apple/containerization)).
 - `docker rename` works only for containers that have **never been started**, which covers Compose recreation (it renames its new replacement before starting it). Apple Container has no rename and names a container by its id, so socktainer recreates the container under the new name, keeping its Docker ID. A container that has run keeps a writable root filesystem that recreating would lose, so renaming it returns `409 Conflict`.
@@ -511,6 +511,39 @@ services:
 > Compose projects running simultaneously with identically-named services
 > (e.g. both have a `db` service) will share the short-form alias — last
 > started wins. Use the qualified form (`db.myapp`) to resolve unambiguously.
+
+### DNS modes
+
+Socktainer resolves container names in one of two modes, selected at daemon start:
+
+| Mode | Flag | How it works |
+|---|---|---|
+| `socktainer-dns` (default) | `--dns-mode socktainer-dns` | One DNS forwarder container per named network; names are served by socktainer's in-process DNS server. |
+| `apple-dns` | `--dns-mode apple-dns` | No sidecars: names are registered as network aliases on each attachment and served by Apple Container's built-in DNS. |
+
+The mode can also be set via the `SOCKTAINER_DNS_MODE` environment variable
+(the flag takes precedence). `apple-dns` needs setup on the apple/container
+side; the daemon refuses to start until it is done. See apple/container's
+[networking guide](https://github.com/apple/container/blob/main/docs/networking.md)
+for the steps.
+
+In `apple-dns` mode:
+
+- A container's hostname, name and aliases on a named network become
+  `<label>.<network>.<domain>` unless they already end in a dot or the configured
+  `<domain>`. Search domains let containers reach each other by short name.
+- **Scaled Compose services**: the service name resolves to replica 1 only;
+  replicas ≥2 are reachable by their container name alone and never take over
+  the service name, even after replica 1 stops.
+- **Compose recreation fails**: any attempt by `docker compose up` to recreate a
+  container attached to a user-defined network will be rejected with a `409 Conflict`
+  "name already in use" error, even if the old container is stopped. Recreate via
+  `docker compose down && docker compose up`.
+- **`--internal` (host-only) networks get no DNS at all**: neither external nor
+  container names resolve. Use `--dns-mode socktainer-dns` (the default) when containers
+  on internal networks need name resolution.
+- **Unregistered short names can leak to your upstream DNS**: `socktainer-dns` mode
+  answers them locally; `apple-dns` mode forwards them to your normal resolver.
 
 ### Container-to-container connections fail with `EHOSTUNREACH`
 
