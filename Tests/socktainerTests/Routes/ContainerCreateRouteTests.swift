@@ -333,6 +333,41 @@ struct ShmSizeBytesTests {
     }
 }
 
+/// Compose's `tmpfs:` key arrives as `HostConfig.Tmpfs`, not as a `Mounts` entry.
+/// Dropping it puts data a service expects in memory (a throwaway test database)
+/// on the container's disk instead.
+@Suite("ContainerCreateRoute.tmpfsMounts")
+struct TmpfsMountsTests {
+
+    private func filesystems(_ tmpfs: [String: String]) throws -> [Filesystem] {
+        try ContainerCreateRoute.tmpfsMounts(tmpfs).map {
+            guard case .filesystem(let fs) = $0 else { throw Abort(.internalServerError) }
+            return fs
+        }
+    }
+
+    @Test("Each HostConfig.Tmpfs path becomes a tmpfs mount with its Docker options")
+    func pathsBecomeTmpfsMounts() throws {
+        let mounts = try filesystems(["/var/lib/postgresql/data": "", "/run": "size=64m,mode=1777"])
+        #expect(mounts.map(\.destination) == ["/run", "/var/lib/postgresql/data"])
+        #expect(mounts.map(\.isTmpfs) == [true, true])
+        #expect(mounts[0].options == ["size=64m", "mode=1777"])
+        #expect(mounts[1].options.isEmpty)
+    }
+
+    @Test("No HostConfig.Tmpfs adds no mounts")
+    func emptyAddsNothing() throws {
+        #expect(try filesystems([:]).isEmpty)
+    }
+
+    /// Parser's error is not an `Abort`, so without the mapping the client gets a 500.
+    @Test("A relative path is rejected with 400")
+    func relativePathRejected() {
+        let error = #expect(throws: Abort.self) { try filesystems(["data": ""]) }
+        #expect(error?.status == .badRequest)
+    }
+}
+
 /// Docker distinguishes an absent list (runtime defaults) from an empty one (no
 /// paths). Collapsing `[]` to nil re-applies the default /proc masks, which makes
 /// a nested `bwrap --proc /proc` fail with EPERM inside the container.
