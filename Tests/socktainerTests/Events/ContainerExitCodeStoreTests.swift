@@ -91,4 +91,37 @@ struct ResolveExitCodeTests {
         #expect(code != 0, "a failed wait must be distinguishable from a genuine exit-0")
         #expect(calls == 4)
     }
+
+    @Test("timed waitForCode returns a code that is already recorded")
+    func timedReturnsAlreadyRecorded() async {
+        let store = ContainerExitCodeStore()
+        await store.set(id: "timed-pre", code: 5)
+        #expect(await store.waitForCode(id: "timed-pre", timeout: .seconds(3)) == 5)
+    }
+
+    @Test("timed waitForCode resumes as soon as the code is recorded, not at the timeout")
+    func timedResumesOnSet() async {
+        // `docker run --rm` hit this path on every run: auto-remove deleted the container
+        // before the attach stream recorded the exit code, and wait() then slept in fixed
+        // 100ms steps. The waiter must wake on set(), well before its timeout.
+        let store = ContainerExitCodeStore()
+        let clock = ContinuousClock()
+        let start = clock.now
+        async let code = store.waitForCode(id: "timed-late", timeout: .seconds(3))
+        try? await Task.sleep(for: .milliseconds(20))
+        await store.set(id: "timed-late", code: 9)
+        #expect(await code == 9)
+        #expect(clock.now - start < .seconds(1))
+        #expect(await store.pendingTimedWaiters(id: "timed-late") == 0)
+    }
+
+    @Test("timed waitForCode returns nil after the timeout and drops the waiter")
+    func timedExpires() async {
+        let store = ContainerExitCodeStore()
+        #expect(await store.waitForCode(id: "timed-never", timeout: .milliseconds(30)) == nil)
+        #expect(await store.pendingTimedWaiters(id: "timed-never") == 0)
+        // A code recorded after expiry is still stored for later readers.
+        await store.set(id: "timed-never", code: 4)
+        #expect(await store.get(id: "timed-never") == 4)
+    }
 }
