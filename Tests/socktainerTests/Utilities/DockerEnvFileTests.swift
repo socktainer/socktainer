@@ -153,4 +153,17 @@ struct DockerEnvFileTests {
 
         #expect(ClientContainerService.mountsWithPreStartInjections([own], staged: [stagedMarker]) == nil)
     }
+
+    @Test("A client mount wins over a staged file even when its path is spelled differently")
+    func clientMountBeatsStagedFileWithUnnormalizedPath() {
+        let stagedMarker = Filesystem.virtiofs(source: "/tmp/staged/.dockerenv", destination: "/.dockerenv", options: [])
+        let stagedOther = Filesystem.virtiofs(source: "/tmp/staged/etc/app.conf", destination: "/etc/app.conf", options: [])
+
+        for destination in ["/.dockerenv/", "//.dockerenv", "/./.dockerenv"] {
+            let own = Filesystem.virtiofs(source: "/tmp/my-dockerenv", destination: destination, options: [])
+            #expect(ClientContainerService.mountsWithPreStartInjections([own], staged: [stagedMarker]) == nil, "\(destination)")
+        }
+        let ownConf = Filesystem.virtiofs(source: "/tmp/my-app.conf", destination: "/etc//app.conf/", options: [])
+        #expect(ClientContainerService.mountsWithPreStartInjections([ownConf], staged: [stagedOther]) == nil)
+    }
 }
