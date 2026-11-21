@@ -3,6 +3,8 @@ import ContainerXPC
 import Foundation
 import Logging
 import Testing
+import Vapor
+import VaporTesting
 
 @testable import socktainer
 
@@ -496,6 +498,96 @@ struct ContainerRestartRecoveryTests {
         #expect(await client.startCount == 1)
         await cleanUpRecovery(snapshot)
     }
+
+    @Test(
+        "A stopped instance skipped by recovery restores its persisted exit code for inspect",
+        arguments: [("unless-stopped", Int32(137)), ("on-failure", Int32(3)), ("no", Int32(7))]
+    )
+    func stoppedSkipRestoresDurableExitCode(policy: String, expectedExitCode: Int32) async throws {
+        let snapshot = try recoverySnapshot(policy: policy)
+        let id = DockerContainerID.hexId(for: snapshot)
+        let directory = try temporaryRecoveryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = RestartPolicyOverrideStore()
+        try await previous.configure(storageDirectory: directory)
+        if policy == "on-failure" {
+            await previous.set(id: id, policy: RestartPolicy(Name: "on-failure", MaximumRetryCount: 2))
+        }
+        try await previous.recordStarted(id: id)
+        if policy == "on-failure" {
+            try await previous.recordRestarted(id: id, attempt: 2)
+        }
+        try await previous.recordExit(id: id, code: expectedExitCode)
+        if policy == "unless-stopped" {
+            try await previous.recordStopIntent(id: id, hasStarted: true)
+            try await previous.recordStopped(id: id)
+        }
+        let store = RestartPolicyOverrideStore()
+        try await store.configure(storageDirectory: directory)
+        let client = RecoveryClient(snapshot: snapshot)
+
+        let report = await recover(client: client, store: store)
+
+        #expect(report.skipped.count == 1)
+        #expect(await client.startCount == 0)
+        #expect(await ContainerExitCodeStore.shared.get(id: snapshot.id) == expectedExitCode)
+        #expect(try await inspectExitCodeViaRoute(client: client, id: snapshot.id) == Int(expectedExitCode))
+        await ContainerExitCodeStore.shared.remove(id: snapshot.id)
+        await ContainerRestartState.shared.reset(id: snapshot.id)
+    }
+
+    @Test(
+        "A stopped instance without a real persisted exit code keeps reporting 0 for inspect",
+        arguments: [Int32?.none, ContainerExitCodeStore.waitFailureSentinel] as [Int32?]
+    )
+    func stoppedSkipDoesNotRestoreUnknownExitCode(exitCode: Int32?) async throws {
+        let snapshot = try recoverySnapshot(policy: "on-failure")
+        let id = DockerContainerID.hexId(for: snapshot)
+        let store = RestartPolicyOverrideStore()
+        try await store.recordStarted(id: id)
+        if let exitCode { try await store.recordExit(id: id, code: exitCode) }
+        let client = RecoveryClient(snapshot: snapshot)
+
+        let report = await recover(client: client, store: store)
+
+        #expect(report.skipped.first?.reason == .missingExitEvidence)
+        #expect(await ContainerExitCodeStore.shared.get(id: snapshot.id) == nil)
+        #expect(try await inspectExitCodeViaRoute(client: client, id: snapshot.id) == 0)
+        await ContainerExitCodeStore.shared.remove(id: snapshot.id)
+        await ContainerRestartState.shared.reset(id: snapshot.id)
+    }
+
+    @Test("A failed recovery start keeps the prior persisted exit code")
+    func failedRecoveryStartPreservesExitCode() async throws {
+        let snapshot = try recoverySnapshot(policy: "always")
+        let id = DockerContainerID.hexId(for: snapshot)
+        let store = RestartPolicyOverrideStore()
+        try await store.recordStarted(id: id)
+        try await store.recordExit(id: id, code: 7)
+        let client = RecoveryClient(snapshot: snapshot, failStart: true)
+
+        let report = await recover(client: client, store: store)
+
+        #expect(report.failed.map(\.id) == [id])
+        #expect(await ContainerExitCodeStore.shared.get(id: snapshot.id) == 7)
+        await ContainerExitCodeStore.shared.remove(id: snapshot.id)
+        await ContainerRestartState.shared.reset(id: snapshot.id)
+    }
+}
+
+private func inspectExitCodeViaRoute(client: any ClientContainerProtocol, id: String) async throws -> Int {
+    var exitCode: Int?
+    try await withApp(configure: { _ in }) { app in
+        let regexRouter = app.regexRouter(with: app.logger)
+        app.setRegexRouter(regexRouter)
+        regexRouter.installMiddleware(on: app)
+        try app.register(collection: ContainerInspectRoute(client: client))
+
+        try await app.testing().test(.GET, "/v1.51/containers/\(id)/json") { res async throws in
+            exitCode = try res.content.decode(RESTContainerInspect.self).State.ExitCode
+        }
+    }
+    return try #require(exitCode)
 }
 
 private func recover(
