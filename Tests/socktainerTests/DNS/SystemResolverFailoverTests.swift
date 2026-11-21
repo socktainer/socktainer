@@ -6,11 +6,29 @@ import Testing
 
 @Suite("SocktainerDNSServer system resolver failover")
 struct SystemResolverFailoverTests {
-    /// Loopback UDP stub that answers every query with `rcode`. Returns its port.
-    private func startStub(rcode: UInt8) throws -> (fd: Int32, port: Int) {
+    /// Loopback UDP stub that answers every query with `rcode` until `stop()`.
+    ///
+    /// It runs until told to stop, not until its socket has been quiet for a while: a
+    /// loaded CI runner can stop scheduling the test process for longer than any such
+    /// idle timeout, and the stub would then be gone before the server forwarded to it.
+    /// The stub thread closes its own socket, so the descriptor cannot be reused by
+    /// another test while the thread still reads from it.
+    private final class Stub: @unchecked Sendable {
+        let port: Int
+        private let lock = NSLock()
+        private var stopped = false
+
+        init(port: Int) { self.port = port }
+
+        var isStopped: Bool { lock.withLock { stopped } }
+
+        func stop() { lock.withLock { stopped = true } }
+    }
+
+    private func startStub(rcode: UInt8) throws -> Stub {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         try #require(fd >= 0)
-        var tv = timeval(tv_sec: 12, tv_usec: 0)  // lets the stub thread exit after the test
+        var tv = timeval(tv_sec: 0, tv_usec: 100_000)  // how often the stub thread checks for stop()
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -21,15 +39,17 @@ struct SystemResolverFailoverTests {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, len) == 0 && getsockname(fd, $0, &len) == 0 }
         }
         try #require(bound)
+        let stub = Stub(port: Int(UInt16(bigEndian: addr.sin_port)))
         let thread = Thread {
+            defer { Darwin.close(fd) }
             var buf = [UInt8](repeating: 0, count: 512)
             var from = sockaddr_in()
             var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            while true {
+            while !stub.isStopped {
                 let n = withUnsafeMutablePointer(to: &from) {
                     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, buf.count, 0, $0, &fromLen) }
                 }
-                guard n >= 12 else { return }
+                guard n >= 12 else { continue }
                 buf[2] |= 0x80
                 buf[3] = (buf[3] & 0xF0) | rcode
                 _ = withUnsafePointer(to: &from) {
@@ -38,7 +58,7 @@ struct SystemResolverFailoverTests {
             }
         }
         thread.start()
-        return (fd, Int(UInt16(bigEndian: addr.sin_port)))
+        return stub
     }
 
     /// Retries: the server binds on a background thread, so the first datagram can be lost.
@@ -81,11 +101,9 @@ struct SystemResolverFailoverTests {
     @Test("A refusing or unreachable resolver falls through to the next one")
     func failover() throws {
         let refusing = try startStub(rcode: 5)
+        defer { refusing.stop() }
         let good = try startStub(rcode: 3)  // NXDOMAIN counts as a real answer
-        defer {
-            Darwin.close(refusing.fd)
-            Darwin.close(good.fd)
-        }
+        defer { good.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [
             DNSUpstream(host: "127.0.0.1", port: 1),  // nothing listens: times out or is refused
@@ -102,11 +120,9 @@ struct SystemResolverFailoverTests {
     @Test("The resolver list can be replaced while the server runs")
     func liveUpdate() throws {
         let first = try startStub(rcode: 5)
+        defer { first.stop() }
         let second = try startStub(rcode: 3)
-        defer {
-            Darwin.close(first.fd)
-            Darwin.close(second.fd)
-        }
+        defer { second.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [DNSUpstream(host: "127.0.0.1", port: first.port)]
         guard let port = server.start(preferredPort: 19840, maxAttempts: 5) else {
@@ -121,7 +137,7 @@ struct SystemResolverFailoverTests {
     @Test("An empty resolver list uses the single upstream")
     func emptyListUsesUpstream() throws {
         let stub = try startStub(rcode: 3)
-        defer { Darwin.close(stub.fd) }
+        defer { stub.stop() }
         let server = SocktainerDNSServer()
         server.setUpstream(host: "127.0.0.1", port: stub.port)
         guard let port = server.start(preferredPort: 19850, maxAttempts: 5) else {
@@ -134,11 +150,9 @@ struct SystemResolverFailoverTests {
     @Test("When every resolver fails the first failure answer is returned")
     func allFail() throws {
         let first = try startStub(rcode: 5)
+        defer { first.stop() }
         let second = try startStub(rcode: 2)
-        defer {
-            Darwin.close(first.fd)
-            Darwin.close(second.fd)
-        }
+        defer { second.stop() }
         let server = SocktainerDNSServer()
         server.systemResolvers = [
             DNSUpstream(host: "127.0.0.1", port: first.port), DNSUpstream(host: "127.0.0.1", port: second.port),
