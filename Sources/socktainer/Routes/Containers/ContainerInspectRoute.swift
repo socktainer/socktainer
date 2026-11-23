@@ -136,7 +136,7 @@ extension ContainerInspectRoute {
                 Shell: nil  // no mechanism to derive this value
             )
 
-            let mounts = container.configuration.mounts.map { mount in
+            let mounts = DockerEnvFile.reported(container.configuration.mounts).map { mount in
                 let mountType: String
                 let mountName: String?
 

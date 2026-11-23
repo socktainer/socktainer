@@ -392,12 +392,22 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
+    /// The mounts for a container rebuilt to carry `staged`, or nil when every staged file
+    /// is already mounted. A staged file never replaces a mount the client asked for, but
+    /// it does replace the generated `/.dockerenv` marker. Destinations are compared
+    /// normalized, so a client mount at `/.dockerenv/` still counts as `/.dockerenv`.
+    static func mountsWithPreStartInjections(_ mounts: [Filesystem], staged: [Filesystem]) -> [Filesystem]? {
+        let mounts = DockerEnvFile.yielding(mounts, to: staged)
+        let existing = Set(mounts.map { DockerEnvFile.normalized($0.destination) })
+        let additions = staged.filter { !existing.contains(DockerEnvFile.normalized($0.destination)) }
+        guard !additions.isEmpty else { return nil }
+        return mounts + additions
+    }
+
     private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {
         var configuration = container.configuration
-        let existing = Set(configuration.mounts.map(\.destination))
-        let additions = staged.filter { !existing.contains($0.destination) }
-        guard !additions.isEmpty else { return }
-        configuration.mounts.append(contentsOf: additions)
+        guard let mounts = Self.mountsWithPreStartInjections(configuration.mounts, staged: staged) else { return }
+        configuration.mounts = mounts
         let rebuilt = configuration
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
