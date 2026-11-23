@@ -56,8 +56,8 @@ struct ContainerResourceDefaultsTests {
             for _ in 0..<5 {
                 group.addTask { await defaults.current(logger: logger) }
             }
-            // Let every caller reach the actor before the load completes.
-            try? await Task.sleep(for: .milliseconds(100))
+            // Release only once all five are awaiting the one in-flight load.
+            await waitUntil { await defaults.waitingCallers == 5 }
             await gate.release()
             var results: [ContainerPersistence.ContainerConfig?] = []
             for await result in group { results.append(result) }
@@ -91,5 +91,38 @@ struct ContainerResourceDefaultsTests {
         #expect(await defaults.current(logger: logger) == nil)
         #expect(await defaults.current(logger: logger)?.cpus == 6)
         #expect(await gate.loads == 2)
+    }
+
+    @Test("a failed load shared by concurrent callers is retried by the next caller")
+    func sharedFailureIsRetried() async throws {
+        let config = try configured()
+        let gate = LoadGate(failures: 1)
+        let defaults = ContainerResourceDefaults(load: { try await gate.load(config) })
+        let logger = self.logger
+
+        let results = await withTaskGroup(of: ContainerPersistence.ContainerConfig?.self) { group in
+            for _ in 0..<3 {
+                group.addTask { await defaults.current(logger: logger) }
+            }
+            await waitUntil { await defaults.waitingCallers == 3 }
+            await gate.release()
+            var results: [ContainerPersistence.ContainerConfig?] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+
+        #expect(results.count == 3)
+        #expect(results.allSatisfy { $0 == nil })
+        #expect(await defaults.current(logger: logger)?.cpus == 6)
+        #expect(await gate.loads == 2)
+    }
+
+    /// Yields until `condition` holds, failing the test after about five seconds.
+    private func waitUntil(_ condition: () async -> Bool) async {
+        for _ in 0..<5_000 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("condition not met in time")
     }
 }

@@ -50,11 +50,25 @@ actor ContainerResourceDefaults {
     /// not a reason to fail container creation. The caller then leaves the
     /// configuration untouched, which is the previous behaviour.
     func current(logger: Logger) async -> ContainerPersistence.ContainerConfig? {
-        if let loading {
-            return await loading.value
+        let task = loading ?? startLoad(logger: logger)
+        loading = task
+        waitingCallers += 1
+        let config = await task.value
+        waitingCallers -= 1
+        // Every caller clears a failed load, not only the one that started it: callers resume
+        // in no defined order, and a later caller must not reuse the failed task.
+        if config == nil, loading == task {
+            loading = nil
         }
+        return config
+    }
+
+    /// Callers currently awaiting a load. Lets tests wait until callers have joined it.
+    private(set) var waitingCallers = 0
+
+    private func startLoad(logger: Logger) -> Task<ContainerPersistence.ContainerConfig?, Never> {
         let load = self.load
-        let task = Task { () -> ContainerPersistence.ContainerConfig? in
+        return Task { () -> ContainerPersistence.ContainerConfig? in
             do {
                 let config = try await load()
                 logger.debug(
@@ -68,12 +82,6 @@ actor ContainerResourceDefaults {
                 return nil
             }
         }
-        loading = task
-        let config = await task.value
-        if config == nil, loading == task {
-            loading = nil
-        }
-        return config
     }
 
     /// Reads the `[container]` block the way the `container` CLI does.
