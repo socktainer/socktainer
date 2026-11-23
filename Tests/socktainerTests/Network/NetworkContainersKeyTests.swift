@@ -7,7 +7,7 @@ import Testing
 @testable import socktainer
 
 /// `GET /networks/{id}` keyed `Containers` by the container's name, while `docker ps` and
-/// `docker inspect` report the 64-hex Docker ID. .NET Aspire's DCP looks its tunnel proxy up
+/// `docker inspect` report the 64-hex Docker ID. .NET Aspire's DCP looks a container up
 /// in the network by that ID and waited forever.
 @Suite("Network Containers keys")
 struct NetworkContainersKeyTests {
@@ -40,14 +40,14 @@ struct NetworkContainersKeyTests {
     @Test("keys are the Docker container IDs and Name is the container name")
     func keyedByDockerID() throws {
         let net = try network("appnet")
-        let attached = try container("tunnel-proxy-a4efcb58", network: "appnet", ip: "192.168.100.5/24")
+        let attached = try container("demo", network: "appnet", ip: "192.168.100.5/24")
         let elsewhere = try container("other", network: "othernet", ip: "192.168.101.5/24")
 
         let containers = ClientNetworkService.containers(attachedTo: net, in: [attached, elsewhere])
 
         let hexId = DockerContainerID.hexId(for: attached)
         #expect(Array(containers.keys) == [hexId])
-        #expect(containers[hexId]?.Name == "tunnel-proxy-a4efcb58")
+        #expect(containers[hexId]?.Name == "demo")
         #expect(containers[hexId]?.IPv4Address == "192.168.100.5/24")
     }
 
