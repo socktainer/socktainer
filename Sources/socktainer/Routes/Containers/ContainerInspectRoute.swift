@@ -180,7 +180,9 @@ extension ContainerInspectRoute {
             )
 
             // Enhanced network settings with proper port mapping
-            let networkEndpoints = Self.networkEndpoints(for: container, dnsDomain: req.application.dnsDomain)
+            let networkEndpoints = NetworkNameNormalization.displayKeyed(
+                Self.networkEndpoints(for: container, dnsDomain: req.application.dnsDomain),
+                containerLabels: container.configuration.labels)
             let networkSettings = ContainerNetworkSettings(
                 Bridge: nil,
                 SandboxID: nil,

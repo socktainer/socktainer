@@ -125,7 +125,12 @@ struct ClientNetworkService: ClientNetworkProtocol {
                 }
             }
             if let nameArr = filtersDict["name"], !nameArr.isEmpty {
-                if !nameArr.contains(where: { network.Name.localizedCaseInsensitiveContains($0) }) {
+                // Match the reported (original) name, the stored name, or a name that normalizes to it.
+                let matchesName: (String) -> Bool = { value in
+                    network.Name.localizedCaseInsensitiveContains(value) || network.Id.localizedCaseInsensitiveContains(value)
+                        || NetworkNameNormalization.normalize(value) == network.Id
+                }
+                if !nameArr.contains(where: matchesName) {
                     excludedReason = "name mismatch"
                 }
             }
@@ -150,7 +155,19 @@ struct ClientNetworkService: ClientNetworkProtocol {
 
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
         let networks = try await list(logger: logger)
-        return networks.first { $0.Id == id || $0.Name == id }
+        return Self.findNetwork(in: networks, reference: id)
+    }
+
+    /// Resolves a client-supplied network id or name. An exact match on the stored Id or the
+    /// reported Name (the original client name) wins; otherwise the normalized reference is
+    /// matched against the stored Id, so `FOO-BAR.WEB` still finds a network created as
+    /// `Foo-Bar.Web` (stored as `foo-bar.web`).
+    static func findNetwork(in networks: [RESTNetworkSummary], reference: String) -> RESTNetworkSummary? {
+        if let exact = networks.first(where: { $0.Id == reference || $0.Name == reference }) {
+            return exact
+        }
+        let normalized = NetworkNameNormalization.normalize(reference)
+        return networks.first { $0.Id == normalized }
     }
 
     func delete(id: String, logger: Logger) async throws {
@@ -161,7 +178,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
     func create(name: String, labels: [String: String], ipv4Subnet: String?, mode: NetworkMode, logger: Logger) async throws -> RESTNetworkCreate {
         let pinnedSubnet = try ipv4Subnet.map { try CIDRv4($0) }
         let configuration = try NetworkConfiguration(
-            name: name,
+            name: NetworkNameNormalization.normalize(name),
             mode: mode,
             ipv4Subnet: pinnedSubnet,
             labels: ResourceLabels(labels),
@@ -176,10 +193,15 @@ struct ClientNetworkService: ClientNetworkProtocol {
 extension RESTNetworkSummary {
     init(networkResource: NetworkResource) {
         let id = networkResource.configuration.name
+        var storedLabels = networkResource.configuration.labels.dictionary
+        // Name reports the client's original name when it was recorded; Id stays the stored name,
+        // which every internal caller uses to address the backend. The label itself stays hidden.
+        let name = NetworkNameNormalization.displayName(storedName: id, networkLabels: storedLabels)
+        storedLabels.removeValue(forKey: NetworkNameNormalization.originalNameLabel)
         // The backend mode controls isolation, not the public network driver.
         let driver = "nat"
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels = LabelNormalization.restore(networkResource.configuration.labels.dictionary)
+        let labels = LabelNormalization.restore(storedLabels)
         let subnet =
             networkResource.configuration.ipv4Subnet.map { String(describing: $0) }
             ?? String(describing: networkResource.status.ipv4Subnet)
@@ -193,7 +215,7 @@ extension RESTNetworkSummary {
         )
 
         self.init(
-            Name: id,
+            Name: name,
             Id: id,
             Created: createdTimestamp,
             Scope: "local",  // We will always use "local", other modes are not available

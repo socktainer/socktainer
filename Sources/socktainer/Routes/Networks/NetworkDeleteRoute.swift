@@ -15,11 +15,11 @@ struct NetworkDeleteRoute: RouteCollection {
             throw Abort(.badRequest, reason: "Missing network id parameter")
         }
         do {
-            // Resolve the network before deletion: getNetwork matches an exact Id or Name and
-            // returns the canonical Id, Name and Driver, so the request maps to the real network
-            // for DNS cleanup and the destroy event (moby network events include {name, type}).
+            // Resolve the network before deletion: getNetwork matches an Id or Name (exact, then
+            // lowercased) and returns the canonical Id, Name and Driver, so the request maps to the
+            // real network for DNS cleanup and the destroy event (moby network events include {name, type}).
             let summary = try? await client.getNetwork(id: id, logger: logger)
-            let resolvedId = summary?.Id ?? id
+            let resolvedId = summary?.Id ?? NetworkNameNormalization.normalize(id)
 
             // Remove the DNS forwarder sidecar BEFORE deleting the network —
             // the network can't be deleted while the DNS container is still attached.

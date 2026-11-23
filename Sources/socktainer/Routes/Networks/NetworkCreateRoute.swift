@@ -1,4 +1,5 @@
 import ContainerResource
+import ContainerizationError
 import ContainerizationExtras
 import Vapor
 
@@ -28,19 +29,32 @@ struct NetworkCreateRoute: RouteCollection {
     func handler(_ req: Request) async throws -> Response {
         let logger = req.logger
         let query = try req.content.decode(NetworksCreateQuery.self)
+        guard !query.Name.isEmpty else {
+            throw Abort(.badRequest, reason: "network name is required")
+        }
+        // Apple Container only accepts lowercase names of up to 63 characters from [a-z0-9._-];
+        // store the normalized name and record the client's original name in a label when they differ.
+        let name = NetworkNameNormalization.normalize(query.Name)
         let mode: NetworkMode = query.Internal == true ? .hostOnly : .nat
         let originalLabels = query.Labels ?? [:]
         guard !LabelNormalization.containsReservedKey(originalLabels) else {
             throw Abort(.badRequest, reason: "Label key '\(LabelNormalization.mappingKey)' is reserved for internal use")
         }
         var labels = LabelNormalization.sanitize(originalLabels)
+        guard labels[NetworkNameNormalization.originalNameLabel] == nil else {
+            throw Abort(.badRequest, reason: "Label key '\(NetworkNameNormalization.originalNameLabel)' is reserved for internal use")
+        }
         if let mapping = LabelNormalization.buildMapping(originalLabels) {
             labels[LabelNormalization.mappingKey] = mapping
         }
+        if name != query.Name {
+            labels[NetworkNameNormalization.originalNameLabel] = query.Name
+        }
+        try Self.validateLabels(labels, originalName: query.Name)
         let response: RESTNetworkCreate
         do {
             response = try await NetworkCreateRoute.createPinned(
-                client: client, name: query.Name, labels: labels, ipam: query.IPAM, mode: mode, logger: logger)
+                client: client, name: name, labels: labels, ipam: query.IPAM, mode: mode, logger: logger)
             // moby network events carry {name, type} where type is the driver.
             // Only broadcast on actual creation — not on the idempotent "already exists" path.
             if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
@@ -50,6 +64,11 @@ struct NetworkCreateRoute: RouteCollection {
                         attributes: ["name": query.Name, "type": "nat"]))
             }
         } catch {
+            // Apple rejected the configuration (for example an oversized label) — report its
+            // message as a 400 instead of a bare 500.
+            if let containerError = error as? ContainerizationError, containerError.code == .invalidArgument {
+                throw Abort(.badRequest, reason: containerError.message)
+            }
             // Docker's `network create` is effectively create-to-ensure for tools
             // (e.g. the Supabase CLI) that may issue it more than once during a
             // single bring-up; socktainer's create throws "already exists", which
@@ -58,9 +77,9 @@ struct NetworkCreateRoute: RouteCollection {
             // existing network; any other failure is a real error and propagates.
             // (Mirrors VolumeCreateRoute's idempotent create.)
             guard "\(error)".lowercased().contains("already exists") else { throw error }
-            guard let existing = try await client.getNetwork(id: query.Name, logger: logger) else { throw error }
+            guard let existing = try await client.getNetwork(id: name, logger: logger) else { throw error }
             guard existing.Internal == (query.Internal ?? false) else {
-                throw Abort(.conflict, reason: "Network '\(query.Name)' already exists with a different Internal setting")
+                throw Abort(.conflict, reason: "Network '\(name)' already exists with a different Internal setting")
             }
             response = RESTNetworkCreate(Id: existing.Id, Warning: "")
         }
@@ -103,6 +122,26 @@ struct NetworkCreateRoute: RouteCollection {
         }
         logger.warning("[networks] no free pinnable subnet for \(name); creating without a pinned subnet")
         return try await client.create(name: name, labels: labels, ipv4Subnet: nil, mode: mode, logger: logger)
+    }
+
+    /// Validates labels the way Apple Container will, so an invalid label is a descriptive 400
+    /// before any backend call rather than a `ResourceLabels.LabelError` that surfaces as a 500.
+    /// The original-name label is checked first: a name whose label cannot fit Apple's
+    /// `key=value` limit is reported as a too-long network name.
+    static func validateLabels(_ labels: [String: String], originalName: String) throws {
+        if let recorded = labels[NetworkNameNormalization.originalNameLabel],
+            (try? ResourceLabels.validateLabel(key: NetworkNameNormalization.originalNameLabel, value: recorded)) == nil
+        {
+            let maxLength = ResourceLabels.labelLengthMax - NetworkNameNormalization.originalNameLabel.count - 1
+            throw Abort(
+                .badRequest,
+                reason: "network name is too long: \(originalName.count) characters, the maximum is \(maxLength)")
+        }
+        do {
+            _ = try ResourceLabels(labels)
+        } catch let error as ResourceLabels.LabelError {
+            throw Abort(.badRequest, reason: "invalid network label: \(error.code.rawValue)")
+        }
     }
 
     static let maxSubnetConflictRetries = 5

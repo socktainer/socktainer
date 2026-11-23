@@ -1,4 +1,5 @@
 import ContainerResource
+import ContainerizationError
 import ContainerizationExtras
 import Foundation
 import Testing
@@ -83,6 +84,183 @@ struct NetworkCreateRouteTests {
         }
         #expect(client.createCalls == 2, "both creates reach the backend")
         #expect(client.getNetworkCalls == 1, "the conflict is resolved by looking up the existing network")
+    }
+
+    @Test("a mixed-case name is created and reported in lowercase")
+    func mixedCaseNameIsLowercased() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"aspire-session-network-ghfpwpdj-MyApp.Web"}"#)
+            ) { res async throws in
+                #expect(res.status == .created)
+                let created = try res.content.decode(RESTNetworkCreate.self)
+                #expect(created.Id == "aspire-session-network-ghfpwpdj-myapp.web")
+            }
+        }
+        #expect(client.createdNames == ["aspire-session-network-ghfpwpdj-myapp.web"])
+    }
+
+    @Test("re-creating with different casing takes the idempotent \"already exists\" path")
+    func recreateWithDifferentCasingIsIdempotent() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            for name in ["Foo-Bar.Web", "foo-bar.web", "FOO-BAR.WEB"] {
+                try await app.testing().test(
+                    .POST, "/v1.51/networks/create",
+                    headers: ["Content-Type": "application/json"],
+                    body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+                ) { res async throws in
+                    #expect(res.status == .created)
+                    let body = try res.content.decode(RESTNetworkCreate.self)
+                    #expect(body.Id == "foo-bar.web")
+                }
+            }
+        }
+        #expect(client.createdNames == ["foo-bar.web", "foo-bar.web", "foo-bar.web"])
+        #expect(client.getNetworkCalls == 2, "the second and third creates resolve the existing network")
+    }
+
+    @Test("a renamed network records the original name in a label; an unchanged name does not")
+    func originalNameLabelOnlyWhenChanged() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            for name in ["Mixed-Case.Test", "plain"] {
+                try await app.testing().test(
+                    .POST, "/v1.51/networks/create",
+                    headers: ["Content-Type": "application/json"],
+                    body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+                ) { res async in
+                    #expect(res.status == .created)
+                }
+            }
+        }
+        #expect(client.createdLabels.count == 2)
+        #expect(client.createdLabels.first?[NetworkNameNormalization.originalNameLabel] == "Mixed-Case.Test")
+        #expect(client.createdLabels.last?[NetworkNameNormalization.originalNameLabel] == nil)
+    }
+
+    @Test("a client-supplied original-name label is rejected with 400")
+    func clientSuppliedOriginalNameLabelRejected() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a","Labels":{"\#(NetworkNameNormalization.originalNameLabel)":"x"}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+        #expect(client.createCalls == 0)
+    }
+
+    @Test("an empty name is rejected with 400 and never reaches the backend")
+    func emptyNameRejected() async throws {
+        let client = FakeNetworkClient()
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":""}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+        #expect(client.createCalls == 0)
+    }
+
+    @Test("an over-long name is created under a shortened valid name and keeps its original name")
+    func overLongNameIsShortened() async throws {
+        let client = FakeNetworkClient()
+        let long = "aspire-session-network-ghfpwpdj-Contoso.Enterprise.Inventory.Management.Web.Frontend"
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"\#(long)"}"#)
+            ) { res async throws in
+                #expect(res.status == .created)
+                let created = try res.content.decode(RESTNetworkCreate.self)
+                #expect(NetworkResource.nameValid(created.Id))
+            }
+        }
+        let stored = try #require(client.createdNames.first)
+        #expect(NetworkResource.nameValid(stored))
+        #expect(client.createdLabels.first?[NetworkNameNormalization.originalNameLabel] == long)
+    }
+
+    /// The longest original name whose `socktainer.network-original-name=<name>` label fits
+    /// Apple's 4096-character label limit.
+    static let maxOriginalNameLength = ResourceLabels.labelLengthMax - NetworkNameNormalization.originalNameLabel.count - 1
+
+    @Test("a name too long for the original-name label returns a descriptive 400, not a 500")
+    func originalNameTooLongForLabelReturns400() async throws {
+        let client = FakeNetworkClient()
+        let name = "Net-" + String(repeating: "a", count: Self.maxOriginalNameLength - 3)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("network name is too long"))
+            }
+        }
+        #expect(client.createCalls == 0, "an unstorable name must be rejected before reaching the backend")
+    }
+
+    @Test("an oversized client label returns a 400 instead of a 500")
+    func oversizedClientLabelReturns400() async throws {
+        let client = FakeNetworkClient()
+        let value = String(repeating: "v", count: ResourceLabels.labelLengthMax)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"net-a","Labels":{"app":"\#(value)"}}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("invalid network label"))
+            }
+        }
+        #expect(client.createCalls == 0)
+    }
+
+    @Test("the longest name whose original-name label fits is created")
+    func longestStorableNameIsCreated() async throws {
+        let client = FakeNetworkClient()
+        let name = "Net-" + String(repeating: "a", count: Self.maxOriginalNameLength - 4)
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"\#(name)"}"#)
+            ) { res async in
+                #expect(res.status == .created)
+            }
+        }
+        #expect(client.createdLabels.first?[NetworkNameNormalization.originalNameLabel] == name)
+    }
+
+    @Test("an invalidArgument error from the backend returns 400 with its message")
+    func invalidArgumentReturns400() async throws {
+        let client = FakeNetworkClient()
+        client.createThrowsInvalidArgument = true
+        try await withNetworkRouteApp(client: client) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/networks/create",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Name":"bad name!"}"#)
+            ) { res async in
+                #expect(res.status == .badRequest)
+                #expect(res.body.string.contains("invalid network name: "))
+            }
+        }
+        #expect(client.getNetworkCalls == 0)
     }
 
     @Test("a non-\"already exists\" create failure still propagates (not swallowed)")
@@ -287,12 +465,12 @@ private struct SubnetConflictError: Error, CustomStringConvertible {
     var description: String { "requested subnet is already in use" }
 }
 
-private func makeNetworkResource(name: String, mode: NetworkMode) throws -> NetworkResource {
+private func makeNetworkResource(name: String, mode: NetworkMode, labels: [String: String] = [:]) throws -> NetworkResource {
     let configuration = try NetworkConfiguration(
         name: name,
         mode: mode,
         ipv4Subnet: nil,
-        labels: ResourceLabels([:]),
+        labels: ResourceLabels(labels),
         plugin: "container-network-vmnet"
     )
     let status = NetworkStatus(
@@ -316,6 +494,12 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     var getNetworkReturnsNil = false
     /// When true, `create` fails with a non-"already exists" error.
     var createThrowsOther = false
+    /// When true, `create` fails the way Apple's `NetworkConfiguration` rejects an invalid name.
+    var createThrowsInvalidArgument = false
+    /// Every name passed to `create`, in order.
+    private(set) var createdNames: [String] = []
+    /// Every label set passed to `create`, in order.
+    private(set) var createdLabels: [[String: String]] = []
     /// Number of leading `create` calls with a pinned subnet that fail with a subnet-conflict error.
     var subnetConflictsBeforeSuccess = 0
     /// When true, every `create` with a non-nil subnet fails with a subnet-conflict error.
@@ -323,6 +507,7 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     /// Every subnet passed to `create`, in order — lets tests assert re-pick behavior.
     private(set) var triedSubnets: [String?] = []
     private var existing: [String: NetworkMode] = [:]
+    private var existingLabels: [String: [String: String]] = [:]
     private(set) var triedModes: [NetworkMode] = []
 
     func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary] { [] }
@@ -330,7 +515,7 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
     func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
         getNetworkCalls += 1
         guard !getNetworkReturnsNil, let mode = existing[id] else { return nil }
-        return RESTNetworkSummary(networkResource: try makeNetworkResource(name: id, mode: mode))
+        return RESTNetworkSummary(networkResource: try makeNetworkResource(name: id, mode: mode, labels: existingLabels[id] ?? [:]))
     }
 
     func delete(id: String, logger: Logger) async throws {}
@@ -340,7 +525,12 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
         triedModes.append(mode)
         lastSubnet = ipv4Subnet
         triedSubnets.append(ipv4Subnet)
+        createdNames.append(name)
+        createdLabels.append(labels)
         if createThrowsOther { throw OtherError() }
+        if createThrowsInvalidArgument {
+            throw ContainerizationError(.invalidArgument, message: "invalid network name: \(name)")
+        }
         if ipv4Subnet != nil {
             if conflictAllPinned { throw SubnetConflictError() }
             if subnetConflictsBeforeSuccess > 0 {
@@ -350,6 +540,7 @@ private final class FakeNetworkClient: ClientNetworkProtocol, @unchecked Sendabl
         }
         guard existing[name] == nil else { throw AlreadyExistsError(name: name) }
         existing[name] = mode
+        existingLabels[name] = labels
         return RESTNetworkCreate(Id: name, Warning: "")
     }
 
