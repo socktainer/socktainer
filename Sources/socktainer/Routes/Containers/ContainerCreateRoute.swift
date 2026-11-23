@@ -683,6 +683,7 @@ extension ContainerCreateRoute {
                     mountsOrFs.append(contentsOf: otherMountsOrFs)
                 }
             }
+            mountsOrFs.append(contentsOf: try ContainerCreateRoute.tmpfsMounts(body.HostConfig?.Tmpfs ?? [:]))
 
             let declaredMounts: [VolumeOrFilesystem]
             do {
@@ -1191,6 +1192,20 @@ extension ContainerCreateRoute {
             return .missingSocket
         }
         return .other
+    }
+
+    /// Converts `HostConfig.Tmpfs`, which maps each container path to Docker's tmpfs
+    /// options (`size=64m,mode=1777`), the form Compose's `tmpfs:` key sends.
+    static func tmpfsMounts(_ tmpfs: [String: String]) throws -> [VolumeOrFilesystem] {
+        let specs = tmpfs.keys.sorted().map { path in
+            let options = tmpfs[path] ?? ""
+            return options.isEmpty ? path : "\(path):\(options)"
+        }
+        do {
+            return try Parser.tmpfsMounts(specs).map { .filesystem($0) }
+        } catch {
+            throw Abort(.badRequest, reason: "Invalid tmpfs mount: \(error)")
+        }
     }
 
     /// Splits non-volume `HostConfig.Mounts` into socket binds, already converted, and the
