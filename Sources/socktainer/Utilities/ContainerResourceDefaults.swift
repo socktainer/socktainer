@@ -7,16 +7,25 @@ import SystemPackage
 ///
 /// A container created through the Docker API without explicit limits used to be
 /// sized by whatever `ContainerConfiguration` happened to default to — a fixed
-/// 4 CPUs and 1 GiB — so `container system property set container.cpus`/`memory`
-/// had no effect on anything created through socktainer. Only the unset case was
-/// affected; `docker run -m 4g --cpus 2` was always honoured.
+/// 4 CPUs and 1 GiB — so the configured `[container] cpus`/`memory` had no effect
+/// on anything created through socktainer. Only the unset case was affected;
+/// `docker run -m 4g --cpus 2` was always honoured.
 ///
+/// The defaults are set in `~/.config/container/config.toml`, for example
+///
+///     [container]
+///     memory = "2gb"
+///
+/// `container system start` copies that file to
+/// `~/Library/Application Support/com.apple.container/config/config.toml`, which is
+/// what is read here, layered over the install's `etc/container/config.toml`.
+/// (`container system property set` no longer exists; `property` only has `list`.)
 /// The values are read the same way the `container` CLI reads them, via
 /// `ClientHealthCheck` for the roots and `ConfigurationLoader` for the files.
 ///
-/// Loaded once per process. Apple Container requires an engine restart for a
-/// changed `[container]` block to take effect, and socktainer is restarted with
-/// the engine, so a longer-lived cache cannot go stale in practice.
+/// Loaded once per process. A changed `[container]` block takes effect only after
+/// `container system stop` and `container system start`, and socktainer must then be
+/// restarted too, because it keeps the values it loaded.
 actor ContainerResourceDefaults {
     typealias Loader = @Sendable () async throws -> ContainerPersistence.ContainerConfig
 
