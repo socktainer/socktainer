@@ -51,6 +51,8 @@ enum ClientArchiveError: Error, LocalizedError {
     case rootfsNotFound(id: String)
     case invalidPath(path: String)
     case notADirectory(path: String)
+    /// The uploaded archive is corrupt or truncated: the client's fault.
+    case invalidArchive(reason: String)
     case operationFailed(message: String)
 
     var errorDescription: String? {
@@ -65,6 +67,8 @@ enum ClientArchiveError: Error, LocalizedError {
             return "Invalid path: \(path)"
         case .notADirectory(let path):
             return "Extraction point is not a directory: \(path)"
+        case .invalidArchive(let reason):
+            return "Invalid archive: \(reason)"
         case .operationFailed(let message):
             return "Archive operation failed: \(message)"
         }
@@ -839,11 +843,21 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
     }
 
-    /// Parse the uploaded tar into a copy plan.
+    /// Refuse an uploaded archive whose stream failed while it was read, as
+    /// `invalidArchive`, so the route answers 400 rather than 500.
+    static func throwIfCorrupt(_ reader: ArchiveReader) throws {
+        do {
+            try reader.throwIfStreamFailed()
+        } catch {
+            throw ClientArchiveError.invalidArchive(reason: "\(error)")
+        }
+    }
+
+    /// Parse the uploaded tar into a copy plan. The upload may be compressed.
     func parseArchiveEntries(tarPath: URL, destinationPath: String) throws -> [ArchiveEntryPlan] {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: ArchiveUtility.compressionFilter(of: tarPath),
             file: tarPath
         )
 
@@ -883,6 +897,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
                     relativePath: relativePath, guestPath: guestPath, kind: kind, mode: mode,
                     uid: uid, gid: gid, mtime: mtime))
         }
+        // A corrupt or truncated stream ends the iteration without throwing:
+        // refuse it rather than copy the entries that happened to decode.
+        try Self.throwIfCorrupt(archiveReader)
         return plan
     }
 
@@ -1531,7 +1548,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     ) throws {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: ArchiveUtility.compressionFilter(of: tarPath),
             file: tarPath
         )
 
@@ -1553,7 +1570,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
                     message: "Refusing to overwrite \(existingIsDirectory ? "directory" : "non-directory") at \(fullPath)"
                 )
             }
-        }
+        }  // A corrupt or truncated stream ends the iteration without throwing:
+        // refuse it before the rootfs is rebuilt from a partial archive.
+        try Self.throwIfCorrupt(archiveReader)
     }
 
     /// Extract a path from the ext4 filesystem to a local directory.

@@ -43,6 +43,39 @@ struct ArchiveUtility {
         }
     }
 
+    /// The compression wrapped around an uploaded archive, read from its magic
+    /// bytes.
+    ///
+    /// `PUT /containers/{id}/archive` accepts a tar compressed with gzip, bzip2,
+    /// xz or zstd as well as a plain one: moby runs every upload through
+    /// `DecompressStream`. A reader pinned to `filter: .none` yields no entries
+    /// for a compressed body and reports no error, so the copy would succeed
+    /// while writing nothing. testcontainers-go always uploads gzip.
+    static func compressionFilter(of tarPath: URL) -> Filter {
+        guard let handle = try? FileHandle(forReadingFrom: tarPath) else { return .none }
+        defer { try? handle.close() }
+        let magic = [UInt8]((try? handle.read(upToCount: 10)) ?? Data())
+        // A plain tar starts with its first member's name, so a short prefix is
+        // not enough: `BZh-notes.txt` is a valid first member. Match as much of
+        // each signature as the format fixes.
+        if magic.starts(with: [0x1f, 0x8b, 0x08]) { return .gzip }
+        // "BZh", a block size of '1'...'9', then either the block header
+        // magic or, for a stream that opens with an empty member, the
+        // end-of-stream magic.
+        if magic.count >= 10, magic.starts(with: [0x42, 0x5a, 0x68]), (0x31...0x39).contains(magic[3]),
+            magic[4...9].elementsEqual([0x31, 0x41, 0x59, 0x26, 0x53, 0x59])
+                || magic[4...9].elementsEqual([0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
+        {
+            return .bzip2
+        }
+        if magic.starts(with: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) { return .xz }
+        if magic.starts(with: [0x28, 0xb5, 0x2f, 0xfd]) { return .zstd }
+        // A zstd stream may open with a skippable frame (pzstd writes one):
+        // magic 0x184D2A50...0x184D2A5F, little-endian.
+        if magic.count >= 4, magic[0] & 0xf0 == 0x50, magic[1] == 0x2a, magic[2] == 0x4d, magic[3] == 0x18 { return .zstd }
+        return .none
+    }
+
     static func create(tarPath: URL, from source: URL) throws {
         let fileManager = FileManager.default
 
@@ -98,7 +131,7 @@ struct ArchiveUtility {
     ) throws {
         let archiveReader = try ArchiveReader(
             format: .paxRestricted,
-            filter: .none,
+            filter: compressionFilter(of: tarPath),
             file: tarPath
         )
 
@@ -154,5 +187,7 @@ struct ArchiveUtility {
                 continue
             }
         }
+        // A corrupt or truncated stream ends the iteration without throwing.
+        try archiveReader.throwIfStreamFailed()
     }
 }
