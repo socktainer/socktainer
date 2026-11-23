@@ -324,11 +324,8 @@ struct ClientImageService: ClientImageProtocol {
                 } catch {
                     // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
                     // Apple Container enables Rosetta automatically when the container platform is amd64.
-                    let errMsg = String(describing: error)
-                    if platform.architecture == "arm64",
-                        errMsg.contains("does not support required platforms")
-                    {
-                        let amd64 = Platform(arch: "amd64", os: platform.os, variant: nil)
+                    if RosettaFallback.shouldRetryAsAmd64(error, requested: platform) {
+                        let amd64 = RosettaFallback.amd64(like: platform)
                         logger.info("arm64 not available for \(reference), retrying with amd64 (Rosetta)")
                         continuation.yield(.message("linux/arm64 not available — retrying with linux/amd64 (Rosetta)"))
                         do {

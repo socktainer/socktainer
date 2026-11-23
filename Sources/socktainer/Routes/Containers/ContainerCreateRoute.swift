@@ -175,9 +175,10 @@ extension ContainerCreateRoute {
             }
 
             // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
-            // variant is available. Two cases handled:
-            //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
-            //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
+            // variant is available. Cases handled (see RosettaFallback.shouldRetryAsAmd64):
+            //   1. Image not cached: the pull fails with "does not support required platforms"
+            //   2. Image cached as amd64: fetch's config(for: arm64) fails with "platform linux/arm64"
+            //   3. Fetch returns the cached image anyway: config(for: arm64) is checked below
             // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
             var img: ClientImage
             do {
@@ -187,20 +188,13 @@ extension ContainerCreateRoute {
                     scheme: RegistryScheme.scheme(forReference: imageReference, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
-                // Case 2: image exists locally but may have been pulled as amd64
                 if requestedPlatform.architecture == "arm64",
                     (try? await img.config(for: requestedPlatform)) == nil
                 {
-                    throw ContainerizationError(.notFound, message: "no arm64 content")
+                    throw ContainerizationError(.unsupported, message: "platform \(requestedPlatform.description)")
                 }
-            } catch let fetchError
-                where requestedPlatform.architecture == "arm64"
-                && {
-                    let msg = String(describing: fetchError)
-                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
-                }()
-            {
-                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
+            } catch let fetchError where RosettaFallback.shouldRetryAsAmd64(fetchError, requested: requestedPlatform) {
+                let amd64 = RosettaFallback.amd64(like: requestedPlatform)
                 req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
                 img = try await ClientImage.fetch(
                     reference: imageReference,
