@@ -783,9 +783,10 @@ extension ContainerCreateRoute {
                     try ContainerAnonymousVolumes.encode(createdAnonymousVolumes)
 
                 // Fall back to Apple Container's own `[container]` configuration when the
-                // request carries no explicit limits, so `container system property set
-                // container.cpus` / `container.memory` applies to containers created through
-                // the Docker API too. Without this they were always sized 4 CPUs / 1 GiB.
+                // request carries no explicit limits, so `[container] cpus` / `memory` from
+                // ~/.config/container/config.toml applies to containers created through the
+                // Docker API too (see ContainerResourceDefaults). Without this they were
+                // always sized 4 CPUs / 1 GiB.
                 //
                 // Only loaded when at least one limit is missing: the first load pings the
                 // daemon with a 10s timeout, and a create that specifies both limits would

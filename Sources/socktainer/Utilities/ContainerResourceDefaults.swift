@@ -7,21 +7,39 @@ import SystemPackage
 ///
 /// A container created through the Docker API without explicit limits used to be
 /// sized by whatever `ContainerConfiguration` happened to default to — a fixed
-/// 4 CPUs and 1 GiB — so `container system property set container.cpus`/`memory`
-/// had no effect on anything created through socktainer. Only the unset case was
-/// affected; `docker run -m 4g --cpus 2` was always honoured.
+/// 4 CPUs and 1 GiB — so the configured `[container] cpus`/`memory` had no effect
+/// on anything created through socktainer. Only the unset case was affected;
+/// `docker run -m 4g --cpus 2` was always honoured.
 ///
+/// The defaults are set in `~/.config/container/config.toml`, for example
+///
+///     [container]
+///     memory = "2gb"
+///
+/// `container system start` copies that file to
+/// `~/Library/Application Support/com.apple.container/config/config.toml`, which is
+/// what is read here, layered over the install's `etc/container/config.toml`.
+/// (`container system property set` no longer exists; `property` only has `list`.)
 /// The values are read the same way the `container` CLI reads them, via
 /// `ClientHealthCheck` for the roots and `ConfigurationLoader` for the files.
 ///
-/// Loaded once per process. Apple Container requires an engine restart for a
-/// changed `[container]` block to take effect, and socktainer is restarted with
-/// the engine, so a longer-lived cache cannot go stale in practice.
+/// Loaded once per process. A changed `[container]` block takes effect only after
+/// `container system stop` and `container system start`, and socktainer must then be
+/// restarted too, because it keeps the values it loaded.
 actor ContainerResourceDefaults {
-    static let shared = ContainerResourceDefaults()
+    typealias Loader = @Sendable () async throws -> ContainerPersistence.ContainerConfig
 
-    private var cached: ContainerPersistence.ContainerConfig?
-    private var attempted = false
+    static let shared = ContainerResourceDefaults(load: ContainerResourceDefaults.loadFromAppleContainer)
+
+    private let load: Loader
+    /// The load every caller awaits. Actors are reentrant at `await`, so callers that arrive
+    /// while it is in flight must share it rather than see an empty cache. A successful load
+    /// stays; a failed one is cleared so the next container create tries again.
+    private var loading: Task<ContainerPersistence.ContainerConfig?, Never>?
+
+    init(load: @escaping Loader) {
+        self.load = load
+    }
 
     /// The configured `[container]` defaults, or `nil` if they cannot be read.
     ///
@@ -32,35 +50,52 @@ actor ContainerResourceDefaults {
     /// not a reason to fail container creation. The caller then leaves the
     /// configuration untouched, which is the previous behaviour.
     func current(logger: Logger) async -> ContainerPersistence.ContainerConfig? {
-        if let cached {
-            return cached
+        let task = loading ?? startLoad(logger: logger)
+        loading = task
+        waitingCallers += 1
+        let config = await task.value
+        waitingCallers -= 1
+        // Every caller clears a failed load, not only the one that started it: callers resume
+        // in no defined order, and a later caller must not reuse the failed task.
+        if config == nil, loading == task {
+            loading = nil
         }
-        guard !attempted else {
-            return nil
-        }
-        attempted = true
+        return config
+    }
 
-        do {
-            let health = try await ClientHealthCheck.ping(timeout: .seconds(10))
-            let appRoot = FilePath(health.appRoot.path(percentEncoded: false))
-            let installRoot = FilePath(health.installRoot.path(percentEncoded: false))
-            let config: ContainerSystemConfig = try await ConfigurationLoader.load(
-                configurationFiles: [
-                    ConfigurationLoader.configurationFile(in: appRoot, of: .appRoot),
-                    ConfigurationLoader.configurationFile(in: installRoot, of: .installRoot),
-                ]
-            )
-            cached = config.container
-            logger.debug(
-                "[container] defaults loaded: cpus=\(config.container.cpus) memory=\(config.container.memory.toUInt64(unit: .bytes)) bytes"
-            )
-            return cached
-        } catch {
-            logger.warning(
-                "could not read Apple Container's [container] configuration (\(error)); containers created without explicit limits keep the built-in defaults"
-            )
-            return nil
+    /// Callers currently awaiting a load. Lets tests wait until callers have joined it.
+    private(set) var waitingCallers = 0
+
+    private func startLoad(logger: Logger) -> Task<ContainerPersistence.ContainerConfig?, Never> {
+        let load = self.load
+        return Task { () -> ContainerPersistence.ContainerConfig? in
+            do {
+                let config = try await load()
+                logger.debug(
+                    "[container] defaults loaded: cpus=\(config.cpus) memory=\(config.memory.toUInt64(unit: .bytes)) bytes"
+                )
+                return config
+            } catch {
+                logger.warning(
+                    "could not read Apple Container's [container] configuration (\(error)); containers created without explicit limits keep the built-in defaults"
+                )
+                return nil
+            }
         }
+    }
+
+    /// Reads the `[container]` block the way the `container` CLI does.
+    static func loadFromAppleContainer() async throws -> ContainerPersistence.ContainerConfig {
+        let health = try await ClientHealthCheck.ping(timeout: .seconds(10))
+        let appRoot = FilePath(health.appRoot.path(percentEncoded: false))
+        let installRoot = FilePath(health.installRoot.path(percentEncoded: false))
+        let config: ContainerSystemConfig = try await ConfigurationLoader.load(
+            configurationFiles: [
+                ConfigurationLoader.configurationFile(in: appRoot, of: .appRoot),
+                ConfigurationLoader.configurationFile(in: installRoot, of: .installRoot),
+            ]
+        )
+        return config.container
     }
 }
 
