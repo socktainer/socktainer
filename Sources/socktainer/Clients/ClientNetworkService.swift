@@ -24,29 +24,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
         // Map containers to networks
         for i in 0..<allNetworks.count {
             let network = allNetworks[i]
-            var containersForNetwork: [String: NetworkContainer] = [:]
-            for container in allContainers {
-                // Exclude internal Socktainer DNS sidecars from the Docker API view.
-                // If CoreDNS shows up as an attached container, docker compose down
-                // reports "Resource is still in use" and skips the DELETE /networks/{id}
-                // call — preventing our cleanup hook from firing.
-                guard !ClientContainerService.isDNSSidecar(container) else {
-                    continue
-                }
-                for attachment in container.networks {
-                    if attachment.network == network.Id || attachment.network == network.Name {
-                        let nc = NetworkContainer(
-                            Name: container.id,
-                            EndpointID: nil,  // Apple container doesn't have a matching field
-                            MacAddress: nil,  // Apple container doesn't have a matching field
-                            IPv4Address: String(describing: attachment.ipv4Address),
-                            IPv6Address: nil
-                        )
-                        containersForNetwork[container.id] = nc
-                        logger.debug("Container \(container.id) attached to network \(network.Name) (ID: \(network.Id))")
-                    }
-                }
-            }
+            let containersForNetwork = Self.containers(attachedTo: network, in: allContainers)
             if !containersForNetwork.isEmpty {
                 allNetworks[i] = RESTNetworkSummary(
                     Name: network.Name,
@@ -71,6 +49,32 @@ struct ClientNetworkService: ClientNetworkProtocol {
         }
 
         return Self.applyFilters(allNetworks, filters: filters, logger: logger)
+    }
+
+    /// The network's `Containers` map. Keyed by the Docker container ID, as Docker does, so
+    /// the keys match the `Id` from `GET /containers/json` and `GET /containers/{id}/json`;
+    /// clients such as .NET Aspire's DCP look containers up in it by that ID.
+    static func containers(attachedTo network: RESTNetworkSummary, in containers: [ContainerSnapshot]) -> [String: NetworkContainer] {
+        var result: [String: NetworkContainer] = [:]
+        for container in containers {
+            // Exclude internal Socktainer DNS sidecars from the Docker API view.
+            // If CoreDNS shows up as an attached container, docker compose down
+            // reports "Resource is still in use" and skips the DELETE /networks/{id}
+            // call — preventing our cleanup hook from firing.
+            guard !ClientContainerService.isDNSSidecar(container) else {
+                continue
+            }
+            for attachment in container.networks where attachment.network == network.Id || attachment.network == network.Name {
+                result[DockerContainerID.hexId(for: container)] = NetworkContainer(
+                    Name: container.id,
+                    EndpointID: nil,  // Apple container doesn't have a matching field
+                    MacAddress: nil,  // Apple container doesn't have a matching field
+                    IPv4Address: String(describing: attachment.ipv4Address),
+                    IPv6Address: nil
+                )
+            }
+        }
+        return result
     }
 
     /// Applies Docker network list/prune filters. Multiple values for the same
