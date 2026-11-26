@@ -222,6 +222,57 @@ final class VolumeCopyUpTests {
         }
     }
 
+    @Test("repeated copy-ups from one image open its filesystem once")
+    func opensRootfsOncePerImage() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            try fixture.writeFile(formatter, "/data/seed.txt", "hello\n", mode: 0o644)
+        }
+        let opens = ReadCounter()
+        let readers = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+            opens.increment()
+            return try EXT4.EXT4Reader(blockDevice: FilePath(path))
+        }
+
+        for volume in try fixture.makeVolumes(count: 3) {
+            try VolumeCopyUp.populate(
+                volumeImagePath: volume.path, fromRootfs: fixture.rootfs.path,
+                sourcePath: "/data", logger: logger, readers: readers)
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(volume.path))
+            #expect(try reader.readFile(at: FilePath("/seed.txt")) == Data("hello\n".utf8))
+        }
+
+        #expect(opens.count == 1)
+    }
+
+    @Test("parallel copy-ups from one image each get the full contents")
+    func parallelCopyUpsShareTheReaderSafely() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        let payload = blockDistinctBytes(count: 2 * 1024 * 1024 + 4097)
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            try fixture.writeFile(formatter, "/data/state.db", payload, mode: 0o644)
+        }
+        let volumes = try fixture.makeVolumes(count: 6)
+        let readers = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+            try EXT4.EXT4Reader(blockDevice: FilePath(path))
+        }
+        let logger = self.logger
+
+        DispatchQueue.concurrentPerform(iterations: volumes.count) { index in
+            try? VolumeCopyUp.populate(
+                volumeImagePath: volumes[index].path, fromRootfs: fixture.rootfs.path,
+                sourcePath: "/data", logger: logger, readers: readers)
+        }
+
+        for volume in volumes {
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(volume.path))
+            #expect(try reader.readFile(at: FilePath("/state.db")) == payload)
+        }
+    }
 }
 
 // MARK: - Fixture
@@ -246,6 +297,14 @@ private struct CopyUpFixture {
     /// A volume as Apple Container hands it over: empty apart from /lost+found.
     func makeVolume(size: UInt64 = 8 * 1024 * 1024) throws {
         try Self.formatEmptyVolume(at: volume, size: size)
+    }
+
+    func makeVolumes(count: Int) throws -> [URL] {
+        try (0..<count).map { index in
+            let url = directory.appendingPathComponent("volume-\(index).img")
+            try Self.formatEmptyVolume(at: url, size: 16 * 1024 * 1024)
+            return url
+        }
     }
 
     private static func formatEmptyVolume(at url: URL, size: UInt64) throws {

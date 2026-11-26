@@ -16,6 +16,10 @@ enum VolumeCopyUp {
 
     static let fileCopyBufferSize = 1 << 20
 
+    static let rootfsReaders = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+        try EXT4.EXT4Reader(blockDevice: FilePath(path))
+    }
+
     static func ext4FileContents(_ reader: EXT4.EXT4Reader, _ path: FilePath, _ size: UInt64) -> any ReadableStream {
         EXT4FileStream(reader: reader, path: path, size: size)
     }
@@ -64,9 +68,23 @@ enum VolumeCopyUp {
         fromRootfs rootfsPath: String,
         sourcePath: String,
         logger: Logger,
+        readers: FileReaderCache<EXT4.EXT4Reader> = rootfsReaders,
         fileContents: FileContents = ext4FileContents
     ) throws {
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath))
+        try readers.withReader(at: rootfsPath) { reader in
+            try populate(
+                volumeImagePath: volumeImagePath, from: reader, sourcePath: sourcePath,
+                fileContents: fileContents, logger: logger)
+        }
+    }
+
+    private static func populate(
+        volumeImagePath: String,
+        from reader: EXT4.EXT4Reader,
+        sourcePath: String,
+        fileContents: FileContents,
+        logger: Logger
+    ) throws {
         let source = FilePath(sourcePath.hasPrefix("/") ? sourcePath : "/\(sourcePath)")
 
         var rootInode: EXT4.Inode?
