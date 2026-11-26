@@ -224,6 +224,22 @@ final class FileReaderCacheTests {
         #expect(opener.opened == [postgres, redis])
     }
 
+    @Test("readers kept past capacity while in use are trimmed once their users return")
+    func trimsReadersAboveCapacityOnReturn() throws {
+        let postgres = try makeFile("postgres.ext4", contents: "postgres")
+        let redis = try makeFile("redis.ext4", contents: "redis")
+        let cache = FileReaderCache(capacity: 1, idleTimeout: .seconds(300), open: CountingOpener().open)
+        weak var postgresReader: SnapshotReader?
+        weak var redisReader: SnapshotReader?
+
+        try cache.withReader(at: postgres) { reader in
+            postgresReader = reader
+            try cache.withReader(at: redis) { redisReader = $0 }
+        }
+
+        #expect([postgresReader, redisReader].compactMap { $0 }.count == 1)
+    }
+
     @Test("past capacity the least recently used reader is dropped")
     func evictsLeastRecentlyUsed() throws {
         let postgres = try makeFile("postgres.ext4", contents: "postgres")

@@ -78,11 +78,9 @@ final class FileReaderCache<Reader>: @unchecked Sendable {
             } else {
                 entry = Entry(identity: identity, lastUsed: now())
                 entries[path] = entry
-                for evicted in recentFirst.dropFirst(capacity) where (entries[evicted]?.users ?? 0) == 0 {
-                    drop(evicted)
-                }
             }
             entry.users += 1
+            evictIdleBeyondCapacity()
             return entry
         }
     }
@@ -91,6 +89,15 @@ final class FileReaderCache<Reader>: @unchecked Sendable {
         lock.withLock {
             entry.users -= 1
             entry.lastUsed = now()
+            evictIdleBeyondCapacity()
+        }
+    }
+
+    private func evictIdleBeyondCapacity() {
+        var excess = entries.count - capacity
+        for path in recentFirst.reversed() where excess > 0 && (entries[path]?.users ?? 0) == 0 {
+            drop(path)
+            excess -= 1
         }
     }
 
