@@ -603,7 +603,7 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func load(tarballPath: URL, platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> [String] {
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+        let imageStore = try SharedImageStore.store(path: appleContainerAppSupportUrl)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -698,7 +698,7 @@ struct ClientImageService: ClientImageProtocol {
     }
 
     func exportTarball(resolvedReferences: [String], platform: Platform?, appleContainerAppSupportUrl: URL, logger: Logger) async throws -> URL {
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+        let imageStore = try SharedImageStore.store(path: appleContainerAppSupportUrl)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -784,7 +784,7 @@ struct ClientImageService: ClientImageProtocol {
             logger: logger
         )
 
-        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+        let imageStore = try SharedImageStore.store(path: appleContainerAppSupportUrl)
         let images = try await imageStore.load(from: ociLayoutPath, progress: nil)
         guard let image = images.first else {
             throw ClientImageError.notFound(id: reference ?? "imported image")
