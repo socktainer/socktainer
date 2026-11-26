@@ -188,6 +188,49 @@ struct ClientImageServiceLoadTests {
             ])
     }
 
+    @Test("concurrent loads into one store keep every tag (#518)")
+    func concurrentLoadsKeepEveryTag() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let manifest = try fixture.writeImage()
+        let rounds = 10
+        var tarballs: [(URL, URL)] = []
+        for round in 0..<rounds {
+            try fixture.writeTopIndex(manifests: [fixture.tagged(manifest, as: "crafted-a:\(round)")])
+            let first = try fixture.makeTarball(named: "a-\(round).tar")
+            try fixture.writeTopIndex(manifests: [fixture.tagged(manifest, as: "crafted-b:\(round)")])
+            let second = try fixture.makeTarball(named: "b-\(round).tar")
+            tarballs.append((first, second))
+        }
+
+        for (first, second) in tarballs {
+            async let loadedFirst = fixture.load(first)
+            async let loadedSecond = fixture.load(second)
+            _ = try await (loadedFirst, loadedSecond)
+        }
+
+        let stored = Set(try await ImageStore(path: fixture.storeDir).list().map(\.reference))
+        let expected = Set(
+            (0..<rounds).flatMap { round in
+                ["docker.io/library/crafted-a:\(round)", "docker.io/library/crafted-b:\(round)"]
+            })
+        #expect(expected.subtracting(stored).isEmpty, "lost tags: \(expected.subtracting(stored).sorted())")
+    }
+
+    @Test("the shared store is one instance per path")
+    func sharedStoreIsOneInstancePerPath() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("shared-store-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let first = try SharedImageStore.store(path: dir)
+        let second = try SharedImageStore.store(path: dir.appendingPathComponent("sub/.."))
+        let other = try SharedImageStore.store(path: dir.appendingPathComponent("other"))
+
+        #expect(first === second)
+        #expect(first !== other)
+    }
+
 }
 
 private struct ImageTarballFixture {
@@ -258,8 +301,8 @@ private struct ImageTarballFixture {
         try JSONEncoder().encode(Index(manifests: manifests)).write(to: layoutDir.appendingPathComponent("index.json"))
     }
 
-    func makeTarball() throws -> URL {
-        let tarball = workDir.appendingPathComponent("image.tar")
+    func makeTarball(named name: String = "image.tar") throws -> URL {
+        let tarball = workDir.appendingPathComponent(name)
         try ArchiveUtility.create(tarPath: tarball, from: layoutDir)
         return tarball
     }
