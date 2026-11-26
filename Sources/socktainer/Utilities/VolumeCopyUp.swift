@@ -12,6 +12,18 @@ import SystemPackage
 /// instead, which is why an image like Postgres cannot initialise its own data
 /// directory on a new volume.
 enum VolumeCopyUp {
+    typealias FileContents = (EXT4.EXT4Reader, FilePath, UInt64) -> any ReadableStream
+
+    static let fileCopyBufferSize = 1 << 20
+
+    static let rootfsReaders = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+        try EXT4.EXT4Reader(blockDevice: FilePath(path))
+    }
+
+    static func ext4FileContents(_ reader: EXT4.EXT4Reader, _ path: FilePath, _ size: UInt64) -> any ReadableStream {
+        EXT4FileStream(reader: reader, path: path, size: size)
+    }
+
     /// True when the volume holds nothing but what a freshly formatted EXT4 image
     /// always carries. Copy-up applies to empty volumes only: Docker leaves a
     /// volume that already has contents alone.
@@ -55,9 +67,24 @@ enum VolumeCopyUp {
         volumeImagePath: String,
         fromRootfs rootfsPath: String,
         sourcePath: String,
+        logger: Logger,
+        readers: FileReaderCache<EXT4.EXT4Reader> = rootfsReaders,
+        fileContents: FileContents = ext4FileContents
+    ) throws {
+        try readers.withReader(at: rootfsPath) { reader in
+            try populate(
+                volumeImagePath: volumeImagePath, from: reader, sourcePath: sourcePath,
+                fileContents: fileContents, logger: logger)
+        }
+    }
+
+    private static func populate(
+        volumeImagePath: String,
+        from reader: EXT4.EXT4Reader,
+        sourcePath: String,
+        fileContents: FileContents,
         logger: Logger
     ) throws {
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath))
         let source = FilePath(sourcePath.hasPrefix("/") ? sourcePath : "/\(sourcePath)")
 
         var rootInode: EXT4.Inode?
@@ -81,6 +108,8 @@ enum VolumeCopyUp {
             minDiskSize: max(currentSize, 4 * 1024 * 1024)
         )
         if let rootInode {
+            let fileBuffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: fileCopyBufferSize)
+            defer { fileBuffer.deallocate() }
             // The mount root carries ownership of its own: a directory the image
             // hands to a non-root user is unusable if only its children are copied.
             try formatter.create(
@@ -93,7 +122,8 @@ enum VolumeCopyUp {
             var linkedInodes: [EXT4.InodeNumber: FilePath] = [:]
             try copyChildren(
                 of: source, from: reader, into: formatter,
-                at: FilePath("/"), linked: &linkedInodes, logger: logger)
+                at: FilePath("/"), linked: &linkedInodes,
+                fileContents: fileContents, fileBuffer: fileBuffer, logger: logger)
         }
         try formatter.unlink(path: FilePath("/lost+found"))
         try formatter.close()
@@ -108,6 +138,8 @@ enum VolumeCopyUp {
         into formatter: EXT4.Formatter,
         at target: FilePath,
         linked: inout [EXT4.InodeNumber: FilePath],
+        fileContents: FileContents,
+        fileBuffer: UnsafeMutableBufferPointer<UInt8>,
         logger: Logger
     ) throws {
         for name in try reader.listDirectory(source) where name != "." && name != ".." {
@@ -127,7 +159,8 @@ enum VolumeCopyUp {
                     uid: inode.fullUid, gid: inode.fullGid)
                 try copyChildren(
                     of: child, from: reader, into: formatter,
-                    at: childTarget, linked: &linked, logger: logger)
+                    at: childTarget, linked: &linked,
+                    fileContents: fileContents, fileBuffer: fileBuffer, logger: logger)
             } else if inode.isSymlink {
                 guard let link = symlinkTarget(of: inode, at: child, from: reader) else {
                     logger.warning("[volume-copyup] unreadable symlink skipped: \(child)")
@@ -137,10 +170,10 @@ enum VolumeCopyUp {
                     path: childTarget, link: FilePath(link), mode: inode.mode,
                     ts: timestamps(of: inode), uid: inode.fullUid, gid: inode.fullGid)
             } else if inode.isRegularFile {
-                let contents = EXT4FileStream(reader: reader, path: child, size: UInt64(inode.size))
+                let contents = fileContents(reader, child, UInt64(inode.size))
                 try formatter.create(
                     path: childTarget, mode: inode.mode, ts: timestamps(of: inode),
-                    buf: contents, uid: inode.fullUid, gid: inode.fullGid)
+                    buf: contents, uid: inode.fullUid, gid: inode.fullGid, fileBuffer: fileBuffer)
             } else {
                 // Device nodes, FIFOs and sockets carry a device number the
                 // formatter has no way to set, so they are reported rather than

@@ -222,7 +222,8 @@ struct ClientImageService: ClientImageProtocol {
     static func delete(
         id: String,
         containerSystemConfig: ContainerSystemConfig,
-        imageStore: ImageDeletionStore = LiveImageDeletionStore()
+        imageStore: ImageDeletionStore = LiveImageDeletionStore(),
+        releaseCachedImageReaders: @Sendable () -> Void = { VolumeCopyUp.rootfsReaders.releaseVanishedFiles() }
     ) async throws -> ImageDeletionResult {
         let normalizedRef: String
         let digest: String
@@ -243,6 +244,7 @@ struct ClientImageService: ClientImageProtocol {
         // Use try? so a GC failure does not fail the delete: the tag is already gone
         // and returning an error here would cause the client to retry a completed operation.
         _ = try? await imageStore.cleanUpOrphanedBlobs()
+        releaseCachedImageReaders()
 
         // Check remaining refs AFTER deletion to avoid a TOCTOU race: two concurrent
         // deletes checking before either delete would both see isLastRef=false and

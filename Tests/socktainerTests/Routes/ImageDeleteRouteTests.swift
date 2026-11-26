@@ -235,6 +235,48 @@ struct ImageDeleteRouteTests {
         #expect(store.isEmpty, "image must be deleted even when GC fails")
     }
 
+    @Test("cached image readers are released once the snapshot cleanup has run")
+    func releasesCachedImageReadersAfterCleanup() async throws {
+        let store = FakeImageStore(storedNormalized: "docker.io/library/postgres:16")
+        let releases = ReleaseRecorder()
+
+        try await ClientImageService.delete(
+            id: "postgres:16",
+            containerSystemConfig: ContainerSystemConfig(),
+            imageStore: store,
+            releaseCachedImageReaders: { releases.record(cleanUpCount: store.cleanUpCallCount) }
+        )
+
+        #expect(releases.cleanUpCountsSeen == [1])
+    }
+
+    @Test("cached image readers are released even when the snapshot cleanup fails")
+    func releasesCachedImageReadersWhenCleanupFails() async throws {
+        let store = FakeImageStore(storedNormalized: "docker.io/library/postgres:16")
+        store.cleanUpShouldThrow = true
+        let releases = ReleaseRecorder()
+
+        try await ClientImageService.delete(
+            id: "postgres:16",
+            containerSystemConfig: ContainerSystemConfig(),
+            imageStore: store,
+            releaseCachedImageReaders: { releases.record(cleanUpCount: store.cleanUpCallCount) }
+        )
+
+        #expect(releases.cleanUpCountsSeen == [1])
+    }
+
+    final class ReleaseRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: [Int] = []
+
+        var cleanUpCountsSeen: [Int] { lock.withLock { counts } }
+
+        func record(cleanUpCount: Int) {
+            lock.withLock { counts.append(cleanUpCount) }
+        }
+    }
+
     @Test("delete throws notFound when image does not exist in store")
     func deleteThrowsNotFoundForUnknownImage() async throws {
         struct ThrowingStore: ImageDeletionStore {

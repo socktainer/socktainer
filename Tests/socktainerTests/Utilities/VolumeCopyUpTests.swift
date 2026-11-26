@@ -1,3 +1,4 @@
+import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
 import Logging
@@ -165,6 +166,113 @@ final class VolumeCopyUpTests {
             .listDirectory(FilePath("/"))
         #expect(!entries.contains("lost+found"))
     }
+
+    @Test("copying a file reads its source once per MiB, not once per 4 KiB block")
+    func readsSourceOncePerMiB() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        try fixture.makeVolume(size: 16 * 1024 * 1024)
+        let payload = blockDistinctBytes(count: 8 * 1024 * 1024)
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            try fixture.writeFile(formatter, "/data/lib.jar", payload, mode: 0o644)
+        }
+        let sourceReads = ReadCounter()
+
+        try VolumeCopyUp.populate(
+            volumeImagePath: fixture.volume.path, fromRootfs: fixture.rootfs.path,
+            sourcePath: "/data", logger: logger,
+            fileContents: { reader, path, size in
+                CountingStream(VolumeCopyUp.ext4FileContents(reader, path, size), counter: sourceReads)
+            })
+
+        #expect(sourceReads.count == 8)
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(fixture.volume.path))
+        #expect(try reader.readFile(at: FilePath("/lib.jar")) == payload)
+    }
+
+    @Test("files sized around the read buffer boundary arrive byte for byte")
+    func copiesBufferBoundarySizesExactly() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        try fixture.makeVolume(size: 16 * 1024 * 1024)
+        let mebibyte = 1024 * 1024
+        let files: [String: Data] = [
+            "empty.txt": Data(),
+            "one-byte.txt": blockDistinctBytes(count: 1),
+            "just-under.bin": blockDistinctBytes(count: mebibyte - 1),
+            "exact.bin": blockDistinctBytes(count: mebibyte),
+            "just-over.bin": blockDistinctBytes(count: mebibyte + 1),
+            "several.bin": blockDistinctBytes(count: 3 * mebibyte + mebibyte / 2),
+        ]
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            for (name, contents) in files {
+                try fixture.writeFile(formatter, "/data/\(name)", contents, mode: 0o644)
+            }
+        }
+
+        try VolumeCopyUp.populate(
+            volumeImagePath: fixture.volume.path, fromRootfs: fixture.rootfs.path,
+            sourcePath: "/data", logger: logger)
+
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(fixture.volume.path))
+        for (name, contents) in files {
+            #expect(try reader.readFile(at: FilePath("/\(name)")) == contents, "\(name)")
+        }
+    }
+
+    @Test("repeated copy-ups from one image open its filesystem once")
+    func opensRootfsOncePerImage() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            try fixture.writeFile(formatter, "/data/seed.txt", "hello\n", mode: 0o644)
+        }
+        let opens = ReadCounter()
+        let readers = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+            opens.increment()
+            return try EXT4.EXT4Reader(blockDevice: FilePath(path))
+        }
+
+        for volume in try fixture.makeVolumes(count: 3) {
+            try VolumeCopyUp.populate(
+                volumeImagePath: volume.path, fromRootfs: fixture.rootfs.path,
+                sourcePath: "/data", logger: logger, readers: readers)
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(volume.path))
+            #expect(try reader.readFile(at: FilePath("/seed.txt")) == Data("hello\n".utf8))
+        }
+
+        #expect(opens.count == 1)
+    }
+
+    @Test("parallel copy-ups from one image each get the full contents")
+    func parallelCopyUpsShareTheReaderSafely() throws {
+        let fixture = CopyUpFixture()
+        defer { fixture.cleanUp() }
+        let payload = blockDistinctBytes(count: 2 * 1024 * 1024 + 4097)
+        try fixture.makeRootfs { formatter in
+            try formatter.create(path: FilePath("/data"), mode: EXT4.Inode.Mode(.S_IFDIR, 0o755))
+            try fixture.writeFile(formatter, "/data/state.db", payload, mode: 0o644)
+        }
+        let volumes = try fixture.makeVolumes(count: 6)
+        let readers = FileReaderCache<EXT4.EXT4Reader>(capacity: 4, idleTimeout: .seconds(300)) { path in
+            try EXT4.EXT4Reader(blockDevice: FilePath(path))
+        }
+        let logger = self.logger
+
+        DispatchQueue.concurrentPerform(iterations: volumes.count) { index in
+            try? VolumeCopyUp.populate(
+                volumeImagePath: volumes[index].path, fromRootfs: fixture.rootfs.path,
+                sourcePath: "/data", logger: logger, readers: readers)
+        }
+
+        for volume in volumes {
+            let reader = try EXT4.EXT4Reader(blockDevice: FilePath(volume.path))
+            #expect(try reader.readFile(at: FilePath("/state.db")) == payload)
+        }
+    }
 }
 
 // MARK: - Fixture
@@ -187,8 +295,20 @@ private struct CopyUpFixture {
     }
 
     /// A volume as Apple Container hands it over: empty apart from /lost+found.
-    func makeVolume() throws {
-        let formatter = try EXT4.Formatter(FilePath(volume.path), blockSize: 4096, minDiskSize: 8 * 1024 * 1024)
+    func makeVolume(size: UInt64 = 8 * 1024 * 1024) throws {
+        try Self.formatEmptyVolume(at: volume, size: size)
+    }
+
+    func makeVolumes(count: Int) throws -> [URL] {
+        try (0..<count).map { index in
+            let url = directory.appendingPathComponent("volume-\(index).img")
+            try Self.formatEmptyVolume(at: url, size: 16 * 1024 * 1024)
+            return url
+        }
+    }
+
+    private static func formatEmptyVolume(at url: URL, size: UInt64) throws {
+        let formatter = try EXT4.Formatter(FilePath(url.path), blockSize: 4096, minDiskSize: size)
         try formatter.close()
     }
 
@@ -202,11 +322,49 @@ private struct CopyUpFixture {
         _ formatter: EXT4.Formatter, _ path: String, _ contents: String,
         mode: UInt16, uid: UInt32 = 0, gid: UInt32 = 0
     ) throws {
-        let stream = InputStream(data: Data(contents.utf8))
+        try writeFile(formatter, path, Data(contents.utf8), mode: mode, uid: uid, gid: gid)
+    }
+
+    func writeFile(
+        _ formatter: EXT4.Formatter, _ path: String, _ contents: Data,
+        mode: UInt16, uid: UInt32 = 0, gid: UInt32 = 0
+    ) throws {
+        let stream = InputStream(data: contents)
         stream.open()
         defer { stream.close() }
         try formatter.create(
             path: FilePath(path), mode: EXT4.Inode.Mode(.S_IFREG, mode),
             buf: stream, uid: uid, gid: gid)
+    }
+}
+
+private func blockDistinctBytes(count: Int) -> Data {
+    Data((0..<count).map { UInt8(truncatingIfNeeded: ($0 &* 31) ^ ($0 >> 12)) })
+}
+
+private final class ReadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int { lock.withLock { value } }
+
+    func increment() {
+        lock.withLock { value += 1 }
+    }
+}
+
+private final class CountingStream: ReadableStream {
+    private let base: any ReadableStream
+    private let counter: ReadCounter
+
+    init(_ base: any ReadableStream, counter: ReadCounter) {
+        self.base = base
+        self.counter = counter
+    }
+
+    func read(_ buffer: UnsafeMutablePointer<UInt8>, maxLength: Int) -> Int {
+        let read = base.read(buffer, maxLength: maxLength)
+        if read > 0 { counter.increment() }
+        return read
     }
 }
