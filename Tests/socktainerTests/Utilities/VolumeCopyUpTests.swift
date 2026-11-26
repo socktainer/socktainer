@@ -148,6 +148,15 @@ final class VolumeCopyUpTests {
         #expect(try reader.readFile(at: FilePath("/second.txt")) == Data("shared\n".utf8))
     }
 
+    @Test("copy-up work runs on its own dispatch queue, off the cooperative thread pool")
+    func runsOnCopyUpQueue() async {
+        let queueLabel = await VolumeCopyUp.runOnCopyUpQueue {
+            String(cString: __dispatch_queue_get_label(nil))
+        }
+
+        #expect(queueLabel == VolumeCopyUp.copyUpQueueLabel)
+    }
+
     @Test("an image with nothing at the mount path still yields a usable volume")
     func handlesMissingSourcePath() throws {
         let fixture = CopyUpFixture()

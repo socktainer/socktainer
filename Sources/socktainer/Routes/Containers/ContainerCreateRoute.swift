@@ -840,7 +840,11 @@ extension ContainerCreateRoute {
                     await ContainerExitCodeStore.shared.remove(id: containerConfiguration.id)
                     container = try await containerClient.get(id: containerConfiguration.id)
                     req.logger.debug("Container created successfully with ID: \(container.id)")
-                    ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+                    let candidates = copyUpCandidates
+                    let logger = req.logger
+                    await VolumeCopyUp.runOnCopyUpQueue {
+                        ContainerCreateRoute.populateEmptyVolumes(candidates, for: container, logger: logger)
+                    }
                 } catch {
                     req.logger.error("Failed to create container: \(error)")
                     // Docker Engine answers a duplicate name with 409 Conflict. Clients such as Testcontainers
