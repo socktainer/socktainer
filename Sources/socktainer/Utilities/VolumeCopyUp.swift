@@ -12,6 +12,16 @@ import SystemPackage
 /// instead, which is why an image like Postgres cannot initialise its own data
 /// directory on a new volume.
 enum VolumeCopyUp {
+    static let copyUpQueueLabel = "socktainer.volume-copyup"
+
+    private static let copyUpQueue = DispatchQueue(label: copyUpQueueLabel, attributes: .concurrent)
+
+    static func runOnCopyUpQueue<Result: Sendable>(_ work: @escaping @Sendable () -> Result) async -> Result {
+        await withCheckedContinuation { continuation in
+            copyUpQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
     /// True when the volume holds nothing but what a freshly formatted EXT4 image
     /// always carries. Copy-up applies to empty volumes only: Docker leaves a
     /// volume that already has contents alone.
