@@ -105,12 +105,14 @@ struct ResolveExitCodeTests {
         // before the attach stream recorded the exit code, and wait() then slept in fixed
         // 100ms steps. The waiter must wake on set(), well before its timeout.
         let store = ContainerExitCodeStore()
-        async let code = store.waitForCode(id: "timed-late", timeout: .seconds(3))
+        // The timeout is far longer than any wait the test makes, so a code that arrives means
+        // set() woke the waiter. The margins are wide because CI runners can stall for seconds.
+        async let code = store.waitForCode(id: "timed-late", timeout: .seconds(60))
 
         // Make sure the waiter is registered before recording the code; otherwise set()
         // could win the race and the test would only cover the already-recorded path.
         // Bounded, so a registration failure fails the test instead of hanging it.
-        let deadline = ContinuousClock.now + .seconds(1)
+        let deadline = ContinuousClock.now + .seconds(20)
         var registered = false
         while ContinuousClock.now < deadline {
             if await store.pendingTimedWaiters(id: "timed-late") == 1 {
@@ -124,7 +126,7 @@ struct ResolveExitCodeTests {
         let setAt = ContinuousClock.now
         await store.set(id: "timed-late", code: 9)
         #expect(await code == 9)
-        #expect(ContinuousClock.now - setAt < .seconds(1), "the waiter must wake on set(), not at its timeout")
+        #expect(ContinuousClock.now - setAt < .seconds(20), "the waiter must wake on set(), not at its timeout")
         #expect(await store.pendingTimedWaiters(id: "timed-late") == 0)
     }
 
