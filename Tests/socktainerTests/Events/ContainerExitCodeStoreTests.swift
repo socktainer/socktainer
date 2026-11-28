@@ -91,4 +91,52 @@ struct ResolveExitCodeTests {
         #expect(code != 0, "a failed wait must be distinguishable from a genuine exit-0")
         #expect(calls == 4)
     }
+
+    @Test("timed waitForCode returns a code that is already recorded")
+    func timedReturnsAlreadyRecorded() async {
+        let store = ContainerExitCodeStore()
+        await store.set(id: "timed-pre", code: 5)
+        #expect(await store.waitForCode(id: "timed-pre", timeout: .seconds(3)) == 5)
+    }
+
+    @Test("timed waitForCode resumes as soon as the code is recorded, not at the timeout")
+    func timedResumesOnSet() async {
+        // `docker run --rm` hit this path on every run: auto-remove deleted the container
+        // before the attach stream recorded the exit code, and wait() then slept in fixed
+        // 100ms steps. The waiter must wake on set(), well before its timeout.
+        let store = ContainerExitCodeStore()
+        // The timeout is far longer than any wait the test makes, so a code that arrives means
+        // set() woke the waiter. The margins are wide because CI runners can stall for seconds.
+        async let code = store.waitForCode(id: "timed-late", timeout: .seconds(60))
+
+        // Make sure the waiter is registered before recording the code; otherwise set()
+        // could win the race and the test would only cover the already-recorded path.
+        // Bounded, so a registration failure fails the test instead of hanging it.
+        let deadline = ContinuousClock.now + .seconds(20)
+        var registered = false
+        while ContinuousClock.now < deadline {
+            if await store.pendingTimedWaiters(id: "timed-late") == 1 {
+                registered = true
+                break
+            }
+            await Task.yield()
+        }
+        #expect(registered, "the timed waiter never registered")
+
+        let setAt = ContinuousClock.now
+        await store.set(id: "timed-late", code: 9)
+        #expect(await code == 9)
+        #expect(ContinuousClock.now - setAt < .seconds(20), "the waiter must wake on set(), not at its timeout")
+        #expect(await store.pendingTimedWaiters(id: "timed-late") == 0)
+    }
+
+    @Test("timed waitForCode returns nil after the timeout and drops the waiter")
+    func timedExpires() async {
+        let store = ContainerExitCodeStore()
+        #expect(await store.waitForCode(id: "timed-never", timeout: .milliseconds(30)) == nil)
+        #expect(await store.pendingTimedWaiters(id: "timed-never") == 0)
+        // A code recorded after expiry is still stored for later readers.
+        await store.set(id: "timed-never", code: 4)
+        #expect(await store.get(id: "timed-never") == 4)
+    }
 }
