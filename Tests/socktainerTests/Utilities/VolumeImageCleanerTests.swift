@@ -97,6 +97,36 @@ final class VolumeImageCleanerTests {
         #expect(verifier.exists(path: "/lost+found") == false)
     }
 
+    @Test("Never reformats a volume holding data, even when /lost+found exists")
+    func keepsDataWhenLostFoundReappears() throws {
+        // e2fsck recreates /lost+found on a repaired volume, and users can create it.
+        // The next container create must not erase the volume to remove it.
+        let img = try freshExt4Image()
+        let editor = try EXT4Editor(devicePath: FilePath(img.path))
+        try editor.createDirectory(path: "/18", uid: 0, gid: 0)
+        try editor.addFile(path: "/18/PG_VERSION", data: Data("18\n".utf8))
+        try editor.sync()
+
+        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+
+        let verifier = try EXT4Editor(devicePath: FilePath(img.path))
+        #expect(verifier.exists(path: "/18/PG_VERSION") == true)
+        #expect(verifier.exists(path: "/lost+found") == true)
+    }
+
+    @Test("Never reformats a volume whose /lost+found holds recovered files")
+    func keepsRecoveredFiles() throws {
+        let img = try freshExt4Image()
+        let editor = try EXT4Editor(devicePath: FilePath(img.path))
+        try editor.addFile(path: "/lost+found/#12", data: Data("recovered".utf8))
+        try editor.sync()
+
+        VolumeImageCleaner.removeLostFound(imagePath: img.path, logger: logger)
+
+        let verifier = try EXT4Editor(devicePath: FilePath(img.path))
+        #expect(verifier.exists(path: "/lost+found/#12") == true)
+    }
+
     @Test("isPostgresDataVolume detects PGDATA regardless of its value")
     func isPostgresDataVolume() {
         // Any PGDATA value (postgres:16 path, postgres:18 path, custom) signals Postgres.

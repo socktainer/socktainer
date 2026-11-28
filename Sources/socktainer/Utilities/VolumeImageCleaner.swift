@@ -8,8 +8,13 @@ import SystemPackage
 /// Apple Container always creates `/lost+found` at the volume root, which
 /// causes Postgres's `initdb` to reject the directory as non-empty. Named
 /// volumes are always mounted at their root, so `/lost+found` is always at
-/// the top of every mount — the EXT4 reformat is idempotent (no-op when
-/// already absent) and safe for all images.
+/// the top of every mount.
+///
+/// Removing it means reformatting the image, which erases everything on it, so
+/// the cleaner only acts on a volume that is still empty: `/lost+found` is the
+/// only root entry and has nothing in it. `e2fsck` recreates `/lost+found` on a
+/// repaired volume, and users may create it themselves; those volumes hold data
+/// and are left alone.
 /// Best-effort: failures are logged and never propagate to the caller.
 enum VolumeImageCleaner {
     static let optOutLabel = "socktainer.clean-volumes"
@@ -56,11 +61,15 @@ enum VolumeImageCleaner {
 
         let path = FilePath(imagePath)
 
-        // Idempotency + safety: skip if not EXT4 or already clean.
+        // Idempotency + safety: skip if not EXT4, already clean, or holding data.
         do {
             let probe = try EXT4Editor(devicePath: path)
             guard probe.exists(path: "/lost+found") else {
                 logger.info("[volume-clean] \(imagePath) has no /lost+found; nothing to do")
+                return
+            }
+            guard try isFreshlyFormatted(path) else {
+                logger.info("[volume-clean] skip: \(imagePath) holds data; reformatting would erase it")
                 return
             }
         } catch {
@@ -89,5 +98,12 @@ enum VolumeImageCleaner {
         } catch {
             logger.warning("[volume-clean] post-reformat verification failed for \(imagePath): \(error)")
         }
+    }
+
+    /// True when the image looks like Apple Container just created it: an empty
+    /// `/lost+found` and nothing else at the root.
+    static func isFreshlyFormatted(_ path: FilePath) throws -> Bool {
+        let reader = try EXT4.EXT4Reader(blockDevice: path)
+        return try reader.listDirectory("/") == ["lost+found"] && reader.listDirectory("/lost+found").isEmpty
     }
 }
